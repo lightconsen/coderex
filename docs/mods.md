@@ -1,9 +1,10 @@
 # Mods — in-process JavaScript hooks
 
 A **mod** is a JavaScript file that turns CodeRex hook events into decisions.
-Phase 1 is a small, deliberately limited runtime: a mod can observe an event
-and return `stop`, an updated input, an updated tool output, or paths to watch.
-It cannot call tools, read files, open the network, or reach the engine.
+It can observe an event, return `stop`, an updated input, an updated tool
+output, or paths to watch, and it can call `next(e)` to run the downstream
+chain and inspect or rewrite its result. It cannot call tools, read files, open
+the network, or reach the engine.
 
 The runtime is opt-in. Without the environment variable below, CodeRex does not
 load mods at all and behaves exactly as before.
@@ -37,6 +38,16 @@ function register(on, options) {
   on('PostToolUse', '*', function ($, e) {
     return { updatedToolOutput: e.input + ' finished' };
   });
+
+  // next() runs the downstream chain (the settings hooks) and returns its
+  // result to this hook, which may rewrite it.
+  on('PostToolUse', 'Read', function ($, e, next) {
+    const downstream = next();
+    if (!downstream.failed) {
+      return { updatedToolOutput: '[mod] ' + downstream.updatedToolOutput };
+    }
+    return undefined;
+  });
 }
 ```
 
@@ -44,11 +55,13 @@ function register(on, options) {
 
 ### `register(on, options)`
 
-`register` runs synchronously, once at load (to validate the file and record
-its hooks) and again in each hook call's fresh realm. It must call `on` to
-subscribe; a file with no `register` is skipped with a load error. Keep it
-deterministic: it must register the same hooks each time, so it should not
-depend on the clock or on randomness.
+`register` runs synchronously, once when the runtime loads, in that mod's own
+realm. It must call `on` to subscribe; a file with no `register` is skipped with
+a load error. Keep it deterministic: it must register the same hooks every time.
+
+Because the realm lives for the whole runtime, state that a mod declares at
+top level persists across hook calls (for example a counter). Each mod gets its
+own realm, so two mods cannot see each other's globals.
 
 ### `on(event, matcher, hook)`
 
@@ -58,9 +71,9 @@ depend on the clock or on randomness.
   Each alternative is compared case-insensitively with the event input (the
   tool name for tool events). `on(event, hook)` is accepted as shorthand for
   `on(event, "*", hook)`.
-- `hook` — a **synchronous** function `hook($, e)`. An `async` function is
-  rejected at call time with an error, because phase 1 has no continuation to
-  await.
+- `hook` — a **synchronous** function `hook($, e, next)`. `next` is always
+  supplied but may be ignored. An `async` function is rejected at call time
+  with an error, because there is no promise to await.
 
 Matching hooks run in load order (file name, then registration order). A mod
 may register at most 256 hooks.
@@ -99,6 +112,103 @@ run, and the merged result is marked `failed`. On the gating events
 (`PreToolUse`, `UserPromptSubmit`) a failure also sets `stop`, so a broken hook
 can never read as an allow.
 
+## `next(e)` — running the downstream chain
+
+Every hook receives `next` as its third argument:
+
+```js
+on('PostToolUse', 'Read', function ($, e, next) {
+  const downstream = next();          // run the settings hooks
+  if (downstream.stop) return { stop: true, updatedToolOutput: 'denied by a downstream hook' };
+  return { updatedToolOutput: downstream.updatedToolOutput.toUpperCase() };
+});
+```
+
+`next` is **synchronous**: it blocks the mod worker while the downstream
+executor runs and returns that executor's result to the JavaScript hook. The
+agent never blocks; it waits on the worker from its own thread.
+
+### What it runs
+
+`next` invokes the request's **inner executor** — the downstream hook chain,
+normally the hooks loaded from settings — with the same event name. It does not
+re-enter the other JavaScript hooks; those are this runtime's own list, and
+they continue to run in order after the current hook returns.
+
+What the downstream executor receives:
+
+- `next()` — the event's original input and context.
+- `next(value)` where `value` is a string — that string becomes the input; the
+  context is unchanged.
+- `next(event)` where `value` is an object:
+  - `value.input`, when it is a string, becomes the input;
+  - `value.context`, when it is a plain object, replaces the context. Only
+    string-valued entries are forwarded; other value types are ignored.
+
+The input a hook passes to `next` is the original event input (or what that
+hook chose), not an `updatedInput` returned by an earlier JavaScript hook.
+
+With no inner executor installed (for example a `ModRuntime` used directly,
+without a `JsHookExecutor` wrapper), `next` returns an empty result:
+`stop: false`, `failed: false`, no updated values, no watch paths, no errors.
+
+### The result object
+
+`next` returns:
+
+```js
+{
+  stop: false,                  // downstream asked to stop
+  updatedInput: null,           // downstream input replacement, or null
+  updatedToolOutput: null,      // downstream tool-output replacement, or null
+  watchPaths: [],               // downstream paths to watch
+  errors: [],                   // downstream failure messages
+  failed: false                 // downstream reported a failure
+}
+```
+
+`updatedInput` and `updatedToolOutput` are `null` when the downstream executor
+did not set them.
+
+### Single use
+
+`next` may be called **once per hook invocation**. A second call — even after
+the first one returned — throws a `TypeError` with a message containing "may
+only be called once", and does **not** run the downstream chain again. The
+first result is unaffected. A hook may catch the error and carry on:
+
+```js
+on('PostToolUse', '*', function ($, e, next) {
+  const first = next();
+  try { next(); } catch (error) { $.log(String(error.message)); }
+  return { updatedToolOutput: first.updatedToolOutput };
+});
+```
+
+Each matching hook has its own `next`, so two different hooks on the same
+event each get one downstream run if both call it.
+
+### How a hook's result composes with `next`
+
+- **The hook called `next` and returned an object.** Its non-null fields
+  (`updatedInput`, `updatedToolOutput`) win over the downstream result.
+  `stop` is a disjunction: `true` from either side is `true` and cannot be
+  cleared by returning `stop: false`. `watchPaths` from both sides are
+  combined and deduplicated. Downstream `errors` and `failed` are carried
+  forward.
+- **The hook called `next` and returned `undefined` / `null`.** The downstream
+  result passes through unchanged.
+- **The hook did not call `next`.** It decides on its own, exactly as before.
+- **The hook threw after calling `next`.** The downstream run still counts,
+  its result is preserved, and the hook is marked `failed` with the exception
+  message. On a gating event that also sets `stop`.
+- **Any hook called `next`.** The inner executor is not run a second time
+  after the JavaScript hooks finish. If no hook called `next`, it runs once at
+  the end with the possibly updated input, exactly as in phase 1.
+
+The timeout budget covers the **whole** call, including the downstream run.
+See [Limits and isolation](#limits-and-isolation).
+
 ## The `$` host API
 
 `$` is frozen and contains exactly three things:
@@ -121,19 +231,34 @@ directories and every `CODEREX_*` variable are not readable. The session facts
 a mod legitimately needs come from `$.session`.
 
 There is no `$.tools`, `$.files`, `$.engine`, `$`-level filesystem, `require`,
-`process`, `fetch`, `XMLHttpRequest`, timer or network access. The realm is a
-default `boa_engine` `Context` with only the above installed.
+`process`, `fetch`, `XMLHttpRequest`, timer or network access. `next` is the
+only capability added on top of the phase-1 surface, and it only invokes the
+host's existing downstream hook executor — it exposes no engine object.
 
 ## Limits and isolation
 
 A `boa_engine::Context` is neither `Send` nor interruptible from another
-thread. Each hook call therefore gets **its own OS thread and its own realm**.
-The runtime itself holds only strings and configuration, which is what lets the
-executor be shared as `Arc<dyn HookExecutor>`.
+thread, and `next` must resume in the same context that called it. Each
+`ModRuntime` therefore owns:
+
+- **one worker thread**, created when the runtime is constructed;
+- **one `Context`** on that thread;
+- **one realm per loaded mod**, created at load;
+- **one small current-thread `tokio` runtime** on the worker, used only to
+  `block_on` the downstream executor when a hook calls `next`.
+
+`ModRuntime` itself holds strings and configuration plus a channel, which is
+what lets `JsHookExecutor` be shared as `Arc<dyn HookExecutor>`.
+
+`fire` sends a request to the worker and waits for its reply. The worker runs
+the matching JavaScript hooks in order, then (unless a hook called `next` or
+stopped the event) the downstream executor. A timeout does not stop the
+engine; the caller detaches the worker and reports a hook error. The next
+`fire` starts a fresh worker, which reloads the mods.
 
 | Limit | Default | Behaviour |
 | --- | --- | --- |
-| Wall clock | 5 s per hook | The calling thread stops waiting and reports a hook error. |
+| Wall clock | 5 s per call | Covers every matching JavaScript hook **and** the downstream run. The calling thread stops waiting and reports a hook error. |
 | Loop iterations | 10,000,000 per frame | `while (true) {}` throws an engine runtime-limit error. |
 | Recursion | 256 nested calls | A runaway recursive hook throws instead of overflowing the stack. |
 | Stack values | 10,240 | The engine's stack ceiling. |
@@ -155,60 +280,34 @@ boundary.
 The wall-clock budget is enforced by the caller, not by the engine: boa 0.20
 has no interrupt hook. When the budget expires the call is reported and the
 worker is detached; the engine limits make it terminate shortly afterwards. A
-hook that blocked inside a native call would outlive the timeout until that
-call returned.
+hook that blocked inside a native call, or a downstream executor that never
+resolves, would outlive the timeout until that work returned. Requests are
+serialized by the worker, so a detached runaway delays only its own runtime.
 
 ## Composing with settings hooks
 
 `JsHookExecutor` implements `coderex_core::hook_executor::HookExecutor` and can
 wrap the existing `HookRegistry`:
 
-1. JavaScript hooks run first.
-2. If any JavaScript hook returned `stop`, the inner executor is not called.
-3. Otherwise the inner executor runs with the possibly updated input.
-4. Results merge: `stop` and `failed` are OR-ed, the inner executor wins an
-   `updatedInput` / `updatedToolOutput` conflict (it ran later), watch paths
-   are combined and deduplicated, and errors are appended.
+1. JavaScript hooks run in load order; each one may call `next(e)` to run the
+   settings hooks immediately and inspect or rewrite the result.
+2. If a JavaScript hook returns `stop` and no hook called `next`, the inner
+   executor is not called.
+3. If no hook called `next`, the inner executor runs with the possibly updated
+   input. Results merge as before: `stop` and `failed` are OR-ed, the inner
+   executor wins an `updatedInput` / `updatedToolOutput` conflict (it ran
+   later), watch paths are combined and deduplicated, and errors are appended.
+4. If a hook called `next`, that hook's own non-null fields win over the
+   downstream result instead (see the composition rules above), and the inner
+   executor is not run again at the end.
 
-The runtime is synchronous; `fire_hook` moves the blocking JavaScript work to
-`tokio::task::spawn_blocking` and awaits it, so it does not block an async
-worker.
+The runtime is synchronous; `fire_hook` moves the blocking wait to
+`tokio::task::spawn_blocking`, so it does not block an async worker.
 
 ## Not yet
 
-Phase 1 has no `next(e)`, no UI elements and no async hooks. These are the
-designs, not shipped behaviour.
-
-### `next(e)` — chaining a hook with the rest of the chain
-
-The reference runtime passes a `next(e)` function to each hook; calling it
-continues the chain, and the hook can inspect or replace what comes back.
-Implementing that needs **engine continuation**, which this runtime does not
-have:
-
-- A hook is currently a single synchronous call whose value is read when it
-  returns. `next(e)` must suspend the hook in the middle of its JavaScript
-  frame, let the host run the remaining hooks (including the inner executor),
-  then resume it with the downstream result.
-- The realm is `!Send`, so the suspended frame must stay on one owner thread.
-  The viable shape is a persistent mod worker thread that owns a `Context`,
-  with `fire` requests and `next` round-trips over channels. `next` would
-  block that worker until the host answers; the agent's async side drives the
-  chain, so the agent never blocks.
-- On the JavaScript side the cleanest representation is a generator or an
-  explicitly driven state machine: compile/run the hook as a generator, yield
-  a `NextRequest(e)` when `next` is called, and resume with the downstream
-  `HookFireResult`. Boa 0.20 can run a generator, but the host must drive
-  `run_jobs` in rounds (the `crates/workflow` runtime already has this loop
-  shape).
-- Semantics to pin down: whether `next` composes results forward (this hook
-  then inner hooks then downstream mods) or backward; how a downstream
-  `stop` is surfaced; whether the hook may call `next` more than once; and
-  how a timeout applies to the whole suspended chain rather than one call.
-- The current per-call thread model is incompatible with continuation, so
-  enabling `next` requires moving to a long-lived worker per runtime while
-  keeping the same limits (the worker can still be abandoned on timeout, but
-  now the whole chain's budget must be tracked).
+There are no UI elements and no async hooks. These are the designs, not shipped
+behaviour.
 
 ### UI elements
 

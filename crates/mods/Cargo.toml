@@ -16,6 +16,9 @@ coderex-config = { path = "../config" }
 
 async-trait.workspace = true
 boa_engine.workspace = true
+# The `Finalize`/`Trace` derives expand to `boa_gc` paths, so the crate must be
+# nameable. It is the same version `boa_engine` uses.
+boa_gc = "0.20"
 serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true

@@ -6,16 +6,17 @@ use std::sync::Arc;
 
 use coderex_core::hook_executor::{HookExecutor, HookFireResult};
 
-use crate::runtime::{ModRuntime, ModSession, dedupe_paths, is_gating_event};
+use crate::runtime::{ModRuntime, ModSession, is_gating_event};
 
-/// A [`HookExecutor`] that runs in-process JavaScript hooks first and then an
-/// optional inner executor.
+/// A [`HookExecutor`] that runs in-process JavaScript hooks with an optional
+/// downstream executor.
 ///
-/// The inner executor is normally a `coderex_hooks::HookRegistry`. When the
-/// JavaScript hooks do not stop the event, the inner executor receives the
-/// possibly updated input and its result is merged: either side can stop, the
-/// inner side wins a field conflict (it ran later), watch paths are combined,
-/// and errors are appended.
+/// The downstream executor is normally a `coderex_hooks::HookRegistry`. It is
+/// handed to every request so a JavaScript hook can call `next(e)` and receive
+/// the downstream result. When no hook calls `next`, the downstream executor
+/// runs after the JavaScript hooks with the possibly updated input, exactly as
+/// before: either side can stop, the downstream side wins a field conflict (it
+/// ran later), watch paths are combined, and errors are appended.
 #[derive(Clone)]
 pub struct JsHookExecutor {
     runtime: Arc<ModRuntime>,
@@ -94,68 +95,33 @@ impl HookExecutor for JsHookExecutor {
         let event = event_name.to_string();
         let js_input = input.to_string();
         let js_context = context.clone();
-        let js_result =
-            match tokio::task::spawn_blocking(move || runtime.fire(&event, &js_input, &js_context))
-                .await
-            {
-                Ok(result) => result,
-                Err(error) => {
-                    let mut failed = HookFireResult {
-                        failed: true,
-                        errors: vec![format!("the mod hook task failed: {error}")],
-                        ..HookFireResult::default()
-                    };
-                    if is_gating_event(event_name) {
-                        failed.stop = true;
-                    }
-                    failed
+        let inner = self.inner.clone();
+        // The worker blocks while a hook calls `next(e)`, so it must not run on
+        // an async worker thread.
+        match tokio::task::spawn_blocking(move || {
+            runtime.fire_with_inner(&event, &js_input, &js_context, inner)
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                let mut failed = HookFireResult {
+                    failed: true,
+                    errors: vec![format!("the mod hook task failed: {error}")],
+                    ..HookFireResult::default()
+                };
+                if is_gating_event(event_name) {
+                    failed.stop = true;
                 }
-            };
-
-        if js_result.stop {
-            return js_result;
+                failed
+            }
         }
-
-        let Some(inner) = &self.inner else {
-            return js_result;
-        };
-
-        // A JavaScript hook that rewrote the input is rewriting what the rest
-        // of the chain sees, so the inner executor runs on the new value.
-        let inner_input = js_result
-            .updated_input
-            .clone()
-            .unwrap_or_else(|| input.to_string());
-        let inner_result = inner.fire_hook(event_name, &inner_input, context).await;
-        merge_results(js_result, inner_result)
     }
 
     fn watch_paths(&self) -> Vec<String> {
         self.inner
             .as_ref()
             .map_or_else(Vec::new, |inner| inner.watch_paths())
-    }
-}
-
-/// Merge the JavaScript result with the inner executor's result.
-///
-/// Both sides ran, so `stop` and `failed` are disjunctions. The inner executor
-/// ran second and wins an `updated_*` conflict; a side that left the field
-/// unset does not erase what the other set. Watch paths are combined and
-/// deduplicated in first-seen order.
-fn merge_results(js: HookFireResult, inner: HookFireResult) -> HookFireResult {
-    let mut watch_paths = js.watch_paths;
-    watch_paths.extend(inner.watch_paths);
-    let mut errors = js.errors;
-    errors.extend(inner.errors);
-
-    HookFireResult {
-        stop: js.stop || inner.stop,
-        updated_input: inner.updated_input.or(js.updated_input),
-        updated_tool_output: inner.updated_tool_output.or(js.updated_tool_output),
-        errors,
-        failed: js.failed || inner.failed,
-        watch_paths: dedupe_paths(watch_paths),
     }
 }
 
