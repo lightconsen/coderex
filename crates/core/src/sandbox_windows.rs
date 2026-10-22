@@ -338,7 +338,7 @@ fn is_root_like(path: &std::path::Path) -> bool {
 ///
 /// Pure, so the expansion is tested on every platform.
 #[must_use]
-pub(crate) fn mask_covers(mask: u32, needed: u32) -> bool {
+pub(crate) const fn mask_covers(mask: u32, needed: u32) -> bool {
     const GENERIC_READ: u32 = 0x8000_0000;
     const GENERIC_WRITE: u32 = 0x4000_0000;
     const GENERIC_EXECUTE: u32 = 0x2000_0000;
