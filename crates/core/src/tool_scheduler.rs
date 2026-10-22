@@ -284,7 +284,7 @@ pub async fn run_tool_calls<S: std::hash::BuildHasher + Sync>(
 
     // ─── Phase 3: Post-execution hooks & events ────────────────────────────
     for ((idx, call), outcome) in approved.iter().zip(outcomes) {
-        let result = outcome.result;
+        let mut result = outcome.result;
 
         let mut ctx = HashMap::new();
         ctx.insert("tool_call_id".to_string(), call.id.clone());
@@ -301,6 +301,11 @@ pub async fn run_tool_calls<S: std::hash::BuildHasher + Sync>(
                 call.name,
                 post_result.errors
             );
+        }
+        // A PostToolUse hook that returned `updatedToolOutput` rewrites what
+        // the model sees: that is the hook's decision power, not just a veto.
+        if let Some(updated) = post_result.updated_tool_output {
+            result.output = updated;
         }
 
         let _ = event_tx.send(EngineEvent::ToolCallEnd {
@@ -396,6 +401,59 @@ mod tests {
             self.fired.lock().unwrap().push(event_name.to_string());
             crate::hook_executor::HookFireResult::default()
         }
+    }
+
+    /// A `PostToolUse` hook that rewrites what the model sees.
+    struct RewritingHooks;
+
+    #[async_trait::async_trait]
+    impl HookExecutor for RewritingHooks {
+        async fn fire_hook(
+            &self,
+            event_name: &str,
+            _input: &str,
+            _context: &HashMap<String, String>,
+        ) -> crate::hook_executor::HookFireResult {
+            if event_name == hook_events::POST_TOOL_USE {
+                return crate::hook_executor::HookFireResult {
+                    updated_tool_output: Some("redacted by hook".to_string()),
+                    ..Default::default()
+                };
+            }
+            crate::hook_executor::HookFireResult::default()
+        }
+    }
+
+    /// A PostToolUse hook's `updatedToolOutput` replaces the result the model
+    /// sees — the hook's decision power, not just a veto.
+    #[tokio::test]
+    async fn a_post_tool_use_hook_can_replace_the_tool_output() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let tools = MockToolExecutor;
+        let mut perm_engine = PermissionEngine::new(crate::permissions::PermissionChecker::new(
+            crate::permissions::PermissionMode::BypassPermissions,
+        ));
+        let mut denied = Vec::new();
+        let calls = vec![PendingToolCall {
+            id: "t1".into(),
+            name: "Read".into(),
+            input: serde_json::Value::Null,
+        }];
+
+        let outcome = run_tool_calls(
+            &calls,
+            &tools,
+            &mut perm_engine,
+            &RewritingHooks,
+            &SubmitOptions::default(),
+            &tx,
+            &mut denied,
+            &std::collections::HashMap::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome.results[0].output, "redacted by hook");
     }
 
     #[tokio::test]

@@ -288,6 +288,12 @@ pub struct HookResult {
     pub additional_context: Option<String>,
     /// File paths to watch (for file watcher hooks).
     pub watch_paths: Vec<String>,
+    /// Replacement for the tool's output (`PostToolUse`).
+    ///
+    /// The reference's `updatedToolOutput`: a hook that inspects a tool result
+    /// can rewrite what the model sees, so an auditing hook can redact,
+    /// reformat, or annotate it instead of only being able to stop the turn.
+    pub updated_tool_output: Option<String>,
     /// Permission decision (for PermissionRequest hooks).
     pub permission_decision: Option<HookPermissionDecision>,
 }

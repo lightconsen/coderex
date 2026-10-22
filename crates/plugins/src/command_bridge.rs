@@ -41,7 +41,9 @@ impl PluginCommandBridge {
                         });
 
                         match result {
-                            Ok(output) => CommandResult::success(output),
+                            Ok(output) => CommandResult::success(
+                                crate::plugin_ui::render_plugin_response(&output),
+                            ),
                             Err(e) => CommandResult::error(e),
                         }
                     },
@@ -83,7 +85,9 @@ impl PluginCommandBridge {
                         });
 
                         match result {
-                            Ok(output) => CommandResult::success(output),
+                            Ok(output) => CommandResult::success(
+                                crate::plugin_ui::render_plugin_response(&output),
+                            ),
                             Err(e) => CommandResult::error(e),
                         }
                     },

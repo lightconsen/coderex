@@ -4,6 +4,7 @@
 
 pub mod command_bridge;
 pub mod declarations;
+pub mod plugin_ui;
 pub mod plugins;
 pub mod runtime;
 pub mod skills;

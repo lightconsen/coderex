@@ -47,6 +47,12 @@ pub struct HookFireResult {
     /// `FileChanged` hook can observe files the session only learned about at
     /// start-up. The parser has already rejected relative paths.
     pub watch_paths: Vec<String>,
+    /// Replacement for the tool's output, when a `PostToolUse` hook supplied
+    /// one.
+    ///
+    /// The caller substitutes it for what the tool produced before the model
+    /// sees the result.
+    pub updated_tool_output: Option<String>,
 }
 
 /// Abstract hook executor — implemented by `coderex-hooks::HookRegistry`.

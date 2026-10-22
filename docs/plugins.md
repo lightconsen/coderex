@@ -392,7 +392,35 @@ A `channels` declaration names a configured MCP server and gives it a name:
 - `PluginManager::plugin_channel_report()` returns one entry per declared channel with its **live** state: `Subscribed` (a sink is attached), `Idle` (the server is configured but nothing is subscribed), or `ServerNotConfigured`. A channel naming an unconfigured server is reported as such rather than shown as working.
 - `subscribe_channel(server, sink)` attaches a `ChannelSink`; `route_channel_notification(server, method, params)` turns one JSON-RPC notification from that server into a `PluginChannelEvent` and hands it to every subscribed sink, returning how many received it. `0` is an honest answer — nothing is bound or nothing is subscribed — not an error.
 - `/plugin components` lists each channel as `displayName -> server [state]`.
-- **Honest limit:** this is the routing product, not a transport. Nothing in CodeRex yet calls `route_channel_notification` from a live MCP notification stream — the server-to-sink hop exists, is tested, and is exposed, but the MCP client does not drive it today. A channel whose server is not configured is reported as such.
+- The MCP client **does** drive it: `McpManager` routes every notification a configured server emits through `PluginChannelRouter` into `route_channel_notification`, and the session subscribes a production sink to every declared channel.
+- **Honest limit:** this is routing plus an in-process fan-out, not a transport. The sink records events into a bounded session log; nothing carries a channel message out of the process (a chat product, another host) and there is no inbound path. `PluginChannelEvent` is deliberately transport-free.
+
+## Plugin UI
+
+A plugin **command** may return a JSON object with a `ui` payload instead of a
+plain string:
+
+```json
+{
+  "text": "optional summary printed before the panel",
+  "ui": {
+    "title": "Deploy status",
+    "style": "info",
+    "lines": ["api: ok", "web: failed"]
+  }
+}
+```
+
+`plugin_ui::render_plugin_response` turns it into a titled text panel (a
+scrollable message in the TUI, the same box on the terminal). `style` may be
+`info` (default), `warning` or `error`; the last two prefix the title with a
+marker. Anything that is not a JSON object carrying `ui` is passed through
+unchanged, so a plugin that prints JSON still prints JSON.
+
+**Honest limit:** plugins run out-of-process, so this is a structured text
+block, not a widget tree. There is no `Box`/`Text`/`Button`, no interaction,
+and no per-surface rendering (`terminal`/`desktop`/`vscode`); the reference's
+in-process mods get those because they run inside its UI runtime.
 
 ## Types
 

@@ -4804,7 +4804,7 @@ impl QueryEngine {
         match perm_result {
             PermissionResult::Allow | PermissionResult::AllowForPath { .. } => {
                 let outcome = self.tools.execute(&call.id, &call.name, &call.input).await;
-                let result = outcome.result;
+                let mut result = outcome.result;
 
                 let mut ctx = std::collections::HashMap::new();
                 ctx.insert("tool_call_id".to_string(), call.id.clone());
@@ -4822,6 +4822,11 @@ impl QueryEngine {
                         call.name,
                         post_result.errors
                     );
+                }
+                // A PostToolUse hook's `updatedToolOutput` replaces what the
+                // model sees.
+                if let Some(updated) = post_result.updated_tool_output {
+                    result.output = updated;
                 }
 
                 let _ = self.event_tx.send(EngineEvent::ToolCallEnd {

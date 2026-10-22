@@ -1531,6 +1531,9 @@ impl HookExecutor for HookRegistry {
                     if r.hook_result.updated_input.is_some() {
                         combined.updated_input = r.hook_result.updated_input;
                     }
+                    if r.hook_result.updated_tool_output.is_some() {
+                        combined.updated_tool_output = r.hook_result.updated_tool_output;
+                    }
                     combined.watch_paths.extend(r.hook_result.watch_paths);
                 }
                 Err(e) => {
@@ -2179,12 +2182,21 @@ pub fn parse_hook_output_line(line: &str) -> Result<HookResult, HookError> {
         serde_json::from_value::<crate::events::HookPermissionDecision>(v.clone()).ok()
     });
 
+    // `updatedToolOutput` is the reference spelling; the snake_case one is
+    // accepted too, like `watchPaths`.
+    let updated_tool_output = parsed
+        .get("updatedToolOutput")
+        .or_else(|| parsed.get("updated_tool_output"))
+        .and_then(|v| v.as_str())
+        .map(String::from);
+
     Ok(HookResult {
         action,
         suppress_output,
         updated_input,
         additional_context,
         watch_paths,
+        updated_tool_output,
         permission_decision,
     })
 }
@@ -2516,6 +2528,37 @@ mod tests {
         .to_string();
         let result = parse_hook_output_line(&line).unwrap();
         assert_eq!(result.watch_paths, vec![first, second]);
+    }
+
+    /// A PostToolUse hook may rewrite what the model sees, in either
+    /// spelling the reference and this host use.
+    #[test]
+    fn parse_hook_output_line_reads_updated_tool_output() {
+        let camel = serde_json::json!({
+            "action": "continue",
+            "updatedToolOutput": "redacted",
+        })
+        .to_string();
+        assert_eq!(
+            parse_hook_output_line(&camel).unwrap().updated_tool_output,
+            Some("redacted".to_string())
+        );
+
+        let snake = serde_json::json!({
+            "action": "continue",
+            "updated_tool_output": "reformatted",
+        })
+        .to_string();
+        assert_eq!(
+            parse_hook_output_line(&snake).unwrap().updated_tool_output,
+            Some("reformatted".to_string())
+        );
+
+        let none = serde_json::json!({"action": "continue"}).to_string();
+        assert_eq!(
+            parse_hook_output_line(&none).unwrap().updated_tool_output,
+            None
+        );
     }
 
     #[test]

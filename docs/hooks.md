@@ -286,6 +286,12 @@ reserved.
 
 - `PreToolUse`, `PostToolUse`, `PostToolUseFailure`, `PermissionRequest`,
   `PermissionDenied` — `coderex_core::tool_scheduler`.
+
+A `PostToolUse` hook may return **`updatedToolOutput`** (or
+`updated_tool_output`): a string that replaces the tool's output before the
+model sees it. That is the hook's decision power, not just a veto — an
+auditing hook can redact, reformat or annotate a result. The first hook that
+supplies one wins; hooks without it leave the result unchanged.
 - `UserPromptSubmit`, `SessionStart`, `TurnEnd`, `Stop`, `PreCompact`,
   `PostCompact`, `Notification`, `Elicitation`, `ElicitationResult` —
   `coderex_core::engine`.
