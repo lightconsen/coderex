@@ -19,6 +19,7 @@ use coderex_hooks::{
 
 fn config(event: &str, command: &str) -> HookConfig {
     HookConfig {
+        watch: None,
         event: event.to_string(),
         kind: HookType::Command,
         command: command.to_string(),
@@ -43,6 +44,7 @@ fn config(event: &str, command: &str) -> HookConfig {
 
 fn config_with_env(event: &str, command: &str, env: HashMap<String, String>) -> HookConfig {
     HookConfig {
+        watch: None,
         event: event.to_string(),
         kind: HookType::Command,
         command: command.to_string(),
@@ -304,18 +306,26 @@ async fn hook_postcompact_fires_after_compaction() {
 
 #[tokio::test]
 async fn hook_cwdchanged_runs_through_the_registry() {
+    // `watch_paths` must be absolute: a relative path would be resolved
+    // against whatever cwd the watcher happens to have.
+    let watched = std::env::temp_dir()
+        .join(".coderex")
+        .to_string_lossy()
+        .into_owned();
+    let answer = serde_json::json!({
+        "action": "continue",
+        "watch_paths": [watched.clone()],
+    })
+    .to_string();
     let mut registry = HookRegistry::new();
-    registry.register(config(
-        "CwdChanged",
-        r#"echo '{"action":"continue", "watch_paths": [".coderex"]}'"#,
-    ));
+    registry.register(config("CwdChanged", &format!("echo '{answer}'")));
 
     let results = registry
         .execute_sync(&HookEvent::CwdChanged, &input("CwdChanged"))
         .await;
     let result = results[0].as_ref().unwrap();
     assert!(matches!(result.hook_result.action, HookAction::Continue));
-    assert!(!result.hook_result.watch_paths.is_empty());
+    assert_eq!(result.hook_result.watch_paths, vec![watched]);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -346,6 +356,7 @@ async fn hook_wildcard_matches_all_events() {
 async fn hook_priority_runs_highest_first() {
     let mut registry = HookRegistry::new();
     registry.register(HookConfig {
+        watch: None,
         priority: 1,
         ..config(
             "PreToolUse",
@@ -353,6 +364,7 @@ async fn hook_priority_runs_highest_first() {
         )
     });
     registry.register(HookConfig {
+        watch: None,
         priority: 0,
         ..config(
             "PreToolUse",
@@ -379,6 +391,7 @@ async fn hook_priority_runs_highest_first() {
 async fn hook_timeout_kills_long_running_hook() {
     let mut registry = HookRegistry::new();
     registry.register(HookConfig {
+        watch: None,
         timeout_ms: 100,
         ..config("Stop", "sleep 10")
     });
@@ -483,6 +496,7 @@ fn hook_load_from_settings_null_returns_empty() {
 async fn hook_dry_run_suppresses_stop_action() {
     let mut registry = HookRegistry::new();
     registry.register(HookConfig {
+        watch: None,
         dry_run: true,
         stream: false,
         ..config("PreToolUse", r#"echo '{"action":"stop"}'"#)
@@ -684,6 +698,7 @@ fn http_config_with(
     allowed_env_vars: Vec<String>,
 ) -> HookConfig {
     HookConfig {
+        watch: None,
         event: event.to_string(),
         kind: HookType::Http,
         command: String::new(),

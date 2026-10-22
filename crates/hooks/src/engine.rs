@@ -235,6 +235,15 @@ pub struct HookConfig {
     /// [`HOOK_SANDBOX_ENV`](crate::HOOK_SANDBOX_ENV).
     #[serde(default)]
     pub sandbox: Option<HookSandboxConfig>,
+    /// Absolute paths a `FileChanged` hook wants observed.
+    ///
+    /// A settings entry may write `watch` as a single path string or an array
+    /// of paths. The host watches them in addition to the settings files; see
+    /// [`HookRegistry::watch_paths`]. Relative paths are refused as a whole
+    /// field with a warning: they would be resolved against whatever working
+    /// directory the watcher happens to have.
+    #[serde(default, deserialize_with = "deserialize_watch")]
+    pub watch: Option<Vec<String>>,
     /// Trust tier — assigned by the loader, never read from settings.
     ///
     /// `#[serde(skip)]` is deliberate: a settings file that writes `tier` must
@@ -613,6 +622,9 @@ pub struct RawHookConfig {
     /// OS sandbox policy, or `false` to opt this hook out.
     #[serde(default)]
     pub sandbox: Option<RawSandboxSetting>,
+    /// Absolute paths a `FileChanged` hook wants observed: a string or array.
+    #[serde(default)]
+    pub watch: Option<serde_json::Value>,
 }
 
 /// The two shapes the `sandbox` key accepts.
@@ -642,6 +654,78 @@ impl RawSandboxSetting {
     }
 }
 
+/// Read a `watch`/`watchPaths` value as a list of absolute paths.
+///
+/// Both spellings the hook surface uses are accepted: a single path string or
+/// an array of path strings. The field is all-or-nothing — one non-string
+/// entry or one relative path rejects every path in it. A relative path is
+/// never useful here: the watcher would resolve it against whatever working
+/// directory it happened to hold, which is not the one the hook author meant.
+#[must_use]
+pub fn parse_absolute_paths(value: &serde_json::Value, field: &str) -> Vec<String> {
+    let paths: Vec<String> = match value {
+        serde_json::Value::String(path) => vec![path.clone()],
+        serde_json::Value::Array(entries) => {
+            let mut paths = Vec::with_capacity(entries.len());
+            for entry in entries {
+                let Some(path) = entry.as_str() else {
+                    tracing::warn!(
+                        field,
+                        value = %entry,
+                        "hook {field} must contain only path strings; ignoring the whole field"
+                    );
+                    return Vec::new();
+                };
+                paths.push(path.to_string());
+            }
+            paths
+        }
+        other => {
+            tracing::warn!(
+                field,
+                value = %other,
+                "hook {field} must be a path string or an array of path strings; ignoring it"
+            );
+            return Vec::new();
+        }
+    };
+
+    if let Some(relative) = paths
+        .iter()
+        .find(|path| !std::path::Path::new(path).is_absolute())
+    {
+        tracing::warn!(
+            field,
+            path = %relative,
+            "hook {field} contains a relative path; ignoring the whole field"
+        );
+        return Vec::new();
+    }
+
+    dedupe(paths)
+}
+
+/// Deserialize `HookConfig::watch`, which accepts a string or an array.
+fn deserialize_watch<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let Some(value) = Option::<serde_json::Value>::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+    let paths = parse_absolute_paths(&value, "watch");
+    Ok(if paths.is_empty() { None } else { Some(paths) })
+}
+
+/// Remove duplicates while keeping the first occurrence's order.
+fn dedupe(paths: Vec<String>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    paths
+        .into_iter()
+        .filter(|path| seen.insert(path.clone()))
+        .collect()
+}
+
 /// The fields every hook kind shares, taken from its raw configuration.
 ///
 /// The kind-specific fields (`command`, `http`, `prompt`/`model`, `mcp`) are
@@ -667,6 +751,11 @@ fn from_raw(raw: &RawHookConfig, timeout_ms: u64) -> HookConfig {
         max_memory_mb: raw.max_memory_mb,
         max_file_size_mb: raw.max_file_size_mb,
         sandbox: raw.sandbox.clone().map(RawSandboxSetting::into_config),
+        watch: raw
+            .watch
+            .as_ref()
+            .map(|value| parse_absolute_paths(value, "watch"))
+            .filter(|paths| !paths.is_empty()),
         tier: HookTier::Core,
     }
 }
@@ -1105,11 +1194,42 @@ impl HookRegistry {
         })
     }
 
-    /// Install API: turn the registry into the boxed executor the engine takes,
-    /// so `engine.set_hooks(registry.into_executor())` is one line.
+    /// Install API: turn the registry into the shared executor the engine
+    /// takes, so `engine.set_hooks(registry.into_executor())` is one line.
+    ///
+    /// `Arc` rather than `Box` because a watcher task may fire an event while
+    /// the turn owns the engine.
     #[must_use]
-    pub fn into_executor(self) -> Box<dyn HookExecutor + Send + Sync> {
-        Box::new(self)
+    pub fn into_executor(self) -> Arc<dyn HookExecutor + Send + Sync> {
+        Arc::new(self)
+    }
+
+    /// Absolute paths the installed `FileChanged` hooks asked to watch.
+    ///
+    /// The static `watch` field is a request from the hook author, so it is
+    /// read from the configuration rather than from a fired result. A hook
+    /// configured for `*` is included: it matches `FileChanged` too.
+    ///
+    /// Session-returned paths (`watchPaths`) are separate — the engine merges
+    /// them with this list once `SessionStart` has run.
+    #[must_use]
+    pub fn watch_paths(&self) -> Vec<String> {
+        let mut paths = Vec::new();
+        for entry in &self.hooks {
+            let watches_files = entry.config.event == "*"
+                || entry
+                    .config
+                    .event
+                    .parse::<HookEvent>()
+                    .is_ok_and(|event| event == HookEvent::FileChanged);
+            if !watches_files {
+                continue;
+            }
+            if let Some(watch) = &entry.config.watch {
+                paths.extend(watch.iter().cloned());
+            }
+        }
+        dedupe(paths)
     }
 
     /// Report hooks whose event nothing ever fires.
@@ -1411,6 +1531,7 @@ impl HookExecutor for HookRegistry {
                     if r.hook_result.updated_input.is_some() {
                         combined.updated_input = r.hook_result.updated_input;
                     }
+                    combined.watch_paths.extend(r.hook_result.watch_paths);
                 }
                 Err(e) => {
                     // Fail closed: a hook that could not answer is not an
@@ -1425,7 +1546,12 @@ impl HookExecutor for HookRegistry {
         if combined.failed && gating {
             combined.stop = true;
         }
+        combined.watch_paths = dedupe(combined.watch_paths);
         combined
+    }
+
+    fn watch_paths(&self) -> Vec<String> {
+        Self::watch_paths(self)
     }
 }
 
@@ -2040,14 +2166,13 @@ pub fn parse_hook_output_line(line: &str) -> Result<HookResult, HookError> {
         .and_then(|v| v.as_str())
         .map(String::from);
 
+    // `watchPaths` is the reference spelling; `watch_paths` is the historical
+    // one this host emitted. A hook may deliberately return an empty array to
+    // clear its watch list, so absence is distinct from emptiness.
     let watch_paths = parsed
-        .get("watch_paths")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
+        .get("watchPaths")
+        .or_else(|| parsed.get("watch_paths"))
+        .map(|value| parse_absolute_paths(value, "watchPaths"))
         .unwrap_or_default();
 
     let permission_decision = parsed.get("permission_decision").and_then(|v| {
@@ -2136,6 +2261,7 @@ mod tests {
     fn register_and_match_single_hook() {
         let mut registry = HookRegistry::new();
         registry.register(HookConfig {
+            watch: None,
             event: "SessionStart".to_string(),
             kind: HookType::Command,
             tier: HookTier::Core,
@@ -2166,6 +2292,7 @@ mod tests {
     fn wildcard_hook_matches_all_events() {
         let mut registry = HookRegistry::new();
         registry.register(HookConfig {
+            watch: None,
             event: "*".to_string(),
             kind: HookType::Command,
             tier: HookTier::Core,
@@ -2312,11 +2439,145 @@ mod tests {
         assert_eq!(result.updated_input, Some("new prompt".to_string()));
     }
 
+    /// An absolute path that exists on every platform the tests run on.
+    fn absolute(name: &str) -> String {
+        std::env::temp_dir()
+            .join(name)
+            .to_string_lossy()
+            .into_owned()
+    }
+
     #[test]
-    fn parse_hook_output_line_watch_paths() {
-        let line = r#"{"action": "continue", "watch_paths": ["/src", "/lib"]}"#;
-        let result = parse_hook_output_line(line).unwrap();
-        assert_eq!(result.watch_paths, vec!["/src", "/lib"]);
+    fn watch_paths_accepts_a_single_string() {
+        let path = absolute("coderex-watch-one");
+        let line = serde_json::json!({
+            "action": "continue",
+            "watchPaths": path,
+        })
+        .to_string();
+        let result = parse_hook_output_line(&line).unwrap();
+        assert_eq!(result.watch_paths, vec![path]);
+    }
+
+    #[test]
+    fn watch_paths_accepts_an_array() {
+        let first = absolute("coderex-watch-a");
+        let second = absolute("coderex-watch-b");
+        let line = serde_json::json!({
+            "action": "continue",
+            "watchPaths": [first, second],
+        })
+        .to_string();
+        let result = parse_hook_output_line(&line).unwrap();
+        assert_eq!(result.watch_paths, vec![first, second]);
+    }
+
+    /// One relative path poisons the whole field: watching some of what the
+    /// hook asked for and silently dropping the rest is worse than watching
+    /// nothing, because the hook cannot tell which happened.
+    #[test]
+    fn watch_paths_rejects_the_whole_field_when_any_path_is_relative() {
+        let good = absolute("coderex-watch-good");
+        let line = serde_json::json!({
+            "action": "continue",
+            "watchPaths": [good, "relative/path"],
+        })
+        .to_string();
+        let result = parse_hook_output_line(&line).unwrap();
+        assert!(
+            result.watch_paths.is_empty(),
+            "a relative path must reject the whole watchPaths field: {:?}",
+            result.watch_paths
+        );
+    }
+
+    #[test]
+    fn watch_paths_rejects_non_string_entries() {
+        let good = absolute("coderex-watch-good");
+        let line = serde_json::json!({
+            "action": "continue",
+            "watchPaths": [good, 7],
+        })
+        .to_string();
+        let result = parse_hook_output_line(&line).unwrap();
+        assert!(result.watch_paths.is_empty());
+    }
+
+    /// The historical snake_case spelling keeps working, so a hook written
+    /// against the old host contract is not silently inert.
+    #[test]
+    fn parse_hook_output_line_watch_paths_legacy_spelling() {
+        let first = absolute("coderex-watch-src");
+        let second = absolute("coderex-watch-lib");
+        let line = serde_json::json!({
+            "action": "continue",
+            "watch_paths": [first, second],
+        })
+        .to_string();
+        let result = parse_hook_output_line(&line).unwrap();
+        assert_eq!(result.watch_paths, vec![first, second]);
+    }
+
+    #[test]
+    fn hook_config_accepts_watch_as_a_string_or_array() {
+        let one = absolute("coderex-static-watch-one");
+        let two = absolute("coderex-static-watch-two");
+
+        let string_form = serde_json::json!({
+            "event": "FileChanged",
+            "command": "echo {}",
+            "watch": one,
+        });
+        let registry = HookRegistry::load_from_settings(&serde_json::json!([string_form])).unwrap();
+        assert_eq!(registry.watch_paths(), vec![one.clone()]);
+
+        let array_form = serde_json::json!({
+            "event": "FileChanged",
+            "command": "echo {}",
+            "watch": [one, two],
+        });
+        let registry = HookRegistry::load_from_settings(&serde_json::json!([array_form])).unwrap();
+        assert_eq!(registry.watch_paths(), vec![one, two]);
+
+        // Direct deserialization of `HookConfig` uses the same rule.
+        let config: HookConfig = serde_json::from_value(serde_json::json!({
+            "event": "FileChanged",
+            "command": "echo {}",
+            "watch": absolute("coderex-static-watch-direct"),
+        }))
+        .unwrap();
+        assert_eq!(
+            config.watch,
+            Some(vec![absolute("coderex-static-watch-direct")])
+        );
+    }
+
+    #[test]
+    fn hook_config_rejects_a_relative_static_watch() {
+        let settings = serde_json::json!([{
+            "event": "FileChanged",
+            "command": "echo {}",
+            "watch": ["relative/path"],
+        }]);
+        let registry = HookRegistry::load_from_settings(&settings).unwrap();
+        assert!(
+            registry.watch_paths().is_empty(),
+            "a relative static watch path must be discarded: {:?}",
+            registry.watch_paths()
+        );
+    }
+
+    /// `watch` on a hook that cannot match `FileChanged` asks for something
+    /// that hook can never observe, so it is not advertised to the watcher.
+    #[test]
+    fn static_watch_is_collected_only_from_file_changed_hooks() {
+        let path = absolute("coderex-static-watch-scope");
+        let settings = serde_json::json!([
+            {"event": "SessionStart", "command": "echo {}", "watch": path.clone()},
+            {"event": "FileChanged", "command": "echo {}", "watch": path.clone()},
+        ]);
+        let registry = HookRegistry::load_from_settings(&settings).unwrap();
+        assert_eq!(registry.watch_paths(), vec![path]);
     }
 
     #[test]
@@ -2349,6 +2610,7 @@ mod tests {
     fn hook_matcher_matches_registered_hooks() {
         let mut registry = HookRegistry::new();
         registry.register(HookConfig {
+            watch: None,
             event: "PreToolUse".to_string(),
             kind: HookType::Command,
             tier: HookTier::Core,
@@ -2370,6 +2632,7 @@ mod tests {
             sandbox: None,
         });
         registry.register(HookConfig {
+            watch: None,
             event: "*".to_string(),
             kind: HookType::Command,
             tier: HookTier::Core,
@@ -2406,6 +2669,7 @@ mod tests {
     #[test]
     fn build_hook_env_includes_metadata() {
         let hook = HookConfig {
+            watch: None,
             event: "SessionStart".to_string(),
             kind: HookType::Command,
             tier: HookTier::Core,
@@ -2465,6 +2729,7 @@ mod tests {
     #[tokio::test]
     async fn execute_hook_returns_continue_for_answering_command() {
         let hook = HookConfig {
+            watch: None,
             event: "SessionStart".to_string(),
             kind: HookType::Command,
             tier: HookTier::Core,
@@ -2503,6 +2768,7 @@ mod tests {
     #[tokio::test]
     async fn execute_hook_rejects_unparseable_output() {
         let hook = HookConfig {
+            watch: None,
             event: "SessionStart".to_string(),
             kind: HookType::Command,
             tier: HookTier::Core,
@@ -2536,6 +2802,7 @@ mod tests {
     #[tokio::test]
     async fn execute_hook_timeout_kills_process() {
         let hook = HookConfig {
+            watch: None,
             event: "Stop".to_string(),
             kind: HookType::Command,
             tier: HookTier::Core,
@@ -2575,6 +2842,7 @@ mod tests {
         let target =
             std::env::temp_dir().join(format!("coderex-hook-limit-engine-{}", std::process::id()));
         let hook = HookConfig {
+            watch: None,
             event: "Test".to_string(),
             kind: HookType::Command,
             tier: HookTier::Core,
@@ -2627,6 +2895,7 @@ mod tests {
     #[tokio::test]
     async fn a_hook_that_burns_cpu_past_its_limit_is_stopped() {
         let hook = HookConfig {
+            watch: None,
             event: "Test".to_string(),
             kind: HookType::Command,
             tier: HookTier::Core,
@@ -2668,6 +2937,7 @@ mod tests {
 
     fn tiered(event: &str, command: &str, tier: HookTier, priority: u32) -> HookConfig {
         HookConfig {
+            watch: None,
             event: event.to_string(),
             kind: HookType::Command,
             command: command.to_string(),
@@ -3258,6 +3528,7 @@ mod tests {
 
     fn prompt_config(kind: HookType, prompt: &str) -> HookConfig {
         HookConfig {
+            watch: None,
             event: "PreToolUse".to_string(),
             kind,
             prompt: Some(prompt.to_string()),
@@ -3267,6 +3538,7 @@ mod tests {
 
     fn mcp_config(input: serde_json::Value) -> HookConfig {
         HookConfig {
+            watch: None,
             event: "PreToolUse".to_string(),
             kind: HookType::McpTool,
             mcp: Some(crate::action::McpToolHook {
@@ -3458,6 +3730,7 @@ mod tests {
     async fn an_action_hook_without_a_runner_is_recorded_off_a_gate() {
         let mut registry = HookRegistry::new();
         registry.register(HookConfig {
+            watch: None,
             event: "PostToolUse".to_string(),
             ..prompt_config(HookType::Prompt, "ask")
         });

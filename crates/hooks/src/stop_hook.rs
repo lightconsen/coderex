@@ -142,6 +142,7 @@ mod tests {
 
         let mut registry = HookRegistry::new();
         registry.register(HookConfig {
+            watch: None,
             event: "Stop".to_string(),
             kind: HookType::Command,
             command: "exit 1".to_string(),

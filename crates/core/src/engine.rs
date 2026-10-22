@@ -1429,7 +1429,16 @@ pub struct QueryEngine {
     /// settings and experiment flags.
     context_window_resolver: Option<ContextWindowResolver>,
     /// Hook executor for firing lifecycle hooks.
-    hooks: Box<dyn HookExecutor + Send + Sync>,
+    ///
+    /// Shared rather than owned so a session can hand a clone to a background
+    /// observer — the headless `FileChanged` watcher fires through the same
+    /// registry while the turn runs.
+    hooks: Arc<dyn HookExecutor + Send + Sync>,
+    /// Absolute paths a `SessionStart` hook returned in `watchPaths`.
+    ///
+    /// Merged with the executor's static configuration by
+    /// [`watch_paths`](Self::watch_paths).
+    session_watch_paths: Vec<String>,
     /// Tool executor for dispatching tool calls.
     tools: Box<dyn ToolExecutor + Send + Sync>,
     /// Handler for elicitation requests.
@@ -1716,7 +1725,8 @@ impl QueryEngine {
             prompt_compiler: PromptCompiler::new(config),
             compact_config: config,
             context_window_resolver: None,
-            hooks: Box::new(NoOpHookExecutor),
+            hooks: Arc::new(NoOpHookExecutor),
+            session_watch_paths: Vec::new(),
             tools: Box::new(NoOpToolExecutor),
             elicitation_handler: Box::new(ReplElicitationHandler::default()),
             transcript_path: None,
@@ -1852,8 +1862,35 @@ impl QueryEngine {
     }
 
     /// Set the hook executor for lifecycle hooks.
-    pub fn set_hooks(&mut self, hooks: Box<dyn HookExecutor + Send + Sync>) {
+    ///
+    /// The executor is shared (`Arc`) so an observer outside the turn — the
+    /// headless `FileChanged` watcher — can fire through the same registry.
+    pub fn set_hooks(&mut self, hooks: Arc<dyn HookExecutor + Send + Sync>) {
         self.hooks = hooks;
+    }
+
+    /// A clone of the installed hook executor.
+    ///
+    /// Used by the session to fire `FileChanged` from a watcher task while the
+    /// turn owns the engine exclusively.
+    #[must_use]
+    pub fn hook_executor(&self) -> Arc<dyn HookExecutor + Send + Sync> {
+        Arc::clone(&self.hooks)
+    }
+
+    /// Absolute paths a `FileChanged` hook should observe.
+    ///
+    /// Merges the static `watch` configuration on the installed hooks with any
+    /// `watchPaths` a `SessionStart` hook returned. Relative paths never reach
+    /// this list: both sources reject them at parse time.
+    #[must_use]
+    pub fn watch_paths(&self) -> Vec<String> {
+        let mut paths = self.hooks.watch_paths();
+        paths.extend(self.session_watch_paths.iter().cloned());
+        // Preserve first-seen order while dropping duplicates.
+        let mut seen = std::collections::HashSet::new();
+        paths.retain(|path| seen.insert(path.clone()));
+        paths
     }
 
     /// Set the tool executor for tool call dispatch.
@@ -2362,6 +2399,21 @@ impl QueryEngine {
         if !result.errors.is_empty() {
             tracing::warn!("SessionStart hook errors: {:?}", result.errors);
         }
+        self.session_watch_paths.extend(result.watch_paths);
+        let mut seen = std::collections::HashSet::new();
+        self.session_watch_paths
+            .retain(|path| seen.insert(path.clone()));
+    }
+
+    /// Fire `SessionStart` now, before the first turn.
+    ///
+    /// The engine fires it lazily on the first turn. A workload that must
+    /// know the hook's `watchPaths` before that turn starts — the headless
+    /// `FileChanged` watcher — calls this explicitly; the lazy call then
+    /// becomes a no-op. Firing twice is not observable because of the
+    /// [`session_started`](Self::session_started) latch.
+    pub async fn ensure_session_started(&mut self) {
+        self.fire_session_start_hook().await;
     }
 
     /// Set the JSON schema for structured output validation.
@@ -6035,7 +6087,7 @@ mod tests {
         );
         engine.set_tool_executor(Box::new(StubOkToolExecutor));
         let (hooks, recorded) = RecordingHooks::new();
-        engine.set_hooks(Box::new(hooks));
+        engine.set_hooks(Arc::new(hooks));
         (engine, recorded)
     }
 
@@ -6531,7 +6583,7 @@ mod tests {
     async fn a_budget_exhausted_turn_runs_stop_and_turn_end_hooks() {
         let (mut engine, _rx, _session) = make_test_engine();
         let (hooks, recorded) = RecordingHooks::new();
-        engine.set_hooks(Box::new(hooks));
+        engine.set_hooks(Arc::new(hooks));
         // No recovery budget, so the turn takes the direct budget exit.
         engine.compact_config.max_recovery_retries = 0;
 
@@ -6573,7 +6625,7 @@ mod tests {
             tx,
         );
         let (hooks, recorded) = RecordingHooks::new();
-        engine.set_hooks(Box::new(hooks));
+        engine.set_hooks(Arc::new(hooks));
 
         let mut budget = TokenBudget::with_defaults();
         budget.thresholds.max_tokens_per_session = 1;
@@ -6603,7 +6655,7 @@ mod tests {
     async fn a_recovery_failure_runs_stop_and_turn_end_hooks() {
         let (mut engine, _rx, _session) = make_test_engine();
         let (hooks, recorded) = RecordingHooks::new();
-        engine.set_hooks(Box::new(hooks));
+        engine.set_hooks(Arc::new(hooks));
 
         let mut budget = TokenBudget::with_defaults();
         budget.thresholds.max_tokens_per_session = 1;
@@ -7932,7 +7984,7 @@ mod tests {
             tx,
         );
         let (hooks, recorded) = RecordingHooks::new();
-        engine.set_hooks(Box::new(hooks));
+        engine.set_hooks(Arc::new(hooks));
 
         let mut turn = TurnRuntime::new(TokenBudget::with_defaults());
         turn.last_stop_reason = Some("max_tokens".into());
@@ -8030,7 +8082,7 @@ mod tests {
             crate::elicitation::SdkElicitationHandler::default(),
         ));
         let (hooks, recorded) = RecordingHooks::new();
-        engine.set_hooks(Box::new(hooks));
+        engine.set_hooks(Arc::new(hooks));
         let mut turn = TurnRuntime::new(TokenBudget::with_defaults());
 
         engine
@@ -8093,6 +8145,74 @@ mod tests {
             starts[0].1.contains_key("cwd"),
             "SessionStart should see the working directory: {starts:?}"
         );
+    }
+
+    /// A `SessionStart` hook's `watchPaths` join the static `watch`
+    /// configuration, in that order, with duplicates removed. The merged list
+    /// is what the session hands to a file watcher.
+    #[tokio::test]
+    async fn session_start_watch_paths_merge_with_static_configuration() {
+        struct WatchHooks {
+            session: Vec<String>,
+            statically_configured: Vec<String>,
+        }
+
+        #[async_trait::async_trait]
+        impl HookExecutor for WatchHooks {
+            async fn fire_hook(
+                &self,
+                event_name: &str,
+                _input: &str,
+                _context: &HashMap<String, String>,
+            ) -> HookFireResult {
+                if event_name == hook_events::SESSION_START {
+                    HookFireResult {
+                        watch_paths: self.session.clone(),
+                        ..HookFireResult::default()
+                    }
+                } else {
+                    HookFireResult::default()
+                }
+            }
+
+            fn watch_paths(&self) -> Vec<String> {
+                self.statically_configured.clone()
+            }
+        }
+
+        let temp = std::env::temp_dir();
+        let static_path = temp
+            .join("coderex-static-watch")
+            .to_string_lossy()
+            .into_owned();
+        let session_path = temp
+            .join("coderex-session-watch")
+            .to_string_lossy()
+            .into_owned();
+        let duplicate = static_path.clone();
+
+        let (mut engine, _recorded) = engine_with_recording_hooks(Box::new(MockApiClient));
+        engine.set_hooks(Arc::new(WatchHooks {
+            session: vec![session_path.clone(), duplicate],
+            statically_configured: vec![static_path.clone()],
+        }));
+
+        // Static configuration is visible before the session starts; the
+        // session's own paths appear once `SessionStart` has run.
+        assert_eq!(engine.watch_paths(), vec![static_path.clone()]);
+        engine.ensure_session_started().await;
+        assert_eq!(
+            engine.watch_paths(),
+            vec![static_path, session_path],
+            "the watched paths must merge the static and session lists without duplicates"
+        );
+
+        // The accessor hands out a clone of the same executor.
+        let executor = engine.hook_executor();
+        let fired = executor
+            .fire_hook("FileChanged", "{}", &HashMap::new())
+            .await;
+        assert!(!fired.failed);
     }
 
     #[test]
@@ -8615,7 +8735,7 @@ mod tests {
         engine.compact_config.max_recovery_retries = 0;
 
         let (hooks, recorded) = RecordingHooks::new();
-        engine.set_hooks(Box::new(hooks));
+        engine.set_hooks(Arc::new(hooks));
         (engine, calls, recorded)
     }
 

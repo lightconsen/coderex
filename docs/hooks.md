@@ -15,8 +15,8 @@ prints a JSON result on stdout; a `PreToolUse` hook can deny a tool, a
   also carries the injected [`HookActionRunner`], if the session supplied one.
 - **`HookConfig`** (`engine.rs`) — one hook: `event`, `type`, `command`,
   `http`, `prompt`, `model`, `mcp`, `env`, `cwd`, `timeout_ms`, `priority`,
-  `dry_run`, `stream`, the resource limits, the OS `sandbox` policy, and
-  `tier`.
+  `dry_run`, `stream`, the resource limits, the OS `sandbox` policy, `watch`
+  (absolute paths a `FileChanged` hook wants observed), and `tier`.
 - **`HookSandboxConfig`** (`sandbox.rs`) — per-hook filesystem/network
   policy: `enabled`, `allow_network`, and extra read/write/exec paths. See
   [OS sandbox for command hooks](#os-sandbox-for-command-hooks).
@@ -43,7 +43,9 @@ prints a JSON result on stdout; a `PreToolUse` hook can deny a tool, a
   (`stream.rs`) — the bidirectional protocol: a `stream: true` hook may ask the
   host a question while it runs, and may report progress before its answer.
 - **`HookFireResult`** (`crates/core/src/hook_executor.rs`) — the aggregate a
-  firing site reads: `stop`, `updated_input`, `errors`, and `failed`.
+  firing site reads: `stop`, `updated_input`, `errors`, `failed`, and
+  `watch_paths` (absolute `watchPaths` a hook returned). The executor trait
+  also exposes `watch_paths()`, the static `watch` configuration.
 
 ## Installing hooks (one line)
 
@@ -293,8 +295,8 @@ reserved.
 - `TaskCompleted` — the `TaskUpdate` tool.
 - `CwdChanged` — `coderex_tools::RegistryToolDispatcher::set_cwd`.
 - `Setup` — the REPL when `/init` succeeds.
-- `FileChanged` — the REPL's TUI loop when `ConfigWatcher` reports a settings
-  change.
+- `FileChanged` — the session's file watcher, in the TUI and in a headless
+  one-shot run.
 
 `SessionStart` fires on the first turn the engine runs (`submit` /
 `submit_streaming`), since a session in this engine has no separate begin call.
@@ -309,22 +311,88 @@ after processing input) fire the hook through `QueryEngine::fire_lifecycle_hook`
 The hook input is the command (`/init`) and the context carries a `command`
 entry. A failed `/init` (an `Error:` result) queues nothing.
 
-`FileChanged` fires from the settings watcher. `ConfigWatcher` watches the user
-(`~/.coderex/settings.json`) and project (`.coderex/settings.json`) settings
-files and publishes the changed paths from the `notify` event. The TUI main
-loop takes the receiver out of the REPL before entering its `select!` and fires
-`FileChanged` with the paths as its input and a newline-separated `paths`
-context entry (plus `source = "config_watcher"`). The watcher object itself is
-kept alive on the REPL — dropping it would stop `notify`. `hot-reload` is a
-default feature of `coderex-cli`, so this is on unless the build disables
-default features.
+### `FileChanged`
 
-**The headless one-shot path does not fire `FileChanged`.** `run_headless` runs
-a single turn and returns; it has no long-lived loop to select on the watcher
-receiver, and blocking that turn on a settings event with no consumer would
-delay the prompt for nothing. The receiver is created but not drained there,
-deliberately. `Setup` does fire in the headless path: `execute_command` is the
-async entry point that drains it.
+`FileChanged` fires when a file the session is watching changes. It fires in
+every session mode — the TUI and a headless one-shot — and the watcher is built
+per mode rather than being a TUI-only feature.
+
+**Input.** One event per changed path:
+
+```json
+{ "file_path": "/abs/path/to/file", "event": "change" }
+```
+
+`event` is one of:
+
+| Value | Meaning |
+|---|---|
+| `change` | The file's contents or metadata changed (`notify` `Modify`). |
+| `add` | The file was created (`notify` `Create`). |
+| `unlink` | The file was removed (`notify` `Remove`). |
+
+The context also carries `paths` (the batch's paths, newline-separated — a
+rename reports both names in one batch), `session_id`, and
+`source = "file_watcher"`. A `FileChanged` hook is not gating: its answer is
+not read as a decision.
+
+**What is watched.**
+
+1. The settings files by default, when they exist: the user settings
+   (`~/.coderex/settings.json`) and the project settings
+   (`.coderex/settings.json`). `hot-reload` is a default feature of
+   `coderex-cli`; a build that disables default features compiles the watcher
+   out.
+2. A `SessionStart` hook may return absolute paths in `watchPaths`, as a string
+   or an array:
+
+   ```json
+   { "action": "continue", "watchPaths": ["/abs/one", "/abs/two"] }
+   ```
+
+   `watchPaths` is accepted in both that spelling and the historical
+   `watch_paths`. Every path must be absolute; one relative path (or a
+   non-string entry) rejects the whole field with a warning, because a relative
+   path would be resolved against whatever working directory the watcher
+   happened to hold.
+3. A hook may declare a static `watch` list, again as a string or an array:
+
+   ```json
+   {
+     "event": "FileChanged",
+     "command": "check-changed-file",
+     "watch": ["/abs/one", "/abs/two"]
+   }
+   ```
+
+   `watch` is collected from hooks configured for `FileChanged` (or `*`) and
+   validated the same way: a relative path discards the whole field. The engine
+   merges this static list with `SessionStart`'s `watchPaths` and deduplicates
+   them.
+
+The watcher is non-recursive and only watches paths that exist when it starts;
+a path that does not exist yet is retried on the next sync/start, not watched
+through its parent. This is the same limitation the previous settings-only
+watcher had.
+
+**Mode differences.**
+
+- **TUI.** The shared watcher is created at session start and its receiver is
+  taken out of the REPL before the main `select!`. Static `watch` paths are
+  added before the first turn; after a turn releases the engine (and
+  `SessionStart` may have returned `watchPaths` for the first time) the paths
+  are synced into the live watcher. The watcher object stays on the REPL —
+  dropping it would stop `notify`.
+- **Headless.** `run_headless` has no event loop, so `run_headless_turn`
+  ensures `SessionStart` has fired (making `watchPaths` known), starts a
+  watcher over the settings files plus the hook paths, and spawns a task that
+  fires `FileChanged` through a clone of the engine's hook executor while the
+  turn runs. The watcher is dropped and the task joined before the run
+  returns. A slash-command-only headless run does not start it: no turn runs,
+  so `SessionStart` should not fire either.
+
+`Setup` also fires in the headless path: `execute_command` is the async entry
+point that drains it.
 
 An unknown event name is warned about at load. Event names come from
 `HookEvent::as_str`; for the events core fires it returns core's `hook_events`

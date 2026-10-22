@@ -740,6 +740,7 @@ mod tests {
 
     fn config() -> HookConfig {
         HookConfig {
+            watch: None,
             event: "PreToolUse".into(),
             kind: crate::engine::HookType::Command,
             command: "true".into(),
@@ -883,6 +884,7 @@ mod policy_tests {
 
     fn hook_config() -> HookConfig {
         HookConfig {
+            watch: None,
             event: "PreToolUse".to_string(),
             kind: HookType::Command,
             command: r#"echo '{"action":"continue"}'"#.to_string(),

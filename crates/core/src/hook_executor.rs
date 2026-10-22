@@ -40,6 +40,13 @@ pub struct HookFireResult {
     /// produced output that could not be parsed, or timed out. When `failed` is
     /// set on a gating event, [`stop`](Self::stop) is set as well.
     pub failed: bool,
+    /// Absolute paths the hook asked the host to watch.
+    ///
+    /// A `SessionStart` result may carry `watchPaths`; the engine collects
+    /// those paths and merges them with the static `watch` configuration so a
+    /// `FileChanged` hook can observe files the session only learned about at
+    /// start-up. The parser has already rejected relative paths.
+    pub watch_paths: Vec<String>,
 }
 
 /// Abstract hook executor — implemented by `coderex-hooks::HookRegistry`.
@@ -59,6 +66,15 @@ pub trait HookExecutor: Send + Sync {
         input: &str,
         context: &HashMap<String, String>,
     ) -> HookFireResult;
+
+    /// Absolute paths the installed hooks statically asked to watch.
+    ///
+    /// This is the `watch` field on `FileChanged` hook configuration. An
+    /// executor that has no such concept (the no-op executor, a test double)
+    /// has nothing to watch and keeps the default.
+    fn watch_paths(&self) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 /// No-op hook executor — used when hooks are not configured.

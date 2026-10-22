@@ -1431,6 +1431,175 @@ enum MacroCommandOutcome {
     Run(Vec<String>),
 }
 
+/// One `notify` change, normalized to the reference's three event kinds.
+#[derive(Debug, Clone)]
+struct FileChangeBatch {
+    /// Every path the underlying event named (a rename names two).
+    paths: Vec<String>,
+    /// `"change"`, `"add"`, or `"unlink"` — the `event` value a hook sees.
+    kind: &'static str,
+}
+
+/// A file watcher whose path set can grow after it is constructed.
+///
+/// The settings files are supplied at construction. A `SessionStart` hook can
+/// return `watchPaths`, and a `FileChanged` hook may carry a static `watch`
+/// list; both are added with [`add_paths`](Self::add_paths) once known. Unlike
+/// [`coderex_config::ConfigWatcher`], which publishes only path lists, this
+/// watcher keeps the kind of each change so the hook input can name it.
+#[cfg(feature = "hot-reload")]
+struct HookFileWatcher {
+    watcher: notify::RecommendedWatcher,
+    /// Paths already handed to `notify`, so a repeated sync is a no-op.
+    watched: std::collections::HashSet<std::path::PathBuf>,
+}
+
+#[cfg(feature = "hot-reload")]
+impl HookFileWatcher {
+    /// Watch `paths` and return the event receiver.
+    ///
+    /// A path that does not exist yet is skipped, matching the old settings
+    /// watcher: `notify` cannot watch a file it cannot see. A later
+    /// [`add_paths`](Self::add_paths) call retries it.
+    fn new(
+        paths: &[std::path::PathBuf],
+    ) -> Result<(Self, mpsc::UnboundedReceiver<FileChangeBatch>), notify::Error> {
+        use notify::EventKind;
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        let watcher = notify::recommended_watcher(move |result: notify::Result<notify::Event>| {
+            let Ok(event) = result else {
+                return;
+            };
+            let kind = match event.kind {
+                EventKind::Create(_) => "add",
+                EventKind::Remove(_) => "unlink",
+                EventKind::Modify(_) => "change",
+                // Access events are reads, not changes, and the rest carry no
+                // meaning the hook contract can express.
+                _ => return,
+            };
+            if event.paths.is_empty() {
+                return;
+            }
+            let paths = event
+                .paths
+                .iter()
+                .map(|path| path.to_string_lossy().into_owned())
+                .collect();
+            let _ = tx.send(FileChangeBatch { paths, kind });
+        })?;
+
+        let mut watcher = Self {
+            watcher,
+            watched: std::collections::HashSet::new(),
+        };
+        watcher.add_paths(paths.iter().cloned());
+        Ok((watcher, rx))
+    }
+
+    /// Start watching any path not already watched.
+    ///
+    /// Relative paths are refused here as well: the engine validates them at
+    /// parse time, but a programmatic caller must not be able to slip one in.
+    fn add_paths<I>(&mut self, paths: I)
+    where
+        I: IntoIterator<Item = std::path::PathBuf>,
+    {
+        use notify::{RecursiveMode, Watcher};
+
+        for path in paths {
+            if !path.is_absolute() {
+                tracing::warn!(path = %path.display(), "refusing to watch a relative path");
+                continue;
+            }
+            if !self.watched.insert(path.clone()) {
+                continue;
+            }
+            if !path.exists() {
+                self.watched.remove(&path);
+                continue;
+            }
+            if let Err(error) = self.watcher.watch(&path, RecursiveMode::NonRecursive) {
+                self.watched.remove(&path);
+                tracing::warn!(path = %path.display(), %error, "could not watch path");
+            }
+        }
+    }
+}
+
+/// The settings files watched by default, when they exist.
+#[cfg(feature = "hot-reload")]
+fn default_settings_paths(cwd: &str) -> Vec<std::path::PathBuf> {
+    [
+        coderex_config::config_home().join("settings.json"),
+        std::path::Path::new(cwd).join(".coderex/settings.json"),
+    ]
+    .into_iter()
+    .filter(|path| path.exists())
+    .collect()
+}
+
+/// Build the JSON input a `FileChanged` hook reads.
+///
+/// The reference shape is `{"file_path": "...", "event": "change|add|unlink"}`.
+/// Each batch path gets its own event.
+#[cfg(any(feature = "hot-reload", test))]
+fn file_changed_input(path: &str, kind: &str) -> String {
+    serde_json::json!({
+        "file_path": path,
+        "event": kind,
+    })
+    .to_string()
+}
+
+/// Fire `FileChanged` for every path in a batch through `hooks`.
+///
+/// The per-event input names one file and its kind; the `paths` context entry
+/// keeps the whole batch so a hook can see a rename as one change rather than
+/// two unrelated ones.
+#[cfg(feature = "hot-reload")]
+async fn fire_file_changed_batch(
+    hooks: &dyn coderex_core::hook_executor::HookExecutor,
+    session_id: &str,
+    batch: &FileChangeBatch,
+) {
+    let paths = batch.paths.join("\n");
+    for path in &batch.paths {
+        let mut context = HashMap::new();
+        context.insert("paths".to_string(), paths.clone());
+        context.insert("session_id".to_string(), session_id.to_string());
+        context.insert("source".to_string(), "file_watcher".to_string());
+        let result = hooks
+            .fire_hook(
+                coderex_hooks::HookEvent::FileChanged.as_str(),
+                &file_changed_input(path, batch.kind),
+                &context,
+            )
+            .await;
+        if !result.errors.is_empty() {
+            tracing::warn!(errors = ?result.errors, "FileChanged hook errors");
+        }
+    }
+}
+
+/// Keeps a headless run's watcher and firing task alive, then joins both.
+#[cfg(feature = "hot-reload")]
+struct HeadlessHookWatcher {
+    /// Dropping the watcher closes the channel, which ends the task.
+    watcher: Option<HookFileWatcher>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+#[cfg(feature = "hot-reload")]
+impl HeadlessHookWatcher {
+    /// Stop watching and wait for the firing task to finish.
+    async fn stop(mut self) {
+        self.watcher.take();
+        let _ = self.task.await;
+    }
+}
+
 pub struct ReplLoop {
     /// Command registry.
     commands: CommandRegistry,
@@ -1525,19 +1694,22 @@ pub struct ReplLoop {
     /// `--no-session-persistence`, which arrives after the tools are
     /// registered, so the tools read it at call time.
     memory_writable: Arc<std::sync::atomic::AtomicBool>,
-    /// The live settings watcher.
+    /// The live file watcher behind `FileChanged`.
     ///
     /// The receiver alone is not enough: `notify` stops watching when its
     /// watcher is dropped, so the session has to keep the watcher alive for
-    /// as long as it wants change events.
+    /// as long as it wants change events. Its path set grows after
+    /// `SessionStart` reports `watchPaths`.
     #[cfg(feature = "hot-reload")]
-    _config_watcher: Option<coderex_config::ConfigWatcher>,
-    /// Config watcher for hot-reloading settings.
+    config_watcher: Option<HookFileWatcher>,
+    /// Change batches for the TUI's `select!`.
     ///
     /// Drained by `run_tui`'s event loop, which fires `FileChanged` with the
-    /// paths the watcher reported.
+    /// path and kind the watcher reported. A headless run builds its own
+    /// watcher (see [`Self::spawn_headless_file_watcher`]) because it has no
+    /// event loop to select on it.
     #[cfg(feature = "hot-reload")]
-    config_changed_rx: Option<tokio::sync::watch::Receiver<Vec<String>>>,
+    config_changed_rx: Option<mpsc::UnboundedReceiver<FileChangeBatch>>,
     /// A lifecycle hook queued by a synchronous command path.
     ///
     /// `/init` runs synchronously inside the registry, while firing a hook is
@@ -1904,7 +2076,7 @@ impl ReplLoop {
             cron_rx: None,
             teleport_manager: Some(coderex_bridge::teleport::TeleportManager::new()),
             #[cfg(feature = "hot-reload")]
-            _config_watcher: None,
+            config_watcher: None,
             #[cfg(feature = "hot-reload")]
             config_changed_rx: None,
             pending_setup: None,
@@ -2287,7 +2459,7 @@ impl ReplLoop {
             cron_rx: Some(cron_rx),
             teleport_manager: Some(coderex_bridge::teleport::TeleportManager::new()),
             #[cfg(feature = "hot-reload")]
-            _config_watcher: config_watcher,
+            config_watcher,
             #[cfg(feature = "hot-reload")]
             config_changed_rx,
             pending_setup: None,
@@ -3614,46 +3786,88 @@ impl ReplLoop {
         }
     }
 
-    /// Initialize the ConfigWatcher if the hot-reload feature is enabled.
+    /// Initialize the shared file watcher if the hot-reload feature is on.
     ///
     /// Returns the watcher as well as its receiver: dropping the watcher stops
     /// `notify` (and drops the sender), so the session must keep it alive for
     /// the receiver to ever see a change.
     ///
-    /// Only `run_tui` drains the receiver. A headless one-shot (`run_headless`)
-    /// has no long-lived loop to select on it, so `FileChanged` does not fire
-    /// there; blocking the single turn to watch settings would delay the
-    /// prompt for an event that has no consumer.
+    /// The watcher is created even when neither settings file exists, so a
+    /// path a hook asks for later can still be added. `run_tui` drains the
+    /// receiver; a headless run starts its own watcher for the turn.
     #[cfg(feature = "hot-reload")]
     fn init_config_watcher(
         cwd: &str,
     ) -> (
-        Option<coderex_config::ConfigWatcher>,
-        Option<tokio::sync::watch::Receiver<Vec<String>>>,
+        Option<HookFileWatcher>,
+        Option<mpsc::UnboundedReceiver<FileChangeBatch>>,
     ) {
-        use coderex_config::ConfigWatcher;
-        let user_path = coderex_config::config_home().join("settings.json");
-        let project_path = std::path::Path::new(cwd).join(".coderex/settings.json");
-        let mut paths = Vec::new();
-        if user_path.exists() {
-            paths.push(user_path);
-        }
-        if project_path.exists() {
-            paths.push(project_path);
-        }
-        if paths.is_empty() {
-            return (None, None);
-        }
-        match ConfigWatcher::new(&paths) {
-            Ok(watcher) => {
-                let rx = watcher.subscribe();
-                (Some(watcher), Some(rx))
-            }
+        match HookFileWatcher::new(&default_settings_paths(cwd)) {
+            Ok((watcher, rx)) => (Some(watcher), Some(rx)),
             Err(e) => {
                 tracing::warn!("Failed to initialize config watcher: {e}");
                 (None, None)
             }
         }
+    }
+
+    /// Add every path the hooks currently want watched to the shared watcher.
+    ///
+    /// Static `watch` configuration is present before the first turn;
+    /// `SessionStart`'s `watchPaths` appear once the engine has started. The
+    /// TUI calls this at start-up and again when a turn releases the engine.
+    #[cfg(feature = "hot-reload")]
+    fn sync_hook_watch_paths(&mut self) {
+        let Some(engine) = self.engine.as_ref() else {
+            return;
+        };
+        let paths: Vec<std::path::PathBuf> = engine
+            .watch_paths()
+            .into_iter()
+            .map(std::path::PathBuf::from)
+            .collect();
+        if let Some(watcher) = self.config_watcher.as_mut() {
+            watcher.add_paths(paths);
+        }
+    }
+
+    /// Start a watcher and firing task for the duration of a headless turn.
+    ///
+    /// `SessionStart` is fired first so a `watchPaths` result is known before
+    /// the watcher starts; the lazy call inside the turn is then a no-op. The
+    /// task holds a clone of the engine's executor, so firing does not need
+    /// the engine the turn is using.
+    #[cfg(feature = "hot-reload")]
+    async fn spawn_headless_file_watcher(&mut self) -> Option<HeadlessHookWatcher> {
+        let engine = self.engine.as_mut()?;
+        engine.ensure_session_started().await;
+
+        let hooks = engine.hook_executor();
+        let session_id = engine.session().session_id.to_string();
+        let mut paths = default_settings_paths(&self.cwd);
+        paths.extend(
+            engine
+                .watch_paths()
+                .into_iter()
+                .map(std::path::PathBuf::from),
+        );
+
+        let (watcher, mut rx) = match HookFileWatcher::new(&paths) {
+            Ok(pair) => pair,
+            Err(error) => {
+                tracing::warn!(%error, "headless FileChanged watcher was not started");
+                return None;
+            }
+        };
+        let task = tokio::spawn(async move {
+            while let Some(batch) = rx.recv().await {
+                fire_file_changed_batch(hooks.as_ref(), &session_id, &batch).await;
+            }
+        });
+        Some(HeadlessHookWatcher {
+            watcher: Some(watcher),
+            task,
+        })
     }
 
     /// Run the interactive REPL with full ratatui TUI.
@@ -3675,6 +3889,11 @@ impl ReplLoop {
         if let Some(error) = self.setup_error.as_deref() {
             return Err(anyhow::anyhow!("{error}"));
         }
+
+        // Static `watch` configuration is known before the first turn; add it
+        // now so a FileChanged hook observes it from the start.
+        #[cfg(feature = "hot-reload")]
+        self.sync_hook_watch_paths();
 
         // Artifacts are published to a local origin, so the server has to be
         // up before the model can publish anything. It is started here rather
@@ -3811,16 +4030,17 @@ impl ReplLoop {
         });
 
         let mut event_rx = self.event_rx.take();
-        // Take the config receiver out of `self` before the loop: the other
-        // `select!` branches borrow `self` mutably, so polling a receiver
-        // through `self` for the whole loop would fight them. The watcher
-        // itself stays in `self` so `notify` keeps running.
+        // Take the file-change receiver out of `self` before the loop: the
+        // other `select!` branches borrow `self` mutably, so polling a
+        // receiver through `self` for the whole loop would fight them. The
+        // watcher itself stays in `self` so `notify` keeps running and its
+        // path set can grow after `SessionStart`.
         #[cfg(feature = "hot-reload")]
         let mut config_changed_rx = self.config_changed_rx.take();
         // Without the feature there is no watcher; keep the `select!` branch
         // below compiled and permanently disabled rather than duplicating it.
         #[cfg(not(feature = "hot-reload"))]
-        let mut config_changed_rx: Option<tokio::sync::watch::Receiver<Vec<String>>> = None;
+        let mut config_changed_rx: Option<mpsc::UnboundedReceiver<FileChangeBatch>> = None;
         let mut vim = VimState::new_insert();
         let mut thinking = false;
         let mut phase = InteractivePhase::Idle;
@@ -4753,6 +4973,11 @@ impl ReplLoop {
                     // response".
                     && event_rx.as_ref().is_none_or(tokio::sync::mpsc::UnboundedReceiver::is_empty) => {
                     self.engine = Some(engine);
+                    // The turn may have run `SessionStart` for the first time;
+                    // its `watchPaths` are known now, so add them to the live
+                    // watcher.
+                    #[cfg(feature = "hot-reload")]
+                    self.sync_hook_watch_paths();
                     self.running_query = None;
                     query_done_rx = None;
                     elicit_rx = None;
@@ -4988,29 +5213,21 @@ impl ReplLoop {
                     self.pending_elicitation = Some(request.response_tx);
                 }
 
-                // Settings hot-reload: `ConfigWatcher` reports the paths that
-                // changed and `FileChanged` names them. This main loop is the
-                // only long-lived consumer of the receiver, so it is the only
-                // place the hook fires; a headless one-shot has no loop to
-                // drain and deliberately does not pretend to.
+                // A watched file changed. This main loop drains the shared
+                // watcher; a headless run uses its own task for the duration
+                // of the turn. Each event names the path and the kind.
                 changed = async {
                     match config_changed_rx.as_mut() {
-                        Some(rx) => rx.changed().await,
+                        Some(rx) => rx.recv().await,
                         None => std::future::pending().await,
                     }
                 }, if config_changed_rx.is_some() => {
                     match changed {
-                        Ok(()) => {
-                            let paths = config_changed_rx
-                                .as_mut()
-                                .map(|rx| rx.borrow_and_update().clone())
-                                .unwrap_or_default();
-                            self.fire_file_changed_hook(&paths).await;
-                        }
+                        Some(batch) => self.fire_file_changed_hook(&batch).await,
                         // The watcher (and its sender) is gone. Drop the
                         // closed receiver so the branch stops polling; a
-                        // ready `Err` would otherwise spin the loop.
-                        Err(_) => config_changed_rx = None,
+                        // ready `None` would otherwise spin the loop.
+                        None => config_changed_rx = None,
                     }
                 }
 
@@ -5130,8 +5347,22 @@ impl ReplLoop {
             ));
         }
 
+        // A headless run has no event loop to drain the shared watcher, so it
+        // starts one for exactly this turn and stops it before returning.
+        // `SessionStart` is fired first: its `watchPaths` have to be known
+        // before the watcher starts, and the turn's own lazy call then no-ops.
+        #[cfg(feature = "hot-reload")]
+        let watcher = self.spawn_headless_file_watcher().await;
+
         // Route to the QueryEngine rather than a placeholder.
-        Ok(self.submit_prompt(prompt, true).await)
+        let output = self.submit_prompt(prompt, true).await;
+
+        #[cfg(feature = "hot-reload")]
+        if let Some(watcher) = watcher {
+            watcher.stop().await;
+        }
+
+        Ok(output)
     }
 
     /// Drain pending events from the event channel, appending text deltas to
@@ -5897,29 +6128,20 @@ impl ReplLoop {
         }
     }
 
-    /// Fire `FileChanged` for the settings files `ConfigWatcher` reported.
+    /// Fire `FileChanged` for a change batch the watcher reported.
     ///
-    /// The changed paths are both the hook input and a `paths` context entry
-    /// (newline-separated), so a hook can name what changed without parsing
-    /// an opaque payload out of the input.
-    async fn fire_file_changed_hook(&self, paths: &[String]) {
+    /// Each path gets its own event with the reference input
+    /// `{"file_path": "...", "event": "change|add|unlink"}`. The batch's paths
+    /// also travel as a newline-separated `paths` context entry, so a hook can
+    /// see a rename's two paths together.
+    #[cfg(feature = "hot-reload")]
+    async fn fire_file_changed_hook(&self, batch: &FileChangeBatch) {
         let Some(ref engine) = self.engine else {
             return;
         };
-        let joined = paths.join("\n");
-        let mut context = std::collections::HashMap::new();
-        context.insert("paths".to_string(), joined.clone());
-        context.insert("source".to_string(), "config_watcher".to_string());
-        let result = engine
-            .fire_lifecycle_hook(
-                coderex_hooks::HookEvent::FileChanged.as_str(),
-                &joined,
-                &context,
-            )
-            .await;
-        if !result.errors.is_empty() {
-            tracing::warn!(errors = ?result.errors, "FileChanged hook errors");
-        }
+        let hooks = engine.hook_executor();
+        let session_id = engine.session().session_id.to_string();
+        fire_file_changed_batch(hooks.as_ref(), &session_id, batch).await;
     }
 
     fn apply_tui_theme(&self, ui_state: &mut coderex_ui::state::UiState, theme_name: &str) -> bool {
@@ -8266,7 +8488,7 @@ mod tests {
         repl.engine
             .as_mut()
             .expect("with_engine installs an engine")
-            .set_hooks(Box::new(recorder));
+            .set_hooks(Arc::new(recorder));
 
         repl.sync_command_state("init", &CommandResult::success("Initialized project"));
         repl.drain_pending_setup_hook().await;
@@ -8763,6 +8985,72 @@ mod tests {
         }
     }
 
+    /// A model client that changes a watched file during the turn and waits
+    /// for the `FileChanged` hook to acknowledge it.
+    ///
+    /// Waiting on the marker rather than sleeping a fixed time makes the
+    /// headless watcher test deterministic: the turn cannot finish before the
+    /// hook has run.
+    #[cfg(feature = "hot-reload")]
+    #[derive(Clone)]
+    struct FileChangingApi {
+        watched: std::path::PathBuf,
+        marker: std::path::PathBuf,
+    }
+
+    #[cfg(feature = "hot-reload")]
+    #[async_trait::async_trait]
+    impl ApiClient for FileChangingApi {
+        fn clone_box(&self) -> Box<dyn ApiClient> {
+            Box::new(self.clone())
+        }
+
+        async fn create_message(
+            &self,
+            _system: &str,
+            _messages: &[serde_json::Value],
+            _model: &ModelId,
+            _max_tokens: u32,
+            _tools: &[ToolInfo],
+        ) -> Result<ApiResponse, ApiError> {
+            Ok(ApiResponse {
+                content: String::new(),
+                tool_calls: Vec::new(),
+                thinking: None,
+                usage: UsageSummary {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    cache_read_tokens: 0,
+                    cache_creation_tokens: 0,
+                },
+                stop_reason: "end_turn".into(),
+            })
+        }
+
+        async fn create_message_streaming(
+            &self,
+            _system: &str,
+            _messages: &[serde_json::Value],
+            _model: &ModelId,
+            _max_tokens: u32,
+            _tools: &[ToolInfo],
+        ) -> std::pin::Pin<Box<dyn futures::Stream<Item = StreamEvent> + Send + 'static>> {
+            std::fs::write(&self.watched, "changed during the turn").unwrap();
+
+            // Give the watcher and the hook subprocess a bounded window. If
+            // the hook never runs the test fails on the assertion, not by
+            // hanging forever.
+            for _ in 0..200 {
+                if self.marker.exists() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+
+            Box::pin(futures::stream::empty())
+        }
+    }
+
     #[test]
     fn parse_empty_returns_none() {
         assert!(parse_input("").is_none());
@@ -9054,6 +9342,49 @@ mod tests {
         }
     }
 
+    /// The TUI path uses the same firing routine as the headless one: one
+    /// event per path, the reference input, and the batch in `paths`. A PTY
+    /// test of the interactive loop is not practical here, so this pins the
+    /// handler the TUI calls.
+    #[cfg(feature = "hot-reload")]
+    #[tokio::test]
+    async fn tui_file_changed_handler_fires_one_reference_shaped_event_per_path() {
+        let mut repl = ReplLoop::with_engine(
+            Box::new(CountingApi::new()),
+            "/tmp".into(),
+            ModelId::sonnet(),
+        );
+        let recorder = RecordingHookExecutor::default();
+        let events = Arc::clone(&recorder.events);
+        repl.engine
+            .as_mut()
+            .expect("with_engine installs an engine")
+            .set_hooks(Arc::new(recorder));
+
+        let batch = FileChangeBatch {
+            paths: vec!["/tmp/a.txt".into(), "/tmp/b.txt".into()],
+            kind: "change",
+        };
+        repl.fire_file_changed_hook(&batch).await;
+
+        let recorded = events.lock().expect("the recording hook lock is clean");
+        assert_eq!(recorded.len(), 2, "one event per path: {recorded:?}");
+        for (index, path) in ["/tmp/a.txt", "/tmp/b.txt"].iter().enumerate() {
+            let (event, input, context) = &recorded[index];
+            assert_eq!(event, "FileChanged");
+            let parsed: serde_json::Value = serde_json::from_str(input).unwrap();
+            assert_eq!(
+                parsed,
+                serde_json::json!({"file_path": path, "event": "change"})
+            );
+            assert_eq!(
+                context.get("paths").map(String::as_str),
+                Some("/tmp/a.txt\n/tmp/b.txt"),
+                "the batch context must keep both paths together"
+            );
+        }
+    }
+
     /// A `hooks` block in settings used to be parsed, validated, and then
     /// dropped: the engine kept the no-op executor it is constructed with, so a
     /// configured hook never ran. This pins the install, not the registry —
@@ -9095,6 +9426,69 @@ mod tests {
             api.turn_requests(),
             1,
             "a hook that answered 'continue' should not have stopped the turn"
+        );
+    }
+
+    /// The `FileChanged` input is the reference shape for every kind the
+    /// watcher can report. The path is the file that changed, not a batch.
+    #[test]
+    fn file_changed_input_names_one_path_and_its_kind() {
+        for kind in ["change", "add", "unlink"] {
+            let input: serde_json::Value =
+                serde_json::from_str(&file_changed_input("/tmp/watched.txt", kind)).unwrap();
+            assert_eq!(
+                input,
+                serde_json::json!({"file_path": "/tmp/watched.txt", "event": kind}),
+                "the FileChanged input drifted from the reference shape"
+            );
+        }
+    }
+
+    /// A headless one-shot has no event loop, so it must keep its own watcher
+    /// alive for the turn. The watched path is a real temp file and the change
+    /// happens during the model request, not from a mock event.
+    #[cfg(feature = "hot-reload")]
+    #[tokio::test]
+    async fn headless_run_fires_file_changed_for_a_real_file_change() {
+        let temp = tempfile::tempdir().unwrap();
+        let watched = temp.path().join("watched.txt");
+        std::fs::write(&watched, "before").unwrap();
+        let marker = temp.path().join("file-changed-hook-ran");
+
+        let hooks = serde_json::json!([{
+            "event": "FileChanged",
+            // Static watch configuration, the path a FileChanged hook wants
+            // observed.
+            "watch": watched.to_string_lossy(),
+            "cwd": temp.path().to_string_lossy(),
+            "command": platform_hook_command(
+                &format!("touch {} && echo '{{}}'", marker.display()),
+                &format!("echo changed> \"{}\" & echo {{}}", marker.display()),
+            ),
+        }]);
+
+        let api = FileChangingApi {
+            watched: watched.clone(),
+            marker: marker.clone(),
+        };
+        let mut repl = ReplLoop::with_engine(
+            Box::new(api),
+            temp.path().to_string_lossy().into_owned(),
+            ModelId::sonnet(),
+        );
+        repl.with_hooks(Some(hooks));
+        repl.apply_cli_config();
+
+        repl.run_headless("Hello").await.unwrap();
+
+        assert!(
+            marker.exists(),
+            "the headless run did not fire FileChanged for a changed watched file"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&watched).unwrap(),
+            "changed during the turn",
+            "the test's file change did not happen during the turn"
         );
     }
 
