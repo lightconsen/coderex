@@ -214,6 +214,20 @@ impl PtySession {
         )
         .expect("seed config home");
         cmd.env("CLAUDE_CONFIG_DIR", config_home.path());
+        // A developer's exported provider variables must not reach the child:
+        // `ANTHROPIC_MODEL`/`OPENAI_MODEL` take precedence over `--model`, so a
+        // shell that exports one would make the rendered model name depend on
+        // the machine. Tests that need one pass it through `extra_envs`.
+        for key in [
+            "ANTHROPIC_MODEL",
+            "OPENAI_MODEL",
+            "ANTHROPIC_BASE_URL",
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_AUTH_TOKEN",
+            "OPENAI_API_KEY",
+        ] {
+            cmd.env_remove(key);
+        }
         for (key, value) in extra_envs {
             cmd.env(key, value);
         }
