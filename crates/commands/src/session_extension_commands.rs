@@ -176,7 +176,7 @@ pub fn register(registry: &mut CommandRegistry) {
     // /rewind — rewind to a point in history
     registry.register(SlashCommand::local(
         "rewind",
-        "Rewind to a previous point in the session",
+        "Rewind to a previous point in the session (files are restored too)",
         true,
         true,
         true,

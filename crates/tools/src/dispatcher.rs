@@ -78,6 +78,12 @@ pub struct RegistryToolDispatcher {
     /// Tools that own a lifecycle moment the engine cannot see fire through
     /// it, and [`Self::set_cwd`] fires `CwdChanged`.
     hooks: Arc<parking_lot::RwLock<Option<Arc<dyn HookExecutor>>>>,
+    /// The session's file checkpoint store, when the session installed one.
+    ///
+    /// Mutating edit tools snapshot through it before they write, so `/rewind`
+    /// can undo the file half of a truncated turn.
+    checkpoint_store:
+        Arc<parking_lot::RwLock<Option<Arc<coderex_core::checkpoints::CheckpointStore>>>>,
 }
 
 impl RegistryToolDispatcher {
@@ -167,6 +173,14 @@ impl RegistryToolDispatcher {
         *self.hooks.write() = Some(hooks);
     }
 
+    /// Give the dispatcher the session's file checkpoint store.
+    ///
+    /// Edit tools snapshot their targets through it before they write, so
+    /// `/rewind` can restore the files a truncated turn touched.
+    pub fn set_checkpoint_store(&self, store: Arc<coderex_core::checkpoints::CheckpointStore>) {
+        *self.checkpoint_store.write() = Some(store);
+    }
+
     /// The working directory tools run in.
     #[must_use]
     pub fn cwd(&self) -> PathBuf {
@@ -208,6 +222,7 @@ impl RegistryToolDispatcher {
             elicit_tx: Arc::new(std::sync::Mutex::new(None)),
             session_id: None,
             hooks: Arc::new(parking_lot::RwLock::new(None)),
+            checkpoint_store: Arc::new(parking_lot::RwLock::new(None)),
         }
     }
 
@@ -544,6 +559,16 @@ impl CoreToolExecutor for RegistryToolDispatcher {
             extra.insert(
                 HOOK_EXECUTOR_KEY.to_string(),
                 Box::new(hooks) as SharedState,
+            );
+        }
+
+        // Inject the session's file checkpoint store, so a mutating edit tool
+        // can snapshot what it is about to overwrite and `/rewind` can undo it.
+        let session_checkpoint_store = self.checkpoint_store.read().clone();
+        if let Some(store) = session_checkpoint_store {
+            extra.insert(
+                crate::tool::CHECKPOINT_STORE_KEY.to_string(),
+                Box::new(store) as SharedState,
             );
         }
 

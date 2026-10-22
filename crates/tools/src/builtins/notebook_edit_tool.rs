@@ -150,6 +150,11 @@ impl Tool for NotebookEditTool {
                 message: format!("failed to serialize notebook: {e}"),
             })?;
 
+        // Snapshot the current notebook so `/rewind` can undo this edit.
+        if let Some(store) = crate::tool::checkpoint_store_from(&_ctx) {
+            store.snapshot(&input.call_id, std::path::Path::new(&notebook_path));
+        }
+
         std::fs::write(&notebook_path, new_content).map_err(|e| ToolError::InvalidInput {
             message: format!("failed to write notebook: {e}"),
         })?;

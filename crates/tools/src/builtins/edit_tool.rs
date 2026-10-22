@@ -99,6 +99,11 @@ impl Tool for EditTool {
             content.replacen(&old_string, &new_string, 1)
         };
 
+        // Snapshot the current content so `/rewind` can undo this edit.
+        if let Some(store) = crate::tool::checkpoint_store_from(&ctx) {
+            store.snapshot(&input.call_id, &path_buf);
+        }
+
         std::fs::write(&path_buf, &new_content).map_err(|e| ToolError::InvalidInput {
             message: format!("failed to write file: {e}"),
         })?;

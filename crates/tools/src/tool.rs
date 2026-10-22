@@ -40,6 +40,25 @@ pub fn hook_executor_from(ctx: &ToolContext<'_>) -> Option<Arc<dyn HookExecutor>
         .cloned()
 }
 
+/// The `ToolContext.extra` key under which the session's file checkpoint
+/// store rides.
+///
+/// A mutating edit tool snapshots its target through this store before it
+/// writes, so `/rewind` can undo the file half of a truncated turn.
+pub const CHECKPOINT_STORE_KEY: &str = "checkpoint_store";
+
+/// Borrow the session's file checkpoint store out of a tool context, if one
+/// is installed.
+#[must_use]
+pub fn checkpoint_store_from(
+    ctx: &ToolContext<'_>,
+) -> Option<Arc<coderex_core::checkpoints::CheckpointStore>> {
+    ctx.extra
+        .get(CHECKPOINT_STORE_KEY)
+        .and_then(|state| state.downcast_ref::<Arc<coderex_core::checkpoints::CheckpointStore>>())
+        .cloned()
+}
+
 /// Fire a lifecycle hook through the session's executor, if one is installed.
 ///
 /// A tool that owns a lifecycle moment the engine cannot see (`WorktreeCreate`

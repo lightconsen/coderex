@@ -8,6 +8,7 @@
 
 pub mod api_client;
 pub mod budget;
+pub mod checkpoints;
 pub mod compact;
 pub mod compaction_backend;
 pub mod confirmation_bus;

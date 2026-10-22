@@ -1717,6 +1717,11 @@ pub struct ReplLoop {
     /// async entry points (`execute_command`, and `run_tui` after
     /// `process_tui_input`) take and fire it exactly once.
     pending_setup: Option<String>,
+    /// The session's file checkpoint store.
+    ///
+    /// Edit tools snapshot through it before they write; `/rewind` restores
+    /// the files a truncated turn touched, not just the conversation.
+    checkpoint_store: Option<Arc<coderex_core::checkpoints::CheckpointStore>>,
     /// Command history with persistence.
     command_history: CommandHistory,
     /// Macro registry for user-defined command sequences.
@@ -2056,6 +2061,7 @@ impl ReplLoop {
             hooks_settings: None,
             hook_layers: None,
             active_hooks: 0,
+            checkpoint_store: None,
             protocol_sink: None,
             headless_permission_control: false,
             pending_destructive_cmd: None,
@@ -2377,6 +2383,16 @@ impl ReplLoop {
         // this session, so a later session can tell it apart from its own.
         dispatcher.set_session_id(session_id.to_string());
 
+        // The file checkpoint store lets `/rewind` undo the files a turn
+        // edited, not only the conversation history.
+        let checkpoint_store: Option<Arc<coderex_core::checkpoints::CheckpointStore>> =
+            coderex_core::checkpoints::CheckpointStore::new(&config_home.join("file-history"))
+                .ok()
+                .map(Arc::new);
+        if let Some(store) = &checkpoint_store {
+            dispatcher.set_checkpoint_store(Arc::clone(store));
+        }
+
         let dispatcher = Arc::new(dispatcher);
         let primary_executor: Arc<dyn coderex_core::tool_executor::ToolExecutor + Send + Sync> =
             dispatcher.clone();
@@ -2439,6 +2455,7 @@ impl ReplLoop {
             hooks_settings: None,
             hook_layers: None,
             active_hooks: 0,
+            checkpoint_store,
             protocol_sink: None,
             headless_permission_control: false,
             pending_destructive_cmd: None,
@@ -7080,6 +7097,32 @@ impl ReplLoop {
         args: &[String],
         ui_state: &mut coderex_ui::state::UiState,
     ) {
+        // `/rewind` needs the session and the checkpoint store, which the
+        // registry cannot reach; it is handled here so the TUI path restores
+        // files the same way the non-TUI path does.
+        if cmd_name == "rewind" {
+            let message = args
+                .first()
+                .and_then(|value| value.parse::<usize>().ok())
+                .map_or_else(
+                    || "Usage: /rewind <message-number>".to_string(),
+                    |n| match self.perform_rewind(n) {
+                        Ok((removed, restored, removed_files)) => format!(
+                            "Rewound to message {n}. {removed} messages removed. {restored} \
+                             file(s) restored, {removed_files} created file(s) removed."
+                        ),
+                        Err(error) => error,
+                    },
+                );
+            ui_state.messages.push(coderex_ui::message_list::Message {
+                role: coderex_ui::message_list::MessageRole::System,
+                content: message.into(),
+                tool_name: None,
+                streaming: false,
+                folded: false,
+            });
+            return;
+        }
         let ctx = self.build_context();
         let result = self.commands.execute(cmd_name, &ctx, args);
         self.sync_command_state(cmd_name, &result);
@@ -7243,6 +7286,47 @@ impl ReplLoop {
                 folded: false,
             });
         }
+    }
+
+    /// Apply `/rewind <n>`: truncate the conversation and undo the file edits
+    /// the removed tool calls made.
+    ///
+    /// Returns `(messages_removed, files_restored, created_files_removed)`.
+    fn perform_rewind(&mut self, n: usize) -> Result<(usize, usize, usize), String> {
+        let Some(engine) = self.engine.as_mut() else {
+            return Err("No engine configured.".to_string());
+        };
+        let mut session = engine.session().clone();
+        if n >= session.messages.len() {
+            return Err(format!(
+                "Message {n} not found. Session has {} messages.",
+                session.messages.len()
+            ));
+        }
+        let removed = session.messages.len() - n;
+        // The tool calls this rewind undoes, by id: the checkpoint store can
+        // then restore the files those calls wrote.
+        let undone_call_ids: std::collections::HashSet<String> = session
+            .messages
+            .iter()
+            .skip(n)
+            .filter_map(|message| match &message.content {
+                coderex_core::types::MessageContent::ToolCall(call) => Some(call.id.clone()),
+                coderex_core::types::MessageContent::ToolResult(result) => {
+                    Some(result.tool_call_id.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        session.messages.truncate(n);
+        engine.set_session(session);
+        self.history.truncate(n);
+
+        let (restored, removed_files) = self.checkpoint_store.as_ref().map_or((0, 0), |store| {
+            let report = store.restore(&undone_call_ids);
+            (report.restored.len(), report.removed.len())
+        });
+        Ok((removed, restored, removed_files))
     }
 
     /// Run one command line outside the TUI.
@@ -7470,29 +7554,15 @@ impl ReplLoop {
                         writeln!(stdout, "Usage: /rewind <message-number>")?;
                     } else {
                         match args[0].parse::<usize>() {
-                            Ok(n) => {
-                                if let Some(ref mut engine) = self.engine {
-                                    let mut session = engine.session().clone();
-                                    if n < session.messages.len() {
-                                        let removed = session.messages.len() - n;
-                                        session.messages.truncate(n);
-                                        engine.set_session(session);
-                                        self.history.truncate(n);
-                                        writeln!(
-                                            stdout,
-                                            "Rewound to message {n}. {removed} messages removed."
-                                        )?;
-                                    } else {
-                                        writeln!(
-                                            stdout,
-                                            "Message {n} not found. Session has {} messages.",
-                                            session.messages.len()
-                                        )?;
-                                    }
-                                } else {
-                                    writeln!(stdout, "No engine configured.")?;
-                                }
-                            }
+                            Ok(n) => match self.perform_rewind(n) {
+                                Ok((removed, restored, removed_files)) => writeln!(
+                                    stdout,
+                                    "Rewound to message {n}. {removed} messages removed. \
+                                     {restored} file(s) restored, {removed_files} \
+                                     created file(s) removed."
+                                )?,
+                                Err(error) => writeln!(stdout, "{error}")?,
+                            },
                             Err(_) => {
                                 writeln!(stdout, "Invalid message number.")?;
                             }

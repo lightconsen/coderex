@@ -74,6 +74,12 @@ impl Tool for WriteTool {
             })?;
         }
 
+        // Snapshot what is about to be overwritten so `/rewind` can undo this
+        // write along with the conversation truncation.
+        if let Some(store) = crate::tool::checkpoint_store_from(&ctx) {
+            store.snapshot(&input.call_id, &path_buf);
+        }
+
         std::fs::write(&path_buf, &content).map_err(|e| ToolError::InvalidInput {
             message: format!("failed to write file: {e}"),
         })?;
@@ -114,6 +120,37 @@ mod tests {
 
     fn test_ctx(cwd: &Path) -> ToolContext<'_> {
         ToolContext::new(ExecutionContext::Normal, cwd)
+    }
+
+    /// A session whose dispatcher installed a checkpoint store: the tool must
+    /// snapshot what it is about to overwrite, so `/rewind` can undo the write.
+    #[tokio::test]
+    async fn a_write_snapshots_what_it_overwrites_when_a_store_is_installed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("a.txt");
+        std::fs::write(&target, "v1").unwrap();
+
+        let store = std::sync::Arc::new(
+            coderex_core::checkpoints::CheckpointStore::new(&tmp.path().join("history")).unwrap(),
+        );
+        let mut extra = std::collections::HashMap::new();
+        extra.insert(
+            crate::tool::CHECKPOINT_STORE_KEY.to_string(),
+            Box::new(std::sync::Arc::clone(&store)) as crate::tool::SharedState,
+        );
+        let ctx = ToolContext::new(ExecutionContext::Normal, tmp.path()).with_extra(extra);
+
+        let output = WriteTool
+            .execute(test_input("a.txt", "v2"), ctx)
+            .await
+            .unwrap();
+        assert!(output.output.contains("Wrote"));
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "v2");
+
+        let undone: std::collections::HashSet<String> = ["1".to_string()].into_iter().collect();
+        let report = store.restore(&undone);
+        assert_eq!(report.restored, vec![target.clone()]);
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "v1");
     }
 
     fn test_input(file_path: &str, content: &str) -> ToolInput {
