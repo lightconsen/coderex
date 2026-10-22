@@ -3728,6 +3728,17 @@ impl ReplLoop {
                         let session_cwd = engine.session().cwd.clone();
                         let session_id = engine.session().session_id.to_string();
                         let session_model = engine.model().clone();
+                        // Captured before the two values move into the request
+                        // handler: a mod's read-only `$` sees these facts.
+                        let permission_mode = engine.permission_checker().lock().map_or_else(
+                            |poisoned| poisoned.into_inner().mode(),
+                            |checker| checker.mode(),
+                        );
+                        let mod_session = coderex_mods::ModSession {
+                            cwd: session_cwd.to_string_lossy().to_string(),
+                            model: session_model.0.clone(),
+                            permission_mode: format!("{permission_mode:?}"),
+                        };
                         registry.set_request_handler(Arc::new(
                             crate::hook_actions::SessionHookRequestHandler::new(
                                 session_cwd,
@@ -3736,7 +3747,24 @@ impl ReplLoop {
                                 engine.permission_checker(),
                             ),
                         ));
-                        engine.set_hooks(registry.into_executor());
+                        // In-process JavaScript mods (opt-in via `CODEREX_MODS`
+                        // or `CODEREX_MODS_DIR`): their hooks run first, then
+                        // the hooks from settings.
+                        let inner = registry.into_executor();
+                        engine.set_hooks(
+                            match coderex_mods::JsHookExecutor::load_from_env(
+                                mod_session,
+                                Some(Arc::clone(&inner)
+                                    as Arc<dyn coderex_core::hook_executor::HookExecutor>),
+                            ) {
+                                Some(Ok(executor)) => Arc::new(executor),
+                                Some(Err(error)) => {
+                                    tracing::warn!("mods were not loaded: {error}");
+                                    inner
+                                }
+                                None => inner,
+                            },
+                        );
                         installed_hook_count = hook_count;
                     }
                     Err(e) => tracing::warn!("hooks in settings were not loaded: {e}"),
