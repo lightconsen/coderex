@@ -23,6 +23,7 @@ use boa_engine::{
     property::{Attribute, PropertyKey},
 };
 use coderex_core::hook_executor::{HookExecutor, HookFireResult};
+use coderex_core::ui_protocol::{UiElement, parse_ui_elements};
 
 /// Environment variable that opts the in-process runtime in.
 pub const MODS_ENV: &str = "CODEREX_MODS";
@@ -162,6 +163,8 @@ struct HookEffect {
     updated_input: Option<String>,
     updated_tool_output: Option<String>,
     watch_paths: Vec<String>,
+    /// Elements the hook staged with `$.ui.render`, in call order.
+    ui: Vec<UiElement>,
 }
 
 /// Everything the worker needs to (re)load the mods.
@@ -1054,6 +1057,8 @@ fn optional_string(value: Option<&String>) -> JsValue {
 fn merge_effect_with_downstream(effect: HookEffect, downstream: HookFireResult) -> HookFireResult {
     let mut watch_paths = effect.watch_paths;
     watch_paths.extend(downstream.watch_paths);
+    let mut ui = effect.ui;
+    ui.extend(downstream.ui);
     HookFireResult {
         stop: effect.stop || downstream.stop,
         updated_input: effect.updated_input.or(downstream.updated_input),
@@ -1063,6 +1068,7 @@ fn merge_effect_with_downstream(effect: HookEffect, downstream: HookFireResult) 
         errors: downstream.errors,
         failed: downstream.failed,
         watch_paths: dedupe_paths(watch_paths),
+        ui,
     }
 }
 
@@ -1077,6 +1083,8 @@ fn merge_with_inner(js: HookFireResult, inner: HookFireResult) -> HookFireResult
     watch_paths.extend(inner.watch_paths);
     let mut errors = js.errors;
     errors.extend(inner.errors);
+    let mut ui = js.ui;
+    ui.extend(inner.ui);
 
     HookFireResult {
         stop: js.stop || inner.stop,
@@ -1085,6 +1093,7 @@ fn merge_with_inner(js: HookFireResult, inner: HookFireResult) -> HookFireResult
         errors,
         failed: js.failed || inner.failed,
         watch_paths: dedupe_paths(watch_paths),
+        ui,
     }
 }
 
@@ -1097,6 +1106,7 @@ fn apply_effect(combined: &mut HookFireResult, effect: HookEffect) {
         combined.updated_tool_output = effect.updated_tool_output;
     }
     combined.watch_paths.extend(effect.watch_paths);
+    combined.ui.extend(effect.ui);
 }
 
 fn apply_result(combined: &mut HookFireResult, result: HookFireResult) {
@@ -1110,6 +1120,7 @@ fn apply_result(combined: &mut HookFireResult, result: HookFireResult) {
     combined.watch_paths.extend(result.watch_paths);
     combined.failed |= result.failed;
     combined.errors.extend(result.errors);
+    combined.ui.extend(result.ui);
 }
 
 fn parse_reply(reply: &serde_json::Value) -> Result<HookEffect, String> {
@@ -1124,11 +1135,25 @@ fn parse_reply(reply: &serde_json::Value) -> Result<HookEffect, String> {
         }
     }
 
+    // `$.ui.render` stages elements even when the hook returns `undefined`, so
+    // read them before looking at the decision.
+    let ui = match reply.get("ui") {
+        None | Some(serde_json::Value::Null) => Vec::new(),
+        Some(value) => parse_ui_elements(value)
+            .map_err(|error| format!("the hook returned invalid UI: {error}"))?,
+    };
+
     let Some(result) = reply.get("result") else {
-        return Ok(HookEffect::default());
+        return Ok(HookEffect {
+            ui,
+            ..HookEffect::default()
+        });
     };
     if result.is_null() {
-        return Ok(HookEffect::default());
+        return Ok(HookEffect {
+            ui,
+            ..HookEffect::default()
+        });
     }
 
     Ok(HookEffect {
@@ -1148,6 +1173,7 @@ fn parse_reply(reply: &serde_json::Value) -> Result<HookEffect, String> {
                     .collect()
             })
             .unwrap_or_default(),
+        ui,
     })
 }
 
@@ -1209,9 +1235,7 @@ fn install_host_api(context: &mut Context, session: &ModSession, name: &str) -> 
         dollar,
         Attribute::READONLY | Attribute::NON_ENUMERABLE,
     )?;
-    context.eval(Source::from_bytes(
-        "Object.freeze($.session); Object.freeze($);",
-    ))?;
+    context.eval(Source::from_bytes(HOST_UI_API.as_bytes()))?;
 
     let on = NativeFunction::from_fn_ptr(on_hook).to_js_function(context.realm());
     context.register_global_property(
@@ -1221,6 +1245,140 @@ fn install_host_api(context: &mut Context, session: &ModSession, name: &str) -> 
     )?;
     Ok(())
 }
+
+/// The `$.ui` host API, installed in each mod's realm before the mod runs.
+///
+/// The constructors return plain, JSON-shaped descriptors; `render` stages
+/// them and the main-realm dispatcher drains the staging area after each hook
+/// call. Validation happens here (so the mod gets a JavaScript error at the
+/// call site) and again in [`parse_ui_elements`] at the boundary.
+const HOST_UI_API: &str = r#"
+'use strict';
+(function () {
+  const STYLES = ['plain', 'bold', 'dim', 'warning', 'error'];
+  const staging = [];
+
+  function styleName(style) {
+    if (style === undefined || style === null) return 'plain';
+    if (typeof style !== 'string') {
+      throw new TypeError('$.ui.text(text, style): style must be a string');
+    }
+    const normalized = style.toLowerCase();
+    if (STYLES.indexOf(normalized) === -1) {
+      throw new TypeError("$.ui.text(text, style): unknown style '" + style + "'; expected one of " + STYLES.join(', '));
+    }
+    return normalized;
+  }
+
+  function assertElement(element, depth) {
+    if (depth > 32) {
+      throw new RangeError('$.ui.render: UI elements may nest at most 32 levels');
+    }
+    if (element === null || typeof element !== 'object' || Array.isArray(element)) {
+      throw new TypeError('$.ui.render: every element must be an object created by $.ui.text(), $.ui.box() or $.ui.button()');
+    }
+    if (element.type === 'text') {
+      if (typeof element.text !== 'string') {
+        throw new TypeError('$.ui.text(text, style): text must be a string');
+      }
+      styleName(element.style);
+      return;
+    }
+    if (element.type === 'button') {
+      if (typeof element.label !== 'string' || element.label.length === 0) {
+        throw new TypeError('$.ui.button(label, id): label must be a non-empty string');
+      }
+      if (typeof element.id !== 'string' || element.id.length === 0) {
+        throw new TypeError('$.ui.button(label, id): id must be a non-empty string');
+      }
+      return;
+    }
+    if (element.type === 'box') {
+      if (element.title !== null && element.title !== undefined && typeof element.title !== 'string') {
+        throw new TypeError('$.ui.box({title}, children...): title must be a string');
+      }
+      if (!Array.isArray(element.children)) {
+        throw new TypeError('$.ui.box({title}, children...): children must be an array');
+      }
+      for (let index = 0; index < element.children.length; index++) {
+        assertElement(element.children[index], depth + 1);
+      }
+      return;
+    }
+    throw new TypeError("$.ui.render: unknown element type '" + String(element.type) + "'");
+  }
+
+  const ui = {
+    text: function (text, style) {
+      if (typeof text !== 'string') {
+        throw new TypeError('$.ui.text(text, style): text must be a string');
+      }
+      return { type: 'text', text: text, style: styleName(style) };
+    },
+    box: function (options) {
+      let title = null;
+      let start = 0;
+      if (options !== undefined && options !== null) {
+        if (typeof options !== 'object' || Array.isArray(options)) {
+          throw new TypeError('$.ui.box({title}, children...): the first argument must be an options object');
+        }
+        if (options.title !== undefined && options.title !== null) {
+          if (typeof options.title !== 'string') {
+            throw new TypeError('$.ui.box({title}, children...): title must be a string');
+          }
+          title = options.title;
+        }
+        start = 1;
+      }
+      const children = [];
+      for (let index = start; index < arguments.length; index++) {
+        const child = arguments[index];
+        if (Array.isArray(child)) {
+          for (let inner = 0; inner < child.length; inner++) {
+            assertElement(child[inner], 1);
+            children.push(child[inner]);
+          }
+        } else {
+          assertElement(child, 1);
+          children.push(child);
+        }
+      }
+      return { type: 'box', title: title, children: children };
+    },
+    button: function (label, id) {
+      if (typeof label !== 'string' || label.length === 0) {
+        throw new TypeError('$.ui.button(label, id): label must be a non-empty string');
+      }
+      if (typeof id !== 'string' || id.length === 0) {
+        throw new TypeError('$.ui.button(label, id): id must be a non-empty string');
+      }
+      return { type: 'button', label: label, id: id };
+    },
+    render: function (element) {
+      if (arguments.length === 0) {
+        throw new TypeError('$.ui.render(element(s)): at least one element is required');
+      }
+      const elements = arguments.length > 1
+        ? Array.prototype.slice.call(arguments)
+        : (Array.isArray(element) ? element : [element]);
+      for (let index = 0; index < elements.length; index++) {
+        assertElement(elements[index], 0);
+        staging.push(elements[index]);
+      }
+      return undefined;
+    },
+    // Host plumbing: the dispatcher clears and drains this area around each
+    // hook call. Mods have no reason to call these.
+    __resetUi: function () { staging.length = 0; },
+    __takeUi: function () { const taken = staging.slice(); staging.length = 0; return taken; }
+  };
+
+  Object.freeze(ui);
+  $.ui = ui;
+})();
+Object.freeze($.session);
+Object.freeze($);
+"#;
 
 /// The main realm's harness: the per-mod registry and the hook dispatcher.
 ///
@@ -1284,13 +1442,21 @@ globalThis.__coderExCall = function (modIndex, hookIndex, event, input, contextJ
     // A malformed context is simply not exposed.
   }
 
+  const host = registration.host;
+  const ui = host && host.ui;
+  if (ui && typeof ui.__resetUi === 'function') ui.__resetUi();
+
   try {
-    const value = registration.hook(registration.host, eventObject, nextFn);
+    const value = registration.hook(host, eventObject, nextFn);
+    // Take whatever `$.ui.render` staged, even when the hook returns nothing:
+    // rendering is itself the result.
+    const staged = (ui && typeof ui.__takeUi === 'function') ? ui.__takeUi() : [];
     if (value !== null && typeof value === 'object' && typeof value.then === 'function') {
       return JSON.stringify({ ok: false, error: 'async hooks are not supported yet; return a value synchronously' });
     }
-    return JSON.stringify({ ok: true, result: __coderExNormalize(value) });
+    return JSON.stringify({ ok: true, result: __coderExNormalize(value), ui: staged });
   } catch (error) {
+    if (ui && typeof ui.__takeUi === 'function') ui.__takeUi();
     const message = (error && error.message) ? String(error.message) : String(error);
     return JSON.stringify({ ok: false, error: message });
   }
@@ -1413,6 +1579,7 @@ pub fn dedupe_paths(paths: Vec<String>) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use coderex_core::ui_protocol::UiStyle;
 
     #[derive(Clone)]
     struct RecordingInner {
@@ -2058,6 +2225,175 @@ mod tests {
                 .as_deref(),
             Some("b!!"),
             "the second mod's realm state persists between calls"
+        );
+    }
+
+    // ── UI elements ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn ui_render_contributes_text_boxes_and_buttons_without_a_return_value() {
+        let runtime = load(
+            "function register(on) { on('PostToolUse', '*', function ($) { \
+             $.ui.render($.ui.box({ title: 'Report' }, \
+             $.ui.text('hello', 'bold'), $.ui.button('Retry', 'retry'))); }); }",
+        );
+
+        let result = runtime.fire("PostToolUse", "Read", &HashMap::new());
+
+        assert!(!result.failed, "{result:?}");
+        assert_eq!(
+            result.ui,
+            vec![UiElement::Box {
+                title: Some("Report".to_string()),
+                children: vec![
+                    UiElement::Text {
+                        text: "hello".to_string(),
+                        style: UiStyle::Bold,
+                    },
+                    UiElement::Button {
+                        label: "Retry".to_string(),
+                        id: "retry".to_string(),
+                    },
+                ],
+            }]
+        );
+    }
+
+    #[test]
+    fn ui_render_accumulates_every_element_in_call_order() {
+        let runtime = load(
+            "function register(on) { on('PostToolUse', '*', function ($) { \
+             $.ui.render($.ui.text('first')); \
+             $.ui.render([$.ui.text('second'), $.ui.button('Third', 'third')]); }); }",
+        );
+
+        let result = runtime.fire("PostToolUse", "Read", &HashMap::new());
+
+        assert_eq!(
+            result.ui,
+            vec![
+                UiElement::Text {
+                    text: "first".to_string(),
+                    style: UiStyle::Plain,
+                },
+                UiElement::Text {
+                    text: "second".to_string(),
+                    style: UiStyle::Plain,
+                },
+                UiElement::Button {
+                    label: "Third".to_string(),
+                    id: "third".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn ui_styles_accept_case_insensitive_names_and_default_to_plain() {
+        let runtime = load(
+            "function register(on) { on('PostToolUse', '*', function ($) { \
+             $.ui.render($.ui.text('a'), $.ui.text('b', 'WARNING'), \
+             $.ui.text('c', 'Error'), $.ui.text('d', 'dim')); }); }",
+        );
+
+        let result = runtime.fire("PostToolUse", "Read", &HashMap::new());
+
+        let styles: Vec<_> = result
+            .ui
+            .iter()
+            .map(|element| match element {
+                UiElement::Text { style, .. } => *style,
+                _ => panic!("expected text elements"),
+            })
+            .collect();
+        assert_eq!(
+            styles,
+            vec![
+                UiStyle::Plain,
+                UiStyle::Warning,
+                UiStyle::Error,
+                UiStyle::Dim
+            ]
+        );
+    }
+
+    #[test]
+    fn ui_staging_is_cleared_between_hook_calls() {
+        let runtime = load(
+            "let calls = 0; \
+             function register(on) { on('PostToolUse', '*', function ($) { \
+             if (calls++ === 0) { $.ui.render($.ui.text('once')); } }); }",
+        );
+
+        let first = runtime.fire("PostToolUse", "Read", &HashMap::new());
+        let second = runtime.fire("PostToolUse", "Read", &HashMap::new());
+
+        assert_eq!(first.ui.len(), 1, "the first call rendered one element");
+        assert!(second.ui.is_empty(), "the second call rendered nothing");
+    }
+
+    #[test]
+    fn invalid_ui_shapes_become_clear_hook_errors() {
+        let cases = [
+            ("$.ui.render($.ui.text(42));", "text must be a string"),
+            (
+                "$.ui.render($.ui.text('hi', 'loud'));",
+                "unknown style 'loud'",
+            ),
+            (
+                "$.ui.render($.ui.button('', 'retry'));",
+                "label must be a non-empty string",
+            ),
+            (
+                "$.ui.render({ type: 'blink' });",
+                "unknown element type 'blink'",
+            ),
+        ];
+
+        for (statement, expected) in cases {
+            let runtime = load(&format!(
+                "function register(on) {{ on('PostToolUse', '*', function ($) {{ {statement} }}); }}"
+            ));
+            let result = runtime.fire("PostToolUse", "Read", &HashMap::new());
+
+            assert!(result.failed, "{statement} was accepted: {result:?}");
+            assert!(
+                result.errors.iter().any(|error| error.contains(expected)),
+                "{statement}: expected {expected:?} in {:?}",
+                result.errors
+            );
+            assert!(result.ui.is_empty(), "{statement} kept a partial tree");
+        }
+    }
+
+    #[test]
+    fn ui_from_a_hook_and_from_next_is_combined() {
+        let inner = Arc::new(RecordingInner::answering(HookFireResult {
+            ui: vec![UiElement::Text {
+                text: "downstream".to_string(),
+                style: UiStyle::Dim,
+            }],
+            ..HookFireResult::default()
+        }));
+        let runtime = load(
+            "function register(on) { on('PostToolUse', '*', function ($, e, next) { \
+             $.ui.render($.ui.text('hook')); next(); }); }",
+        );
+
+        let result = fire_with(&runtime, "PostToolUse", "Bash", Arc::clone(&inner) as _);
+
+        assert_eq!(
+            result.ui,
+            vec![
+                UiElement::Text {
+                    text: "hook".to_string(),
+                    style: UiStyle::Plain,
+                },
+                UiElement::Text {
+                    text: "downstream".to_string(),
+                    style: UiStyle::Dim,
+                },
+            ]
         );
     }
 

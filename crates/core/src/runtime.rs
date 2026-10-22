@@ -256,6 +256,10 @@ impl UiState {
                 // Notifications are advisory; log them but don't change state.
                 tracing::info!("engine notification: {message}");
             }
+            EngineEvent::ModUi(elements) => {
+                // This runtime has no mod renderer; the REPL owns that surface.
+                tracing::debug!(elements = elements.len(), "mod UI event");
+            }
             EngineEvent::PermissionExplanation { tool, explanation } => {
                 // Store explanation in transcript as an advisory note.
                 self.transcript

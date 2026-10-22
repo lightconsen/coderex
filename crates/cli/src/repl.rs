@@ -5360,6 +5360,26 @@ impl ReplLoop {
                             apply_agent_event(&mut ui_state, &agent_id, &event);
                             self.persist_interactive_snapshot(&ui_state);
                         }
+                        EngineEvent::ModUi(elements) => {
+                            // A mod rendered UI during a hook. The tree is a
+                            // snapshot, so it renders here without touching
+                            // the mod runtime. It belongs in the transcript,
+                            // not on stdout interleaved with the turn.
+                            let rendered = coderex_ui::mod_elements::render_mod_ui_text(
+                                &elements,
+                                coderex_ui::mod_elements::MOD_UI_DEFAULT_WIDTH,
+                            );
+                            if !rendered.is_empty() {
+                                ui_state.messages.push(Message {
+                                    role: MessageRole::System,
+                                    content: rendered.into(),
+                                    tool_name: None,
+                                    streaming: false,
+                                    folded: false,
+                                });
+                                self.persist_interactive_snapshot(&ui_state);
+                            }
+                        }
                         EngineEvent::PermissionExplanation { tool, explanation } => {
                             if let Some(detail) = ui_state.permission_detail.as_mut() {
                                 if detail.tool.eq_ignore_ascii_case(&tool) {
@@ -5825,13 +5845,37 @@ impl ReplLoop {
             .unwrap_or_default();
         for event in events {
             self.record_engine_event_telemetry(&event);
-            if let EngineEvent::TextDelta(delta) = event {
-                output.push_str(&delta);
+            match event {
+                EngineEvent::TextDelta(delta) => output.push_str(&delta),
+                EngineEvent::ModUi(elements) => append_mod_ui_block(output, &elements),
+                _ => {}
             }
         }
         self.drain_agent_observable_events();
     }
+}
 
+/// Append a rendered mod UI block to a headless turn's output.
+///
+/// Headless runs have no transcript pane; the block joins the turn's output
+/// rather than being printed live from the event loop. A blank line separates
+/// it from model text when the preceding output did not end with one.
+fn append_mod_ui_block(output: &mut String, elements: &[coderex_core::ui_protocol::UiElement]) {
+    let rendered = coderex_ui::mod_elements::render_mod_ui_text(
+        elements,
+        coderex_ui::mod_elements::MOD_UI_DEFAULT_WIDTH,
+    );
+    if rendered.is_empty() {
+        return;
+    }
+    if !output.is_empty() && !output.ends_with('\n') {
+        output.push('\n');
+    }
+    output.push_str(&rendered);
+    output.push('\n');
+}
+
+impl ReplLoop {
     /// Record a tool event for telemetry, when the session opted in.
     fn record_engine_event_telemetry(&mut self, event: &EngineEvent) {
         let Some(handle) = self.telemetry.as_ref() else {
@@ -6714,6 +6758,9 @@ impl ReplLoop {
                 }
                 if let EngineEvent::TextDelta(delta) = &event {
                     output.push_str(delta);
+                }
+                if let EngineEvent::ModUi(elements) = &event {
+                    append_mod_ui_block(&mut output, elements);
                 }
             }
             Some(request) = elicit_rx.recv() => {
@@ -9741,6 +9788,32 @@ mod tests {
         let mut loop_obj = ReplLoop::new("/src".into(), ModelId::sonnet());
         let result = loop_obj.run_headless("/help").await.unwrap();
         assert!(result.contains("System Status") || result.contains("Available"));
+    }
+
+    /// A mod's UI block joins the headless output at the point the event was
+    /// drained, instead of being printed live from the event loop.
+    #[tokio::test]
+    async fn headless_output_contains_a_rendered_mod_ui_block() {
+        let mut repl = ReplLoop::new("/src".into(), ModelId::sonnet());
+        let (tx, rx) = mpsc::unbounded_channel();
+        repl.event_rx = Some(rx);
+        tx.send(EngineEvent::ModUi(vec![
+            coderex_core::ui_protocol::UiElement::Box {
+                title: Some("Mods".to_string()),
+                children: vec![coderex_core::ui_protocol::UiElement::Button {
+                    label: "Retry".to_string(),
+                    id: "retry".to_string(),
+                }],
+            },
+        ]))
+        .unwrap();
+
+        let mut output = String::new();
+        repl.drain_events(&mut output);
+
+        assert!(output.contains("┌─ Mods"), "{output}");
+        assert!(output.contains("[Retry]"), "{output}");
+        assert!(output.ends_with('\n'), "{output:?}");
     }
 
     /// Headless output must be exactly what the model produced. The old path

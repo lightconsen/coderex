@@ -53,6 +53,12 @@ pub struct HookFireResult {
     /// The caller substitutes it for what the tool produced before the model
     /// sees the result.
     pub updated_tool_output: Option<String>,
+    /// UI elements a mod contributed during this hook call, in render order.
+    ///
+    /// The tree is a host-owned snapshot ([`UiElement`](crate::ui_protocol::UiElement)),
+    /// not a live JavaScript object. It is empty when no mod rendered anything,
+    /// and the engine emits no `ModUi` event for an empty tree.
+    pub ui: Vec<crate::ui_protocol::UiElement>,
 }
 
 /// Abstract hook executor — implemented by `coderex-hooks::HookRegistry`.

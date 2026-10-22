@@ -21,6 +21,7 @@ Terminal user interface via ratatui. Renders messages, statusline, input line, c
 - **`OverlayStack`** (`overlay.rs`) — Modal dialog stack: PermissionDialog, Notification, CommandPalette, Confirm.
 - **`VimState`** (`vim.rs`) — Vim mode state machine: Normal, Insert, Visual (`v`) and Visual-line (`V`). Selection anchors and the selected text live in `InputBuffer` (`input.rs`), which is the layer that knows the buffer contents.
 - **`Theme`** (`themes.rs`) — Color scheme definitions.
+- **`mod_elements`** (`mod_elements.rs`) — Pure renderer for the UI tree a mod contributes (`UiElement` from `coderex_core::ui_protocol`). `render_mod_ui` returns styled `Line`s and `render_mod_ui_text` returns the plain block used by the transcript and headless output. Boxes nest with box-drawing borders and titles, `UiStyle` maps to the existing modifiers/colors, and buttons render as `[label]`. There is no input routing: a button is a labelled affordance, not a control. The renderer keeps no TUI state, so a tree can be rendered after the mod runtime is gone.
 
 ### Layout (bottom-up)
 

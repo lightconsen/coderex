@@ -211,13 +211,14 @@ See [Limits and isolation](#limits-and-isolation).
 
 ## The `$` host API
 
-`$` is frozen and contains exactly three things:
+`$` is frozen and contains exactly four things:
 
 | Member | Meaning |
 | --- | --- |
 | `$.session` | Frozen `{ cwd, model, permission_mode }`, captured when the runtime was constructed. |
 | `$.log(message)` | Writes a line at `info` under the `coderex_mods` tracing target. |
 | `$.env(name)` | The value of an allowlisted environment variable, or `null`. |
+| `$.ui` | Build and render a declarative UI tree. See [UI elements](#ui-elements). |
 
 `$.env` returns `null` for every name outside this exact, case-sensitive list:
 
@@ -304,28 +305,76 @@ wrap the existing `HookRegistry`:
 The runtime is synchronous; `fire_hook` moves the blocking wait to
 `tokio::task::spawn_blocking`, so it does not block an async worker.
 
+## UI elements
+
+A hook may contribute UI to the terminal surface with `$.ui`. The host owns
+the tree: it is a serializable **snapshot**, not a live JavaScript object, so
+it can be rendered after the hook returns, times out, or its worker is
+unloaded.
+
+```js
+on('PostToolUse', 'Read', function ($, e) {
+  $.ui.render(
+    $.ui.box({ title: 'Read result' },
+      $.ui.text('checked ' + e.input, 'dim'),
+      $.ui.button('Show details', 'read-details'))
+  );
+});
+```
+
+### `$.ui.text(text, style?)`
+
+Returns a text element. `text` must be a string. `style` is optional and one
+of `plain` (the default), `bold`, `dim`, `warning` or `error`
+(case-insensitive). An unknown style throws a `TypeError` at the call site.
+
+### `$.ui.box(options?, children...)`
+
+Returns a bordered container. The first argument, when present, is an options
+object with an optional string `title`. Every following argument is a child
+element; an array is flattened one level. Invalid options or children throw.
+
+### `$.ui.button(label, id)`
+
+Returns a labelled button affordance. `label` and `id` must be non-empty
+strings. The id is reserved for a future input-routing pass; nothing reads it
+today.
+
+### `$.ui.render(element(s))`
+
+Stages one element, an array of elements, or several arguments for the
+current hook call. Elements render in call order. A hook may call `render`
+more than once; every staged element is appended to that call's result.
+Rendering is independent of the return value: a hook that returns `undefined`
+still contributes its UI. The staging area is cleared before each hook call,
+so a later call never replays what an earlier one produced.
+
+`render` validates the whole tree before staging it. A value that is not a
+`$.ui` element, an unknown type or style, or a malformed nested box throws at
+the call site. A thrown error becomes a hook error like any other exception:
+the call is marked `failed` and no partial tree is kept.
+
+### Delivery and rendering
+
+The elements travel in `HookFireResult.ui`, and the engine emits
+`EngineEvent::ModUi(Vec<UiElement>)` for a non-empty tree (empty trees emit
+nothing). The terminal REPL renders the block into the transcript as a system
+message; a headless run appends it to the turn's output. Boxes render with
+nested borders and titles, text uses the terminal style vocabulary, and
+buttons render as `[label]`.
+
+### Limitations
+
+- **Snapshot, not live.** Elements are plain data. There is no `mount`,
+  `update` or `unmount`, no stable node identity, and no way to mutate an
+  element after `render`. Render again from a later hook to show new content.
+- **Terminal only.** There is no web or other surface.
+- **Buttons do nothing.** They render as `[label]`. Input routing — clicks,
+  focus, key bindings, and the callback that would receive a button's `id` —
+  is not implemented. A button is a labelled affordance, not a control.
+- **One block per hook call.** The host renders a hook's tree on its own; it
+  is not merged into the built-in panes.
+
 ## Not yet
 
-There are no UI elements and no async hooks. These are the designs, not shipped
-behaviour.
-
-### UI elements
-
-The reference lets a mod contribute panes, status lines, toasts and prompts.
-That needs two pieces this phase does not have:
-
-1. **An element tree owned by the host.** A mod would describe elements
-   declaratively (for example `{ type: 'status', text }`,
-   `{ type: 'pane', id, lines }`, `{ type: 'toast', message }`), with a stable
-   id and a lifecycle (`mount`, `update`, `unmount`). The tree must be a
-   serializable value crossing the worker boundary, not JavaScript objects.
-2. **A renderer.** `coderex-ui` would need a render pass that merges mod
-   elements with the built-in TUI layout, respects the terminal profile and
-   accessibility settings, and routes input (slash commands, key bindings)
-   back to the owning mod. Rendering must remain possible when a mod is
-   timing out or has been unloaded, so the tree is a snapshot rather than a
-   live engine reference.
-
-Both features would extend `register`/`on` rather than change the read-only
-`$` surface: a mod still gets no tools or files, only the ability to hand the
-host a decision or a description of pixels.
+There are no async hooks. An `async` hook is rejected at call time.

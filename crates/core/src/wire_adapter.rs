@@ -27,8 +27,9 @@ pub fn engine_event_to_wire(event: &EngineEvent) -> Option<WireEvent> {
         },
         // The summary is a local display hint for the interactive renderer;
         // it rides in front of a `ToolCallStart` whose `summary` field already
-        // carries the same text, so the wire protocol needs no new frame.
-        EngineEvent::ToolUseSummary { .. } => return None,
+        // carries the same text. Mod UI is likewise rendered in-process by the
+        // terminal surfaces. The wire protocol needs no frame for either.
+        EngineEvent::ToolUseSummary { .. } | EngineEvent::ModUi(_) => return None,
         EngineEvent::CompactBoundary => WireEvent::CompactBoundary,
         EngineEvent::Compaction(event) => WireEvent::Compaction(event.clone()),
         EngineEvent::PermissionRequest { id, tool, args } => WireEvent::PermissionRequest {

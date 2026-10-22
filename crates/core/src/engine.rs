@@ -2325,7 +2325,14 @@ impl QueryEngine {
         input: &str,
         context: &std::collections::HashMap<String, String>,
     ) -> HookFireResult {
-        self.hooks.fire_hook(event_name, input, context).await
+        let result = self.hooks.fire_hook(event_name, input, context).await;
+        // A mod's UI is a snapshot the host can render without the runtime.
+        // Only a non-empty tree is worth an event; an empty one would make
+        // every ordinary hook look like it wanted to draw something.
+        if !result.ui.is_empty() {
+            let _ = self.event_tx.send(EngineEvent::ModUi(result.ui.clone()));
+        }
+        result
     }
 
     /// Fire a lifecycle hook on behalf of the session that owns this engine.
@@ -2360,7 +2367,6 @@ impl QueryEngine {
         ctx.insert("turn_number".to_string(), turn_number.to_string());
         ctx.insert("stop_reason".to_string(), stop_reason.to_string());
         let result = self
-            .hooks
             .fire_hook(hook_events::STOP, &format!("turn_{turn_number}"), &ctx)
             .await;
         if !result.errors.is_empty() {
@@ -2373,8 +2379,7 @@ impl QueryEngine {
         let mut ctx = std::collections::HashMap::new();
         ctx.insert("turn_number".to_string(), turn_number.to_string());
         ctx.insert("stop_reason".to_string(), stop_reason.to_string());
-        self.hooks
-            .fire_hook(hook_events::TURN_END, &format!("turn_{turn_number}"), &ctx)
+        self.fire_hook(hook_events::TURN_END, &format!("turn_{turn_number}"), &ctx)
             .await
     }
 
@@ -4751,7 +4756,6 @@ impl QueryEngine {
         ctx.insert("tool_call_id".to_string(), call.id.clone());
         ctx.insert("tool_input".to_string(), call.input.to_string());
         let pre_hook = self
-            .hooks
             .fire_hook(hook_events::PRE_TOOL_USE, &call.name, &ctx)
             .await;
         if pre_hook.stop {
@@ -4813,7 +4817,6 @@ impl QueryEngine {
                     result.output.len().to_string(),
                 );
                 let post_result = self
-                    .hooks
                     .fire_hook(hook_events::POST_TOOL_USE, &call.name, &ctx)
                     .await;
                 if !post_result.errors.is_empty() {
@@ -4857,7 +4860,6 @@ impl QueryEngine {
                 ctx.insert("tool_call_id".to_string(), call.id.clone());
                 ctx.insert("reason".to_string(), reason.clone());
                 let fail_result = self
-                    .hooks
                     .fire_hook(hook_events::POST_TOOL_USE_FAILURE, &call.name, &ctx)
                     .await;
                 if !fail_result.errors.is_empty() {
@@ -4890,7 +4892,6 @@ impl QueryEngine {
                 ctx.insert("tool_call_id".to_string(), call.id.clone());
                 ctx.insert("reason".to_string(), reason.clone());
                 let fail_result = self
-                    .hooks
                     .fire_hook(hook_events::POST_TOOL_USE_FAILURE, &call.name, &ctx)
                     .await;
                 if !fail_result.errors.is_empty() {
@@ -5294,6 +5295,56 @@ mod tests {
         );
         engine.set_tool_executor(Box::new(StubOkToolExecutor));
         (engine, rx, session)
+    }
+
+    /// A mod's UI is forwarded as an engine event, but only when the hook
+    /// actually contributed something. An empty tree would make every
+    /// ordinary hook look like it wanted to draw.
+    #[tokio::test]
+    async fn a_hook_that_returns_ui_emits_mod_ui_only_when_non_empty() {
+        struct UiHooks;
+
+        #[async_trait::async_trait]
+        impl HookExecutor for UiHooks {
+            async fn fire_hook(
+                &self,
+                event_name: &str,
+                _input: &str,
+                _context: &HashMap<String, String>,
+            ) -> HookFireResult {
+                if event_name == "WithUi" {
+                    HookFireResult {
+                        ui: vec![crate::ui_protocol::UiElement::Text {
+                            text: "hello".to_string(),
+                            style: crate::ui_protocol::UiStyle::Bold,
+                        }],
+                        ..HookFireResult::default()
+                    }
+                } else {
+                    HookFireResult::default()
+                }
+            }
+        }
+
+        let (mut engine, mut events, _session) = make_test_engine();
+        engine.set_hooks(Arc::new(UiHooks));
+
+        let with_ui = engine.fire_hook("WithUi", "input", &HashMap::new()).await;
+        let without_ui = engine
+            .fire_hook("WithoutUi", "input", &HashMap::new())
+            .await;
+
+        assert_eq!(with_ui.ui.len(), 1);
+        assert!(without_ui.ui.is_empty());
+
+        let mut mod_ui = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            if let EngineEvent::ModUi(elements) = event {
+                mod_ui.push(elements);
+            }
+        }
+        assert_eq!(mod_ui.len(), 1, "only the non-empty result may emit");
+        assert_eq!(mod_ui[0], with_ui.ui);
     }
 
     /// A hook executor that records the events the engine fires and their

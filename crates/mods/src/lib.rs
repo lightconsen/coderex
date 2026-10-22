@@ -32,11 +32,18 @@
 //! as a hook error rather than hanging the agent. See [`ModLimits`] for the
 //! exact ceilings.
 //!
+//! # UI
+//!
+//! A hook may build a declarative UI tree with `$.ui.text`, `$.ui.box`,
+//! `$.ui.button` and stage it with `$.ui.render`. The tree crosses the worker
+//! boundary as a host-owned snapshot in
+//! [`HookFireResult`](coderex_core::hook_executor::HookFireResult) `ui`, and
+//! the engine emits it as `EngineEvent::ModUi` when non-empty. Rendering is
+//! terminal-only and buttons are non-interactive. See `docs/mods.md`.
+//!
 //! # Not yet
 //!
-//! The reference runtime also lets mods contribute UI elements. That needs an
-//! element tree and a renderer, neither of which exists here. See
-//! `docs/mods.md` for the design.
+//! There are no async hooks.
 
 mod executor;
 mod runtime;
