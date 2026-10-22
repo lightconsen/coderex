@@ -326,7 +326,7 @@ The manifest is parsed with `deny_unknown_fields`: a field that is not in the ta
 | `lspServers` | ✅ implemented | The first configured server is the default for the `LSP` tool (the REPL fills the tool's shared default at startup). |
 | `channels` | ✅ implemented | A channel names a configured MCP server and routes that server's JSON-RPC notifications to subscribed sinks (`PluginManager::subscribe_channel` / `route_channel_notification`). `/plugin components` lists each channel with its live state — `subscribed`, `idle (no subscriber)`, or `server not configured`. See "Channels". |
 | `binaries` | ✅ implemented | SHA-256-pinned HTTPS fetch into `<plugin>/bin/` (`fetch_plugin_binaries`); `CODEREX_PLUGIN_NO_BINARIES=1` skips the fetch. |
-| `types` | ✅ implemented | Validated `.d.ts` files are exported at startup to `config_home()/plugin-types/<plugin>/` (`export_plugin_types`) so a plugin author has a stable include path, **and** read into a `PluginTypeRegistry` that `/plugin components` lists. CodeRex has no TypeScript runtime, so "loaded" means read into memory and exposed — never executed. See "Types". |
+| `types` | ✅ implemented | Validated `.d.ts` files are exported at startup to `config_home()/plugin-types/<plugin>/` (`export_plugin_types`) so a plugin author has a stable include path, **and** read into a `PluginTypeRegistry` that `/plugin components` lists. The same export writes the host's generated surface — `coderex/`, `coderex-tools/`, `coderex-mcp/` and a `tsconfig.json` — from the registered tool schemas; `/plugin types [name]` lists or prints them. CodeRex has no TypeScript runtime, so "loaded" means read into memory and exposed — never executed. See "Types". |
 | `settings` | ✅ implemented (allowlisted) | A typed patch deep-merges into the resolved settings, by source: user/project values win over every plugin, and a plugin only fills a key the user left unset. `permission_mode`, `telemetry` and `max_budget_usd` are tighten-only; `hooks`, `mcpServers`, `api_key` and `env` are never taken. Unknown keys warn and are ignored. See "Settings". |
 | `experimental` | ✅ implemented (raw) | Exposed per plugin; expansion (themes/monitors/outputStyles/…) is the caller's job. |
 
@@ -396,15 +396,64 @@ A `channels` declaration names a configured MCP server and gives it a name:
 
 ## Types
 
+There are two halves to the type surface: the declarations a plugin ships, and the declarations CodeRex generates for its own builtin surface. Both are exported under `config_home()/plugin-types/`.
+
+### The plugin's own declarations
+
 A plugin may export TypeScript declarations:
 
 ```json
 { "types": ["./types/index.d.ts"] }
 ```
 
-- Validated `.d.ts` files are exported at startup to `config_home()/plugin-types/<plugin>/` (`export_plugin_types`), so a plugin author has a stable include path.
+- Every declared path is validated (relative, no `..`, ends in `.d.ts`) and exported at startup to `config_home()/plugin-types/<plugin>/` by `PluginManager::export_plugin_types`, so a plugin author has a stable include path. Declared files are flattened to their file name under the plugin directory (`types/index.d.ts` becomes `<plugin>/index.d.ts`).
 - They are also read into a `PluginTypeRegistry` (`PluginManager::plugin_type_registry()`), and `/plugin components` lists each file as `name (plugin)`.
-- **"Loaded" means exactly this:** the file text is read into memory and exposed through the registry, so the LSP/tool context and `/plugin` can enumerate and print it. CodeRex has no TypeScript runtime and does not execute, type-check, or evaluate the declarations. A file that cannot be read is recorded in the registry's error list (and warned about) rather than dropped.
+- A file that cannot be read is recorded in the registry's error list (and warned about) rather than dropped.
+
+### The host's generated declarations
+
+At startup the same call writes CodeRex's own type surface, generated from the actual registered tool schemas. The root contains:
+
+| Artefact | Contents |
+|---|---|
+| `coderex/index.d.ts` | `declare module 'coderex'`: `EngineInterface`, `HookContext` (session id, cwd, model, permission mode, turn number), `Hook`, `HookResult`, `HookEvent`, and `PermissionMode`. |
+| `coderex-tools/index.d.ts` | `declare module 'coderex-tools'`: `interface BuiltinToolInputs { <ToolName>: <input schema> }` and `interface BuiltinToolResults { <ToolName>: <result schema> }`, one member per builtin tool. |
+| `coderex-mcp/index.d.ts` | `declare module 'coderex-mcp'`: `McpServer` with name, transport, `command`/`url`, headers/env, and `status`, plus the `McpTransport` and `McpServerStatus` unions. |
+| `tsconfig.json` | `compilerOptions` with `strict` and `noEmit`, and an `include` array listing every emitted directory. A plugin can extend it. |
+| `<plugin>/` | Each active plugin's declared `.d.ts` files, as above. |
+
+The generator is `crates/plugins/src/declarations.rs`; the four pure entry points are `builtin_tools_declaration` / `builtin_tools_declaration_with_results`, `engine_declaration`, `mcp_declaration`, and `tsconfig_declaration`. `PluginManager::export_plugin_types` is the IO half: it writes the three generated modules, the plugin-declared files, and the `tsconfig.json` whose `include` lists the directories it actually emitted.
+
+The CLI supplies the tool schemas from the builtin tool registry (`register_builtin_tools` → `all_descriptors`). A tool's `input_schema` becomes its input type; its `output_schema` becomes its result type when one is declared, and `unknown` otherwise. Tool names are sorted, so the file is stable from run to run. MCP and other dynamic tools are not in the generated file: they are only known after a session connects.
+
+### JSON Schema → TypeScript
+
+The conversion is intentionally bounded. It handles the shapes the builtin schemas use and falls back to `unknown` rather than inventing a type:
+
+| JSON Schema | TypeScript |
+|---|---|
+| `type: "object"` + `properties` + `required` | `{ name: T; optional?: T }`; members not listed in `required` are optional. |
+| `type: "string"` / `"number"` / `"integer"` / `"boolean"` / `"null"` | `string` / `number` / `number` / `boolean` / `null`. |
+| `type: "array"` + `items` | `Array<T>`; `items` absent → `Array<unknown>`. |
+| `enum` | A union of literals (`"a" \| "b"`), `never` when empty. |
+| `const` | The literal value. |
+| `anyOf` / `oneOf` | A union of the converted branches, with duplicates dropped. |
+| `additionalProperties` | An index signature; an explicit property union is widened to keep the emitted signature valid. |
+| Anything else (`$ref`, unknown `type`, no `type`) | `unknown`. |
+
+Property and tool names that are not TypeScript identifiers are quoted (`"run-in-background"?: boolean`). Nested objects are indented from their enclosing context.
+
+### Reading the generated declarations
+
+- `/plugin types` lists every emitted declaration with its path: `coderex`, `coderex-tools`, `coderex-mcp`, `tsconfig`, and one entry per plugin directory.
+- `/plugin types <name>` prints one. The name is the listed name; a relative path such as `coderex-tools/index.d.ts` also works. A name that is not in the list is an error — the resolver only matches already-listed files, so it cannot read outside the type root.
+- `/plugin components` continues to list the *plugin-declared* declarations as `name (plugin)`; the generated modules are a separate artefact.
+
+### Deliberately out of scope
+
+- **No TypeScript execution.** The Rust binary does not run a TypeScript compiler, type-check the generated output, or host a language server. "Generated" and "loaded" both mean text that is written, read into memory, and printed; it is never evaluated.
+- **No schema compilation for validation.** TypeScript types are for plugin authors' editors and builds; CodeRex's own runtime validation is unchanged.
+- **No invented types.** A schema feature the converter does not understand is `unknown`, not a guess. In particular `$ref` is not resolved across documents.
 
 ## Install Sources
 

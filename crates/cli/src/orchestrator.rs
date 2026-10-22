@@ -330,6 +330,14 @@ impl Default for StartupOrchestrator {
     }
 }
 
+/// Whether a tool declared a real output schema.
+///
+/// An absent schema (`Null`) and an empty object both mean "untyped"; either
+/// is rendered as `unknown` rather than as an object with no properties.
+fn schema_is_present(schema: &serde_json::Value) -> bool {
+    schema.as_object().is_some_and(|object| !object.is_empty())
+}
+
 /// Build a plugin manager, taking the signing key from the environment.
 ///
 /// The key is the trust anchor for plugin signatures, so it comes from the
@@ -1436,6 +1444,28 @@ impl StartupOrchestrator {
         Ok(())
     }
 
+    /// The builtin tool schemas the plugin type declaration is generated from.
+    ///
+    /// The session's dispatcher is built per query and is not reachable from
+    /// plugin startup, so this mirrors the registration source both the REPL
+    /// and the served engine use: [`coderex_tools::register_builtin_tools`].
+    /// MCP and other dynamic tools only exist after a session connects, so
+    /// they are not part of the generated declaration.
+    fn builtin_tool_type_schemas() -> Vec<coderex_plugins::declarations::ToolTypeSchema> {
+        let mut registry = coderex_tools::ToolRegistry::new();
+        coderex_tools::register_builtin_tools(&mut registry);
+        registry
+            .all_descriptors()
+            .into_iter()
+            .map(|descriptor| coderex_plugins::declarations::ToolTypeSchema {
+                name: descriptor.name,
+                input_schema: descriptor.input_schema,
+                output_schema: schema_is_present(&descriptor.output_schema)
+                    .then_some(descriptor.output_schema),
+            })
+            .collect()
+    }
+
     /// InitPlugins: discover, load, and spawn plugins from plugin directories.
     async fn phase_init_plugins(&mut self) -> Result<()> {
         let mut manager = plugin_manager_with_signing_key();
@@ -1545,10 +1575,15 @@ impl StartupOrchestrator {
             self.apply_plugin_settings(&value);
         }
         // Declared `.d.ts` files are exported so the declaration has a real
-        // consumer (a stable include path for plugin authors).
-        self.ctx.plugin_types_dir = match manager
-            .export_plugin_types(&coderex_config::config_home().join("plugin-types"))
-        {
+        // consumer (a stable include path for plugin authors). The same root
+        // also receives the host's generated type surface: the builtin tool
+        // schemas, the engine/hook shape, the MCP server shape, and a
+        // `tsconfig.json` that includes every emitted directory.
+        let tool_schemas = Self::builtin_tool_type_schemas();
+        self.ctx.plugin_types_dir = match manager.export_plugin_types(
+            &coderex_config::config_home().join("plugin-types"),
+            &tool_schemas,
+        ) {
             Ok(paths) if paths.is_empty() => None,
             Ok(paths) => {
                 tracing::info!(count = paths.len(), "plugin type declarations exported");

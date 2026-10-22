@@ -3,6 +3,7 @@
 #![warn(missing_docs)]
 
 pub mod command_bridge;
+pub mod declarations;
 pub mod plugins;
 pub mod runtime;
 pub mod skills;

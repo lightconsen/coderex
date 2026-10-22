@@ -59,6 +59,112 @@ fn list_dir_items(path: &std::path::Path) -> Vec<String> {
         .collect()
 }
 
+/// One declaration emitted under `config_home()/plugin-types`.
+struct GeneratedDeclaration {
+    /// The name `/plugin types <name>` accepts.
+    name: String,
+    /// The declaration file on disk.
+    path: std::path::PathBuf,
+}
+
+/// List the declarations under `root`, sorted by name.
+///
+/// The generated artefacts are directories with an `index.d.ts` (named after
+/// the directory) plus `tsconfig.json` (named `tsconfig`). A plugin directory
+/// uses its `index.d.ts` when it has one; otherwise every `.d.ts` it contains
+/// is listed as `<plugin>/<file>` so a plugin-declared name is still
+/// printable.
+fn generated_declarations(root: &std::path::Path) -> Vec<GeneratedDeclaration> {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut entries: Vec<std::fs::DirEntry> = entries.filter_map(std::result::Result::ok).collect();
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+
+    let mut declarations = Vec::new();
+    for entry in entries {
+        let path = entry.path();
+        let file_name = entry.file_name().to_string_lossy().to_string();
+        if path.is_file() {
+            if file_name.ends_with(".d.ts") {
+                declarations.push(GeneratedDeclaration {
+                    name: file_name,
+                    path,
+                });
+            } else if file_name == "tsconfig.json" {
+                declarations.push(GeneratedDeclaration {
+                    name: "tsconfig".to_string(),
+                    path,
+                });
+            }
+            continue;
+        }
+        if !path.is_dir() {
+            continue;
+        }
+        let index = path.join("index.d.ts");
+        if index.is_file() {
+            declarations.push(GeneratedDeclaration {
+                name: file_name,
+                path: index,
+            });
+            continue;
+        }
+        let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(&path)
+            .into_iter()
+            .flatten()
+            .filter_map(std::result::Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.is_file()
+                    && path
+                        .extension()
+                        .is_some_and(|extension| extension.eq_ignore_ascii_case("ts"))
+            })
+            .collect();
+        files.sort();
+        for file in files {
+            let Some(stem) = file.file_name() else {
+                continue;
+            };
+            declarations.push(GeneratedDeclaration {
+                name: format!("{file_name}/{}", stem.to_string_lossy()),
+                path: file,
+            });
+        }
+    }
+    declarations.sort_by(|left, right| left.name.cmp(&right.name));
+    declarations
+}
+
+/// Resolve `/plugin types <name>` against the listed declarations.
+///
+/// The canonical name is accepted, and so is a relative path
+/// (`coderex-tools/index.d.ts`). No path is joined here: the requested name is
+/// only ever matched against an already-listed file, so `..` cannot escape
+/// the type root.
+fn find_declaration(
+    root: &std::path::Path,
+    declarations: &[GeneratedDeclaration],
+    requested: &str,
+) -> Option<std::path::PathBuf> {
+    if let Some(found) = declarations
+        .iter()
+        .find(|declaration| declaration.name == requested)
+    {
+        return Some(found.path.clone());
+    }
+    declarations
+        .iter()
+        .find(|declaration| {
+            declaration
+                .path
+                .strip_prefix(root)
+                .is_ok_and(|relative| relative.to_string_lossy() == requested)
+        })
+        .map(|declaration| declaration.path.clone())
+}
+
 /// Read memory entries from the memory file.
 fn read_memory_entries() -> Vec<String> {
     let memory_path = config_home().join("memory").join("MEMORY.md");
@@ -306,7 +412,49 @@ pub fn register(registry: &mut CommandRegistry) {
                         }
                         CommandResult::success(output)
                     }
-                    _ => CommandResult::error("Usage: /plugin [list|components|install <name>]"),
+                    "types" => {
+                        let root = config_home().join("plugin-types");
+                        let declarations = generated_declarations(&root);
+                        if declarations.is_empty() {
+                            return CommandResult::success(format!(
+                                "No generated plugin type declarations at {}.\nThey are written at startup when the plugin type surface is exported.",
+                                root.display()
+                            ));
+                        }
+                        if let Some(requested) = args.get(1) {
+                            return find_declaration(&root, &declarations, requested).map_or_else(
+                                || {
+                                    CommandResult::error(format!(
+                                        "No generated declaration named '{requested}'. Try /plugin types."
+                                    ))
+                                },
+                                |path| match std::fs::read_to_string(&path) {
+                                    Ok(source) => CommandResult::success(source),
+                                    Err(error) => CommandResult::error(format!(
+                                        "Cannot read {}: {error}",
+                                        path.display()
+                                    )),
+                                },
+                            );
+                        }
+                        let mut output = String::from("Generated plugin type declarations:");
+                        for declaration in &declarations {
+                            let relative = declaration
+                                .path
+                                .strip_prefix(&root)
+                                .unwrap_or(&declaration.path);
+                            let _ = write!(
+                                output,
+                                "\n  {:<20} {}",
+                                declaration.name,
+                                relative.display()
+                            );
+                        }
+                        CommandResult::success(output)
+                    }
+                    _ => CommandResult::error(
+                        "Usage: /plugin [list|components|types [name]|install <name>]",
+                    ),
                 }
             }
         }),
@@ -603,6 +751,70 @@ mod tests {
         };
         let result = reg.execute("plugin", &ctx(), &["list".into()]);
         assert!(result.output.contains("plugin") || result.output.contains("No plugins"));
+    }
+
+    #[test]
+    fn plugin_types_lists_and_prints_generated_declarations() {
+        let home = tempfile::tempdir().unwrap();
+        set_test_config_home(home.path().to_path_buf());
+        let types_root = home.path().join("plugin-types");
+        std::fs::create_dir_all(types_root.join("coderex-tools")).unwrap();
+        std::fs::create_dir_all(types_root.join("acme")).unwrap();
+        std::fs::write(
+            types_root.join("coderex-tools/index.d.ts"),
+            "declare module 'coderex-tools' {}",
+        )
+        .unwrap();
+        std::fs::write(
+            types_root.join("acme/index.d.ts"),
+            "declare module 'acme' {}",
+        )
+        .unwrap();
+        std::fs::write(types_root.join("tsconfig.json"), "{}").unwrap();
+
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
+
+        let listing = reg.execute("plugin", &ctx(), &["types".into()]);
+        assert!(!listing.output.starts_with("Error:"), "{listing:?}");
+        for name in ["acme", "coderex-tools", "tsconfig"] {
+            assert!(listing.output.contains(name), "{listing:?}");
+        }
+
+        let printed = reg.execute("plugin", &ctx(), &["types".into(), "coderex-tools".into()]);
+        assert_eq!(printed.output, "declare module 'coderex-tools' {}");
+
+        let by_path = reg.execute(
+            "plugin",
+            &ctx(),
+            &["types".into(), "acme/index.d.ts".into()],
+        );
+        assert_eq!(by_path.output, "declare module 'acme' {}");
+
+        let missing = reg.execute("plugin", &ctx(), &["types".into(), "nope".into()]);
+        assert!(missing.output.starts_with("Error:"), "{missing:?}");
+        assert!(missing.output.contains("nope"));
+    }
+
+    #[test]
+    fn plugin_types_reports_an_empty_root() {
+        let home = tempfile::tempdir().unwrap();
+        set_test_config_home(home.path().to_path_buf());
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
+        let result = reg.execute("plugin", &ctx(), &["types".into()]);
+        assert!(!result.output.starts_with("Error:"), "{result:?}");
+        assert!(
+            result
+                .output
+                .contains("No generated plugin type declarations")
+        );
     }
 
     #[test]

@@ -1,5 +1,9 @@
 //! Plugin manager — loading, handles, marketplace reconciliation.
 
+use crate::declarations::{
+    ToolTypeSchema, builtin_tools_declaration_with_results, engine_declaration, mcp_declaration,
+    tsconfig_declaration,
+};
 use dashmap::DashMap;
 use ed25519_dalek::Verifier;
 use reqwest::Client;
@@ -1397,6 +1401,35 @@ fn validate_relative_component_path(path: &str) -> Result<(), String> {
         return Err(format!("'{path}' must not contain '..'"));
     }
     Ok(())
+}
+
+/// Write one exported declaration, creating its parent directory.
+///
+/// A failed write is a warning, not an error: one declaration that cannot be
+/// written should not stop the rest of the type surface from being exported.
+/// Returns whether the file was written.
+fn write_exported_declaration(destination: &Path, content: &str) -> bool {
+    if let Some(parent) = destination.parent() {
+        if let Err(error) = std::fs::create_dir_all(parent) {
+            tracing::warn!(
+                path = %parent.display(),
+                %error,
+                "cannot create the types directory"
+            );
+            return false;
+        }
+    }
+    match std::fs::write(destination, content) {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::warn!(
+                path = %destination.display(),
+                %error,
+                "types file was not exported"
+            );
+            false
+        }
+    }
 }
 
 /// The extra constraint on a `types` declaration path.
@@ -3821,22 +3854,67 @@ impl PluginManager {
         registry
     }
 
-    /// Copy the validated `.d.ts` declarations of active plugins into
-    /// `root`, one directory per plugin.
+    /// Export the host's plugin type surface and the validated `.d.ts`
+    /// declarations of active plugins into `root`.
     ///
-    /// The reference writes plugin types into the plugin directory so a
-    /// TypeScript author has a stable include path. CodeRex plugins speak
-    /// JSON-RPC rather than loading TypeScript, but exporting the declared
-    /// files gives the declaration a real consumer (and `/plugin components`
-    /// can point at it). Missing or unreadable files are warnings; a failure
-    /// to create the root directory is an error.
+    /// Under `root` this writes:
+    ///
+    /// - `coderex/index.d.ts` — engine and hook declarations.
+    /// - `coderex-tools/index.d.ts` — the builtin tool inputs and results,
+    ///   generated from `tools`.
+    /// - `coderex-mcp/index.d.ts` — configured MCP server declarations.
+    /// - `<plugin>/<file>` — each active plugin's declared `.d.ts` files.
+    /// - `tsconfig.json` — a config whose `include` lists every emitted
+    ///   directory.
+    ///
+    /// The generated declarations are the host's own type surface. The
+    /// plugin-declared files are copied so a TypeScript author has one stable
+    /// include root; CodeRex itself never executes or type-checks them.
+    /// Missing or unreadable plugin files are warnings; a failure to create
+    /// the root directory is an error.
     ///
     /// # Errors
     ///
     /// Returns the I/O error from creating `root`.
-    pub fn export_plugin_types(&self, root: &Path) -> Result<Vec<PathBuf>, String> {
+    pub fn export_plugin_types(
+        &self,
+        root: &Path,
+        tools: &[ToolTypeSchema],
+    ) -> Result<Vec<PathBuf>, String> {
         std::fs::create_dir_all(root)
             .map_err(|error| format!("cannot create {}: {error}", root.display()))?;
+
+        let mut exported = Vec::new();
+        let mut directory_names = Vec::new();
+
+        let inputs: Vec<(String, Value)> = tools
+            .iter()
+            .map(|tool| (tool.name.clone(), tool.input_schema.clone()))
+            .collect();
+        let results: Vec<(String, Value)> = tools
+            .iter()
+            .filter_map(|tool| {
+                tool.output_schema
+                    .clone()
+                    .map(|schema| (tool.name.clone(), schema))
+            })
+            .collect();
+
+        let generated: [(&str, String); 3] = [
+            ("coderex", engine_declaration()),
+            (
+                "coderex-tools",
+                builtin_tools_declaration_with_results(&inputs, &results),
+            ),
+            ("coderex-mcp", mcp_declaration()),
+        ];
+        for (directory, declaration) in generated {
+            let destination = root.join(directory).join("index.d.ts");
+            if write_exported_declaration(&destination, &declaration) {
+                directory_names.push(directory.to_string());
+                exported.push(destination);
+            }
+        }
 
         let mut active: Vec<(String, PathBuf, Value)> = self
             .plugins
@@ -3852,7 +3930,6 @@ impl PluginManager {
             .collect();
         active.sort_by(|a, b| a.0.cmp(&b.0));
 
-        let mut exported = Vec::new();
         for (plugin, plugin_dir, types) in active {
             let mut relative_paths = Vec::new();
             match &types {
@@ -3882,26 +3959,25 @@ impl PluginManager {
                         continue;
                     }
                 };
-                if let Err(error) = std::fs::create_dir_all(&plugin_root) {
-                    tracing::warn!(plugin = %plugin, %error, "cannot create the types directory");
-                    continue;
-                }
                 let file_name = Path::new(&relative).file_name().map_or_else(
                     || "types.d.ts".to_string(),
                     |name| name.to_string_lossy().to_string(),
                 );
                 let destination = plugin_root.join(file_name);
-                match std::fs::write(&destination, content) {
-                    Ok(()) => exported.push(destination),
-                    Err(error) => tracing::warn!(
-                        plugin = %plugin,
-                        path = %destination.display(),
-                        %error,
-                        "types file was not exported"
-                    ),
+                if write_exported_declaration(&destination, &content) {
+                    if !directory_names.contains(&plugin) {
+                        directory_names.push(plugin.clone());
+                    }
+                    exported.push(destination);
                 }
             }
         }
+
+        let destination = root.join("tsconfig.json");
+        if write_exported_declaration(&destination, &tsconfig_declaration(&directory_names)) {
+            exported.push(destination);
+        }
+
         Ok(exported)
     }
 
@@ -7411,7 +7487,7 @@ mod tests {
     }
 
     #[test]
-    fn types_are_exported_for_a_type_consumer() {
+    fn export_writes_all_five_artefact_kinds() {
         let plugin_dir = tempfile::tempdir().unwrap();
         let plugin_root = plugin_dir.path().join("typed");
         std::fs::create_dir_all(plugin_root.join("types")).unwrap();
@@ -7427,14 +7503,66 @@ mod tests {
             plugin_root,
         );
 
+        let tools = vec![
+            ToolTypeSchema {
+                name: "Bash".to_string(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {"command": {"type": "string"}},
+                    "required": ["command"],
+                }),
+                output_schema: Some(serde_json::json!({
+                    "type": "object",
+                    "properties": {"stdout": {"type": "string"}},
+                    "required": ["stdout"],
+                })),
+            },
+            ToolTypeSchema {
+                name: "Read".to_string(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {"file_path": {"type": "string"}},
+                    "required": ["file_path"],
+                }),
+                output_schema: None,
+            },
+        ];
+
         let out = tempfile::tempdir().unwrap();
-        let exported = mgr.export_plugin_types(out.path()).unwrap();
-        assert_eq!(exported.len(), 1, "{exported:?}");
+        let exported = mgr.export_plugin_types(out.path(), &tools).unwrap();
+        assert_eq!(exported.len(), 5, "{exported:?}");
+
+        let engine = out.path().join("coderex/index.d.ts");
+        let builtins = out.path().join("coderex-tools/index.d.ts");
+        let mcp = out.path().join("coderex-mcp/index.d.ts");
+        let plugin_file = out.path().join("typed/index.d.ts");
+        let tsconfig = out.path().join("tsconfig.json");
+        for path in [&engine, &builtins, &mcp, &plugin_file, &tsconfig] {
+            assert!(path.is_file(), "{} was not written", path.display());
+            assert!(
+                exported.contains(path),
+                "{} was not reported",
+                path.display()
+            );
+        }
+
+        let tool_declaration = std::fs::read_to_string(&builtins).unwrap();
+        assert!(tool_declaration.contains("interface BuiltinToolInputs {"));
+        assert!(tool_declaration.contains("command: string;"));
+        assert!(tool_declaration.contains("stdout: string;"));
+        assert!(tool_declaration.contains("Read: unknown;"));
+
         assert_eq!(
-            std::fs::read_to_string(&exported[0]).unwrap(),
+            std::fs::read_to_string(&plugin_file).unwrap(),
             "declare module 'coderex' { export const x: number }"
         );
-        assert!(exported[0].starts_with(out.path().join("typed")));
+
+        let config: Value = serde_json::from_str(&std::fs::read_to_string(&tsconfig).unwrap())
+            .expect("tsconfig is valid JSON");
+        assert_eq!(
+            config["include"],
+            serde_json::json!(["coderex", "coderex-mcp", "coderex-tools", "typed"])
+        );
     }
 
     #[test]
