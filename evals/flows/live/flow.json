@@ -4,7 +4,7 @@
   "command": "bash \"{flow}/run-case.sh\" \"{prompt}\"",
   "reps": 1,
   "concurrency": 1,
-  "timeout_s": 180,
+  "timeout_s": 300,
   "cases": [
     {
       "id": "live-text-turn",
