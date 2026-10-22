@@ -1,7 +1,12 @@
 //! In-process JavaScript extension hooks for CodeRex.
 //!
-//! A *mod* is a `.js` file in a mods directory that declares a global
-//! `register(on, options)` function. `on(event, matcher, hook)` subscribes a
+//! A *mod* is a `.js`, `.jsx`, `.ts` or `.tsx` file in a mods directory that
+//! declares a global `register(on, options)` function. `.js` files are
+//! evaluated as they are; the other extensions are lowered first: TypeScript
+//! types are stripped and JSX becomes classic-runtime calls to the global
+//! `h`, with `Fragment` for fragments. `h` and `Fragment` build the same
+//! descriptors as [`$.ui`](#ui), and a component function is invoked with its
+//! props. `on(event, matcher, hook)` subscribes a
 //! synchronous `hook($, e, next)` to a hook event. When an event fires, the
 //! runtime runs the matching hooks, and merges what they return into a
 //! [`HookFireResult`](coderex_core::hook_executor::HookFireResult).
@@ -47,6 +52,7 @@
 
 mod executor;
 mod runtime;
+mod transform;
 
 pub use executor::JsHookExecutor;
 pub use runtime::{

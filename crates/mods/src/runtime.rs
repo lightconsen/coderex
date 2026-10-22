@@ -25,6 +25,8 @@ use boa_engine::{
 use coderex_core::hook_executor::{HookExecutor, HookFireResult};
 use coderex_core::ui_protocol::{UiElement, parse_ui_elements};
 
+use crate::transform;
+
 /// Environment variable that opts the in-process runtime in.
 pub const MODS_ENV: &str = "CODEREX_MODS";
 
@@ -215,13 +217,13 @@ pub struct ModRuntime {
 }
 
 impl ModRuntime {
-    /// Load every `*.js` file in `path`.
+    /// Load every `.js`, `.jsx`, `.ts` and `.tsx` file in `path`.
     ///
     /// A missing directory is an empty runtime: opting in before creating the
-    /// directory is not an error. A file that cannot be read, is too large, or
-    /// fails to evaluate or register is reported once through `tracing::warn`
-    /// and in [`load_errors`](Self::load_errors), and is skipped; the rest
-    /// still load.
+    /// directory is not an error. A file that cannot be read, is too large,
+    /// fails to transform, or fails to evaluate or register is reported once
+    /// through `tracing::warn` and in [`load_errors`](Self::load_errors), and
+    /// is skipped; the rest still load.
     ///
     /// # Errors
     ///
@@ -246,19 +248,33 @@ impl ModRuntime {
 
         let mut load_errors = Vec::new();
         let mut mods = Vec::new();
-        for (name, file_path) in files {
-            match read_source(&file_path) {
-                Ok(source) => mods.push(ModSource {
-                    name,
-                    path: file_path,
-                    source,
-                }),
+        for (name, file_path, kind) in files {
+            let source = match read_source(&file_path) {
+                Ok(source) => source,
                 Err(error) => {
-                    let message = format!("{}: {error}", file_path.display());
-                    tracing::warn!("{message}");
-                    load_errors.push(message);
+                    record_load_error(&mut load_errors, &file_path, &error);
+                    continue;
                 }
-            }
+            };
+            // `.js` is evaluated as it is. The other extensions are lowered
+            // here, at load, so a transform failure is reported once and the
+            // broken mod is skipped while the rest still load.
+            let source = if kind.needs_transform() {
+                match transform::transform(&source, &file_path) {
+                    Ok(source) => source,
+                    Err(error) => {
+                        record_load_error(&mut load_errors, &file_path, &error);
+                        continue;
+                    }
+                }
+            } else {
+                source
+            };
+            mods.push(ModSource {
+                name,
+                path: file_path,
+                source,
+            });
         }
 
         let config = Arc::new(WorkerConfig {
@@ -494,8 +510,38 @@ impl ModRuntimeBuilder {
     }
 }
 
-/// List the `*.js` files directly in `path`, sorted by file name.
-fn collect_mod_files(path: &Path) -> Result<Vec<(String, PathBuf)>, String> {
+/// The source languages a mod file may use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModKind {
+    JavaScript,
+    Jsx,
+    TypeScript,
+    Tsx,
+}
+
+impl ModKind {
+    /// The kind for a file extension, case-insensitively.
+    fn from_extension(extension: &OsStr) -> Option<Self> {
+        match extension.to_str()?.to_ascii_lowercase().as_str() {
+            "js" => Some(Self::JavaScript),
+            "jsx" => Some(Self::Jsx),
+            "ts" => Some(Self::TypeScript),
+            "tsx" => Some(Self::Tsx),
+            _ => None,
+        }
+    }
+
+    /// Whether the source must be lowered before evaluation.
+    ///
+    /// `.js` keeps the original behaviour; every other extension is parsed and
+    /// printed by [`crate::transform`].
+    const fn needs_transform(self) -> bool {
+        !matches!(self, Self::JavaScript)
+    }
+}
+
+/// List the mod files directly in `path`, sorted by file name.
+fn collect_mod_files(path: &Path) -> Result<Vec<(String, PathBuf, ModKind)>, String> {
     let mut files = Vec::new();
     match std::fs::read_dir(path) {
         Ok(entries) => {
@@ -507,18 +553,15 @@ fn collect_mod_files(path: &Path) -> Result<Vec<(String, PathBuf)>, String> {
                 if !file_path.is_file() {
                     continue;
                 }
-                let is_javascript = file_path
-                    .extension()
-                    .is_some_and(|extension| extension.eq_ignore_ascii_case("js"));
-                if !is_javascript {
+                let Some(kind) = file_path.extension().and_then(ModKind::from_extension) else {
                     continue;
-                }
+                };
                 let name = file_path
                     .file_name()
                     .and_then(OsStr::to_str)
                     .unwrap_or("<unnamed>")
                     .to_string();
-                files.push((name, file_path));
+                files.push((name, file_path, kind));
             }
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -533,6 +576,13 @@ fn collect_mod_files(path: &Path) -> Result<Vec<(String, PathBuf)>, String> {
     }
     files.sort_by(|left, right| left.0.cmp(&right.0));
     Ok(files)
+}
+
+/// Report one skipped mod once: in the log and in the runtime's error list.
+fn record_load_error(errors: &mut Vec<String>, path: &Path, error: &str) {
+    let message = format!("{}: {error}", path.display());
+    tracing::warn!("{message}");
+    errors.push(message);
 }
 
 fn read_source(path: &Path) -> Result<String, String> {
@@ -1236,6 +1286,7 @@ fn install_host_api(context: &mut Context, session: &ModSession, name: &str) -> 
         Attribute::READONLY | Attribute::NON_ENUMERABLE,
     )?;
     context.eval(Source::from_bytes(HOST_UI_API.as_bytes()))?;
+    context.eval(Source::from_bytes(JSX_RUNTIME.as_bytes()))?;
 
     let on = NativeFunction::from_fn_ptr(on_hook).to_js_function(context.realm());
     context.register_global_property(
@@ -1378,6 +1429,108 @@ const HOST_UI_API: &str = r#"
 })();
 Object.freeze($.session);
 Object.freeze($);
+"#;
+
+/// The JSX classic runtime, installed in each mod's realm after `$.ui`.
+///
+/// The transform emits `h(type, props, ...children)` and `Fragment`.
+/// `h` maps the three host element names straight onto `$.ui`, so the
+/// descriptor shape is exactly what `$.ui` already produces. A function type
+/// is called as a component with its props (including `children`); `Fragment`
+/// returns its children as an array, which `$.ui.box` and `$.ui.render`
+/// already flatten one level. Anything else throws, and the dispatcher turns
+/// that into an ordinary hook error.
+const JSX_RUNTIME: &str = r#"
+'use strict';
+(function () {
+  const Fragment = Symbol('Fragment');
+
+  function flatten(value, out) {
+    if (value === null || value === undefined || value === false || value === true) {
+      return;
+    }
+    if (Array.isArray(value)) {
+      for (let index = 0; index < value.length; index++) {
+        flatten(value[index], out);
+      }
+      return;
+    }
+    out.push(value);
+  }
+
+  function textOf(children, element) {
+    let text = '';
+    for (let index = 0; index < children.length; index++) {
+      const child = children[index];
+      if (typeof child === 'string') {
+        text += child;
+      } else if (typeof child === 'number' || typeof child === 'bigint') {
+        text += String(child);
+      } else {
+        throw new TypeError("h('" + element + "', ...): children must be strings or numbers");
+      }
+    }
+    return text;
+  }
+
+  function componentProps(props, children) {
+    const result = {};
+    if (props !== null && props !== undefined) {
+      if (typeof props !== 'object') {
+        throw new TypeError('h(Component, ...): props must be an object');
+      }
+      for (const key of Object.keys(props)) {
+        result[key] = props[key];
+      }
+    }
+    if (children.length === 1) {
+      result.children = children[0];
+    } else if (children.length > 1) {
+      result.children = children;
+    }
+    return result;
+  }
+
+  function h(type, props, ...children) {
+    const flat = [];
+    for (let index = 0; index < children.length; index++) {
+      flatten(children[index], flat);
+    }
+
+    if (type === Fragment) {
+      return flat;
+    }
+    if (typeof type === 'function') {
+      return type(componentProps(props, flat));
+    }
+    if (typeof type !== 'string') {
+      throw new TypeError('h(type, ...): type must be an element name, Fragment or a component function');
+    }
+
+    const options = (props !== null && typeof props === 'object') ? props : {};
+
+    if (type === 'text') {
+      return $.ui.text(textOf(flat, 'text'), options.style);
+    }
+    if (type === 'box') {
+      return $.ui.box({ title: options.title }, flat);
+    }
+    if (type === 'button') {
+      if (flat.length === 0) {
+        throw new TypeError("h('button', ...): a button needs a label child");
+      }
+      return $.ui.button(textOf(flat, 'button'), options.id);
+    }
+    throw new TypeError("h(type, ...): unknown element type '" + type + "'; expected 'text', 'box', 'button', Fragment or a component function");
+  }
+
+  Object.defineProperty(globalThis, 'h', {
+    value: h, writable: false, enumerable: false, configurable: false
+  });
+  Object.defineProperty(globalThis, 'Fragment', {
+    value: Fragment, writable: false, enumerable: false, configurable: false
+  });
+})();
 "#;
 
 /// The main realm's harness: the per-mod registry and the hook dispatcher.
@@ -2420,6 +2573,229 @@ mod tests {
                 .updated_input
                 .as_deref(),
             Some("2")
+        );
+    }
+
+    // ── TypeScript and JSX ──────────────────────────────────────────────────
+
+    /// Load every `(file name, source)` pair from one directory.
+    fn load_files(files: &[(&str, &str)]) -> ModRuntime {
+        let directory = tempfile::tempdir().unwrap();
+        for (name, source) in files {
+            std::fs::write(directory.path().join(name), source).unwrap();
+        }
+        ModRuntime::load_dir(directory.path(), session()).unwrap()
+    }
+
+    #[test]
+    fn a_typescript_mod_loads_and_registers() {
+        let runtime = load_files(&[(
+            "typed.ts",
+            "interface Shape { input: string }\n\
+             const suffix: string = ' typed';\n\
+             function register(on: (event: string, matcher: string, hook: (event: Shape) => unknown) => void): void {\n\
+               on('PostToolUse', '*', function ($, e: Shape) {\n\
+                 return { updatedInput: e.input + suffix };\n\
+               });\n\
+             }\n",
+        )]);
+
+        assert_eq!(runtime.load_errors(), &[] as &[String]);
+        assert_eq!(runtime.hook_count(), 1);
+        assert_eq!(
+            runtime
+                .fire("PostToolUse", "Bash", &HashMap::new())
+                .updated_input
+                .as_deref(),
+            Some("Bash typed")
+        );
+    }
+
+    #[test]
+    fn a_tsx_mod_builds_ui_that_renders_through_the_existing_renderer() {
+        let runtime = load_files(&[(
+            "panel.tsx",
+            "function Badge(props: { label: string }) {\n\
+               return <text style=\"bold\">{props.label}</text>;\n\
+             }\n\
+             function register(on) {\n\
+               on('PostToolUse', '*', function ($) {\n\
+                 $.ui.render(\n\
+                   <box title=\"Typed report\">\n\
+                     <text style=\"dim\">hello</text>\n\
+                     <Badge label=\"ok\" />\n\
+                     <button id=\"retry\">Retry</button>\n\
+                   </box>);\n\
+               });\n\
+             }\n",
+        )]);
+
+        assert_eq!(runtime.load_errors(), &[] as &[String]);
+        let result = runtime.fire("PostToolUse", "Read", &HashMap::new());
+
+        assert!(!result.failed, "{result:?}");
+        assert_eq!(
+            result.ui,
+            vec![UiElement::Box {
+                title: Some("Typed report".to_string()),
+                children: vec![
+                    UiElement::Text {
+                        text: "hello".to_string(),
+                        style: UiStyle::Dim,
+                    },
+                    UiElement::Text {
+                        text: "ok".to_string(),
+                        style: UiStyle::Bold,
+                    },
+                    UiElement::Button {
+                        label: "Retry".to_string(),
+                        id: "retry".to_string(),
+                    },
+                ],
+            }]
+        );
+
+        let rendered = coderex_ui::mod_elements::render_mod_ui_text(&result.ui, 60);
+        for expected in ["Typed report", "hello", "ok", "[Retry]"] {
+            assert!(
+                rendered.contains(expected),
+                "{expected:?} missing from:\n{rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_fragment_and_a_component_return_array_are_flattened_into_the_box() {
+        let runtime = load_files(&[(
+            "fragment.tsx",
+            "function Pair() {\n\
+               return <><text>one</text><text>two</text></>;\n\
+             }\n\
+             function register(on) {\n\
+               on('PostToolUse', '*', function ($) {\n\
+                 $.ui.render(<box><Pair /><text>three</text></box>);\n\
+               });\n\
+             }\n",
+        )]);
+
+        let result = runtime.fire("PostToolUse", "Read", &HashMap::new());
+        assert!(!result.failed, "{result:?}");
+        assert_eq!(
+            result.ui,
+            vec![UiElement::Box {
+                title: None,
+                children: vec![
+                    UiElement::Text {
+                        text: "one".to_string(),
+                        style: UiStyle::Plain,
+                    },
+                    UiElement::Text {
+                        text: "two".to_string(),
+                        style: UiStyle::Plain,
+                    },
+                    UiElement::Text {
+                        text: "three".to_string(),
+                        style: UiStyle::Plain,
+                    },
+                ],
+            }]
+        );
+    }
+
+    #[test]
+    fn an_unknown_jsx_element_is_a_clear_hook_error() {
+        let runtime = load_files(&[(
+            "unknown.tsx",
+            "function register(on) {\n\
+               on('PostToolUse', '*', function () { return <div />; });\n\
+             }\n",
+        )]);
+
+        let result = runtime.fire("PostToolUse", "Read", &HashMap::new());
+
+        assert!(result.failed, "{result:?}");
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|error| error.contains("unknown element type 'div'")),
+            "{:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    fn a_transform_error_is_reported_with_its_line_and_the_mod_is_skipped() {
+        let runtime = load_files(&[
+            (
+                "broken.ts",
+                "function register(on) {\n  this is not TypeScript\n}\n",
+            ),
+            (
+                "good.js",
+                "function register(on) { on('PreToolUse', 'Bash', function () { \
+                 return { stop: true }; }); }",
+            ),
+        ]);
+
+        assert_eq!(
+            runtime.load_errors().len(),
+            1,
+            "{:?}",
+            runtime.load_errors()
+        );
+        let error = &runtime.load_errors()[0];
+        assert!(error.contains("broken.ts"), "{error}");
+        assert!(error.contains("line 2"), "{error}");
+        assert_eq!(runtime.hook_count(), 1);
+        assert!(runtime.fire("PreToolUse", "Bash", &HashMap::new()).stop);
+    }
+
+    #[test]
+    fn a_tsx_mod_without_register_is_still_skipped() {
+        let runtime = load_files(&[(
+            "component.tsx",
+            "const label: string = 'hi';\n\
+             function Badge() { return <text>{label}</text>; }\n",
+        )]);
+
+        assert_eq!(runtime.load_errors().len(), 1);
+        assert!(runtime.load_errors()[0].contains("register(on, options)"));
+        assert_eq!(runtime.hook_count(), 0);
+    }
+
+    #[test]
+    fn a_jsx_mod_loads_and_a_plain_js_file_is_not_transformed() {
+        let runtime = load_files(&[
+            (
+                "view.jsx",
+                "function register(on) { on('PostToolUse', '*', function ($) { \
+                 $.ui.render(<text>from jsx</text>); }); }",
+            ),
+            (
+                "plain.js",
+                // A string that only a JavaScript parse would accept: if `.js`
+                // went through the JSX/TS transform, this would be a syntax
+                // error instead of a registered hook.
+                "function register(on) { on('PostToolUse', '*', function () { \
+                 return { updatedInput: '<not jsx> !== type' }; }); }",
+            ),
+        ]);
+
+        assert_eq!(runtime.load_errors(), &[] as &[String]);
+        let result = runtime.fire("PostToolUse", "Read", &HashMap::new());
+
+        assert_eq!(
+            result.ui,
+            vec![UiElement::Text {
+                text: "from jsx".to_string(),
+                style: UiStyle::Plain,
+            }]
+        );
+        assert_eq!(
+            result.updated_input.as_deref(),
+            Some("<not jsx> !== type"),
+            "the .js file keeps its original source"
         );
     }
 }

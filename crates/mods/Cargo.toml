@@ -19,9 +19,18 @@ boa_engine.workspace = true
 # The `Finalize`/`Trace` derives expand to `boa_gc` paths, so the crate must be
 # nameable. It is the same version `boa_engine` uses.
 boa_gc = "0.20"
+# TypeScript stripping and JSX lowering. See `src/transform.rs`.
+oxc_allocator = "0.155"
+oxc_codegen = "0.155"
+oxc_diagnostics = "0.155"
+oxc_parser = "0.155"
+oxc_semantic = "0.155"
+oxc_span = "0.155"
+oxc_transformer = "0.155"
 serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+coderex-ui = { path = "../ui" }
 tempfile.workspace = true

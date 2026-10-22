@@ -1,10 +1,15 @@
-# Mods — in-process JavaScript hooks
+# Mods — in-process JavaScript, TypeScript and JSX hooks
 
-A **mod** is a JavaScript file that turns CodeRex hook events into decisions.
-It can observe an event, return `stop`, an updated input, an updated tool
-output, or paths to watch, and it can call `next(e)` to run the downstream
-chain and inspect or rewrite its result. It cannot call tools, read files, open
-the network, or reach the engine.
+A **mod** is a `.js`, `.jsx`, `.ts` or `.tsx` file that turns CodeRex hook
+events into decisions. It can observe an event, return `stop`, an updated
+input, an updated tool output, or paths to watch, and it can call `next(e)` to
+run the downstream chain and inspect or rewrite its result. It cannot call
+tools, read files, open the network, or reach the engine.
+
+`.js` files are evaluated as they are. `.jsx`, `.ts` and `.tsx` files are
+transformed first: TypeScript types are stripped and JSX is lowered to the
+classic runtime, with `h` and `Fragment` mapped onto the same UI descriptors
+as `$.ui`. See [TypeScript and JSX](#typescript-and-jsx).
 
 The runtime is opt-in. Without the environment variable below, CodeRex does not
 load mods at all and behaves exactly as before.
@@ -21,8 +26,10 @@ the config home.
 
 ## A mod file
 
-Every `*.js` file directly inside the mods directory is loaded, sorted by file
-name. A file must define a global `register(on, options)` function:
+Every `.js`, `.jsx`, `.ts` and `.tsx` file directly inside the mods directory
+is loaded, sorted by file name. Extensions are matched case-insensitively; a
+file with any other extension is ignored. A file must define a global
+`register(on, options)` function:
 
 ```js
 // ~/.coderex/mods/guard.js
@@ -111,6 +118,88 @@ exception, an engine limit or a timeout becomes a hook error: other hooks still
 run, and the merged result is marked `failed`. On the gating events
 (`PreToolUse`, `UserPromptSubmit`) a failure also sets `stop`, so a broken hook
 can never read as an allow.
+
+## TypeScript and JSX
+
+Every mod file is picked by extension:
+
+| Extension | Parsed as | Transform before evaluation |
+| --- | --- | --- |
+| `.js` | JavaScript | none — the source is evaluated as it is |
+| `.jsx` | JavaScript with JSX | JSX lowered to `h(...)` |
+| `.ts` | TypeScript | types stripped |
+| `.tsx` | TypeScript with JSX | types stripped, JSX lowered |
+
+The transform is built in source; there is no `tsconfig.json` to supply. It
+uses the classic JSX runtime with `pragma: "h"` and
+`pragmaFrag: "Fragment"`, and TypeScript syntax is enabled. The lowered
+JavaScript is then evaluated by the same `boa_engine` realm as a `.js` mod, so
+everything else in this document applies unchanged.
+
+A transform or parse failure is reported **once** at load as
+`<file>: line N, column M: message`, and that mod is skipped. The remaining
+mods still load. `.ts` and `.tsx` are never silently treated as `.js`: they are
+always parsed as TypeScript.
+
+### The `h` and `Fragment` runtime
+
+`h(type, props, ...children)` and `Fragment` are non-writable globals in each
+mod's realm, created after `$.ui`. They return exactly the descriptors
+`$.ui.text` / `$.ui.box` / `$.ui.button` already accept, so the host snapshot
+and renderer are unchanged.
+
+| JSX | Lowered call | Result |
+| --- | --- | --- |
+| `<text style="bold">hi</text>` | `h("text", { style: "bold" }, "hi")` | `$.ui.text("hi", "bold")` |
+| `<box title="Report">…</box>` | `h("box", { title: "Report" }, …)` | `$.ui.box({ title: "Report" }, …)` |
+| `<button id="retry">Retry</button>` | `h("button", { id: "retry" }, "Retry")` | `$.ui.button("Retry", "retry")` |
+| `<Badge label="ok" />` | `h(Badge, { label: "ok" })` | the component's return value |
+| `<><text>a</text><text>b</text></>` | `h(Fragment, null, …)` | an array of children |
+
+- **Text children** are stringified and concatenated. Numbers are accepted;
+  any other value throws.
+- **Box children** are flattened one level (so a fragment or an array returned
+  by a component can sit inside a box) and validated by `$.ui.box`.
+- **Button label** is its child text; its `id` comes from the `id` prop.
+- **Components** are called synchronously with a props object that also
+  carries `children` (a single child, or an array when there are several). A
+  component may return any element or a fragment array.
+- `null`, `undefined`, `true` and `false` children are ignored, so
+  `{condition && <text>shown</text>}` works.
+- **Unknown element names** such as `<div />` throw
+  `unknown element type 'div'`; that becomes a normal hook error and, on a
+  gating event, a failure that stops.
+
+```tsx
+function Badge(props: { label: string }) {
+  return <text style="bold">{props.label}</text>;
+}
+
+function register(on) {
+  on('PostToolUse', 'Read', function ($) {
+    $.ui.render(
+      <box title="Read result">
+        <Badge label="ok" />
+        <button id="retry">Retry</button>
+      </box>);
+  });
+}
+```
+
+### Dependency cost
+
+The transform is implemented with oxc (`oxc_parser`, `oxc_semantic`,
+`oxc_transformer`, `oxc_codegen`, `oxc_allocator`, `oxc_span`, plus
+`oxc_diagnostics` for locations), pinned at `0.155`. It adds 47 package names
+to `coderex-mods`' resolved dependency tree (311 with it, 264 without), and a
+cold `cargo check -p coderex-mods` completed in about 26 seconds on the
+development machine used for this change.
+
+`swc_core` was the first choice but cannot resolve in this workspace at
+version 82: `swc_common 26` requires `unicode-width ^0.2.1`, while the
+workspace's `ratatui 0.29` pins `unicode-width = "=0.2.0"`. Moving to swc
+would mean upgrading ratatui and the UI crate, which is outside the mod
+runtime.
 
 ## `next(e)` — running the downstream chain
 
@@ -266,9 +355,10 @@ engine; the caller detaches the worker and reports a hook error. The next
 | Mod file size | 1 MiB | Larger files are skipped with a load error. |
 | Hooks per mod | 256 | `on` throws when the cap is reached. |
 
-A file that fails to parse, evaluate or register is reported **once** at load
-(`tracing::warn!`, plus `ModRuntime::load_errors`) and skipped. The remaining
-mods still load.
+A file that fails to read, transform, parse, evaluate or register is reported
+**once** at load (`tracing::warn!`, plus `ModRuntime::load_errors`) and
+skipped. The remaining mods still load. A TypeScript/JSX transform error
+includes its line and column.
 
 **Memory caveat.** `boa_engine` 0.20 exposes no heap or allocation limit. The
 wall clock and loop ceiling bound ordinary runaway code, and recursion/stack
