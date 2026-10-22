@@ -1575,6 +1575,10 @@ globalThis.__coderExCall = function (modIndex, hookIndex, event, input, contextJ
   }
   eventObject.event = event;
   eventObject.input = input;
+  // The surface a person is looking at. CodeRex ships one — the terminal — so
+  // this is constant today; the field exists so a mod can branch on it without
+  // changing when another surface is actually built.
+  eventObject.surface = 'terminal';
 
   try {
     const parsedContext = JSON.parse(contextJson);
@@ -2168,6 +2172,18 @@ mod tests {
             result.updated_input.as_deref(),
             Some("PreToolUse|Bash|git status|s-1")
         );
+    }
+
+    /// `e.surface` is exposed so a mod can branch on where it is running.
+    /// CodeRex has one surface today, so it is always `terminal`.
+    #[test]
+    fn the_hook_sees_the_terminal_surface() {
+        let runtime = load(
+            "function register(on) { on('PreToolUse', '*', function ($, e) { \
+             return { updatedInput: String(e.surface) }; }); }",
+        );
+        let result = runtime.fire("PreToolUse", "Bash", &HashMap::new());
+        assert_eq!(result.updated_input.as_deref(), Some("terminal"));
     }
 
     #[test]

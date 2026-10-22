@@ -92,6 +92,11 @@ may register at most 256 hooks.
 - If the input string is a JSON object, its fields are copied onto `e`.
 - `e.input` is always the raw input string (for tool events, the tool name).
 - `e.event` is the event name that fired.
+- `e.surface` says where the person is seeing this session. CodeRex ships one
+  surface — the terminal — so it is **always `"terminal"`** today. The field
+  exists so a mod can branch on it without a later API change; the reference's
+  other values (`desktop`, `vscode`, `mobile`) are not reachable because those
+  products do not exist here, and the UI renderer is terminal-only.
 - Every context entry is copied onto `e` as a string. `tool_input` is the
   exception: when it parses as JSON (the usual case for tool arguments), it is
   exposed as an object.
