@@ -10,6 +10,7 @@ members = [
     "crates/hooks",
     "crates/memory",
     "crates/mcp",
+    "crates/mods",
     "crates/plugins",
     "crates/bridge",
     "crates/server",
@@ -35,6 +36,9 @@ futures-util = "0.3"
 async-trait = "0.1"
 pin-project = "1"
 async-stream = "0.3"
+
+# JavaScript engine — in-process workflow scripts and extension hooks
+boa_engine = "0.20"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
