@@ -518,6 +518,7 @@ fn settings_with_every_key() -> Settings {
         context_window: Some(coderex_config::settings::ContextWindowSettings::default()),
         vim_mode: Some(false),
         statusline: Some(coderex_config::settings::StatuslineSettings::default()),
+        prompt_caching: Some(false),
         ..Settings::default()
     }
 }
@@ -2201,10 +2202,14 @@ impl StartupOrchestrator {
     ///
     /// Uses `ProviderConfig::from_env()` to build a [`ModelRouter`] that
     /// supports multi-provider fallback (Anthropic → OpenAI → Groq → custom).
-    fn try_create_api_client(api_key_override: Option<&str>) -> Option<Box<dyn ApiClient>> {
+    fn try_create_api_client(
+        api_key_override: Option<&str>,
+        prompt_caching: Option<bool>,
+    ) -> Option<Box<dyn ApiClient>> {
         Self::api_client_from_provider_config(
             ProviderConfig::from_env(),
             api_key_override,
+            prompt_caching,
             |name| std::env::var(name).ok(),
         )
     }
@@ -2220,11 +2225,15 @@ impl StartupOrchestrator {
     fn api_client_from_provider_config(
         mut config: ProviderConfig,
         api_key_override: Option<&str>,
+        prompt_caching: Option<bool>,
         get_env: impl Fn(&str) -> Option<String>,
     ) -> Option<Box<dyn ApiClient>> {
         if let Some(key) = api_key_override {
             config.set_anthropic_api_key(key.into());
         }
+        // The resolved setting rides into the provider config; the core
+        // builder combines it with the environment override.
+        config.prompt_caching = prompt_caching;
         // Core's transport rejects an empty key before it reaches the cloud
         // auth branch. For AWS SigV4 providers the key is not actually used
         // when AWS credentials are present, so a non-empty sentinel lets the
@@ -2314,6 +2323,16 @@ impl StartupOrchestrator {
             .settings
             .as_ref()
             .and_then(|s| s.api_key.as_deref())
+    }
+
+    /// The resolved `prompt_caching` setting, if the user set one.
+    ///
+    /// `CODEREX_PROMPT_CACHING` is applied by the core client on top of this.
+    fn prompt_caching_from_settings(&self) -> Option<bool> {
+        self.ctx
+            .settings
+            .as_ref()
+            .and_then(|settings| settings.prompt_caching)
     }
 
     /// Configure a ReplLoop with all CLI-derived settings.
@@ -2571,12 +2590,14 @@ impl StartupOrchestrator {
         interactive: bool,
     ) -> crate::repl::ReplLoop {
         let api_key = self.api_key_from_settings();
-        let mut repl = if let Some(api_client) = Self::try_create_api_client(api_key) {
-            let api_client = Self::apply_effort(api_client, self.ctx.effort.as_deref());
-            crate::repl::ReplLoop::with_engine(api_client, cwd.to_string(), model)
-        } else {
-            crate::repl::ReplLoop::new(cwd.to_string(), model)
-        };
+        let prompt_caching = self.prompt_caching_from_settings();
+        let mut repl =
+            if let Some(api_client) = Self::try_create_api_client(api_key, prompt_caching) {
+                let api_client = Self::apply_effort(api_client, self.ctx.effort.as_deref());
+                crate::repl::ReplLoop::with_engine(api_client, cwd.to_string(), model)
+            } else {
+                crate::repl::ReplLoop::new(cwd.to_string(), model)
+            };
         if let Some(ref pm) = self.ctx.plugin_manager {
             repl.with_plugin_manager(Arc::clone(pm));
         }
@@ -2820,6 +2841,7 @@ impl StartupOrchestrator {
             self.ctx.mcp_manager.clone(),
             permission_mode,
             self.ctx.effort.as_deref(),
+            self.prompt_caching_from_settings(),
         ) {
             server.set_engine_factory(factory);
         } else {
@@ -2915,6 +2937,7 @@ impl StartupOrchestrator {
         mcp_manager: Option<std::sync::Arc<coderex_mcp::manager::McpManager>>,
         permission_mode: coderex_core::permissions::PermissionMode,
         effort: Option<&str>,
+        prompt_caching: Option<bool>,
     ) -> Option<coderex_server::session::EngineFactory> {
         use coderex_tools::{
             ChromeClient, CronScheduler, ExecutionConfig, ExecutionContext, RateLimiter,
@@ -2923,7 +2946,7 @@ impl StartupOrchestrator {
         };
 
         let api_key = std::env::var("ANTHROPIC_API_KEY").ok();
-        let api_client = Self::try_create_api_client(api_key.as_deref())?;
+        let api_client = Self::try_create_api_client(api_key.as_deref(), prompt_caching)?;
         let api_client = Self::apply_effort(api_client, effort);
 
         let cwd = cwd.to_string();
@@ -3115,7 +3138,11 @@ impl StartupOrchestrator {
         let checks = [
             (
                 "API key configured",
-                Self::try_create_api_client(self.api_key_from_settings()).is_some(),
+                Self::try_create_api_client(
+                    self.api_key_from_settings(),
+                    self.prompt_caching_from_settings(),
+                )
+                .is_some(),
             ),
             (
                 "Settings file exists",
@@ -3591,12 +3618,14 @@ impl StartupOrchestrator {
 
         // Enter REPL with the resumed context
         let api_key = self.api_key_from_settings();
-        let mut repl = if let Some(api_client) = Self::try_create_api_client(api_key) {
-            let api_client = Self::apply_effort(api_client, self.ctx.effort.as_deref());
-            crate::repl::ReplLoop::with_engine(api_client, cwd.to_string(), model)
-        } else {
-            crate::repl::ReplLoop::new(cwd.to_string(), model)
-        };
+        let prompt_caching = self.prompt_caching_from_settings();
+        let mut repl =
+            if let Some(api_client) = Self::try_create_api_client(api_key, prompt_caching) {
+                let api_client = Self::apply_effort(api_client, self.ctx.effort.as_deref());
+                crate::repl::ReplLoop::with_engine(api_client, cwd.to_string(), model)
+            } else {
+                crate::repl::ReplLoop::new(cwd.to_string(), model)
+            };
         repl.with_resume_session(Some(resolved_session_id));
         if let Some(ref pm) = self.ctx.plugin_manager {
             repl.with_plugin_manager(Arc::clone(pm));
@@ -4395,8 +4424,12 @@ mod tests {
             "AWS_SECRET_ACCESS_KEY" => Some("secret".to_string()),
             _ => None,
         };
-        let client =
-            StartupOrchestrator::api_client_from_provider_config(bedrock_config(), None, get_env);
+        let client = StartupOrchestrator::api_client_from_provider_config(
+            bedrock_config(),
+            None,
+            None,
+            get_env,
+        );
         assert!(
             client.is_some(),
             "a valid cloud deployment must not be blocked by the CLI provider gate"
@@ -4756,6 +4789,7 @@ mod tests {
                 }),
                 ..Default::default()
             },
+            None,
             None,
             |_| None,
         );

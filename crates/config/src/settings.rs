@@ -71,7 +71,7 @@ pub const MAX_SETTINGS_FILE_BYTES: u64 = 2 * 1024 * 1024;
 /// *not* a [`Settings`] field, so serde ignores it and no settings file
 /// (including a repository-controlled one) can inject environment variables.
 /// Remote environment variables now live in `remote_env.json`.
-const KNOWN_SETTINGS_FIELDS: [&str; 16] = [
+const KNOWN_SETTINGS_FIELDS: [&str; 17] = [
     "config_version",
     "model",
     "permission_mode",
@@ -87,6 +87,7 @@ const KNOWN_SETTINGS_FIELDS: [&str; 16] = [
     "context_window",
     "vim_mode",
     "statusline",
+    "prompt_caching",
     "env",
 ];
 
@@ -332,6 +333,13 @@ pub struct Settings {
     /// Statusline preferences (written by `/statusline-setup`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub statusline: Option<StatuslineSettings>,
+    /// Whether Anthropic-protocol requests carry prompt-cache breakpoints.
+    ///
+    /// `None` means the default (enabled). `CODEREX_PROMPT_CACHING=0`
+    /// overrides this setting and disables the markers. OpenAI-compatible
+    /// providers ignore it: they cache automatically.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_caching: Option<bool>,
 }
 
 impl Settings {
@@ -358,6 +366,7 @@ impl Settings {
             context_window: None,
             vim_mode: None,
             statusline: None,
+            prompt_caching: None,
         }
     }
 
@@ -495,6 +504,7 @@ impl Settings {
                 .or_else(|| self.context_window.clone()),
             vim_mode: other.vim_mode.or(self.vim_mode),
             statusline: other.statusline.clone().or_else(|| self.statusline.clone()),
+            prompt_caching: other.prompt_caching.or(self.prompt_caching),
         }
     }
 
@@ -519,6 +529,7 @@ impl Settings {
             "context_window",
             "vim_mode",
             "statusline",
+            "prompt_caching",
         ];
         let mut changes = Vec::new();
 
@@ -1561,6 +1572,7 @@ mod tests {
             context_window: None,
             vim_mode: None,
             statusline: None,
+            prompt_caching: None,
         };
         migrate_settings(&mut settings, "test");
         assert_eq!(settings.config_version, CURRENT_SCHEMA_VERSION);

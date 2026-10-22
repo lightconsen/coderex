@@ -33,6 +33,12 @@ pub struct ProviderConfig {
     pub custom: Vec<NamedProviderEndpoint>,
     /// Explicit fallback provider allowlist/order.
     pub fallback_providers: Vec<String>,
+    /// Whether Anthropic-protocol requests may carry prompt-cache breakpoints.
+    ///
+    /// `None` falls back to the `CODEREX_PROMPT_CACHING` environment override
+    /// and then to the enabled default. The CLI sets this from the resolved
+    /// `prompt_caching` setting.
+    pub prompt_caching: Option<bool>,
 }
 
 /// A provider endpoint configuration.
@@ -146,12 +152,24 @@ impl ProviderConfig {
             let mut config = ApiConfig::new(key);
             config.base_url = cloud_base_url(endpoint);
             config.cloud = Some(endpoint.clone());
+            config.prompt_caching = crate::api_client::prompt_caching_enabled(
+                self.prompt_caching,
+                std::env::var(crate::api_client::PROMPT_CACHING_ENV)
+                    .ok()
+                    .as_deref(),
+            );
             router.add_provider(Box::new(AnthropicProvider::new(config)));
         } else if let Some(ref ep) = self.anthropic {
             let mut config = ApiConfig::new(ep.api_key.clone());
             if let Some(ref url) = ep.base_url {
                 config.base_url.clone_from(url);
             }
+            config.prompt_caching = crate::api_client::prompt_caching_enabled(
+                self.prompt_caching,
+                std::env::var(crate::api_client::PROMPT_CACHING_ENV)
+                    .ok()
+                    .as_deref(),
+            );
             if let Some(ref profile) = ep.provider_profile {
                 config = config.with_provider_profile(profile.clone());
             }

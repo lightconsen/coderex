@@ -50,6 +50,43 @@ The foundational engine of CodeRex. Manages LLM API communication, conversation 
 
 Re-exports 50+ types from 44 submodules: `types`, `state`, `runtime`, `engine`, `api_client`, `budget`, `cost`, `permissions`, `permission_engine`, `permission_manager`, `confirmation_bus`, `sandbox`, `loop_detector`, `shell_security`, `file_traversal`, `fuzzy_matcher`, `markdown`, `syntax`, `scheduler`, `prompt`, `compact`, `stop_hook`, `hook_executor`, `hook_security`, `tool_executor`, `tool_scheduler`, `elicitation`, `task`, `worktree`, `team`, `coordinator`, `team_context`, `orchestrator`, `query_profiles`, `prompts`, `wire_protocol`, `wire_transport`, `wire_adapter`, `provider`, `providers`, `model_router`, `provider_config`.
 
+### Prompt caching
+
+`AnthropicApiClient` marks request prefixes with the Anthropic API's
+`cache_control: {"type": "ephemeral"}` breakpoints, so a multi-turn session
+reads the conversation it already paid to write instead of re-processing it on
+every request.
+
+Breakpoints are attached, in prefix order, by `apply_cache_breakpoints` in
+`api_client.rs`:
+
+1. the last `system` block — the string form is converted to a one-block text
+   array because a marker can only attach to a block;
+2. the last tool definition — the tool list is a prefix that rarely changes;
+3. the last content block of the last message;
+4. the last content block of the second-to-last message, when the conversation
+   has at least two messages.
+
+Items 3 and 4 are a sliding pair: the next request reads the prefix this request
+just wrote, while the older breakpoint remains a valid read point. Message
+content supplied as a string is converted to a block array for the same reason
+as `system`. The total is capped at the API's **four** breakpoints per request;
+empty prefixes (blank system text, empty message content, an empty tool list)
+are never marked.
+
+The markers are only emitted by the Anthropic-protocol transport
+(`AnthropicApiClient`, including the Bedrock/Vertex/cloud shapes that speak the
+Messages API). `OpenAiCompatibleProvider` never sends `cache_control`: those
+providers reject the field and perform their own automatic caching.
+
+Prompt caching is on by default. It can be disabled with the top-level
+`prompt_caching: false` setting in `settings.json` or with
+`CODEREX_PROMPT_CACHING=0`; the environment override wins over the setting.
+`UsageSummary::cache_read_tokens` / `cache_creation_tokens` parse the
+`cache_read_input_tokens` / `cache_creation_input_tokens` response fields, and a
+debug log line (`"prompt cache hit"`) is emitted when a response reports a
+non-zero read, so a session can be checked.
+
 ## Current Status
 
 ### What Works

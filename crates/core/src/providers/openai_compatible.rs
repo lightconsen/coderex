@@ -1350,6 +1350,34 @@ mod tests {
     }
 
     #[test]
+    fn openai_compatible_bodies_never_carry_cache_control() {
+        let provider = OpenAiCompatibleProvider::new("openai", "https://api.openai.com", "k");
+        let tools = [crate::tool_executor::ToolInfo {
+            name: "Read".into(),
+            description: "read".into(),
+            input_schema: serde_json::json!({}),
+        }];
+        let messages = vec![
+            serde_json::json!({"role": "user", "content": "earlier"}),
+            serde_json::json!({"role": "assistant", "content": "answer"}),
+            serde_json::json!({"role": "user", "content": "latest"}),
+        ];
+        let body = provider.build_chat_request_body(
+            "system",
+            &messages,
+            &ModelId("gpt-4o".into()),
+            64,
+            &tools,
+            "req-1",
+            false,
+        );
+        assert!(
+            !body.to_string().contains("cache_control"),
+            "OpenAI-compatible providers reject cache_control and cache automatically"
+        );
+    }
+
+    #[test]
     fn reasoning_effort_maps_to_the_openai_chat_field() {
         let mut context = RequestContext::default();
         context.set_reasoning_effort(crate::api_client::ReasoningEffort::High);

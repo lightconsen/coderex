@@ -458,6 +458,38 @@ impl std::str::FromStr for ReasoningEffort {
     }
 }
 
+/// The environment variable that overrides the prompt-caching setting.
+///
+/// Set it to `0`/`false` to stop sending `cache_control` breakpoints, or to
+/// `1`/`true` to force them on. The variable wins over the settings file.
+pub const PROMPT_CACHING_ENV: &str = "CODEREX_PROMPT_CACHING";
+
+/// Parse a prompt-caching override, returning `None` for "not specified".
+///
+/// An unrecognised value is left unset rather than guessed at, so a typo does
+/// not silently change billing behaviour.
+#[must_use]
+pub fn parse_prompt_caching(value: Option<&str>) -> Option<bool> {
+    match value?.trim().to_ascii_lowercase().as_str() {
+        "0" | "false" | "no" | "off" | "disabled" => Some(false),
+        "1" | "true" | "yes" | "on" | "enabled" => Some(true),
+        _ => None,
+    }
+}
+
+/// Resolve whether prompt caching is enabled.
+///
+/// The environment override wins over the settings value, which wins over the
+/// default (enabled). Prompt caching is only ever applied by the
+/// Anthropic-protocol client; OpenAI-compatible providers ignore this flag and
+/// cache automatically.
+#[must_use]
+pub fn prompt_caching_enabled(settings_value: Option<bool>, env_value: Option<&str>) -> bool {
+    parse_prompt_caching(env_value)
+        .or(settings_value)
+        .unwrap_or(true)
+}
+
 /// Configuration for the API client.
 #[derive(Debug, Clone)]
 pub struct ApiConfig {
@@ -493,6 +525,12 @@ pub struct ApiConfig {
     /// A per-request value on [`RequestContext`] wins over this default; see
     /// [`ApiConfig::effective_reasoning_effort`].
     pub reasoning_effort: Option<ReasoningEffort>,
+    /// Whether to attach ephemeral `cache_control` breakpoints to requests.
+    ///
+    /// Resolved from [`PROMPT_CACHING_ENV`] and the `prompt_caching` setting;
+    /// see [`prompt_caching_enabled`]. Only the Anthropic-protocol client acts
+    /// on it.
+    pub prompt_caching: bool,
 }
 
 /// Controls how request metadata is attached to provider requests.
@@ -565,6 +603,10 @@ impl ApiConfig {
             client_name: "cli".into(),
             request_context: None,
             reasoning_effort: None,
+            prompt_caching: prompt_caching_enabled(
+                None,
+                std::env::var(PROMPT_CACHING_ENV).ok().as_deref(),
+            ),
         }
     }
 
@@ -629,6 +671,13 @@ impl ApiConfig {
     #[must_use]
     pub const fn with_reasoning_effort(mut self, effort: ReasoningEffort) -> Self {
         self.reasoning_effort = Some(effort);
+        self
+    }
+
+    /// Enable or disable Anthropic prompt-caching breakpoints.
+    #[must_use]
+    pub const fn with_prompt_caching(mut self, enabled: bool) -> Self {
+        self.prompt_caching = enabled;
         self
     }
 
@@ -1065,6 +1114,13 @@ impl AnthropicApiClient {
         }
     }
 
+    /// Attach cache breakpoints when the client is configured to.
+    fn maybe_apply_cache_breakpoints(&self, body: &mut serde_json::Value) {
+        if self.config.prompt_caching {
+            apply_cache_breakpoints(body);
+        }
+    }
+
     pub(crate) fn resolved_profile(&self) -> ResolvedProviderProfile {
         ResolvedProviderProfile::resolve(
             self.config.provider_profile.as_deref(),
@@ -1355,6 +1411,8 @@ impl ApiClient for AnthropicApiClient {
                 .insert("tools".to_string(), serde_json::Value::Array(tools_json));
         }
 
+        self.maybe_apply_cache_breakpoints(&mut body);
+
         // The bytes are serialized here rather than by `json()`, because a
         // signed request has to hash exactly what it sends.
         let body_bytes = serde_json::to_vec(&body)
@@ -1476,6 +1534,15 @@ impl ApiClient for AnthropicApiClient {
                     tool_fallback,
                     "provider response received"
                 );
+                if usage.cache_read_tokens > 0 {
+                    tracing::debug!(
+                        provider = "anthropic",
+                        request_id = %request_id,
+                        cache_read_input_tokens = usage.cache_read_tokens,
+                        cache_creation_input_tokens = usage.cache_creation_tokens,
+                        "prompt cache hit"
+                    );
+                }
 
                 Ok(ApiResponse {
                     content,
@@ -1551,6 +1618,8 @@ impl ApiClient for AnthropicApiClient {
                 .unwrap()
                 .insert("tools".to_string(), serde_json::Value::Array(tools_json));
         }
+
+        self.maybe_apply_cache_breakpoints(&mut body);
 
         let client = self.client.clone();
         let config = self.config.clone();
@@ -1719,6 +1788,126 @@ fn split_url(url: &str) -> (String, String, String) {
 
     let host = authority.rsplit('@').next().unwrap_or(authority);
     (host.to_string(), path, query)
+}
+
+/// The marker that asks the Anthropic API to cache a prefix.
+fn cache_control() -> serde_json::Value {
+    serde_json::json!({"type": "ephemeral"})
+}
+
+/// Attach ephemeral `cache_control` breakpoints to an Anthropic Messages body.
+///
+/// The Anthropic API caches a request prefix only at a marked breakpoint, and
+/// accepts at most four per request. The markers go on, in prefix order:
+///
+/// 1. the last `system` block (converting the string form to a text block,
+///    which is what makes a marker attachable);
+/// 2. the last tool definition;
+/// 3. the last content block of the last message;
+/// 4. the last content block of the second-to-last message, when there is one.
+///
+/// The last two are a sliding pair: the next request reads the prefix this one
+/// just wrote, while the older breakpoint stays a valid read point.
+///
+/// Empty prefixes are never marked, and the four-breakpoint cap is enforced by
+/// construction. Only the Anthropic protocol client calls this — OpenAI-shaped
+/// providers reject `cache_control` and cache automatically.
+fn apply_cache_breakpoints(body: &mut serde_json::Value) {
+    let Some(object) = body.as_object_mut() else {
+        return;
+    };
+    let mut breakpoints = 0_usize;
+
+    if let Some(system) = object.get_mut("system") {
+        match system {
+            serde_json::Value::String(text) if !text.trim().is_empty() => {
+                let text = std::mem::take(text);
+                *system = serde_json::json!([{
+                    "type": "text",
+                    "text": text,
+                    "cache_control": cache_control(),
+                }]);
+                breakpoints += 1;
+            }
+            serde_json::Value::Array(blocks) => {
+                if mark_last_block(blocks) {
+                    breakpoints += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if let Some(serde_json::Value::Array(tools)) = object.get_mut("tools") {
+        if mark_last_block(tools) {
+            breakpoints += 1;
+        }
+    }
+
+    if let Some(serde_json::Value::Array(messages)) = object.get_mut("messages") {
+        if breakpoints < 4 {
+            if let Some(last) = messages.last_mut() {
+                if mark_message(last) {
+                    breakpoints += 1;
+                }
+            }
+        }
+        let message_count = messages.len();
+        if breakpoints < 4 && message_count >= 2 {
+            if let Some(second_to_last) = messages.get_mut(message_count - 2) {
+                let _ = mark_message(second_to_last);
+            }
+        }
+    }
+}
+
+/// Mark the last cacheable block of a block array.
+///
+/// Returns whether a marker was attached. An empty array, a non-object block,
+/// or an empty text block is left alone: marking it would cache nothing.
+fn mark_last_block(blocks: &mut [serde_json::Value]) -> bool {
+    let Some(last) = blocks.last_mut() else {
+        return false;
+    };
+    if last.get("type").and_then(serde_json::Value::as_str) == Some("text")
+        && last
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|text| text.trim().is_empty())
+    {
+        return false;
+    }
+    let Some(block) = last.as_object_mut() else {
+        return false;
+    };
+    block.insert("cache_control".to_string(), cache_control());
+    true
+}
+
+/// Mark the last content block of one message.
+///
+/// Anthropic accepts message content as a string or an array of blocks; a
+/// string is converted to a one-block array so the marker has somewhere to go.
+fn mark_message(message: &mut serde_json::Value) -> bool {
+    let Some(object) = message.as_object_mut() else {
+        return false;
+    };
+    let Some(content) = object.get_mut("content") else {
+        return false;
+    };
+    match content {
+        serde_json::Value::String(text) if !text.trim().is_empty() => {
+            let text = std::mem::take(text);
+            *content = serde_json::json!([{
+                "type": "text",
+                "text": text,
+                "cache_control": cache_control(),
+            }]);
+            true
+        }
+        serde_json::Value::Array(blocks) => mark_last_block(blocks),
+        _ => false,
+    }
 }
 
 fn parse_sse_stream(
@@ -1987,6 +2176,14 @@ fn parse_sse_message(message: &str, state: &mut SseParserState) -> Vec<StreamEve
                 .map(str::to_string);
             let mut events = Vec::with_capacity(2);
             if let Some(u) = usage {
+                if u.cache_read_tokens > 0 {
+                    tracing::debug!(
+                        provider = "anthropic",
+                        cache_read_input_tokens = u.cache_read_tokens,
+                        cache_creation_input_tokens = u.cache_creation_tokens,
+                        "prompt cache hit"
+                    );
+                }
                 events.push(StreamEvent::UsageSummary(u));
             }
             if let Some(r) = stop_reason {
@@ -2055,6 +2252,123 @@ mod tests {
         assert_eq!(json, "\"low\"");
         let parsed: ReasoningEffort = serde_json::from_str("\"high\"").expect("deserializes");
         assert_eq!(parsed, ReasoningEffort::High);
+    }
+
+    fn count_cache_markers(value: &serde_json::Value) -> usize {
+        match value {
+            serde_json::Value::Object(object) => {
+                usize::from(object.contains_key("cache_control"))
+                    + object.values().map(count_cache_markers).sum::<usize>()
+            }
+            serde_json::Value::Array(items) => items.iter().map(count_cache_markers).sum::<usize>(),
+            _ => 0,
+        }
+    }
+
+    fn caching_body(message_count: usize, with_tools: bool) -> serde_json::Value {
+        let messages: Vec<serde_json::Value> = (0..message_count)
+            .map(|index| {
+                if index + 1 == message_count {
+                    serde_json::json!({"role": "user", "content": "latest question"})
+                } else if index % 2 == 0 {
+                    serde_json::json!({"role": "user", "content": "earlier question"})
+                } else {
+                    serde_json::json!({
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "earlier answer"}],
+                    })
+                }
+            })
+            .collect();
+        let mut body = serde_json::json!({
+            "model": "claude-sonnet-4-6",
+            "system": "You are CodeRex.",
+            "messages": messages,
+            "max_tokens": 1024,
+        });
+        if with_tools {
+            body.as_object_mut().unwrap().insert(
+                "tools".to_string(),
+                serde_json::json!([
+                    {"name": "Read", "description": "read", "input_schema": {}},
+                    {"name": "Write", "description": "write", "input_schema": {}},
+                ]),
+            );
+        }
+        body
+    }
+
+    #[test]
+    fn anthropic_body_marks_system_last_tool_and_last_two_messages() {
+        let client = AnthropicApiClient::new(ApiConfig::new("k".into()).with_prompt_caching(true));
+        let mut body = caching_body(4, true);
+        client.maybe_apply_cache_breakpoints(&mut body);
+
+        // System is converted to a block array so the marker has a home.
+        assert_eq!(body["system"][0]["type"], "text");
+        assert!(body["system"][0]["cache_control"].is_object());
+        // Only the last tool is marked; tools are a stable prefix.
+        assert!(body["tools"][0].get("cache_control").is_none());
+        assert_eq!(body["tools"][1]["cache_control"]["type"], "ephemeral");
+        // The sliding pair: last and second-to-last message.
+        let messages = body["messages"].as_array().unwrap();
+        assert!(messages[2]["content"][0]["cache_control"].is_object());
+        assert!(messages[3]["content"][0]["cache_control"].is_object());
+        assert!(messages[1]["content"][0].get("cache_control").is_none());
+        // system + tool + two messages, and never more than the API cap.
+        assert_eq!(count_cache_markers(&body), 4);
+    }
+
+    #[test]
+    fn a_one_message_conversation_has_no_second_to_last_breakpoint() {
+        let client = AnthropicApiClient::new(ApiConfig::new("k".into()).with_prompt_caching(true));
+        let mut body = caching_body(1, true);
+        client.maybe_apply_cache_breakpoints(&mut body);
+
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0]["content"][0]["cache_control"].is_object());
+        // system + tool + the one message.
+        assert_eq!(count_cache_markers(&body), 3);
+    }
+
+    #[test]
+    fn prompt_caching_disabled_leaves_the_body_untouched() {
+        let client = AnthropicApiClient::new(ApiConfig::new("k".into()).with_prompt_caching(false));
+        let mut body = caching_body(4, true);
+        client.maybe_apply_cache_breakpoints(&mut body);
+
+        assert_eq!(count_cache_markers(&body), 0);
+        assert_eq!(
+            body["system"],
+            serde_json::json!("You are CodeRex."),
+            "the string form is kept when there is no marker to attach"
+        );
+    }
+
+    #[test]
+    fn prompt_caching_setting_and_env_resolve_in_the_right_order() {
+        // Default on.
+        assert!(prompt_caching_enabled(None, None));
+        // The settings key can turn it off.
+        assert!(!prompt_caching_enabled(Some(false), None));
+        // The environment override wins over the setting in both directions.
+        assert!(!prompt_caching_enabled(Some(true), Some("0")));
+        assert!(prompt_caching_enabled(Some(false), Some("1")));
+        // Unrecognised values are ignored rather than guessed at.
+        assert_eq!(parse_prompt_caching(Some("maybe")), None);
+        assert!(prompt_caching_enabled(None, Some("maybe")));
+    }
+
+    #[test]
+    fn empty_prefixes_are_never_marked() {
+        let mut body = serde_json::json!({
+            "system": "   ",
+            "messages": [{"role": "user", "content": ""}],
+            "tools": [],
+        });
+        apply_cache_breakpoints(&mut body);
+        assert_eq!(count_cache_markers(&body), 0);
     }
 
     #[test]

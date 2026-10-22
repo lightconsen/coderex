@@ -176,6 +176,7 @@ fn settings_json_serde_roundtrip() {
         statusline: None,
         api_key: Some("sk-test".into()),
         context_window: None,
+        prompt_caching: Some(true),
     };
 
     let json = serde_json::to_string_pretty(&settings).unwrap();
