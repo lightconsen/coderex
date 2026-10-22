@@ -4,6 +4,7 @@ use crate::channel::{
     InboundRequestHandler, JsonRpcError, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse,
     JsonRpcServerRequest, METHOD_NOT_FOUND, ServerNotificationHandler,
 };
+use crate::elicitation::{SAMPLING_CREATE, sampling_disabled_error};
 use reqwest::Url;
 use reqwest::header::{
     ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue, WWW_AUTHENTICATE,
@@ -641,6 +642,9 @@ impl RequestContext {
                 handler
                     .handle(&request.method, request.params.as_ref())
                     .await
+            }
+            None if request.method == SAMPLING_CREATE => {
+                Err(sampling_disabled_error(&request.method))
             }
             None => Err(JsonRpcError {
                 code: METHOD_NOT_FOUND,

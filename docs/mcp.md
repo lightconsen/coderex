@@ -182,6 +182,40 @@ question (one with no schema); it is read only under `allow`, and an unset or
 empty value leaves the question cancelled. See the elicitation note above for
 the validation rules.
 
+### Sampling
+
+MCP `sampling/createMessage` lets a server ask the *client's* model to
+generate text in the middle of a request. It is the server's conversation and
+the server's choice of prompt, but the completion is billed to the person
+running CodeRex. Sampling is therefore **denied by default**: without an
+explicit opt-in, the request is answered with a JSON-RPC `-32601` error whose
+message names the switch, rather than being silently ignored or forwarded.
+
+Set `CODEREX_MCP_SAMPLING=allow` to enable it. The value is matched
+case-insensitively; any other value (including `deny`) leaves sampling
+disabled and logs a warning. When enabled, CodeRex forwards the request to the
+session's own API client and model:
+
+- `maxTokens` is honoured only up to a ceiling: **4096** output tokens by
+  default. Raise or lower it with `CODEREX_MCP_SAMPLING_MAX_TOKENS` (a positive
+  integer; an invalid or zero value falls back to 4096).
+- A model named in `modelPreferences.hints` is used only when CodeRex knows it
+  (`opus`/`claude-opus-4-6`, `sonnet`/`claude-sonnet-4-6`,
+  `haiku`/`claude-haiku-4-5-20251001`). Any other hint is ignored and the
+  session's resolved model answers instead.
+- Only `text` content blocks are forwarded. A request whose messages are
+  empty, whose `maxTokens` is zero, or whose params do not parse is rejected
+  with `-32602` (invalid params); an unsupported content type or a provider
+  failure is returned as a JSON-RPC error, never a panic.
+
+The handler is installed by the REPL and one-shot runners after the session's
+API client exists. A headless run (`--print`, a piped prompt, or no terminal)
+keeps the deny default: with the opt-in absent, nothing is installed and
+sampling stays refused. With `CODEREX_MCP_SAMPLING=allow` a headless run uses
+the same clamped handler, because the environment variable is the explicit
+consent. Served sessions (`coderex serve`) install no sampling handler and
+therefore keep refusing.
+
 ### IDE tool whitelist
 
 The reference allows two IDE tools (`mcp__ide__executeCode`, `mcp__ide__getDiagnostics`) to be used without a prompt. `--ide` in CodeRex connects to a configured IDE MCP endpoint and registers its tools like any other server, but there is no bundled IDE product, no fixed `ide` server, and no automatic allow rule for those names. Users who want them prompt-free add an explicit `mcp__ide__*` rule; CodeRex does not ship a product-specific allowlist.
