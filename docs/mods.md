@@ -543,9 +543,27 @@ meanings (submit, interrupt/clear, permission-mode cycle). Ordinary typing
 always reaches the input line; focus never swallows a character. The focused
 button renders as `> [label] <`.
 
+A **left mouse click** on a button in the most recent block activates it too.
+The transcript re-renders that block from its live tree at the message pane's
+actual width, so the button's screen cells are known exactly even when the
+block wraps or the transcript is scrolled. Clicks on borders, padding or text
+are ignored, and so is a click while an overlay (command palette, dialog), a
+tool-permission confirmation, or an MCP form is open. Wheel scrolling is
+unaffected. In the compact transcript (a message pane shorter than ten rows) a
+block is truncated to one line and is not clickable; keyboard activation still
+works there.
+
+Mouse reporting must be enabled and supported by the terminal. CodeRex enables
+it when the TUI starts (`EnableMouseCapture`) and disables it on exit; iTerm2,
+kitty, WezTerm, Ghostty, Windows Terminal and the VS Code/Cursor terminals
+report mouse input. In a terminal that does not, or with mouse reporting
+turned off, clicks do nothing — the keyboard bindings above remain the
+fallback, and focus/activation behave identically either way.
+
 Activation calls the handler on the mod worker. The elements it staged and
 returned are appended to the transcript as a new mod UI block, rendered with
-the same renderer. An error is shown as a system message.
+the same renderer. An error is shown as a system message. Keyboard and mouse
+activation share this path.
 
 **Headless runs do not interact.** `--print` / non-interactive output renders
 the block and does not read keys or wait for input; a button is inert there.
@@ -556,8 +574,9 @@ The same applies when the REPL is not attached to a terminal.
 - **Snapshot, not live.** Elements are plain data. There is no `mount`,
   `update` or `unmount`, no stable node identity, and no way to mutate an
   element after `render`. Render again from a later hook to show new content.
-- **Terminal only.** There is no web or other surface, and no mouse-click
-  routing: activation is keyboard focus plus `Enter`.
+- **Terminal only.** There is no web or other surface. Only the most recent
+  block with buttons is interactive; an older block's buttons are inert, and
+  activation is still available through keyboard focus plus `Enter`.
 - **One block per hook call.** The host renders a hook's tree on its own; it
   is not merged into the built-in panes.
 

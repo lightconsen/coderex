@@ -11,12 +11,31 @@
 //! focus is an argument, not something cached here.
 
 use coderex_core::ui_protocol::{UiElement, UiStyle};
+use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// Width used when a caller has no terminal measurement to offer.
 pub const MOD_UI_DEFAULT_WIDTH: usize = 80;
+
+/// The position of a button within a rendered mod UI block.
+///
+/// Rows and columns are zero-based and relative to the block's first rendered
+/// line and column. `col_end` is exclusive, so a click lands on the button when
+/// `col_start <= column < col_end`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ButtonHit {
+    /// The button's host-owned id: the value passed to the mod's activation
+    /// handler.
+    pub id: String,
+    /// Zero-based row within the rendered block.
+    pub row: u16,
+    /// First column of the button, inclusive.
+    pub col_start: u16,
+    /// One past the button's last column.
+    pub col_end: u16,
+}
 
 /// Map a mod's [`UiStyle`] onto the terminal UI's style vocabulary.
 ///
@@ -54,7 +73,67 @@ pub fn render_mod_ui_with_focus(
     width: usize,
     focused: Option<&str>,
 ) -> Vec<Line<'static>> {
-    render_children(elements, width.max(1), focused)
+    render_mod_ui_with_focus_and_hits(elements, width, focused).0
+}
+
+/// Render a mod UI tree together with the position of every button.
+///
+/// The returned lines are exactly [`render_mod_ui`]'s output. Each
+/// [`ButtonHit`] is relative to those lines, so a caller that prefixes or
+/// scrolls the block only needs to translate rows and columns.
+#[must_use]
+pub fn render_mod_ui_with_hits(
+    elements: &[UiElement],
+    width: usize,
+) -> (Vec<Line<'static>>, Vec<ButtonHit>) {
+    render_mod_ui_with_focus_and_hits(elements, width, None)
+}
+
+/// The focus-aware form of [`render_mod_ui_with_hits`].
+///
+/// The focus marker changes the button's rendered width, so hits are computed
+/// from the same text the caller will see rather than from the label alone.
+#[must_use]
+pub fn render_mod_ui_with_focus_and_hits(
+    elements: &[UiElement],
+    width: usize,
+    focused: Option<&str>,
+) -> (Vec<Line<'static>>, Vec<ButtonHit>) {
+    let mut hits = Vec::new();
+    let lines = render_children_at(elements, width.max(1), focused, 0, 0, &mut hits);
+    (lines, hits)
+}
+
+/// Find the button under a click.
+///
+/// `rect` is the block's absolute screen rect: its `x` is the column of the
+/// block's first rendered column and its `y` is the screen row of the first
+/// rendered row that is visible. `scroll_offset` is the number of block rows
+/// clipped above `rect.y`; the mapping is `block_row = scroll_offset +
+/// (row - rect.y)`. Clicks outside `rect`, or on padding and borders, return
+/// `None`.
+#[must_use]
+pub fn button_at(
+    rect: Rect,
+    scroll_offset: usize,
+    column: u16,
+    row: u16,
+    hits: &[ButtonHit],
+) -> Option<&str> {
+    if rect.width == 0 || rect.height == 0 || column < rect.x || row < rect.y {
+        return None;
+    }
+    let offset_x = column - rect.x;
+    let offset_y = row - rect.y;
+    if offset_x >= rect.width || offset_y >= rect.height {
+        return None;
+    }
+    let block_row = u16::try_from(scroll_offset)
+        .unwrap_or(u16::MAX)
+        .saturating_add(offset_y);
+    hits.iter()
+        .find(|hit| hit.row == block_row && hit.col_start <= offset_x && offset_x < hit.col_end)
+        .map(|hit| hit.id.as_str())
 }
 
 /// Render a mod UI tree as a plain text block, one line per row.
@@ -88,19 +167,32 @@ fn line_text(line: &Line<'static>) -> String {
     text
 }
 
-fn render_children(
+fn render_children_at(
     elements: &[UiElement],
     width: usize,
     focused: Option<&str>,
+    row: u16,
+    col: u16,
+    hits: &mut Vec<ButtonHit>,
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     for element in elements {
-        lines.extend(render_element(element, width, focused));
+        let child_row = row.saturating_add(u16::try_from(lines.len()).unwrap_or(u16::MAX));
+        lines.extend(render_element_at(
+            element, width, focused, child_row, col, hits,
+        ));
     }
     lines
 }
 
-fn render_element(element: &UiElement, width: usize, focused: Option<&str>) -> Vec<Line<'static>> {
+fn render_element_at(
+    element: &UiElement,
+    width: usize,
+    focused: Option<&str>,
+    row: u16,
+    col: u16,
+    hits: &mut Vec<ButtonHit>,
+) -> Vec<Line<'static>> {
     match element {
         UiElement::Text { text, style } => {
             let style = ui_style(*style);
@@ -117,6 +209,15 @@ fn render_element(element: &UiElement, width: usize, focused: Option<&str>) -> V
                 format!("[{label}]")
             };
             let text = truncate_to_width(&text, width);
+            let text_width = display_width(&text);
+            if text_width > 0 {
+                hits.push(ButtonHit {
+                    id: id.clone(),
+                    row,
+                    col_start: col,
+                    col_end: col.saturating_add(u16::try_from(text_width).unwrap_or(u16::MAX)),
+                });
+            }
             let style = if is_focused {
                 ui_style(UiStyle::Bold).add_modifier(Modifier::REVERSED)
             } else {
@@ -125,7 +226,7 @@ fn render_element(element: &UiElement, width: usize, focused: Option<&str>) -> V
             vec![Line::from(Span::styled(text, style))]
         }
         UiElement::Box { title, children } => {
-            render_box(title.as_deref(), children, width, focused)
+            render_box_at(title.as_deref(), children, width, focused, row, col, hits)
         }
     }
 }
@@ -135,20 +236,30 @@ fn render_element(element: &UiElement, width: usize, focused: Option<&str>) -> V
 /// children render on their own.
 const MIN_BOX_WIDTH: usize = 5;
 
-fn render_box(
+fn render_box_at(
     title: Option<&str>,
     children: &[UiElement],
     width: usize,
     focused: Option<&str>,
+    row: u16,
+    col: u16,
+    hits: &mut Vec<ButtonHit>,
 ) -> Vec<Line<'static>> {
     if width < MIN_BOX_WIDTH {
-        return render_children(children, width, focused);
+        return render_children_at(children, width, focused, row, col, hits);
     }
 
     let border = Style::new().fg(Color::DarkGray);
     let inner_width = width - 4;
     let mut lines = vec![top_border(title, width, border)];
-    let child_lines = render_children(children, inner_width, focused);
+    let child_lines = render_children_at(
+        children,
+        inner_width,
+        focused,
+        row.saturating_add(1),
+        col.saturating_add(2),
+        hits,
+    );
     if child_lines.is_empty() {
         lines.push(content_line(Line::default(), inner_width, border));
     } else {
@@ -453,5 +564,104 @@ mod tests {
         for line in rendered.lines() {
             assert_eq!(display_width(line), 16, "{line:?}");
         }
+    }
+
+    #[test]
+    fn hits_match_the_rendered_lines_for_nested_boxes() {
+        let tree = vec![UiElement::Box {
+            title: Some("Outer".to_string()),
+            children: vec![
+                text("hi"),
+                UiElement::Box {
+                    title: Some("Inner".to_string()),
+                    children: vec![button("Go")],
+                },
+            ],
+        }];
+        let (lines, hits) = render_mod_ui_with_hits(&tree, 24);
+        assert_eq!(lines, render_mod_ui(&tree, 24), "rendering must not change");
+        assert_eq!(
+            hits,
+            vec![ButtonHit {
+                id: "go".to_string(),
+                row: 3,
+                col_start: 4,
+                col_end: 8,
+            }]
+        );
+    }
+
+    #[test]
+    fn wrapped_text_moves_a_button_down() {
+        let tree = vec![text("one two three four"), button("Ok")];
+        let (lines, hits) = render_mod_ui_with_hits(&tree, 9);
+        assert_eq!(lines.len(), 4, "three text rows and one button row");
+        assert_eq!(hits[0].row, 3);
+        assert_eq!(hits[0].col_start, 0);
+        assert_eq!(hits[0].col_end, 4);
+    }
+
+    #[test]
+    fn the_focus_marker_changes_the_hit_width_but_not_its_origin() {
+        let plain = render_mod_ui_with_hits(&[button("Run")], 20).1;
+        assert_eq!(plain[0].col_start, 0);
+        assert_eq!(plain[0].col_end, 5, "[Run]");
+
+        let focused = render_mod_ui_with_focus_and_hits(&[button("Run")], 20, Some("run")).1;
+        assert_eq!(focused[0].col_start, 0);
+        assert_eq!(focused[0].col_end, 9, "> [Run] <");
+    }
+
+    #[test]
+    fn clicks_on_borders_padding_or_outside_the_block_miss() {
+        let tree = vec![UiElement::Box {
+            title: None,
+            children: vec![button("Go")],
+        }];
+        let (_, hits) = render_mod_ui_with_hits(&tree, 20);
+        // The box renders three rows; the button is on row 1 at columns 2..6.
+        let rect = Rect::new(10, 5, 20, 3);
+        assert_eq!(button_at(rect, 0, 12, 6, &hits), Some("go"));
+        // Left border (block column 0) and the padding after it.
+        assert_eq!(button_at(rect, 0, 10, 6, &hits), None);
+        assert_eq!(button_at(rect, 0, 11, 6, &hits), None);
+        // Right of the label.
+        assert_eq!(button_at(rect, 0, 17, 6, &hits), None);
+        // Left of and above the rect.
+        assert_eq!(button_at(rect, 0, 9, 6, &hits), None);
+        assert_eq!(button_at(rect, 0, 12, 4, &hits), None);
+        // Below the visible block.
+        assert_eq!(button_at(rect, 0, 12, 8, &hits), None);
+    }
+
+    #[test]
+    fn scroll_offset_maps_the_visible_top_row_back_to_the_block() {
+        let tree = vec![text("a"), text("b"), button("Go")];
+        let (_, hits) = render_mod_ui_with_hits(&tree, 10);
+        assert_eq!(hits[0].row, 2);
+
+        let rect = Rect::new(0, 10, 10, 2);
+        assert_eq!(button_at(rect, 2, 1, 10, &hits), Some("go"));
+        // The next visible screen row is block row 3, not a button.
+        assert_eq!(button_at(rect, 2, 1, 11, &hits), None);
+        // Without the scroll offset the same click lands on text row 1.
+        assert_eq!(button_at(rect, 0, 1, 10, &hits), None);
+    }
+
+    #[test]
+    fn a_click_between_buttons_misses_both() {
+        let tree = vec![button("A"), button("B")];
+        let (_, hits) = render_mod_ui_with_hits(&tree, 10);
+        let rect = Rect::new(0, 0, 10, 2);
+        assert_eq!(button_at(rect, 0, 0, 0, &hits), Some("a"));
+        assert_eq!(button_at(rect, 0, 0, 1, &hits), Some("b"));
+        assert_eq!(button_at(rect, 0, 3, 0, &hits), None);
+    }
+
+    #[test]
+    fn a_zero_sized_rect_never_matches() {
+        let (_, hits) = render_mod_ui_with_hits(&[button("Go")], 10);
+        assert_eq!(button_at(Rect::new(0, 0, 0, 1), 0, 0, 0, &hits), None);
+        assert_eq!(button_at(Rect::new(0, 0, 1, 0), 0, 0, 0, &hits), None);
     }
 }

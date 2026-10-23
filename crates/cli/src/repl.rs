@@ -4336,7 +4336,7 @@ impl ReplLoop {
         use coderex_ui::state::{UiState, ViewMode};
         use coderex_ui::terminal::TerminalUi;
         use coderex_ui::vim::{VimAction, VimMode, VimState};
-        use crossterm::event::{Event, KeyCode, KeyModifiers, MouseEventKind};
+        use crossterm::event::{Event, KeyCode, KeyModifiers, MouseButton, MouseEventKind};
         use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
         use std::fmt::Write as _;
         use std::time::{Duration, Instant};
@@ -4608,8 +4608,11 @@ impl ReplLoop {
                 }
             }
 
-            // Draw frame
-            if let Err(e) = terminal_ui.draw(&mut ui_state) {
+            // Draw frame. The block spec lets the transcript render the live
+            // mod UI tree at the pane's width and record where each button
+            // landed, so the mouse handler can hit-test the frame the user saw.
+            let mod_ui_block = mod_ui_focus.spec();
+            if let Err(e) = terminal_ui.draw_with_mod_ui(&mut ui_state, mod_ui_block.as_slice()) {
                 tracing::warn!("TUI draw error: {e}");
             }
 
@@ -4702,65 +4705,12 @@ impl ReplLoop {
                                             if let Some(id) =
                                                 mod_ui_focus.focused_id().map(str::to_string)
                                             {
-                                                let outcome = match self.mod_ui_handle.clone() {
-                                                    Some(handle) => {
-                                                        match tokio::task::spawn_blocking(move || {
-                                                            handle.activate(&id)
-                                                        })
-                                                        .await
-                                                        {
-                                                            Ok(result) => result,
-                                                            Err(error) => Err(format!(
-                                                                "the activation task failed: {error}"
-                                                            )),
-                                                        }
-                                                    }
-                                                    None => Err(
-                                                        "mod UI activation is unavailable in this session"
-                                                            .to_string(),
-                                                    ),
-                                                };
-                                                match outcome {
-                                                    Ok(elements) => {
-                                                        let rendered =
-                                                            coderex_ui::mod_elements::render_mod_ui_text(
-                                                                &elements,
-                                                                coderex_ui::mod_elements::MOD_UI_DEFAULT_WIDTH,
-                                                            );
-                                                        let content = if rendered.is_empty() {
-                                                            "Mod UI action completed with no elements."
-                                                                .to_string()
-                                                        } else {
-                                                            rendered
-                                                        };
-                                                        ui_state.messages.push(Message {
-                                                            role: MessageRole::System,
-                                                            content: content.into(),
-                                                            tool_name: None,
-                                                            streaming: false,
-                                                            folded: false,
-                                                        });
-                                                        let index = ui_state
-                                                            .messages
-                                                            .messages
-                                                            .len()
-                                                            .saturating_sub(1);
-                                                        mod_ui_focus.reset(&elements, index);
-                                                    }
-                                                    Err(error) => {
-                                                        ui_state.messages.push(Message {
-                                                            role: MessageRole::System,
-                                                            content: format!(
-                                                                "Mod UI action failed: {error}"
-                                                            )
-                                                            .into(),
-                                                            tool_name: None,
-                                                            streaming: false,
-                                                            folded: false,
-                                                        });
-                                                    }
-                                                }
-                                                self.persist_interactive_snapshot(&ui_state);
+                                                self.activate_mod_ui_button(
+                                                    &mut ui_state,
+                                                    &mut mod_ui_focus,
+                                                    id,
+                                                )
+                                                .await;
                                             }
                                         }
                                     }
@@ -5364,9 +5314,42 @@ impl ReplLoop {
                             }
                         }
                         Event::Mouse(mouse) => {
+                            // Wheel scrolling keeps working everywhere. A left
+                            // click reaches the transcript only while no modal
+                            // or confirmation owns the screen.
                             match mouse.kind {
                                 MouseEventKind::ScrollUp => ui_state.messages.scroll_up(3),
-                                MouseEventKind::ScrollDown => ui_state.messages.scroll_down_by(3),
+                                MouseEventKind::ScrollDown => {
+                                    ui_state.messages.scroll_down_by(3);
+                                }
+                                MouseEventKind::Down(MouseButton::Left)
+                                    if !ui_state.overlays.is_active()
+                                        && pending_confirmation.is_none()
+                                        && self.pending_mcp_form.is_none() =>
+                                {
+                                    let target = terminal_ui
+                                        .mod_ui_hit_regions()
+                                        .iter()
+                                        .rev()
+                                        .find_map(|region| {
+                                            coderex_ui::mod_elements::button_at(
+                                                region.rect,
+                                                region.scroll_offset,
+                                                mouse.column,
+                                                mouse.row,
+                                                &region.hits,
+                                            )
+                                            .map(str::to_string)
+                                        });
+                                    if let Some(id) = target {
+                                        self.activate_mod_ui_button(
+                                            &mut ui_state,
+                                            &mut mod_ui_focus,
+                                            id,
+                                        )
+                                        .await;
+                                    }
+                                }
                                 _ => {}
                             }
                         }
@@ -6120,9 +6103,73 @@ impl ModUiFocus {
     fn button_count(&self) -> usize {
         self.button_ids.len()
     }
+
+    /// What the transcript needs to draw and hit-test this block.
+    ///
+    /// A block without buttons owns no focus and no interactive region, so it
+    /// needs no spec.
+    fn spec(&self) -> Option<coderex_ui::terminal::ModUiBlockSpec> {
+        Some(coderex_ui::terminal::ModUiBlockSpec {
+            message_index: self.message_index?,
+            content: self.rendered.clone()?,
+            elements: self.elements.clone(),
+            focused: self.focused_id().map(str::to_string),
+        })
+    }
 }
 
 impl ReplLoop {
+    /// Run a mod UI button's activation handler and append the result.
+    ///
+    /// Keyboard activation and mouse clicks share this path, so both render the
+    /// mod's next UI snapshot (or the failure) the same way.
+    async fn activate_mod_ui_button(
+        &self,
+        ui_state: &mut coderex_ui::state::UiState,
+        focus: &mut ModUiFocus,
+        id: String,
+    ) {
+        let outcome = match self.mod_ui_handle.clone() {
+            Some(handle) => match tokio::task::spawn_blocking(move || handle.activate(&id)).await {
+                Ok(result) => result,
+                Err(error) => Err(format!("the activation task failed: {error}")),
+            },
+            None => Err("mod UI activation is unavailable in this session".to_string()),
+        };
+        match outcome {
+            Ok(elements) => {
+                let rendered = coderex_ui::mod_elements::render_mod_ui_text(
+                    &elements,
+                    coderex_ui::mod_elements::MOD_UI_DEFAULT_WIDTH,
+                );
+                let content = if rendered.is_empty() {
+                    "Mod UI action completed with no elements.".to_string()
+                } else {
+                    rendered
+                };
+                ui_state.messages.push(coderex_ui::message_list::Message {
+                    role: coderex_ui::message_list::MessageRole::System,
+                    content: content.into(),
+                    tool_name: None,
+                    streaming: false,
+                    folded: false,
+                });
+                let index = ui_state.messages.messages.len().saturating_sub(1);
+                focus.reset(&elements, index);
+            }
+            Err(error) => {
+                ui_state.messages.push(coderex_ui::message_list::Message {
+                    role: coderex_ui::message_list::MessageRole::System,
+                    content: format!("Mod UI action failed: {error}").into(),
+                    tool_name: None,
+                    streaming: false,
+                    folded: false,
+                });
+            }
+        }
+        self.persist_interactive_snapshot(ui_state);
+    }
+
     /// Redraw the transcript block that owns the focused mod UI button.
     ///
     /// The transcript stores rendered text, so focus is applied by rendering
