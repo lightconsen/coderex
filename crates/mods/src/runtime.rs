@@ -946,6 +946,46 @@ fn configured_timeout_breaker_limit() -> usize {
         .unwrap_or(DEFAULT_TIMEOUT_BREAKER_LIMIT)
 }
 
+/// Budget for the downstream executor when no call deadline is in force.
+///
+/// This is the path where mods are disabled and the caller runs the inner
+/// executor directly; it still must not hang forever.
+const DOWNSTREAM_BUDGET_FALLBACK: Duration = Duration::from_secs(5);
+
+/// Run the inner executor, bounded by `budget`.
+///
+/// QuickJS interrupts JavaScript at the deadline, but a native `block_on` for
+/// the downstream executor is outside the engine. Bounding it here means the
+/// worker returns at the deadline (with a failed result) instead of leaving
+/// the caller to abandon the thread.
+///
+/// The timeout needs the executor's future to yield. An executor that blocks
+/// the worker thread inside a single poll cannot be cut off here; that case
+/// still falls back to the caller's reply budget, which abandons the worker.
+fn run_inner_bounded(
+    runtime: &tokio::runtime::Runtime,
+    budget: Duration,
+    inner: &Arc<dyn HookExecutor>,
+    event: &str,
+    input: &str,
+    context: &HashMap<String, String>,
+) -> HookFireResult {
+    // Build the timer inside `block_on`: `tokio::time::timeout` registers with
+    // the runtime's timer driver as soon as it is constructed.
+    runtime
+        .block_on(async {
+            tokio::time::timeout(budget, inner.fire_hook(event, input, context)).await
+        })
+        .unwrap_or_else(|_| HookFireResult {
+            failed: true,
+            errors: vec![
+                "the downstream hook executor did not finish within the wall-clock budget"
+                    .to_string(),
+            ],
+            ..HookFireResult::default()
+        })
+}
+
 /// Run the downstream executor once while mods are disabled.
 ///
 /// The normal path runs the inner executor on the worker's own current-thread
@@ -962,7 +1002,14 @@ fn run_inner_blocking(
         .enable_all()
         .build()
     {
-        Ok(runtime) => runtime.block_on(inner.fire_hook(event, input, context)),
+        Ok(runtime) => run_inner_bounded(
+            &runtime,
+            DOWNSTREAM_BUDGET_FALLBACK,
+            inner,
+            event,
+            input,
+            context,
+        ),
         Err(error) => HookFireResult {
             failed: true,
             errors: vec![format!(
@@ -1217,6 +1264,21 @@ impl Deadline {
         expired
     }
 
+    /// Time left before the deadline, or `None` when no call is in flight.
+    ///
+    /// Used to bound the native hop into the downstream executor: QuickJS can
+    /// interrupt JavaScript, but not a Rust `block_on`, so that hop gets the
+    /// same budget and returns at the deadline instead of being abandoned.
+    fn remaining(&self) -> Option<Duration> {
+        let state = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state
+            .deadline
+            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+    }
+
     /// Finish a call and report whether the engine interrupted it.
     fn end(&self) -> bool {
         let mut state = self
@@ -1445,6 +1507,7 @@ impl WorkerState {
         let inner = Arc::new(InnerCall {
             runtime: Arc::clone(&self.runtime),
             inner: request.inner.clone(),
+            deadline: self.deadline.clone(),
             called: AtomicBool::new(false),
         });
 
@@ -1485,11 +1548,18 @@ impl WorkerState {
                     && !inner.called.load(Ordering::SeqCst)
                     && let Some(executor) = &request.inner
                 {
-                    let inner_result = self.runtime.block_on(executor.fire_hook(
+                    let budget = self
+                        .deadline
+                        .remaining()
+                        .unwrap_or(DOWNSTREAM_BUDGET_FALLBACK);
+                    let inner_result = run_inner_bounded(
+                        &self.runtime,
+                        budget,
+                        executor,
                         &request.event,
                         &request.input,
                         &request.context,
-                    ));
+                    );
                     result = merge_with_inner(result, inner_result);
                 }
                 Reply { result, timed_out }
@@ -1662,6 +1732,8 @@ fn string_property(object: &Object<'_>, name: &str) -> Option<String> {
 struct InnerCall {
     runtime: Arc<tokio::runtime::Runtime>,
     inner: Option<Arc<dyn HookExecutor>>,
+    /// The call's shared deadline, so the native hop is bounded like the JS.
+    deadline: Deadline,
     /// Whether the executor was already reached, so a fatal harness error
     /// cannot make [`WorkerState::fire`] run it a second time.
     called: AtomicBool,
@@ -1673,12 +1745,15 @@ fn inner_entry(event: &str, input: &str, context_json: &str, call: &Arc<InnerCal
     let inner_context: HashMap<String, String> =
         serde_json::from_str(context_json).unwrap_or_default();
     call.called.store(true, Ordering::SeqCst);
+    let budget = call
+        .deadline
+        .remaining()
+        .unwrap_or(DOWNSTREAM_BUDGET_FALLBACK);
     let result = call
         .inner
         .as_ref()
         .map_or_else(HookFireResult::default, |inner| {
-            call.runtime
-                .block_on(inner.fire_hook(event, input, &inner_context))
+            run_inner_bounded(&call.runtime, budget, inner, event, input, &inner_context)
         });
     serde_json::json!({
         "stop": result.stop,
@@ -3203,6 +3278,54 @@ mod tests {
             result.errors
         );
         assert!(elapsed < Duration::from_secs(2), "took {elapsed:?}");
+    }
+
+    #[test]
+    fn a_cut_off_downstream_run_does_not_abandon_the_worker() {
+        let limits = ModLimits {
+            hook_timeout: Duration::from_millis(100),
+            ..ModLimits::default()
+        };
+        // `calls` lives in the mod's realm: a rebuilt worker would start at 1,
+        // so the follow-up call also proves the realm survived.
+        let runtime = load_with(
+            "let calls = 0; \
+             function register(on) { on('PostToolUse', '*', function ($, e, next) { \
+               calls += 1; const downstream = next(); \
+               return { updatedInput: calls + ':' + downstream.updatedInput }; }); }",
+            limits,
+        );
+
+        let result = fire_with(&runtime, "PostToolUse", "Bash", Arc::new(SlowInner) as _);
+        assert!(result.failed, "{result:?}");
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|error| error.contains("wall-clock budget")),
+            "{:?}",
+            result.errors
+        );
+        assert_eq!(
+            runtime.timeout_abandonments(),
+            0,
+            "the bounded downstream hop returns to the caller; it must not be abandoned"
+        );
+
+        // The same worker and realm keep serving calls, and the downstream
+        // executor still runs on the next one.
+        let inner = Arc::new(RecordingInner::answering(HookFireResult {
+            updated_input: Some("inner".to_string()),
+            ..HookFireResult::default()
+        }));
+        let follow_up = fire_with(&runtime, "PostToolUse", "Bash", Arc::clone(&inner) as _);
+        assert!(!follow_up.failed, "{follow_up:?}");
+        assert_eq!(inner.calls().len(), 1);
+        assert_eq!(
+            follow_up.updated_input.as_deref(),
+            Some("2:inner"),
+            "the mod state from the first call must survive"
+        );
     }
 
     // ── Chaining: next runs the hooks after the current one ─────────────────

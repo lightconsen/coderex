@@ -505,6 +505,14 @@ the JavaScript or the caller's backstop had to detach the worker. CodeRex
 counts them per runtime (one runtime per session) and stops feeding the problem
 after a small threshold.
 
+The downstream settings hooks reached through `next()` share that budget. That
+hop is a native call outside QuickJS, so it is bounded by the call's remaining
+budget: a downstream run that does not finish in time returns a failed result
+at the deadline, the JavaScript resumes and finishes normally, and the worker —
+with its realm and module state — stays alive. The cutoff needs the executor's
+future to yield; an executor that blocks the worker thread inside a single poll
+cannot be stopped this way, and the caller's backstop detaches the worker.
+
 - **What counts:** only a call that exceeds the wall-clock budget — a hook
   `fire`, a nested `next`, or a UI activation handler. Ordinary hook
   exceptions, heap and stack errors, and a worker that disconnects do **not**
