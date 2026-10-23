@@ -11,15 +11,17 @@
 //! runtime runs the matching hooks, and merges what they return into a
 //! [`HookFireResult`](coderex_core::hook_executor::HookFireResult).
 //!
-//! A hook may call `next(e)` to run the downstream (settings) hook chain and
-//! receive its result. `next` is single-use per hook invocation; the hook's
-//! non-null return fields then override the downstream result, `stop` is
-//! OR-ed, and watch paths are deduplicated.
+//! A hook may call `next(e)` to continue the chain: the matching hooks
+//! registered after it run in order, then the downstream (settings) hook
+//! executor, and the combined result is returned to the caller. `next` is
+//! single-use per hook invocation; the hook's non-null return fields then
+//! override the downstream result, `stop` is OR-ed, and watch paths are
+//! deduplicated. A single call may nest at most 64 `next` levels.
 //!
 //! The host API exposed to a mod is deliberately small: `$.session` (read
 //! only), `$.log(message)` and `$.env(name)` over a fixed allowlist. Mods get
-//! no tools, no filesystem, no network and no engine object; `next` only
-//! invokes the host's existing downstream executor.
+//! no tools, no filesystem, no network and no engine object; `next` only runs
+//! the host's existing chain and downstream executor.
 //!
 //! The runtime is opt-in. It is constructed only when [`is_enabled`] is true,
 //! which means `CODEREX_MODS` is truthy or `CODEREX_MODS_DIR` is set. The

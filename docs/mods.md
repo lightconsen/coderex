@@ -3,8 +3,9 @@
 A **mod** is a `.js`, `.jsx`, `.ts` or `.tsx` file that turns CodeRex hook
 events into decisions. It can observe an event, return `stop`, an updated
 input, an updated tool output, or paths to watch, and it can call `next(e)` to
-run the downstream chain and inspect or rewrite its result. It cannot call
-tools, read files, open the network, or reach the engine.
+run the rest of the matching hooks and the downstream chain, and inspect or
+rewrite their combined result. It cannot call tools, read files, open the
+network, or reach the engine.
 
 `.js` files are evaluated as they are. `.jsx`, `.ts` and `.tsx` files are
 transformed first: TypeScript types are stripped and JSX is lowered to the
@@ -46,8 +47,9 @@ function register(on, options) {
     return { updatedToolOutput: e.input + ' finished' };
   });
 
-  // next() runs the downstream chain (the settings hooks) and returns its
-  // result to this hook, which may rewrite it.
+  // next() runs the hooks registered after this one, then the downstream
+  // chain (the settings hooks), and returns their combined result to this
+  // hook, which may rewrite it.
   on('PostToolUse', 'Read', function ($, e, next) {
     const downstream = next();
     if (!downstream.failed) {
@@ -206,32 +208,50 @@ workspace's `ratatui 0.29` pins `unicode-width = "=0.2.0"`. Moving to swc
 would mean upgrading ratatui and the UI crate, which is outside the mod
 runtime.
 
-## `next(e)` — running the downstream chain
+## `next(e)` — continuing the chain
 
 Every hook receives `next` as its third argument:
 
 ```js
 on('PostToolUse', 'Read', function ($, e, next) {
-  const downstream = next();          // run the settings hooks
-  if (downstream.stop) return { stop: true, updatedToolOutput: 'denied by a downstream hook' };
+  const downstream = next();  // the hooks after this one, then the settings hooks
+  if (downstream.stop) return { stop: true, updatedToolOutput: 'denied downstream' };
   return { updatedToolOutput: downstream.updatedToolOutput.toUpperCase() };
 });
 ```
 
-`next` is **synchronous**: it blocks the mod worker while the downstream
-executor runs and returns that executor's result to the JavaScript hook. The
-agent never blocks; it waits on the worker from its own thread.
+`next` is **synchronous**: it blocks the mod worker while the rest of the
+chain runs and returns the combined result to the JavaScript hook. The agent
+never blocks; it waits on the worker from its own thread.
 
 ### What it runs
 
-`next` invokes the request's **inner executor** — the downstream hook chain,
-normally the hooks loaded from settings — with the same event name. It does not
-re-enter the other JavaScript hooks; those are this runtime's own list, and
-they continue to run in order after the current hook returns.
+Matching JavaScript hooks run in registration order. A hook's `next(e)`
+continues that order from just after the calling hook: the remaining matching
+JavaScript hooks run, and then the request's **inner executor** — the
+downstream hook chain, normally the hooks loaded from settings — runs. The
+combined result of the remaining hooks and the inner executor is returned to
+the caller.
 
-What the downstream executor receives:
+With hooks A, B and C registered in that order:
 
-- `next()` — the event's original input and context.
+- `A`'s `next()` runs B, then C, then the inner executor.
+- `B`'s `next()` runs C, then the inner executor.
+- `C`'s `next()` runs only the inner executor.
+
+Because those hooks already ran inside `next`, they do **not** run again when
+the calling hook returns. If no hook in a chain segment calls `next`, the inner
+executor runs once at the end of that segment, after every hook in it, with the
+input the hooks settled on.
+
+A hook that returns `stop` before the inner executor has run prevents it from
+running on that leg of the chain. `stop` is OR-ed across the chain, so a
+downstream stop survives the caller's own return value.
+
+What the remaining chain receives:
+
+- `next()` — the calling hook's own input and context (the original event, or
+  what an enclosing `next` passed down).
 - `next(value)` where `value` is a string — that string becomes the input; the
   context is unchanged.
 - `next(event)` where `value` is an object:
@@ -239,12 +259,14 @@ What the downstream executor receives:
   - `value.context`, when it is a plain object, replaces the context. Only
     string-valued entries are forwarded; other value types are ignored.
 
-The input a hook passes to `next` is the original event input (or what that
-hook chose), not an `updatedInput` returned by an earlier JavaScript hook.
+The input a hook passes to `next` applies to the hooks after it and to the
+inner executor. It does not change the input of hooks that already ran. It is
+also not the `updatedInput` returned by an earlier JavaScript hook.
 
 With no inner executor installed (for example a `ModRuntime` used directly,
-without a `JsHookExecutor` wrapper), `next` returns an empty result:
-`stop: false`, `failed: false`, no updated values, no watch paths, no errors.
+without a `JsHookExecutor` wrapper), the remaining hooks still run and `next`
+returns their combined result with the empty downstream fields: `stop: false`,
+`failed: false`, no updated values, no watch paths, no errors.
 
 ### The result object
 
@@ -252,17 +274,17 @@ without a `JsHookExecutor` wrapper), `next` returns an empty result:
 
 ```js
 {
-  stop: false,                  // downstream asked to stop
-  updatedInput: null,           // downstream input replacement, or null
-  updatedToolOutput: null,      // downstream tool-output replacement, or null
-  watchPaths: [],               // downstream paths to watch
-  errors: [],                   // downstream failure messages
-  failed: false                 // downstream reported a failure
+  stop: false,                  // the chain asked to stop
+  updatedInput: null,           // input replacement, or null
+  updatedToolOutput: null,      // tool-output replacement, or null
+  watchPaths: [],               // paths to watch
+  errors: [],                   // failure messages
+  failed: false                 // a hook or the inner executor failed
 }
 ```
 
-`updatedInput` and `updatedToolOutput` are `null` when the downstream executor
-did not set them.
+`updatedInput` and `updatedToolOutput` are `null` when no hook in the
+downstream chain set them.
 
 ### Single use
 
@@ -279,20 +301,30 @@ on('PostToolUse', '*', function ($, e, next) {
 });
 ```
 
-Each matching hook has its own `next`, so two different hooks on the same
-event each get one downstream run if both call it.
+Each matching hook has its own `next`, positioned at that hook, so it
+continues the chain from wherever the hook sits rather than from the start.
+
+### Chain depth
+
+Nested `next(e)` calls are bounded. One `fire` call may nest at most **64**
+`next` levels. A `next` that would exceed the limit throws a `RangeError`; if
+the hook does not catch it, that hook is marked failed and the error is
+reported. The bound exists so a mod cannot make `next` recurse without limit.
+See [Limits and isolation](#limits-and-isolation).
 
 ### How a hook's result composes with `next`
 
 - **The hook called `next` and returned an object.** Its non-null fields
-  (`updatedInput`, `updatedToolOutput`) win over the downstream result.
-  `stop` is a disjunction: `true` from either side is `true` and cannot be
-  cleared by returning `stop: false`. `watchPaths` from both sides are
+  (`updatedInput`, `updatedToolOutput`) win over the combined downstream
+  result. `stop` is a disjunction: `true` from either side is `true` and cannot
+  be cleared by returning `stop: false`. `watchPaths` from both sides are
   combined and deduplicated. Downstream `errors` and `failed` are carried
   forward.
 - **The hook called `next` and returned `undefined` / `null`.** The downstream
   result passes through unchanged.
 - **The hook did not call `next`.** It decides on its own, exactly as before.
+  Its result is merged with the earlier hooks' results, and the inner executor
+  at the end of the chain runs later and wins an updated-value conflict.
 - **The hook threw after calling `next`.** The downstream run still counts,
   its result is preserved, and the hook is marked `failed` with the exception
   message. On a gating event that also sets `stop`.
@@ -300,8 +332,8 @@ event each get one downstream run if both call it.
   after the JavaScript hooks finish. If no hook called `next`, it runs once at
   the end with the possibly updated input, exactly as in phase 1.
 
-The timeout budget covers the **whole** call, including the downstream run.
-See [Limits and isolation](#limits-and-isolation).
+The timeout budget covers the **whole** call: every hook, every nested `next`,
+and the inner executor. See [Limits and isolation](#limits-and-isolation).
 
 ## The `$` host API
 
@@ -327,8 +359,9 @@ a mod legitimately needs come from `$.session`.
 
 There is no `$.tools`, `$.files`, `$.engine`, `$`-level filesystem, `require`,
 `process`, `fetch`, `XMLHttpRequest`, timer or network access. `next` is the
-only capability added on top of the phase-1 surface, and it only invokes the
-host's existing downstream hook executor — it exposes no engine object.
+only capability added on top of the phase-1 surface, and it only continues the
+host's existing hook chain and downstream executor — it exposes no engine
+object.
 
 ## Limits and isolation
 
@@ -340,22 +373,23 @@ thread, and `next` must resume in the same context that called it. Each
 - **one `Context`** on that thread;
 - **one realm per loaded mod**, created at load;
 - **one small current-thread `tokio` runtime** on the worker, used only to
-  `block_on` the downstream executor when a hook calls `next`.
+  `block_on` the downstream executor when the chain reaches it.
 
 `ModRuntime` itself holds strings and configuration plus a channel, which is
 what lets `JsHookExecutor` be shared as `Arc<dyn HookExecutor>`.
 
 `fire` sends a request to the worker and waits for its reply. The worker runs
-the matching JavaScript hooks in order, then (unless a hook called `next` or
-stopped the event) the downstream executor. A timeout does not stop the
-engine; the caller detaches the worker and reports a hook error. The next
-`fire` starts a fresh worker, which reloads the mods.
+the matching JavaScript hooks and any nested `next` calls as one chain, then
+(unless a hook called `next` or stopped the event) the downstream executor. A
+timeout does not stop the engine; the caller detaches the worker and reports a
+hook error. The next `fire` starts a fresh worker, which reloads the mods.
 
 | Limit | Default | Behaviour |
 | --- | --- | --- |
-| Wall clock | 5 s per call | Covers every matching JavaScript hook **and** the downstream run. The calling thread stops waiting and reports a hook error. |
+| Wall clock | 5 s per call | Covers every matching JavaScript hook, every nested `next` **and** the downstream run. The calling thread stops waiting and reports a hook error. |
+| Chain depth | 64 nested `next(e)` calls per call | The 65th `next` throws a `RangeError`; uncaught, it marks that hook failed. |
 | Loop iterations | 10,000,000 per frame | `while (true) {}` throws an engine runtime-limit error. |
-| Recursion | 256 nested calls | A runaway recursive hook throws instead of overflowing the stack. |
+| Recursion | 512 nested calls | A runaway recursive hook throws instead of overflowing the stack. One `next` level uses about four frames, so this ceiling is above the chain limit's frames. |
 | Stack values | 10,240 | The engine's stack ceiling. |
 | Mod file size | 1 MiB | Larger files are skipped with a load error. |
 | Hooks per mod | 256 | `on` throws when the cap is reached. |
@@ -385,17 +419,19 @@ serialized by the worker, so a detached runaway delays only its own runtime.
 `JsHookExecutor` implements `coderex_core::hook_executor::HookExecutor` and can
 wrap the existing `HookRegistry`:
 
-1. JavaScript hooks run in load order; each one may call `next(e)` to run the
-   settings hooks immediately and inspect or rewrite the result.
+1. JavaScript hooks run in load order. Each one may call `next(e)` to run the
+   hooks registered after it and then the settings hooks immediately, and to
+   inspect or rewrite their combined result.
 2. If a JavaScript hook returns `stop` and no hook called `next`, the inner
    executor is not called.
-3. If no hook called `next`, the inner executor runs with the possibly updated
-   input. Results merge as before: `stop` and `failed` are OR-ed, the inner
-   executor wins an `updatedInput` / `updatedToolOutput` conflict (it ran
+3. If no hook called `next`, the inner executor runs once with the possibly
+   updated input. Results merge as before: `stop` and `failed` are OR-ed, the
+   inner executor wins an `updatedInput` / `updatedToolOutput` conflict (it ran
    later), watch paths are combined and deduplicated, and errors are appended.
 4. If a hook called `next`, that hook's own non-null fields win over the
-   downstream result instead (see the composition rules above), and the inner
-   executor is not run again at the end.
+   combined downstream result instead (see the composition rules above), and
+   the inner executor is not run again at the end. The settings hooks still
+   ran inside `next` unless an earlier hook stopped that leg of the chain.
 
 The runtime is synchronous; `fire_hook` moves the blocking wait to
 `tokio::task::spawn_blocking`, so it does not block an async worker.

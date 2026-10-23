@@ -17,13 +17,10 @@ use std::time::Duration;
 
 use boa_engine::{
     Context, Finalize, JsObject, JsResult, JsString, JsValue, NativeFunction, Source, Trace,
-    js_string,
-    object::ObjectInitializer,
-    object::builtins::JsArray,
-    property::{Attribute, PropertyKey},
+    js_string, object::ObjectInitializer, object::builtins::JsArray, property::Attribute,
 };
 use coderex_core::hook_executor::{HookExecutor, HookFireResult};
-use coderex_core::ui_protocol::{UiElement, parse_ui_elements};
+use coderex_core::ui_protocol::parse_ui_elements;
 
 use crate::transform;
 
@@ -59,6 +56,13 @@ const MAX_MOD_BYTES: u64 = 1_048_576;
 /// Most hooks a single mod may register.
 const MAX_HOOKS_PER_MOD: usize = 256;
 
+/// Most nested `next(e)` calls one [`ModRuntime::fire`] may perform.
+///
+/// Each `next(e)` continues the chain after the calling hook, so the depth is
+/// the number of chained hooks plus the final one. Without this bound a mod
+/// could build an unbounded `next` recursion; exceeding it is a hook error.
+const MAX_CHAIN_DEPTH: usize = 64;
+
 /// The session facts a mod may read through `$.session`.
 ///
 /// These are captured when the runtime is constructed so a mod cannot observe
@@ -92,6 +96,10 @@ pub struct ModLimits {
     /// infinite loop terminates even when the wall-clock budget has not fired.
     pub max_loop_iterations: u64,
     /// Most nested JavaScript calls.
+    ///
+    /// One `next(e)` level uses about four frames, so this must stay above
+    /// [`MAX_CHAIN_DEPTH`]'s frames for a bounded chain to reach the chain's
+    /// own error rather than an engine runtime-limit error.
     pub recursion_limit: usize,
     /// Most values one JavaScript stack may hold.
     pub stack_size_limit: usize,
@@ -102,7 +110,12 @@ impl Default for ModLimits {
         Self {
             hook_timeout: Duration::from_secs(5),
             max_loop_iterations: 10_000_000,
-            recursion_limit: 256,
+            // One `next` level costs roughly four JavaScript frames
+            // (`__coderExChain` → `__coderExCall` → hook → `next`), so the
+            // engine ceiling must stay above [`MAX_CHAIN_DEPTH`]'s frames or
+            // a bounded chain would die as a runtime-limit error before the
+            // chain's own limit fires.
+            recursion_limit: 512,
             stack_size_limit: 10 * 1024,
         }
     }
@@ -156,17 +169,6 @@ struct WorkerHook {
     hook_index: usize,
     event: String,
     matcher: String,
-}
-
-/// What a single hook asked the host to do.
-#[derive(Debug, Clone, Default)]
-struct HookEffect {
-    stop: bool,
-    updated_input: Option<String>,
-    updated_tool_output: Option<String>,
-    watch_paths: Vec<String>,
-    /// Elements the hook staged with `$.ui.render`, in call order.
-    ui: Vec<UiElement>,
 }
 
 /// Everything the worker needs to (re)load the mods.
@@ -358,15 +360,17 @@ impl ModRuntime {
     }
 
     /// Fire `event` against every matching hook, with `inner` available as the
-    /// downstream chain behind `next(e)`.
+    /// downstream executor behind `next(e)`.
     ///
     /// Hooks run in load order (files sorted by name, then registration
     /// order). A hook that does not call `next` behaves exactly as before: its
     /// return value is merged into the result. A hook that calls `next`
-    /// receives the downstream result and its own non-empty fields win over
-    /// it; `stop` is OR-ed and watch paths are deduplicated. When no hook
-    /// called `next`, `inner` runs after the JavaScript hooks with the
-    /// possibly updated input, exactly like a plain
+    /// continues the chain: the hooks registered after it run in order and
+    /// then, unless a hook stopped the chain or a deeper `next` already ran
+    /// it, `inner`. The caller receives that combined result and its own
+    /// non-empty fields win over it; `stop` is OR-ed and watch paths are
+    /// deduplicated. When no hook called `next`, `inner` runs once after the
+    /// JavaScript hooks with the possibly updated input, exactly like a plain
     /// [`JsHookExecutor`](crate::JsHookExecutor) delegation.
     ///
     /// An exception, timeout or engine limit becomes an entry in
@@ -392,20 +396,9 @@ impl ModRuntime {
             reply,
         };
 
-        let result = self.dispatch(request, &reply_receiver);
-        match result {
+        match self.dispatch(request, &reply_receiver) {
             Ok(result) => result,
-            Err(error) => {
-                let mut failed = HookFireResult {
-                    failed: true,
-                    errors: vec![error],
-                    ..HookFireResult::default()
-                };
-                if is_gating_event(event) {
-                    failed.stop = true;
-                }
-                failed
-            }
+            Err(error) => failure_result(event, error),
         }
     }
 
@@ -486,7 +479,7 @@ impl ModRuntimeBuilder {
             limits: ModLimits {
                 hook_timeout: Duration::from_secs(5),
                 max_loop_iterations: 10_000_000,
-                recursion_limit: 256,
+                recursion_limit: 512,
                 stack_size_limit: 10 * 1024,
             },
         }
@@ -666,8 +659,9 @@ impl WorkerState {
     fn load(config: &WorkerConfig, runtime: Arc<tokio::runtime::Runtime>) -> Result<Self, String> {
         let mut context = Context::default();
         apply_limits(&mut context, &config.limits);
+        let harness = MAIN_HARNESS.replace("@@MAX_CHAIN_DEPTH@@", &MAX_CHAIN_DEPTH.to_string());
         context
-            .eval(Source::from_bytes(MAIN_HARNESS.as_bytes()))
+            .eval(Source::from_bytes(harness.as_bytes()))
             .map_err(|error| format!("could not install the runtime harness: {error}"))?;
 
         let registry = context
@@ -745,129 +739,111 @@ impl WorkerState {
     }
 
     /// Run every matching JavaScript hook for one request.
+    ///
+    /// The chain itself lives in the main-realm harness: each hook's `next(e)`
+    /// calls back into it for the hooks registered after that hook, then the
+    /// inner executor. All this function does is hand the matching hooks to
+    /// [`__coderExRun`] and read the merged result back.
     fn fire(&mut self, request: &Request) -> HookFireResult {
         let context_json = serde_json::to_string(&request.context).unwrap_or_else(|_| "{}".into());
-        let matching: Vec<WorkerHook> = self
+        let chain = self.chain_json(request);
+        let inner = Arc::new(InnerCall {
+            runtime: Arc::clone(&self.runtime),
+            inner: request.inner.clone(),
+            called: AtomicBool::new(false),
+        });
+        match self.run_chain(&chain, &context_json, request, &inner) {
+            Ok(mut result) => {
+                if result.failed && is_gating_event(&request.event) {
+                    result.stop = true;
+                }
+                result
+            }
+            Err(error) => {
+                let mut result = failure_result(&request.event, error);
+                // An engine-limit error aborts the whole harness call, so the
+                // chain could not reach its inner-executor step. Preserve the
+                // old behaviour for a non-gating event: when the inner
+                // executor never ran, run it once with the request input.
+                if !result.stop && !inner.called.load(Ordering::SeqCst) {
+                    if let Some(executor) = &request.inner {
+                        let inner_result = self.runtime.block_on(executor.fire_hook(
+                            &request.event,
+                            &request.input,
+                            &request.context,
+                        ));
+                        result = merge_with_inner(result, inner_result);
+                    }
+                }
+                result
+            }
+        }
+    }
+
+    /// The matching hooks, in registration order, as the harness reads them.
+    fn chain_json(&self, request: &Request) -> String {
+        let hooks: Vec<serde_json::Value> = self
             .hooks
             .iter()
             .filter(|hook| {
                 event_matches(&hook.event, &request.event)
                     && matcher_matches(&hook.matcher, &request.input)
             })
-            .cloned()
+            .map(|hook| {
+                serde_json::json!({
+                    "m": hook.mod_index,
+                    "h": hook.hook_index,
+                    "name": self
+                        .mod_names
+                        .get(hook.mod_index)
+                        .map_or("<unknown>", String::as_str),
+                })
+            })
             .collect();
-
-        let mut combined = HookFireResult::default();
-        let mut next_called = false;
-
-        for hook in &matching {
-            let next = Arc::new(NextCall::new(
-                request.inner.clone(),
-                Arc::clone(&self.runtime),
-                request.event.clone(),
-                request.input.clone(),
-                request.context.clone(),
-            ));
-            let outcome =
-                self.invoke_hook(hook, &request.event, &request.input, &context_json, &next);
-            next.close();
-            match outcome {
-                Ok(effect) => {
-                    if let Some(downstream) = next.take_downstream() {
-                        next_called = true;
-                        apply_result(
-                            &mut combined,
-                            merge_effect_with_downstream(effect, downstream),
-                        );
-                    } else {
-                        apply_effect(&mut combined, effect);
-                    }
-                }
-                Err(error) => {
-                    if let Some(downstream) = next.take_downstream() {
-                        next_called = true;
-                        apply_result(&mut combined, downstream);
-                    }
-                    combined.failed = true;
-                    combined.errors.push(format!(
-                        "mod `{}`: {error}",
-                        self.mod_names
-                            .get(hook.mod_index)
-                            .map_or("<unknown>", String::as_str)
-                    ));
-                }
-            }
-        }
-
-        if combined.failed && is_gating_event(&request.event) {
-            combined.stop = true;
-        }
-
-        if !next_called && !combined.stop {
-            if let Some(inner) = &request.inner {
-                let inner_input = combined
-                    .updated_input
-                    .clone()
-                    .unwrap_or_else(|| request.input.clone());
-                let inner_result = self.runtime.block_on(inner.fire_hook(
-                    &request.event,
-                    &inner_input,
-                    &request.context,
-                ));
-                combined = merge_with_inner(combined, inner_result);
-            }
-        }
-
-        combined.watch_paths = dedupe_paths(combined.watch_paths);
-        combined
+        serde_json::to_string(&hooks).unwrap_or_else(|_| "[]".to_string())
     }
 
-    /// Invoke one hook in its realm through the main-realm harness.
-    fn invoke_hook(
+    /// Call the harness chain runner with one native inner-executor function.
+    fn run_chain(
         &mut self,
-        hook: &WorkerHook,
-        event: &str,
-        input: &str,
+        chain: &str,
         context_json: &str,
-        next: &Arc<NextCall>,
-    ) -> Result<HookEffect, String> {
-        let next_function = NativeFunction::from_copy_closure_with_captures(
-            next_entry,
-            NextCapture {
-                call: Arc::clone(next),
+        request: &Request,
+        inner_call: &Arc<InnerCall>,
+    ) -> Result<HookFireResult, String> {
+        // The chain calls this at its end; it owns only Rust state, which is
+        // why the capture can leave it untraced.
+        let inner = NativeFunction::from_copy_closure_with_captures(
+            inner_entry,
+            InnerCapture {
+                call: Arc::clone(inner_call),
             },
         );
         let realm = self.context.realm().clone();
-        let next_function = JsObject::from(next_function.to_js_function(&realm));
+        let inner = JsValue::from(JsObject::from(inner.to_js_function(&realm)));
 
-        let helper = self
+        let runner = self
             .context
             .global_object()
-            .get(js_string!("__coderExCall"), &mut self.context)
+            .get(js_string!("__coderExRun"), &mut self.context)
             .map_err(|error| format!("could not read the runtime harness: {error}"))?;
-        let callable = helper
+        let runner = runner
             .as_callable()
             .cloned()
             .ok_or_else(|| "the runtime harness is missing".to_string())?;
 
         let args = [
-            JsValue::from(hook.mod_index),
-            JsValue::from(hook.hook_index),
-            JsString::from(event).into(),
-            JsString::from(input).into(),
+            JsString::from(chain).into(),
+            JsString::from(request.event.clone()).into(),
+            JsString::from(request.input.clone()).into(),
             JsString::from(context_json).into(),
-            JsValue::from(next_function),
+            inner,
+            JsValue::from(is_gating_event(&request.event)),
         ];
-        let value = callable
+        let value = runner
             .call(&JsValue::undefined(), &args, &mut self.context)
-            .map_err(|error| format!("the hook could not be called: {error}"))?;
-        let text = value
-            .to_string(&mut self.context)
-            .map_err(|error| format!("could not read the hook result: {error}"))?
-            .to_std_string_escaped();
-        let reply: serde_json::Value = serde_json::from_str(&text)
-            .map_err(|error| format!("the hook returned unreadable output: {error}"))?;
-        parse_reply(&reply)
+            .map_err(|error| format!("the hook chain could not be called: {error}"))?;
+        parse_chain_result(&value, &mut self.context)
     }
 }
 
@@ -921,208 +897,127 @@ fn load_mod_in_realm(
         .map_err(|error| format!("register() did not leave readable hook registrations: {error}"))
 }
 
-/// A `next(e)` invocation, shared between the native function and the worker.
-struct NextCall {
-    used: AtomicBool,
-    inner: Option<Arc<dyn HookExecutor>>,
+/// The inner executor the JavaScript chain runs at its end.
+struct InnerCall {
     runtime: Arc<tokio::runtime::Runtime>,
-    event: String,
-    input: String,
-    context: HashMap<String, String>,
-    downstream: Mutex<Option<HookFireResult>>,
+    inner: Option<Arc<dyn HookExecutor>>,
+    /// Whether the executor was already reached, so a fatal harness error
+    /// cannot make [`WorkerState::fire`] run it a second time.
+    called: AtomicBool,
 }
 
-impl NextCall {
-    fn new(
-        inner: Option<Arc<dyn HookExecutor>>,
-        runtime: Arc<tokio::runtime::Runtime>,
-        event: String,
-        input: String,
-        context: HashMap<String, String>,
-    ) -> Self {
-        Self {
-            used: AtomicBool::new(false),
-            inner,
-            runtime,
-            event,
-            input,
-            context,
-            downstream: Mutex::new(None),
-        }
-    }
-
-    /// The downstream result, if this hook successfully called `next`.
-    fn take_downstream(&self) -> Option<HookFireResult> {
-        self.downstream
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take()
-    }
-
-    /// Expire the handle after its hook has returned.
-    ///
-    /// A hook that stashed `next` somewhere and calls it during a later event
-    /// gets the single-use error instead of running the stale downstream
-    /// chain.
-    fn close(&self) {
-        self.used.store(true, Ordering::SeqCst);
-    }
-
-    /// The body of `next(e)`: run the inner executor synchronously and return
-    /// its result as a JavaScript object.
-    fn invoke(&self, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
-        if self.used.swap(true, Ordering::SeqCst) {
-            return Err(boa_engine::JsNativeError::typ()
-                .with_message("next(e) may only be called once per hook invocation")
-                .into());
-        }
-
-        let mut input = self.input.clone();
-        let mut inner_context = self.context.clone();
-        if let Some(argument) = args.first() {
-            if let Some(text) = argument.as_string() {
-                input = text.to_std_string_escaped();
-            } else if let Some(object) = argument.as_object() {
-                if let Ok(value) = object.get(js_string!("input"), context) {
-                    if let Some(text) = value.as_string() {
-                        input = text.to_std_string_escaped();
-                    }
-                }
-                if let Ok(value) = object.get(js_string!("context"), context) {
-                    if let Some(modified) = context_from_value(&value, context) {
-                        inner_context = modified;
-                    }
-                }
-            }
-        }
-
-        let result = self
-            .inner
-            .as_ref()
-            .map_or_else(HookFireResult::default, |inner| {
-                self.runtime
-                    .block_on(inner.fire_hook(&self.event, &input, &inner_context))
-            });
-        *self
-            .downstream
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(result.clone());
-
-        Ok(result_to_js(&result, context))
-    }
-}
-
-/// The capture stored in the native `next` function.
+/// The capture stored in the native inner-executor function.
 ///
-/// It holds only Rust-owned state (an `Arc`), never a garbage-collected handle,
-/// so it is safe to leave untraced.
+/// The chain is JavaScript; only the host executor is native. The capture holds
+/// Rust-owned state (an `Arc`), never a garbage-collected handle, so it is safe
+/// to leave untraced.
 #[derive(Finalize, Trace)]
-struct NextCapture {
+struct InnerCapture {
     #[unsafe_ignore_trace]
-    call: Arc<NextCall>,
+    call: Arc<InnerCall>,
 }
 
-fn next_entry(
+/// The body of the chain's final step: run the inner executor synchronously
+/// and return its result as JSON for the harness to merge.
+#[allow(clippy::unnecessary_wraps)] // `NativeFunction` requires a `JsResult`.
+fn inner_entry(
     _this: &JsValue,
     args: &[JsValue],
-    capture: &NextCapture,
-    context: &mut Context,
+    capture: &InnerCapture,
+    _context: &mut Context,
 ) -> JsResult<JsValue> {
-    capture.call.invoke(args, context)
+    let event = string_arg(args, 0);
+    let input = string_arg(args, 1);
+    let context_json = string_arg(args, 2);
+    let inner_context: HashMap<String, String> =
+        serde_json::from_str(&context_json).unwrap_or_default();
+    capture.call.called.store(true, Ordering::SeqCst);
+    let result = capture
+        .call
+        .inner
+        .as_ref()
+        .map_or_else(HookFireResult::default, |inner| {
+            capture
+                .call
+                .runtime
+                .block_on(inner.fire_hook(&event, &input, &inner_context))
+        });
+    let value = serde_json::json!({
+        "stop": result.stop,
+        "updatedInput": result.updated_input,
+        "updatedToolOutput": result.updated_tool_output,
+        "watchPaths": result.watch_paths,
+        "errors": result.errors,
+        "failed": result.failed,
+        "ui": result.ui,
+    });
+    Ok(JsString::from(value.to_string()).into())
 }
 
-/// Read a plain object of string context entries.
-fn context_from_value(value: &JsValue, context: &mut Context) -> Option<HashMap<String, String>> {
-    let object = value.as_object()?;
-    let keys = object.own_property_keys(context).ok()?;
-    let mut entries = HashMap::new();
-    for key in keys {
-        let name = match &key {
-            PropertyKey::String(name) => name.to_std_string_escaped(),
-            PropertyKey::Index(index) => index.get().to_string(),
-            PropertyKey::Symbol(_) => continue,
-        };
-        if let Ok(value) = object.get(key.clone(), context) {
-            if let Some(text) = value.as_string() {
-                entries.insert(name, text.to_std_string_escaped());
-            }
-        }
-    }
-    Some(entries)
+fn string_arg(args: &[JsValue], index: usize) -> String {
+    args.get(index)
+        .and_then(JsValue::as_string)
+        .map_or_else(String::new, JsString::to_std_string_escaped)
 }
 
-/// Convert a downstream result into the object `next(e)` returns to JavaScript.
-fn result_to_js(result: &HookFireResult, context: &mut Context) -> JsValue {
-    let watch_paths = JsArray::from_iter(
-        result
-            .watch_paths
-            .iter()
-            .map(|path| JsString::from(path.clone()).into()),
-        context,
-    );
-    let errors = JsArray::from_iter(
-        result
-            .errors
-            .iter()
-            .map(|error| JsString::from(error.clone()).into()),
-        context,
-    );
+/// Read the harness chain's merged result back.
+fn parse_chain_result(value: &JsValue, context: &mut Context) -> Result<HookFireResult, String> {
+    let text = value
+        .to_string(context)
+        .map_err(|error| format!("could not read the hook chain result: {error}"))?
+        .to_std_string_escaped();
+    let reply: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|error| format!("the hook chain returned unreadable output: {error}"))?;
 
-    let object = ObjectInitializer::new(context)
-        .property(js_string!("stop"), result.stop, Attribute::all())
-        .property(
-            js_string!("updatedInput"),
-            optional_string(result.updated_input.as_ref()),
-            Attribute::all(),
-        )
-        .property(
-            js_string!("updatedToolOutput"),
-            optional_string(result.updated_tool_output.as_ref()),
-            Attribute::all(),
-        )
-        .property(
-            js_string!("watchPaths"),
-            JsObject::from(watch_paths),
-            Attribute::all(),
-        )
-        .property(
-            js_string!("errors"),
-            JsObject::from(errors),
-            Attribute::all(),
-        )
-        .property(js_string!("failed"), result.failed, Attribute::all())
-        .build();
-    object.into()
-}
+    let ui = match reply.get("ui") {
+        None | Some(serde_json::Value::Null) => Vec::new(),
+        Some(value) => parse_ui_elements(value)
+            .map_err(|error| format!("the hook chain returned invalid UI: {error}"))?,
+    };
+    let strings = |name: &str| {
+        reply
+            .get(name)
+            .and_then(serde_json::Value::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(|value| value.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
 
-fn optional_string(value: Option<&String>) -> JsValue {
-    value.map_or_else(JsValue::null, |text| JsString::from(text.clone()).into())
-}
-
-/// Merge a hook's own return value over the downstream result it saw.
-///
-/// The hook's non-null fields win, `stop` is a disjunction, and watch paths
-/// are combined and deduplicated. Downstream errors and failure state are
-/// carried forward.
-fn merge_effect_with_downstream(effect: HookEffect, downstream: HookFireResult) -> HookFireResult {
-    let mut watch_paths = effect.watch_paths;
-    watch_paths.extend(downstream.watch_paths);
-    let mut ui = effect.ui;
-    ui.extend(downstream.ui);
-    HookFireResult {
-        stop: effect.stop || downstream.stop,
-        updated_input: effect.updated_input.or(downstream.updated_input),
-        updated_tool_output: effect
-            .updated_tool_output
-            .or(downstream.updated_tool_output),
-        errors: downstream.errors,
-        failed: downstream.failed,
-        watch_paths: dedupe_paths(watch_paths),
+    Ok(HookFireResult {
+        stop: reply
+            .get("stop")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        updated_input: string_field(&reply, "updatedInput"),
+        updated_tool_output: string_field(&reply, "updatedToolOutput"),
+        watch_paths: strings("watchPaths"),
+        errors: strings("errors"),
+        failed: reply
+            .get("failed")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
         ui,
-    }
+    })
 }
 
-/// Merge the JavaScript result with the inner executor's result.
+/// A result that reports `error` as a hook failure, fail-closed on a gate.
+fn failure_result(event: &str, error: String) -> HookFireResult {
+    let mut result = HookFireResult {
+        failed: true,
+        errors: vec![error],
+        ..HookFireResult::default()
+    };
+    if is_gating_event(event) {
+        result.stop = true;
+    }
+    result
+}
+
+/// Merge a failure with the inner executor's result.
 ///
 /// Both sides ran, so `stop` and `failed` are disjunctions. The inner executor
 /// ran second and wins an `updated_*` conflict; a side that left the field
@@ -1147,84 +1042,15 @@ fn merge_with_inner(js: HookFireResult, inner: HookFireResult) -> HookFireResult
     }
 }
 
-fn apply_effect(combined: &mut HookFireResult, effect: HookEffect) {
-    combined.stop |= effect.stop;
-    if effect.updated_input.is_some() {
-        combined.updated_input = effect.updated_input;
-    }
-    if effect.updated_tool_output.is_some() {
-        combined.updated_tool_output = effect.updated_tool_output;
-    }
-    combined.watch_paths.extend(effect.watch_paths);
-    combined.ui.extend(effect.ui);
-}
-
-fn apply_result(combined: &mut HookFireResult, result: HookFireResult) {
-    combined.stop |= result.stop;
-    if result.updated_input.is_some() {
-        combined.updated_input = result.updated_input;
-    }
-    if result.updated_tool_output.is_some() {
-        combined.updated_tool_output = result.updated_tool_output;
-    }
-    combined.watch_paths.extend(result.watch_paths);
-    combined.failed |= result.failed;
-    combined.errors.extend(result.errors);
-    combined.ui.extend(result.ui);
-}
-
-fn parse_reply(reply: &serde_json::Value) -> Result<HookEffect, String> {
-    match reply.get("ok").and_then(serde_json::Value::as_bool) {
-        Some(true) => {}
-        _ => {
-            return Err(reply
-                .get("error")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("the hook failed without an error message")
-                .to_string());
+fn dedupe_paths(paths: Vec<String>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut unique = Vec::with_capacity(paths.len());
+    for path in paths {
+        if seen.insert(path.clone()) {
+            unique.push(path);
         }
     }
-
-    // `$.ui.render` stages elements even when the hook returns `undefined`, so
-    // read them before looking at the decision.
-    let ui = match reply.get("ui") {
-        None | Some(serde_json::Value::Null) => Vec::new(),
-        Some(value) => parse_ui_elements(value)
-            .map_err(|error| format!("the hook returned invalid UI: {error}"))?,
-    };
-
-    let Some(result) = reply.get("result") else {
-        return Ok(HookEffect {
-            ui,
-            ..HookEffect::default()
-        });
-    };
-    if result.is_null() {
-        return Ok(HookEffect {
-            ui,
-            ..HookEffect::default()
-        });
-    }
-
-    Ok(HookEffect {
-        stop: result
-            .get("stop")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false),
-        updated_input: string_field(result, "updatedInput"),
-        updated_tool_output: string_field(result, "updatedToolOutput"),
-        watch_paths: result
-            .get("watchPaths")
-            .and_then(serde_json::Value::as_array)
-            .map(|paths| {
-                paths
-                    .iter()
-                    .filter_map(|path| path.as_str().map(str::to_string))
-                    .collect()
-            })
-            .unwrap_or_default(),
-        ui,
-    })
+    unique
 }
 
 fn string_field(value: &serde_json::Value, name: &str) -> Option<String> {
@@ -1533,12 +1359,16 @@ const JSX_RUNTIME: &str = r#"
 })();
 "#;
 
-/// The main realm's harness: the per-mod registry and the hook dispatcher.
+/// The main realm's harness: the per-mod registry, the hook dispatcher and the
+/// `next(e)` chain.
 ///
-/// The dispatcher runs in the main realm but calls the hook function and passes
-/// it the `$` captured in its own realm, so every mod keeps its realm (and its
-/// globals) to itself.
-const MAIN_HARNESS: &str = r"
+/// The dispatcher and the chain run in the main realm but call each hook
+/// function with the `$` captured in that hook's own realm, so every mod keeps
+/// its realm (and its globals) to itself. The chain is JavaScript because a
+/// native `next` only has `&mut Context` while the hook is on the stack; the
+/// one native step, `innerFn`, runs the host's downstream executor at the end
+/// of a chain segment.
+const MAIN_HARNESS: &str = r#"
 'use strict';
 globalThis.__coderExMods = [];
 
@@ -1618,7 +1448,213 @@ globalThis.__coderExCall = function (modIndex, hookIndex, event, input, contextJ
     return JSON.stringify({ ok: false, error: message });
   }
 };
-";
+
+// ── The chain ───────────────────────────────────────────────────────────────
+//
+// A merged result has exactly the shape of HookFireResult: `stop`,
+// `updatedInput` and `updatedToolOutput` (string or null), `watchPaths`,
+// `errors`, `failed`, and `ui`. `__coderExChain` runs `hooks[start..]` in
+// order. If a hook calls `next`, that hook's closure recurses for the hooks
+// after it, the recursion runs the inner executor when no deeper hook called
+// `next`, and this level then merges the hook's own return value over that
+// downstream result and stops: the remaining hooks already ran inside `next`.
+// If no hook at this level calls `next`, the loop runs them all and then the
+// inner executor once.
+
+globalThis.__coderExEmptyResult = function () {
+  return {
+    stop: false,
+    updatedInput: null,
+    updatedToolOutput: null,
+    watchPaths: [],
+    errors: [],
+    failed: false,
+    ui: []
+  };
+};
+
+globalThis.__coderExDedupe = function (paths) {
+  // A null prototype keeps a path such as "__proto__" an ordinary entry.
+  const seen = Object.create(null);
+  const unique = [];
+  for (let index = 0; index < paths.length; index++) {
+    const path = paths[index];
+    if (seen[path] !== true) {
+      seen[path] = true;
+      unique.push(path);
+    }
+  }
+  return unique;
+};
+
+// What `next(e)` hands back to the hook: the public result, without the UI
+// snapshot, and detached from the stored downstream result so a hook that
+// mutates it cannot change what is merged.
+globalThis.__coderExPublicResult = function (result) {
+  return {
+    stop: result.stop,
+    updatedInput: result.updatedInput,
+    updatedToolOutput: result.updatedToolOutput,
+    watchPaths: result.watchPaths.slice(),
+    errors: result.errors.slice(),
+    failed: result.failed
+  };
+};
+
+// The calling hook's non-null fields win; `stop` is OR-ed; watch paths are
+// combined and deduplicated; downstream errors and failure state are carried.
+globalThis.__coderExMergeEffect = function (effect, ui, downstream) {
+  const ownWatchPaths = (effect !== null && Array.isArray(effect.watchPaths))
+    ? effect.watchPaths
+    : [];
+  return {
+    stop: (effect !== null && effect.stop === true) || downstream.stop,
+    updatedInput: (effect !== null && effect.updatedInput !== undefined)
+      ? effect.updatedInput
+      : downstream.updatedInput,
+    updatedToolOutput: (effect !== null && effect.updatedToolOutput !== undefined)
+      ? effect.updatedToolOutput
+      : downstream.updatedToolOutput,
+    errors: downstream.errors.slice(),
+    failed: downstream.failed,
+    watchPaths: __coderExDedupe(ownWatchPaths.concat(downstream.watchPaths)),
+    ui: ui.concat(downstream.ui)
+  };
+};
+
+globalThis.__coderExApplyEffect = function (combined, effect, ui) {
+  if (effect !== null) {
+    if (effect.stop === true) combined.stop = true;
+    if (effect.updatedInput !== undefined) combined.updatedInput = effect.updatedInput;
+    if (effect.updatedToolOutput !== undefined) combined.updatedToolOutput = effect.updatedToolOutput;
+    if (Array.isArray(effect.watchPaths)) combined.watchPaths = combined.watchPaths.concat(effect.watchPaths);
+  }
+  combined.ui = combined.ui.concat(ui);
+};
+
+globalThis.__coderExApplyResult = function (combined, result) {
+  combined.stop = combined.stop || result.stop;
+  if (result.updatedInput !== null && result.updatedInput !== undefined) {
+    combined.updatedInput = result.updatedInput;
+  }
+  if (result.updatedToolOutput !== null && result.updatedToolOutput !== undefined) {
+    combined.updatedToolOutput = result.updatedToolOutput;
+  }
+  combined.watchPaths = combined.watchPaths.concat(result.watchPaths);
+  combined.failed = combined.failed || result.failed;
+  combined.errors = combined.errors.concat(result.errors);
+  combined.ui = combined.ui.concat(result.ui);
+};
+
+// The inner executor ran second, so it wins an updated-value conflict; a side
+// that left a field unset does not erase what the other set.
+globalThis.__coderExMergeWithInner = function (js, inner) {
+  return {
+    stop: js.stop || inner.stop,
+    updatedInput: (inner.updatedInput !== null && inner.updatedInput !== undefined)
+      ? inner.updatedInput
+      : js.updatedInput,
+    updatedToolOutput: (inner.updatedToolOutput !== null && inner.updatedToolOutput !== undefined)
+      ? inner.updatedToolOutput
+      : js.updatedToolOutput,
+    errors: js.errors.concat(inner.errors),
+    failed: js.failed || inner.failed,
+    watchPaths: __coderExDedupe(js.watchPaths.concat(inner.watchPaths)),
+    ui: js.ui.concat(inner.ui)
+  };
+};
+
+globalThis.__coderExChain = function (hooks, start, event, input, contextJson, innerFn, depth, gating) {
+  const combined = __coderExEmptyResult();
+  let nextCalled = false;
+
+  for (let index = start; index < hooks.length; index++) {
+    const hook = hooks[index];
+    let downstream = null;
+    let used = false;
+    let closed = false;
+
+    const next = function (argument) {
+      if (used || closed) {
+        throw new TypeError('next(e) may only be called once per hook invocation');
+      }
+      used = true;
+      if (depth + 1 > __coderExMaxChainDepth) {
+        throw new RangeError('next(e) exceeded the chain depth limit of ' + __coderExMaxChainDepth);
+      }
+
+      let nextInput = input;
+      let nextContext = contextJson;
+      if (typeof argument === 'string') {
+        nextInput = argument;
+      } else if (argument !== null && typeof argument === 'object' && !Array.isArray(argument)) {
+        if (typeof argument.input === 'string') {
+          nextInput = argument.input;
+        }
+        if (argument.context !== null && typeof argument.context === 'object' && !Array.isArray(argument.context)) {
+          const forwarded = {};
+          for (const key of Object.keys(argument.context)) {
+            if (typeof argument.context[key] === 'string') {
+              forwarded[key] = argument.context[key];
+            }
+          }
+          nextContext = JSON.stringify(forwarded);
+        }
+      }
+
+      downstream = __coderExChain(hooks, index + 1, event, nextInput, nextContext, innerFn, depth + 1, gating);
+      return __coderExPublicResult(downstream);
+    };
+
+    const reply = JSON.parse(__coderExCall(hook.m, hook.h, event, input, contextJson, next));
+    closed = true;
+
+    if (reply.ok) {
+      if (downstream !== null) {
+        __coderExApplyResult(combined, __coderExMergeEffect(reply.result, reply.ui, downstream));
+      } else {
+        __coderExApplyEffect(combined, reply.result, reply.ui);
+      }
+    } else {
+      if (downstream !== null) {
+        __coderExApplyResult(combined, downstream);
+      }
+      combined.failed = true;
+      combined.errors.push('mod `' + hook.name + '`: ' + reply.error);
+    }
+
+    if (downstream !== null) {
+      nextCalled = true;
+      break;
+    }
+  }
+
+  // A failed hook on a gating event fails closed, and the gate is closed
+  // before the inner executor is reached, exactly as it was before the chain
+  // became recursive.
+  if (combined.failed && gating) combined.stop = true;
+
+  let result = combined;
+  if (!nextCalled && !combined.stop && typeof innerFn === 'function') {
+    // The inner executor sees the input the JavaScript hooks settled on, as it
+    // did before the chain existed.
+    const innerInput = (combined.updatedInput !== null && combined.updatedInput !== undefined)
+      ? combined.updatedInput
+      : input;
+    result = __coderExMergeWithInner(combined, JSON.parse(innerFn(event, innerInput, contextJson)));
+  }
+  result.watchPaths = __coderExDedupe(result.watchPaths);
+  return result;
+};
+
+globalThis.__coderExRun = function (chainJson, event, input, contextJson, innerFn, gating) {
+  return JSON.stringify(
+    __coderExChain(JSON.parse(chainJson), 0, event, input, contextJson, innerFn, 0, gating === true)
+  );
+};
+
+globalThis.__coderExMaxChainDepth = @@MAX_CHAIN_DEPTH@@;
+"#;
 
 /// The per-mod harness: `on` and the registration array it fills.
 fn install_mod_harness(context: &mut Context) -> JsResult<()> {
@@ -1722,21 +1758,10 @@ pub fn is_gating_event(event: &str) -> bool {
     event.eq_ignore_ascii_case(PRE_TOOL_USE) || event.eq_ignore_ascii_case(USER_PROMPT_SUBMIT)
 }
 
-pub fn dedupe_paths(paths: Vec<String>) -> Vec<String> {
-    let mut seen = std::collections::HashSet::new();
-    let mut unique = Vec::with_capacity(paths.len());
-    for path in paths {
-        if seen.insert(path.clone()) {
-            unique.push(path);
-        }
-    }
-    unique
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use coderex_core::ui_protocol::UiStyle;
+    use coderex_core::ui_protocol::{UiElement, UiStyle};
 
     #[derive(Clone)]
     struct RecordingInner {
@@ -2047,8 +2072,12 @@ mod tests {
             hook_timeout: Duration::from_millis(100),
             ..ModLimits::default()
         };
+        // Two chained hooks, then the slow inner executor: the budget covers
+        // the JavaScript chain and the downstream run inside the same call.
         let runtime = load_with(
-            "function register(on) { on('PostToolUse', '*', function ($, e, next) { next(); }); }",
+            "function register(on) { \
+             on('PostToolUse', '*', function ($, e, next) { next(); }); \
+             on('PostToolUse', '*', function ($, e, next) { next(); }); }",
             limits,
         );
 
@@ -2066,6 +2095,201 @@ mod tests {
             result.errors
         );
         assert!(elapsed < Duration::from_secs(2), "took {elapsed:?}");
+    }
+
+    // ── Chaining: next runs the hooks after the current one ─────────────────
+
+    #[test]
+    fn next_runs_the_following_hook_and_returns_its_result() {
+        let runtime = load(
+            "function register(on) { \
+             on('PostToolUse', '*', function ($, e, next) { \
+               const downstream = next(); \
+               return { updatedInput: 'A[' + downstream.updatedInput + ']' }; }); \
+             on('PostToolUse', '*', function ($, e) { return { updatedInput: 'B' }; }); }",
+        );
+
+        let result = runtime.fire("PostToolUse", "Bash", &HashMap::new());
+
+        assert_eq!(result.updated_input.as_deref(), Some("A[B]"), "{result:?}");
+        assert!(!result.failed, "{result:?}");
+    }
+
+    #[test]
+    fn a_downstream_hooks_failure_is_carried_through_next() {
+        let runtime = load(
+            "function register(on) { \
+             on('PostToolUse', '*', function ($, e, next) { \
+               const downstream = next(); \
+               return { updatedInput: downstream.failed ? 'saw-failure' : 'saw-success' }; }); \
+             on('PostToolUse', '*', function () { throw new Error('downstream-broke'); }); }",
+        );
+
+        let result = runtime.fire("PostToolUse", "Bash", &HashMap::new());
+
+        assert_eq!(result.updated_input.as_deref(), Some("saw-failure"));
+        assert!(result.failed, "{result:?}");
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|error| error.contains("downstream-broke")),
+            "{:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    fn a_later_hooks_next_runs_the_inner_executor() {
+        let inner = Arc::new(RecordingInner::answering(HookFireResult {
+            updated_input: Some("inner".to_string()),
+            ..HookFireResult::default()
+        }));
+        let runtime = load(
+            "function register(on) { \
+             on('PostToolUse', '*', function ($, e) { return { updatedToolOutput: 'first' }; }); \
+             on('PostToolUse', '*', function ($, e, next) { \
+               const downstream = next(); \
+               return { updatedToolOutput: 'second(' + downstream.updatedInput + ')' }; }); }",
+        );
+
+        let result = fire_with(&runtime, "PostToolUse", "Bash", Arc::clone(&inner) as _);
+
+        assert_eq!(
+            inner.calls(),
+            vec![("PostToolUse".to_string(), "Bash".to_string())],
+            "the chain must reach the inner executor exactly once"
+        );
+        assert_eq!(result.updated_tool_output.as_deref(), Some("second(inner)"));
+        assert_eq!(
+            result.updated_input.as_deref(),
+            Some("inner"),
+            "a field the hook did not set comes from downstream"
+        );
+        assert!(!result.failed, "{result:?}");
+    }
+
+    #[test]
+    fn three_hooks_chain_in_registration_order() {
+        // Each hook records its name before continuing. The nested return
+        // value spells out the order the hooks actually ran in.
+        let runtime = load(
+            "function register(on) { \
+             const order = []; \
+             on('PostToolUse', '*', function ($, e, next) { \
+               order.push('A'); \
+               const downstream = next(); \
+               return { updatedInput: 'A(' + downstream.updatedInput + ')' }; }); \
+             on('PostToolUse', '*', function ($, e, next) { \
+               order.push('B'); \
+               const downstream = next(); \
+               return { updatedInput: 'B(' + downstream.updatedInput + ')' }; }); \
+             on('PostToolUse', '*', function ($, e) { \
+               order.push('C'); \
+               return { updatedInput: order.join('') }; }); }",
+        );
+
+        let result = runtime.fire("PostToolUse", "Bash", &HashMap::new());
+
+        assert_eq!(
+            result.updated_input.as_deref(),
+            Some("A(B(ABC))"),
+            "{result:?}"
+        );
+        assert!(!result.failed, "{result:?}");
+    }
+
+    #[test]
+    fn next_input_and_context_reach_the_following_hook() {
+        let runtime = load(
+            "function register(on) { \
+             on('PostToolUse', '*', function ($, e, next) { \
+               next({ input: 'rewritten', context: { mode: 'review' } }); return {}; }); \
+             on('PostToolUse', '*', function ($, e) { \
+               return { updatedInput: e.input + '|' + e.mode }; }); }",
+        );
+
+        let result = runtime.fire(
+            "PostToolUse",
+            "Bash",
+            &HashMap::from([("mode".to_string(), "original".to_string())]),
+        );
+
+        assert_eq!(
+            result.updated_input.as_deref(),
+            Some("rewritten|review"),
+            "{result:?}"
+        );
+        assert!(!result.failed, "{result:?}");
+    }
+
+    #[test]
+    fn hooks_that_do_not_call_next_run_once_and_then_the_inner() {
+        let inner = Arc::new(RecordingInner::answering(HookFireResult {
+            updated_tool_output: Some("inner".to_string()),
+            ..HookFireResult::default()
+        }));
+        let runtime = load(
+            "function register(on) { \
+             on('PostToolUse', '*', function ($, e) { return { updatedInput: 'first' }; }); \
+             on('PostToolUse', '*', function ($, e) { return { updatedInput: 'second', \
+               updatedToolOutput: 'js' }; }); }",
+        );
+
+        let result = fire_with(&runtime, "PostToolUse", "Bash", Arc::clone(&inner) as _);
+
+        assert_eq!(
+            inner.calls(),
+            vec![("PostToolUse".to_string(), "second".to_string())],
+            "the inner executor runs once, after the hooks and with their input"
+        );
+        assert_eq!(result.updated_input.as_deref(), Some("second"));
+        assert_eq!(
+            result.updated_tool_output.as_deref(),
+            Some("inner"),
+            "the inner executor ran later and wins the conflict"
+        );
+        assert!(!result.failed, "{result:?}");
+    }
+
+    #[test]
+    fn a_gating_failure_keeps_the_inner_executor_from_running() {
+        let inner = Arc::new(RecordingInner::answering(HookFireResult::default()));
+        let runtime = load(
+            "function register(on) { on('PreToolUse', 'Bash', function () { \
+             throw new Error('broken'); }); }",
+        );
+
+        let result = fire_with(&runtime, "PreToolUse", "Bash", Arc::clone(&inner) as _);
+
+        assert!(result.failed, "{result:?}");
+        assert!(result.stop, "a gating failure must fail closed: {result:?}");
+        assert_eq!(
+            inner.calls().len(),
+            0,
+            "the gate closed before the inner executor was reached"
+        );
+    }
+
+    #[test]
+    fn the_chain_depth_limit_is_a_hook_error() {
+        let hooks = MAX_CHAIN_DEPTH + 6;
+        let runtime = load(&format!(
+            "function register(on) {{ for (let i = 0; i < {hooks}; i++) {{ \
+             on('PostToolUse', '*', function ($, e, next) {{ next(); }}); }} }}"
+        ));
+
+        let result = runtime.fire("PostToolUse", "Bash", &HashMap::new());
+
+        assert!(result.failed, "{result:?}");
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|error| error.contains("chain depth limit")),
+            "{:?}",
+            result.errors
+        );
     }
 
     // ── Phase-1 behaviour, preserved on the worker model ────────────────────
