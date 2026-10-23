@@ -2000,6 +2000,11 @@ pub struct ReplLoop {
     /// `/hooks` and `/status` used to read `CommandContext.active_hooks`,
     /// which nothing ever assigned, so they always reported zero.
     active_hooks: usize,
+    /// Handle for delivering mod UI button activations to the mod worker.
+    ///
+    /// Kept after the executor is installed so the terminal can press a
+    /// button without reaching into the engine.
+    mod_ui_handle: Option<coderex_mods::ModUiHandle>,
     /// Where the line-delimited protocol goes, when `--output-format
     /// stream-json` was asked for.
     ///
@@ -2324,6 +2329,7 @@ impl ReplLoop {
             hooks_settings: None,
             hook_layers: None,
             active_hooks: 0,
+            mod_ui_handle: None,
             checkpoint_store: None,
             protocol_sink: None,
             headless_permission_control: false,
@@ -2721,6 +2727,7 @@ impl ReplLoop {
             hooks_settings: None,
             hook_layers: None,
             active_hooks: 0,
+            mod_ui_handle: None,
             checkpoint_store,
             protocol_sink: None,
             headless_permission_control: false,
@@ -3757,7 +3764,10 @@ impl ReplLoop {
                                 Some(Arc::clone(&inner)
                                     as Arc<dyn coderex_core::hook_executor::HookExecutor>),
                             ) {
-                                Some(Ok(executor)) => Arc::new(executor),
+                                Some(Ok(executor)) => {
+                                    self.mod_ui_handle = Some(executor.ui_handle());
+                                    Arc::new(executor)
+                                }
                                 Some(Err(error)) => {
                                     tracing::warn!("mods were not loaded: {error}");
                                     inner
@@ -4508,6 +4518,7 @@ impl ReplLoop {
         }
         let mut queued_prompts = std::collections::VecDeque::<String>::new();
         let mut pending_confirmation: Option<ConfirmationRequest> = None;
+        let mut mod_ui_focus = ModUiFocus::default();
         let mut last_stream_snapshot = Instant::now();
 
         let result = loop {
@@ -4657,6 +4668,104 @@ impl ReplLoop {
                                 && key.modifiers.contains(KeyModifiers::CONTROL)
                             {
                                 break Ok(());
+                            }
+
+                            // A mod UI block owns Tab/Shift+Tab, Enter and Esc
+                            // only when it has focus and no overlay is asking
+                            // for the keyboard. Ordinary characters are never
+                            // consumed here, so typing still reaches the line.
+                            if !ui_state.overlays.is_active() && pending_confirmation.is_none() {
+                                if let Some(action) = mod_ui_key_action(
+                                    key.code,
+                                    key.modifiers,
+                                    mod_ui_focus.focused,
+                                    mod_ui_focus.button_count(),
+                                ) {
+                                    match action {
+                                        ModUiKeyAction::FocusNext
+                                        | ModUiKeyAction::FocusPrevious => {
+                                            mod_ui_focus
+                                                .cycle(matches!(action, ModUiKeyAction::FocusNext));
+                                            self.redraw_mod_ui_focus(
+                                                &mut ui_state,
+                                                &mut mod_ui_focus,
+                                            );
+                                        }
+                                        ModUiKeyAction::ClearFocus => {
+                                            mod_ui_focus.clear_focus();
+                                            self.redraw_mod_ui_focus(
+                                                &mut ui_state,
+                                                &mut mod_ui_focus,
+                                            );
+                                        }
+                                        ModUiKeyAction::Activate => {
+                                            if let Some(id) =
+                                                mod_ui_focus.focused_id().map(str::to_string)
+                                            {
+                                                let outcome = match self.mod_ui_handle.clone() {
+                                                    Some(handle) => {
+                                                        match tokio::task::spawn_blocking(move || {
+                                                            handle.activate(&id)
+                                                        })
+                                                        .await
+                                                        {
+                                                            Ok(result) => result,
+                                                            Err(error) => Err(format!(
+                                                                "the activation task failed: {error}"
+                                                            )),
+                                                        }
+                                                    }
+                                                    None => Err(
+                                                        "mod UI activation is unavailable in this session"
+                                                            .to_string(),
+                                                    ),
+                                                };
+                                                match outcome {
+                                                    Ok(elements) => {
+                                                        let rendered =
+                                                            coderex_ui::mod_elements::render_mod_ui_text(
+                                                                &elements,
+                                                                coderex_ui::mod_elements::MOD_UI_DEFAULT_WIDTH,
+                                                            );
+                                                        let content = if rendered.is_empty() {
+                                                            "Mod UI action completed with no elements."
+                                                                .to_string()
+                                                        } else {
+                                                            rendered
+                                                        };
+                                                        ui_state.messages.push(Message {
+                                                            role: MessageRole::System,
+                                                            content: content.into(),
+                                                            tool_name: None,
+                                                            streaming: false,
+                                                            folded: false,
+                                                        });
+                                                        let index = ui_state
+                                                            .messages
+                                                            .messages
+                                                            .len()
+                                                            .saturating_sub(1);
+                                                        mod_ui_focus.reset(&elements, index);
+                                                    }
+                                                    Err(error) => {
+                                                        ui_state.messages.push(Message {
+                                                            role: MessageRole::System,
+                                                            content: format!(
+                                                                "Mod UI action failed: {error}"
+                                                            )
+                                                            .into(),
+                                                            tool_name: None,
+                                                            streaming: false,
+                                                            folded: false,
+                                                        });
+                                                    }
+                                                }
+                                                self.persist_interactive_snapshot(&ui_state);
+                                            }
+                                        }
+                                    }
+                                    continue;
+                                }
                             }
 
                             // Shift+Tab: cycle permission mode
@@ -5369,7 +5478,11 @@ impl ReplLoop {
                                 &elements,
                                 coderex_ui::mod_elements::MOD_UI_DEFAULT_WIDTH,
                             );
-                            if !rendered.is_empty() {
+                            if rendered.is_empty() {
+                                // An empty tree clears what was focusable: there
+                                // is no block to route input to.
+                                mod_ui_focus = ModUiFocus::default();
+                            } else {
                                 ui_state.messages.push(Message {
                                     role: MessageRole::System,
                                     content: rendered.into(),
@@ -5377,6 +5490,8 @@ impl ReplLoop {
                                     streaming: false,
                                     folded: false,
                                 });
+                                let index = ui_state.messages.messages.len().saturating_sub(1);
+                                mod_ui_focus.reset(&elements, index);
                                 self.persist_interactive_snapshot(&ui_state);
                             }
                         }
@@ -5875,7 +5990,177 @@ fn append_mod_ui_block(output: &mut String, elements: &[coderex_core::ui_protoco
     output.push('\n');
 }
 
+/// What the terminal does with a key while a mod UI button is focused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModUiKeyAction {
+    FocusNext,
+    FocusPrevious,
+    Activate,
+    ClearFocus,
+}
+
+/// Map a key to a mod UI action.
+///
+/// Ordinary typing returns `None`, so every character still reaches the input
+/// line. With buttons present, `Tab` starts focus on the first button; once a
+/// button is focused, `Tab`/`Shift+Tab` cycle, `Enter` activates and `Esc`
+/// clears. While nothing is focused, `Shift+Tab` is left to the permission-mode
+/// binding and `Enter` to the normal submit path.
+fn mod_ui_key_action(
+    code: crossterm::event::KeyCode,
+    modifiers: crossterm::event::KeyModifiers,
+    focused: Option<usize>,
+    button_count: usize,
+) -> Option<ModUiKeyAction> {
+    use crossterm::event::{KeyCode, KeyModifiers};
+
+    if button_count == 0 {
+        return None;
+    }
+    let shift_tab = matches!(code, KeyCode::BackTab)
+        || (matches!(code, KeyCode::Tab) && modifiers.contains(KeyModifiers::SHIFT));
+    match code {
+        KeyCode::BackTab | KeyCode::Tab if shift_tab => {
+            focused.is_some().then_some(ModUiKeyAction::FocusPrevious)
+        }
+        KeyCode::Tab => Some(ModUiKeyAction::FocusNext),
+        KeyCode::Enter => focused.is_some().then_some(ModUiKeyAction::Activate),
+        KeyCode::Esc => focused.is_some().then_some(ModUiKeyAction::ClearFocus),
+        _ => None,
+    }
+}
+
+/// The next focused index after cycling around `count` buttons.
+///
+/// `None` starts at the first button going forward and the last going
+/// backwards. Callers guard against `count == 0`.
+fn cycle_mod_ui_focus(current: Option<usize>, count: usize, forward: bool) -> usize {
+    debug_assert!(count > 0);
+    match (current, forward) {
+        (None, true) => 0,
+        (None, false) => count - 1,
+        (Some(index), true) => (index + 1) % count,
+        (Some(index), false) => (index + count - 1) % count,
+    }
+}
+
+/// The button ids in one mod UI tree, in render order.
+fn collect_button_ids(elements: &[coderex_core::ui_protocol::UiElement]) -> Vec<String> {
+    fn walk(elements: &[coderex_core::ui_protocol::UiElement], ids: &mut Vec<String>) {
+        for element in elements {
+            match element {
+                coderex_core::ui_protocol::UiElement::Button { id, .. } => ids.push(id.clone()),
+                coderex_core::ui_protocol::UiElement::Box { children, .. } => walk(children, ids),
+                coderex_core::ui_protocol::UiElement::Text { .. } => {}
+            }
+        }
+    }
+
+    let mut ids = Vec::new();
+    walk(elements, &mut ids);
+    ids
+}
+
+/// Which button in the most recent mod UI block is focused.
+///
+/// Focus is terminal state, not part of the host-owned tree, and it lives with
+/// the interactive loop. The tree and the transcript index are kept together
+/// so a focus change can redraw exactly the message the tree came from.
+#[derive(Debug, Default)]
+struct ModUiFocus {
+    elements: Vec<coderex_core::ui_protocol::UiElement>,
+    button_ids: Vec<String>,
+    focused: Option<usize>,
+    message_index: Option<usize>,
+    /// The block's last rendered transcript text, used to confirm that the
+    /// message at `message_index` is still this block after a `/clear` or a
+    /// session restore.
+    rendered: Option<String>,
+}
+
+impl ModUiFocus {
+    /// Adopt a newly rendered block, with no button focused yet.
+    fn reset(&mut self, elements: &[coderex_core::ui_protocol::UiElement], message_index: usize) {
+        self.elements = elements.to_vec();
+        self.button_ids = collect_button_ids(elements);
+        self.focused = None;
+        self.message_index = (!self.button_ids.is_empty()).then_some(message_index);
+        self.rendered = Some(coderex_ui::mod_elements::render_mod_ui_text(
+            elements,
+            coderex_ui::mod_elements::MOD_UI_DEFAULT_WIDTH,
+        ));
+    }
+
+    /// Drop focus without forgetting the block.
+    const fn clear_focus(&mut self) {
+        self.focused = None;
+    }
+
+    /// The id of the focused button, if any.
+    fn focused_id(&self) -> Option<&str> {
+        self.focused
+            .and_then(|index| self.button_ids.get(index))
+            .map(String::as_str)
+    }
+
+    /// Move focus forward or backward around the buttons.
+    fn cycle(&mut self, forward: bool) {
+        if self.button_ids.is_empty() {
+            self.focused = None;
+            return;
+        }
+        self.focused = Some(cycle_mod_ui_focus(
+            self.focused,
+            self.button_ids.len(),
+            forward,
+        ));
+    }
+
+    /// The number of focusable buttons.
+    fn button_count(&self) -> usize {
+        self.button_ids.len()
+    }
+}
+
 impl ReplLoop {
+    /// Redraw the transcript block that owns the focused mod UI button.
+    ///
+    /// The transcript stores rendered text, so focus is applied by rendering
+    /// the snapshot again rather than by mutating a live widget.
+    fn redraw_mod_ui_focus(
+        &self,
+        ui_state: &mut coderex_ui::state::UiState,
+        focus: &mut ModUiFocus,
+    ) {
+        let Some(index) = focus.message_index else {
+            return;
+        };
+        let Some(message) = ui_state.messages.messages.get_mut(index) else {
+            focus.message_index = None;
+            focus.focused = None;
+            focus.rendered = None;
+            return;
+        };
+        // The transcript index is only meaningful while the message still
+        // holds the block this focus belongs to. A `/clear`, a resume or a
+        // rewind can replace it; in that case forget the block rather than
+        // rewrite an unrelated message.
+        if focus.rendered.as_deref() != Some(message.content.as_str()) {
+            focus.message_index = None;
+            focus.focused = None;
+            focus.rendered = None;
+            return;
+        }
+        let rendered = coderex_ui::mod_elements::render_mod_ui_text_with_focus(
+            &focus.elements,
+            coderex_ui::mod_elements::MOD_UI_DEFAULT_WIDTH,
+            focus.focused_id(),
+        );
+        message.content = rendered.clone().into();
+        focus.rendered = Some(rendered);
+        self.persist_interactive_snapshot(ui_state);
+    }
+
     /// Record a tool event for telemetry, when the session opted in.
     fn record_engine_event_telemetry(&mut self, event: &EngineEvent) {
         let Some(handle) = self.telemetry.as_ref() else {
@@ -9007,6 +9292,133 @@ mod tests {
         ToolDispatchOutcome, ToolExecutor as CoreToolExecutor, ToolInfo,
     };
     use coderex_core::types::{ToolResult, UsageSummary};
+
+    // ── Mod UI focus ────────────────────────────────────────────────────────
+
+    #[test]
+    fn mod_ui_keys_map_to_focus_and_activation_only_when_focused() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        assert_eq!(
+            mod_ui_key_action(KeyCode::Tab, KeyModifiers::NONE, None, 2),
+            Some(ModUiKeyAction::FocusNext),
+            "Tab starts focus on the first button"
+        );
+        assert_eq!(
+            mod_ui_key_action(KeyCode::Tab, KeyModifiers::NONE, Some(0), 2),
+            Some(ModUiKeyAction::FocusNext)
+        );
+        assert_eq!(
+            mod_ui_key_action(KeyCode::BackTab, KeyModifiers::SHIFT, Some(0), 2),
+            Some(ModUiKeyAction::FocusPrevious)
+        );
+        assert_eq!(
+            mod_ui_key_action(KeyCode::Tab, KeyModifiers::SHIFT, Some(1), 2),
+            Some(ModUiKeyAction::FocusPrevious)
+        );
+        assert_eq!(
+            mod_ui_key_action(KeyCode::Enter, KeyModifiers::NONE, Some(1), 2),
+            Some(ModUiKeyAction::Activate)
+        );
+        assert_eq!(
+            mod_ui_key_action(KeyCode::Esc, KeyModifiers::NONE, Some(1), 2),
+            Some(ModUiKeyAction::ClearFocus)
+        );
+    }
+
+    #[test]
+    fn mod_ui_keys_leave_ordinary_typing_alone() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        assert_eq!(
+            mod_ui_key_action(KeyCode::Char('a'), KeyModifiers::NONE, Some(0), 2),
+            None,
+            "typing must reach the input line"
+        );
+        assert_eq!(
+            mod_ui_key_action(KeyCode::Backspace, KeyModifiers::NONE, Some(0), 2),
+            None
+        );
+        assert_eq!(
+            mod_ui_key_action(KeyCode::Enter, KeyModifiers::NONE, None, 2),
+            None,
+            "Enter submits when no button is focused"
+        );
+        assert_eq!(
+            mod_ui_key_action(KeyCode::Esc, KeyModifiers::NONE, None, 2),
+            None
+        );
+        assert_eq!(
+            mod_ui_key_action(KeyCode::BackTab, KeyModifiers::SHIFT, None, 2),
+            None,
+            "unfocused Shift+Tab still belongs to the permission bar"
+        );
+        assert_eq!(
+            mod_ui_key_action(KeyCode::Tab, KeyModifiers::NONE, Some(0), 0),
+            None,
+            "a block with no buttons has no focus"
+        );
+    }
+
+    #[test]
+    fn focus_cycles_and_wraps() {
+        assert_eq!(cycle_mod_ui_focus(None, 3, true), 0);
+        assert_eq!(cycle_mod_ui_focus(None, 3, false), 2);
+        assert_eq!(cycle_mod_ui_focus(Some(2), 3, true), 0);
+        assert_eq!(cycle_mod_ui_focus(Some(0), 3, false), 2);
+    }
+
+    #[test]
+    fn mod_ui_focus_walks_nested_buttons_and_clears() {
+        use coderex_core::ui_protocol::UiElement;
+
+        let tree = vec![
+            UiElement::Box {
+                title: None,
+                children: vec![
+                    UiElement::Button {
+                        label: "A".to_string(),
+                        id: "a".to_string(),
+                    },
+                    UiElement::Button {
+                        label: "B".to_string(),
+                        id: "b".to_string(),
+                    },
+                ],
+            },
+            UiElement::Button {
+                label: "C".to_string(),
+                id: "c".to_string(),
+            },
+        ];
+
+        let mut focus = ModUiFocus::default();
+        focus.reset(&tree, 7);
+        assert_eq!(focus.button_count(), 3);
+        assert_eq!(focus.focused_id(), None);
+        assert_eq!(focus.message_index, Some(7));
+
+        focus.cycle(true);
+        assert_eq!(focus.focused_id(), Some("a"));
+        focus.cycle(false);
+        assert_eq!(focus.focused_id(), Some("c"));
+
+        focus.clear_focus();
+        assert_eq!(focus.focused_id(), None);
+
+        focus.reset(
+            &[UiElement::Text {
+                text: "nothing to press".to_string(),
+                style: coderex_core::ui_protocol::UiStyle::Plain,
+            }],
+            9,
+        );
+        assert_eq!(focus.button_count(), 0);
+        assert_eq!(
+            focus.message_index, None,
+            "a block without buttons owns no keyboard focus"
+        );
+    }
 
     /// A hook executor that records what fired, for the lifecycle tests.
     #[derive(Clone, Default)]

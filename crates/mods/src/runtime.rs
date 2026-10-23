@@ -20,7 +20,7 @@ use boa_engine::{
     js_string, object::ObjectInitializer, object::builtins::JsArray, property::Attribute,
 };
 use coderex_core::hook_executor::{HookExecutor, HookFireResult};
-use coderex_core::ui_protocol::parse_ui_elements;
+use coderex_core::ui_protocol::{UiElement, parse_ui_elements};
 
 use crate::transform;
 
@@ -55,6 +55,9 @@ const MAX_MOD_BYTES: u64 = 1_048_576;
 
 /// Most hooks a single mod may register.
 const MAX_HOOKS_PER_MOD: usize = 256;
+
+/// Most UI activation handlers a single mod may register.
+const MAX_ACTIVATIONS_PER_MOD: usize = 256;
 
 /// Most nested `next(e)` calls one [`ModRuntime::fire`] may perform.
 ///
@@ -195,10 +198,22 @@ struct Request {
     reply: mpsc::SyncSender<HookFireResult>,
 }
 
+/// A UI activation request from the caller to the worker.
+struct ActivateRequest {
+    id: String,
+    reply: mpsc::SyncSender<Result<Vec<UiElement>, String>>,
+}
+
+/// Any work the worker accepts, in the order it arrives.
+enum WorkerRequest {
+    Fire(Request),
+    Activate(ActivateRequest),
+}
+
 /// The caller's handle to the worker thread.
 #[derive(Debug)]
 struct WorkerHandle {
-    sender: mpsc::Sender<Request>,
+    sender: mpsc::Sender<WorkerRequest>,
 }
 
 /// Loads mods and fires their hooks.
@@ -402,6 +417,44 @@ impl ModRuntime {
         }
     }
 
+    /// Deliver a button activation to the worker and return the elements its
+    /// handler rendered.
+    ///
+    /// The handler runs on the same worker thread and realm as the mod's
+    /// hooks, under the same wall-clock budget and engine limits. An id with
+    /// no registered handler is ignored: it logs a warning and yields no
+    /// elements.
+    ///
+    /// # Errors
+    ///
+    /// Returns the handler's error message when it throws, returns invalid
+    /// elements, or exceeds the wall-clock budget.
+    pub fn activate(&self, id: &str) -> Result<Vec<UiElement>, String> {
+        let (reply, reply_receiver) = mpsc::sync_channel(1);
+        let sender = self.worker_sender()?;
+        sender
+            .send(WorkerRequest::Activate(ActivateRequest {
+                id: id.to_string(),
+                reply,
+            }))
+            .map_err(|_| "the mod worker stopped before the activation could run".to_string())?;
+
+        match reply_receiver.recv_timeout(self.limits.hook_timeout) {
+            Ok(result) => result,
+            Err(RecvTimeoutError::Timeout) => {
+                self.abandon_worker();
+                Err(format!(
+                    "the activation handler exceeded its {} ms wall-clock budget",
+                    self.limits.hook_timeout.as_millis()
+                ))
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                self.abandon_worker();
+                Err("the mod worker stopped without reporting an activation result".to_string())
+            }
+        }
+    }
+
     fn dispatch(
         &self,
         request: Request,
@@ -409,7 +462,7 @@ impl ModRuntime {
     ) -> Result<HookFireResult, String> {
         let sender = self.worker_sender()?;
         sender
-            .send(request)
+            .send(WorkerRequest::Fire(request))
             .map_err(|_| "the mod worker stopped before the hook could run".to_string())?;
 
         match reply_receiver.recv_timeout(self.limits.hook_timeout) {
@@ -434,7 +487,7 @@ impl ModRuntime {
     /// between the check and the spawn would let two callers start two
     /// workers.
     #[allow(clippy::significant_drop_tightening)]
-    fn worker_sender(&self) -> Result<mpsc::Sender<Request>, String> {
+    fn worker_sender(&self) -> Result<mpsc::Sender<WorkerRequest>, String> {
         let mut worker = self
             .worker
             .lock()
@@ -590,7 +643,9 @@ fn read_source(path: &Path) -> Result<String, String> {
 }
 
 /// Start a worker thread and wait until it has loaded the mods.
-fn spawn_worker(config: Arc<WorkerConfig>) -> Result<(mpsc::Sender<Request>, InitOutcome), String> {
+fn spawn_worker(
+    config: Arc<WorkerConfig>,
+) -> Result<(mpsc::Sender<WorkerRequest>, InitOutcome), String> {
     let (sender, receiver) = mpsc::channel();
     let (init_sender, init_receiver) = mpsc::sync_channel(1);
     std::thread::Builder::new()
@@ -607,7 +662,7 @@ fn spawn_worker(config: Arc<WorkerConfig>) -> Result<(mpsc::Sender<Request>, Ini
 
 fn worker_main(
     config: &WorkerConfig,
-    receiver: &mpsc::Receiver<Request>,
+    receiver: &mpsc::Receiver<WorkerRequest>,
     init: &mpsc::SyncSender<Result<InitOutcome, String>>,
 ) {
     let runtime = match tokio::runtime::Builder::new_current_thread()
@@ -640,8 +695,16 @@ fn worker_main(
     }
 
     while let Ok(request) = receiver.recv() {
-        let result = state.fire(&request);
-        let _ = request.reply.send(result);
+        match request {
+            WorkerRequest::Fire(request) => {
+                let result = state.fire(&request);
+                let _ = request.reply.send(result);
+            }
+            WorkerRequest::Activate(request) => {
+                let result = state.activate(&request.id);
+                let _ = request.reply.send(result);
+            }
+        }
     }
 }
 
@@ -674,19 +737,38 @@ impl WorkerState {
             .and_then(|object| JsArray::from_object(object).ok())
             .ok_or_else(|| "the runtime harness registry is missing".to_string())?;
 
+        let activation_registry = context
+            .global_object()
+            .get(js_string!("__coderExActivations"), &mut context)
+            .map_err(|error| format!("could not read the runtime harness: {error}"))?;
+        let activation_registry = activation_registry
+            .as_object()
+            .cloned()
+            .and_then(|object| JsArray::from_object(object).ok())
+            .ok_or_else(|| "the runtime activation registry is missing".to_string())?;
+
         let mut hooks = Vec::new();
         let mut load_errors = Vec::new();
         let mut mod_names = Vec::new();
 
         for source in &config.mods {
             match load_mod(&mut context, source, &config.session) {
-                Ok(registrations) => {
+                Ok(loaded) => {
                     registry
-                        .push(registrations.clone(), &mut context)
+                        .push(loaded.registrations.clone(), &mut context)
                         .map_err(|error| {
                             format!("could not register {}: {error}", source.path.display())
                         })?;
-                    let array = registrations
+                    activation_registry
+                        .push(loaded.activations.clone(), &mut context)
+                        .map_err(|error| {
+                            format!(
+                                "could not register {}'s UI handlers: {error}",
+                                source.path.display()
+                            )
+                        })?;
+                    let array = loaded
+                        .registrations
                         .as_object()
                         .cloned()
                         .and_then(|object| JsArray::from_object(object).ok())
@@ -780,6 +862,50 @@ impl WorkerState {
         }
     }
 
+    /// Run the handler registered for one button id.
+    ///
+    /// An id with no handler is not an error: the handler registry is looked
+    /// up in the main realm, and a miss is reported as a warning so a stale
+    /// button cannot make a session fail.
+    fn activate(&mut self, id: &str) -> Result<Vec<UiElement>, String> {
+        let activate = self
+            .context
+            .global_object()
+            .get(js_string!("__coderExActivate"), &mut self.context)
+            .map_err(|error| format!("could not read the runtime harness: {error}"))?;
+        let activate = activate
+            .as_callable()
+            .cloned()
+            .ok_or_else(|| "the runtime harness is missing".to_string())?;
+
+        let event = serde_json::json!({ "id": id }).to_string();
+        let args = [JsString::from(id).into(), JsString::from(event).into()];
+        let value = activate
+            .call(&JsValue::undefined(), &args, &mut self.context)
+            .map_err(|error| format!("the activation handler could not be called: {error}"))?;
+        let text = value
+            .to_string(&mut self.context)
+            .map_err(|error| format!("could not read the activation result: {error}"))?
+            .to_std_string_escaped();
+        let reply: serde_json::Value = serde_json::from_str(&text).map_err(|error| {
+            format!("the activation handler returned unreadable output: {error}")
+        })?;
+
+        if reply.get("found").and_then(serde_json::Value::as_bool) == Some(false) {
+            tracing::warn!(id = %id, "no onActivate handler is registered for this UI button");
+            return Ok(Vec::new());
+        }
+        if reply.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
+            return Err(string_field(&reply, "error")
+                .unwrap_or_else(|| "the activation handler failed".to_string()));
+        }
+        match reply.get("ui") {
+            None | Some(serde_json::Value::Null) => Ok(Vec::new()),
+            Some(value) => parse_ui_elements(value)
+                .map_err(|error| format!("the activation handler returned invalid UI: {error}")),
+        }
+    }
+
     /// The matching hooks, in registration order, as the harness reads them.
     fn chain_json(&self, request: &Request) -> String {
         let hooks: Vec<serde_json::Value> = self
@@ -847,12 +973,20 @@ impl WorkerState {
     }
 }
 
-/// Evaluate one mod in its own realm and return its registration array.
+/// What one evaluated mod left behind in its realm.
+struct LoadedMod {
+    /// The mod's `on(...)` registrations.
+    registrations: JsValue,
+    /// The mod's `$.ui.onActivate(...)` registrations.
+    activations: JsValue,
+}
+
+/// Evaluate one mod in its own realm and return its registrations.
 fn load_mod(
     context: &mut Context,
     source: &ModSource,
     session: &ModSession,
-) -> Result<JsValue, String> {
+) -> Result<LoadedMod, String> {
     let realm = context
         .create_realm()
         .map_err(|error| format!("could not create a realm: {error}"))?;
@@ -866,7 +1000,7 @@ fn load_mod_in_realm(
     context: &mut Context,
     source: &ModSource,
     session: &ModSession,
-) -> Result<JsValue, String> {
+) -> Result<LoadedMod, String> {
     install_host_api(context, session, &source.name)
         .map_err(|error| format!("could not install the host API: {error}"))?;
 
@@ -892,9 +1026,20 @@ fn load_mod_in_realm(
         ))
         .map_err(|error| format!("register() failed: {error}"))?;
 
-    context
+    let registrations = context
         .eval(Source::from_bytes("__coderExRegs"))
-        .map_err(|error| format!("register() did not leave readable hook registrations: {error}"))
+        .map_err(|error| {
+            format!("register() did not leave readable hook registrations: {error}")
+        })?;
+    let activations = context
+        .eval(Source::from_bytes("__coderExHandlers"))
+        .map_err(|error| {
+            format!("register() did not leave readable activation registrations: {error}")
+        })?;
+    Ok(LoadedMod {
+        registrations,
+        activations,
+    })
 }
 
 /// The inner executor the JavaScript chain runs at its end.
@@ -1231,6 +1376,16 @@ const HOST_UI_API: &str = r#"
       }
       return { type: 'button', label: label, id: id };
     },
+    onActivate: function (id, handler) {
+      if (typeof id !== 'string' || id.length === 0) {
+        throw new TypeError('$.ui.onActivate(id, handler): id must be a non-empty string');
+      }
+      if (typeof handler !== 'function') {
+        throw new TypeError('$.ui.onActivate(id, handler): handler must be a function');
+      }
+      __coderExOnActivate(id, handler);
+      return undefined;
+    },
     render: function (element) {
       if (arguments.length === 0) {
         throw new TypeError('$.ui.render(element(s)): at least one element is required');
@@ -1371,6 +1526,7 @@ const JSX_RUNTIME: &str = r#"
 const MAIN_HARNESS: &str = r#"
 'use strict';
 globalThis.__coderExMods = [];
+globalThis.__coderExActivations = [];
 
 globalThis.__coderExNormalize = function (value) {
   if (value === undefined || value === null || typeof value !== 'object') return null;
@@ -1446,6 +1602,65 @@ globalThis.__coderExCall = function (modIndex, hookIndex, event, input, contextJ
     if (ui && typeof ui.__takeUi === 'function') ui.__takeUi();
     const message = (error && error.message) ? String(error.message) : String(error);
     return JSON.stringify({ ok: false, error: message });
+  }
+};
+
+// A button activation looks up the last handler registered for the id across
+// every mod (a later registration replaces an earlier one), calls it with its
+// own realm's `$`, and returns whatever it staged plus whatever elements it
+// returned. Validation of the returned tree happens at the Rust boundary.
+globalThis.__coderExActivate = function (id, eventJson) {
+  let chosen = null;
+  for (let modIndex = 0; modIndex < __coderExActivations.length; modIndex++) {
+    const handlers = __coderExActivations[modIndex];
+    for (let index = 0; index < handlers.length; index++) {
+      if (handlers[index] !== null && handlers[index].id === id) chosen = handlers[index];
+    }
+  }
+  if (chosen === null) {
+    return JSON.stringify({ found: false, ok: true, ui: [] });
+  }
+
+  const host = chosen.host;
+  const ui = host && host.ui;
+  if (ui && typeof ui.__resetUi === 'function') ui.__resetUi();
+
+  try {
+    let event = {};
+    try {
+      const parsed = JSON.parse(eventJson);
+      if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        event = parsed;
+      }
+    } catch (_) {
+      event = {};
+    }
+    event.event = 'ModUiActivate';
+    event.input = id;
+    event.id = id;
+    event.surface = 'terminal';
+
+    const value = chosen.handler(host, event);
+    const staged = (ui && typeof ui.__takeUi === 'function') ? ui.__takeUi() : [];
+    if (value !== null && typeof value === 'object' && typeof value.then === 'function') {
+      return JSON.stringify({
+        found: true,
+        ok: false,
+        error: 'async activation handlers are not supported yet; return elements synchronously',
+        ui: staged
+      });
+    }
+    let returned = [];
+    if (Array.isArray(value)) {
+      returned = value;
+    } else if (value !== null && typeof value === 'object') {
+      returned = [value];
+    }
+    return JSON.stringify({ found: true, ok: true, ui: staged.concat(returned) });
+  } catch (error) {
+    if (ui && typeof ui.__takeUi === 'function') ui.__takeUi();
+    const message = (error && error.message) ? String(error.message) : String(error);
+    return JSON.stringify({ found: true, ok: false, error: message, ui: [] });
   }
 };
 
@@ -1659,11 +1874,13 @@ globalThis.__coderExMaxChainDepth = @@MAX_CHAIN_DEPTH@@;
 /// The per-mod harness: `on` and the registration array it fills.
 fn install_mod_harness(context: &mut Context) -> JsResult<()> {
     let max_hooks = MAX_HOOKS_PER_MOD;
+    let max_activations = MAX_ACTIVATIONS_PER_MOD;
     context.eval(Source::from_bytes(
         format!(
             r"
 'use strict';
 globalThis.__coderExRegs = [];
+globalThis.__coderExHandlers = [];
 globalThis.__coderExOn = function (event, matcher, hook) {{
   if (typeof event !== 'string' || event.trim().length === 0) {{
     throw new TypeError('on(event, matcher, hook): event must be a non-empty string');
@@ -1682,6 +1899,19 @@ globalThis.__coderExOn = function (event, matcher, hook) {{
     throw new RangeError('on(event, matcher, hook): a mod may register at most {max_hooks} hooks');
   }}
   __coderExRegs.push({{ event: event, matcher: matcher, hook: hook, host: $ }});
+  return undefined;
+}};
+globalThis.__coderExOnActivate = function (id, handler) {{
+  for (let index = 0; index < __coderExHandlers.length; index++) {{
+    if (__coderExHandlers[index].id === id) {{
+      __coderExHandlers[index] = {{ id: id, handler: handler, host: $ }};
+      return undefined;
+    }}
+  }}
+  if (__coderExHandlers.length >= {max_activations}) {{
+    throw new RangeError('$.ui.onActivate: a mod may register at most {max_activations} handlers');
+  }}
+  __coderExHandlers.push({{ id: id, handler: handler, host: $ }});
   return undefined;
 }};
 ",
@@ -2788,6 +3018,118 @@ mod tests {
                 },
             ]
         );
+    }
+
+    // ── UI activation ───────────────────────────────────────────────────────
+
+    #[test]
+    fn an_activation_handler_returns_the_elements_it_builds() {
+        let runtime = load(
+            "function register(on) { \
+             $.ui.onActivate('retry', function ($, event) { \
+               return [$.ui.text('ran ' + event.id)]; }); }",
+        );
+
+        let elements = runtime.activate("retry").expect("the handler succeeds");
+
+        assert_eq!(
+            elements,
+            vec![UiElement::Text {
+                text: "ran retry".to_string(),
+                style: UiStyle::Plain,
+            }]
+        );
+    }
+
+    #[test]
+    fn an_activation_handler_may_render_and_return_elements() {
+        let runtime = load(
+            "function register(on) { \
+             $.ui.onActivate('go', function ($, event) { \
+               $.ui.render($.ui.button('Again', 'again')); \
+               return $.ui.text('the event is ' + event.event); }); }",
+        );
+
+        let elements = runtime.activate("go").expect("the handler succeeds");
+
+        assert_eq!(
+            elements,
+            vec![
+                UiElement::Button {
+                    label: "Again".to_string(),
+                    id: "again".to_string(),
+                },
+                UiElement::Text {
+                    text: "the event is ModUiActivate".to_string(),
+                    style: UiStyle::Plain,
+                },
+            ],
+            "the staged tree comes first, then what the handler returned"
+        );
+    }
+
+    #[test]
+    fn activating_an_unknown_id_is_ignored() {
+        let runtime = load("function register(on) {}");
+
+        assert_eq!(
+            runtime.activate("missing").expect("a miss is not an error"),
+            Vec::<UiElement>::new()
+        );
+    }
+
+    #[test]
+    fn a_duplicate_activation_registration_replaces_the_earlier_handler() {
+        let runtime = load(
+            "function register(on) { \
+             $.ui.onActivate('go', function () { return [$.ui.text('first')]; }); \
+             $.ui.onActivate('go', function () { return [$.ui.text('second')]; }); }",
+        );
+
+        let elements = runtime.activate("go").expect("the handler succeeds");
+
+        assert_eq!(
+            elements,
+            vec![UiElement::Text {
+                text: "second".to_string(),
+                style: UiStyle::Plain,
+            }],
+            "the later registration must replace the earlier one"
+        );
+    }
+
+    #[test]
+    fn an_activation_handler_error_is_returned() {
+        let runtime = load(
+            "function register(on) { \
+             $.ui.onActivate('boom', function () { throw new Error('handler broke'); }); }",
+        );
+
+        let error = runtime.activate("boom").expect_err("the handler throws");
+
+        assert!(error.contains("handler broke"), "{error}");
+    }
+
+    #[test]
+    fn an_activation_handler_obeys_the_wall_clock_budget() {
+        let limits = ModLimits {
+            hook_timeout: Duration::from_millis(50),
+            ..ModLimits::default()
+        };
+        let runtime = load_with(
+            "function register(on) { \
+             $.ui.onActivate('slow', function () { while (true) {} }); }",
+            limits,
+        );
+
+        let started = std::time::Instant::now();
+        let error = runtime
+            .activate("slow")
+            .expect_err("the handler never returns");
+        let elapsed = started.elapsed();
+
+        assert!(error.contains("wall-clock budget"), "{error}");
+        assert!(elapsed < Duration::from_secs(2), "took {elapsed:?}");
     }
 
     #[test]

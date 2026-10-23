@@ -5,8 +5,35 @@ use std::fmt;
 use std::sync::Arc;
 
 use coderex_core::hook_executor::{HookExecutor, HookFireResult};
+use coderex_core::ui_protocol::UiElement;
 
 use crate::runtime::{ModRuntime, ModSession, is_gating_event};
+
+/// A cloneable handle to a runtime's UI activation channel.
+///
+/// The terminal keeps one after installing the executor so pressing a mod
+/// button can reach the same worker, realm and limits its hooks run under.
+/// Cloning the handle shares the runtime; it does not start a second worker.
+#[derive(Clone, Debug)]
+pub struct ModUiHandle {
+    runtime: Arc<ModRuntime>,
+}
+
+impl ModUiHandle {
+    /// Deliver a button activation to the mod worker.
+    ///
+    /// The returned elements are a host-owned snapshot, ready to render. An id
+    /// with no registered `$.ui.onActivate` handler is ignored with a logged
+    /// warning and yields no elements.
+    ///
+    /// # Errors
+    ///
+    /// Returns the handler's error message when it throws, returns invalid
+    /// elements, or exceeds the wall-clock budget.
+    pub fn activate(&self, id: &str) -> Result<Vec<UiElement>, String> {
+        self.runtime.activate(id)
+    }
+}
 
 /// A [`HookExecutor`] that runs in-process JavaScript hooks with an optional
 /// downstream executor.
@@ -80,6 +107,14 @@ impl JsHookExecutor {
     #[must_use]
     pub fn runtime(&self) -> &ModRuntime {
         &self.runtime
+    }
+
+    /// A handle for delivering UI button activations to the same worker.
+    #[must_use]
+    pub fn ui_handle(&self) -> ModUiHandle {
+        ModUiHandle {
+            runtime: Arc::clone(&self.runtime),
+        }
     }
 }
 
@@ -325,6 +360,32 @@ mod tests {
 
         assert!(result.failed);
         assert!(result.stop);
+    }
+
+    #[test]
+    fn the_ui_handle_activates_on_the_executors_runtime() {
+        use coderex_core::ui_protocol::{UiElement, UiStyle};
+
+        let executor = JsHookExecutor::new(runtime_with(
+            "function register(on) { \
+             $.ui.onActivate('run', function ($, event) { \
+               return [$.ui.text(event.id + ' ran')]; }); }",
+        ));
+        let handle = executor.ui_handle().clone();
+
+        let elements = handle.activate("run").expect("the handler succeeds");
+
+        assert_eq!(
+            elements,
+            vec![UiElement::Text {
+                text: "run ran".to_string(),
+                style: UiStyle::Plain,
+            }]
+        );
+        assert_eq!(
+            handle.activate("missing").expect("a miss is not an error"),
+            Vec::<UiElement>::new()
+        );
     }
 
     #[tokio::test]

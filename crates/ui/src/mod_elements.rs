@@ -5,8 +5,10 @@
 //! no TUI state, so the same tree can be rendered into the interactive
 //! transcript or, through [`render_mod_ui_text`], into a headless run's output.
 //!
-//! Only terminal surfaces exist. Buttons become `[label]` affordances and are
-//! deliberately non-interactive; nothing here routes a click.
+//! Buttons render as `[label]`. The caller may pass the id of the focused
+//! button; that button renders as `> [label] <` with reversed emphasis, while
+//! every other button keeps the plain form. The renderer still keeps no state:
+//! focus is an argument, not something cached here.
 
 use coderex_core::ui_protocol::{UiElement, UiStyle};
 use ratatui::style::{Color, Modifier, Style};
@@ -38,7 +40,21 @@ pub const fn ui_style(style: UiStyle) -> Style {
 /// here refers back to the mod or the engine.
 #[must_use]
 pub fn render_mod_ui(elements: &[UiElement], width: usize) -> Vec<Line<'static>> {
-    render_children(elements, width.max(1))
+    render_mod_ui_with_focus(elements, width, None)
+}
+
+/// Render a mod UI tree, giving one button the focused treatment.
+///
+/// The button whose id equals `focused` renders as `> [label] <` with reversed
+/// emphasis; every other button renders as `[label]`. `None` is exactly
+/// [`render_mod_ui`].
+#[must_use]
+pub fn render_mod_ui_with_focus(
+    elements: &[UiElement],
+    width: usize,
+    focused: Option<&str>,
+) -> Vec<Line<'static>> {
+    render_children(elements, width.max(1), focused)
 }
 
 /// Render a mod UI tree as a plain text block, one line per row.
@@ -47,7 +63,17 @@ pub fn render_mod_ui(elements: &[UiElement], width: usize) -> Vec<Line<'static>>
 /// intentionally dropped because both consumers store plain text.
 #[must_use]
 pub fn render_mod_ui_text(elements: &[UiElement], width: usize) -> String {
-    render_mod_ui(elements, width)
+    render_mod_ui_text_with_focus(elements, width, None)
+}
+
+/// The plain-text form of [`render_mod_ui_with_focus`].
+#[must_use]
+pub fn render_mod_ui_text_with_focus(
+    elements: &[UiElement],
+    width: usize,
+    focused: Option<&str>,
+) -> String {
+    render_mod_ui_with_focus(elements, width, focused)
         .iter()
         .map(line_text)
         .collect::<Vec<_>>()
@@ -62,15 +88,19 @@ fn line_text(line: &Line<'static>) -> String {
     text
 }
 
-fn render_children(elements: &[UiElement], width: usize) -> Vec<Line<'static>> {
+fn render_children(
+    elements: &[UiElement],
+    width: usize,
+    focused: Option<&str>,
+) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     for element in elements {
-        lines.extend(render_element(element, width));
+        lines.extend(render_element(element, width, focused));
     }
     lines
 }
 
-fn render_element(element: &UiElement, width: usize) -> Vec<Line<'static>> {
+fn render_element(element: &UiElement, width: usize, focused: Option<&str>) -> Vec<Line<'static>> {
     match element {
         UiElement::Text { text, style } => {
             let style = ui_style(*style);
@@ -79,11 +109,24 @@ fn render_element(element: &UiElement, width: usize) -> Vec<Line<'static>> {
                 .map(|text| Line::from(Span::styled(text, style)))
                 .collect()
         }
-        UiElement::Button { label, .. } => {
-            let text = truncate_to_width(&format!("[{label}]"), width);
-            vec![Line::from(Span::styled(text, ui_style(UiStyle::Bold)))]
+        UiElement::Button { label, id } => {
+            let is_focused = focused == Some(id.as_str());
+            let text = if is_focused {
+                format!("> [{label}] <")
+            } else {
+                format!("[{label}]")
+            };
+            let text = truncate_to_width(&text, width);
+            let style = if is_focused {
+                ui_style(UiStyle::Bold).add_modifier(Modifier::REVERSED)
+            } else {
+                ui_style(UiStyle::Bold)
+            };
+            vec![Line::from(Span::styled(text, style))]
         }
-        UiElement::Box { title, children } => render_box(title.as_deref(), children, width),
+        UiElement::Box { title, children } => {
+            render_box(title.as_deref(), children, width, focused)
+        }
     }
 }
 
@@ -92,15 +135,20 @@ fn render_element(element: &UiElement, width: usize) -> Vec<Line<'static>> {
 /// children render on their own.
 const MIN_BOX_WIDTH: usize = 5;
 
-fn render_box(title: Option<&str>, children: &[UiElement], width: usize) -> Vec<Line<'static>> {
+fn render_box(
+    title: Option<&str>,
+    children: &[UiElement],
+    width: usize,
+    focused: Option<&str>,
+) -> Vec<Line<'static>> {
     if width < MIN_BOX_WIDTH {
-        return render_children(children, width);
+        return render_children(children, width, focused);
     }
 
     let border = Style::new().fg(Color::DarkGray);
     let inner_width = width - 4;
     let mut lines = vec![top_border(title, width, border)];
-    let child_lines = render_children(children, inner_width);
+    let child_lines = render_children(children, inner_width, focused);
     if child_lines.is_empty() {
         lines.push(content_line(Line::default(), inner_width, border));
     } else {
@@ -281,6 +329,41 @@ mod tests {
                 .contains(Modifier::BOLD),
             "a button should read as an affordance"
         );
+    }
+
+    #[test]
+    fn a_focused_button_is_marked_and_reversed() {
+        let lines = render_mod_ui_with_focus(&[button("Run")], 20, Some("run"));
+        assert_eq!(line_text(&lines[0]), "> [Run] <");
+        assert!(
+            lines[0].spans[0]
+                .style
+                .add_modifier
+                .contains(Modifier::REVERSED),
+            "the focused button should be visually distinct"
+        );
+    }
+
+    #[test]
+    fn only_the_focused_button_changes_its_text() {
+        let elements = [button("Run"), button("Stop")];
+        let rendered = render_mod_ui_text_with_focus(&elements, 20, Some("stop"));
+        assert_eq!(rendered, "[Run]\n> [Stop] <");
+        assert_eq!(
+            render_mod_ui_text(&elements, 20),
+            "[Run]\n[Stop]",
+            "no focus keeps the existing output"
+        );
+    }
+
+    #[test]
+    fn focus_reaches_buttons_nested_in_boxes() {
+        let tree = vec![UiElement::Box {
+            title: Some("Panel".to_string()),
+            children: vec![button("Go")],
+        }];
+        let rendered = render_mod_ui_text_with_focus(&tree, 24, Some("go"));
+        assert!(rendered.contains("> [Go] <"), "{rendered}");
     }
 
     #[test]

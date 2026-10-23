@@ -344,7 +344,7 @@ and the inner executor. See [Limits and isolation](#limits-and-isolation).
 | `$.session` | Frozen `{ cwd, model, permission_mode }`, captured when the runtime was constructed. |
 | `$.log(message)` | Writes a line at `info` under the `coderex_mods` tracing target. |
 | `$.env(name)` | The value of an allowlisted environment variable, or `null`. |
-| `$.ui` | Build and render a declarative UI tree. See [UI elements](#ui-elements). |
+| `$.ui` | Build and render a declarative UI tree, and register button handlers. See [UI elements](#ui-elements). |
 
 `$.env` returns `null` for every name outside this exact, case-sensitive list:
 
@@ -393,6 +393,7 @@ hook error. The next `fire` starts a fresh worker, which reloads the mods.
 | Stack values | 10,240 | The engine's stack ceiling. |
 | Mod file size | 1 MiB | Larger files are skipped with a load error. |
 | Hooks per mod | 256 | `on` throws when the cap is reached. |
+| Activation handlers per mod | 256 | `$.ui.onActivate` throws when the cap is reached. |
 
 A file that fails to read, transform, parse, evaluate or register is reported
 **once** at load (`tracing::warn!`, plus `ModRuntime::load_errors`) and
@@ -467,9 +468,40 @@ element; an array is flattened one level. Invalid options or children throw.
 
 ### `$.ui.button(label, id)`
 
-Returns a labelled button affordance. `label` and `id` must be non-empty
-strings. The id is reserved for a future input-routing pass; nothing reads it
-today.
+Returns a labelled button. `label` and `id` must be non-empty strings. The id
+is what a focused activation sends to the handler registered with
+`$.ui.onActivate(id, handler)`.
+
+### `$.ui.onActivate(id, handler)`
+
+Registers the handler for a button id. `handler($, event)` runs synchronously
+on the mod's worker, in the same realm, under the same wall-clock budget and
+engine limits as a hook. It may call `$.ui.render(...)` and/or return one
+element or an array of elements; the host renders the staged elements followed
+by the returned ones.
+
+```js
+function register(on) {
+  on('PostToolUse', 'Read', function ($) {
+    $.ui.render($.ui.button('Retry', 'retry'));
+  });
+
+  $.ui.onActivate('retry', function ($, event) {
+    // event.id is "retry"; event.event is "ModUiActivate"; event.surface is
+    // "terminal". Returning elements replaces the button block in the
+    // transcript.
+    return [$.ui.text('Retried ' + event.id)];
+  });
+}
+```
+
+- Registering the same id again **replaces** the earlier handler.
+- Activating an id with no handler is ignored: it logs a warning and renders
+  nothing. It is not an error.
+- A thrown exception, an invalid returned tree or a timeout is reported as a
+  system message in the terminal.
+- A mod may register at most 256 activation handlers.
+- An `async` handler is rejected: like a hook, it must return synchronously.
 
 ### `$.ui.render(element(s))`
 
@@ -494,15 +526,38 @@ message; a headless run appends it to the turn's output. Boxes render with
 nested borders and titles, text uses the terminal style vocabulary, and
 buttons render as `[label]`.
 
+### Interaction
+
+In the interactive terminal, the most recent rendered block is focusable when
+it contains at least one button:
+
+| Key | Action |
+| --- | --- |
+| `Tab` | Start focus on the first button, then cycle forward |
+| `Shift+Tab` | Cycle backward while a button is focused |
+| `Enter` | Activate the focused button |
+| `Esc` | Clear focus |
+
+While no button is focused, `Enter`, `Esc` and `Shift+Tab` keep their usual
+meanings (submit, interrupt/clear, permission-mode cycle). Ordinary typing
+always reaches the input line; focus never swallows a character. The focused
+button renders as `> [label] <`.
+
+Activation calls the handler on the mod worker. The elements it staged and
+returned are appended to the transcript as a new mod UI block, rendered with
+the same renderer. An error is shown as a system message.
+
+**Headless runs do not interact.** `--print` / non-interactive output renders
+the block and does not read keys or wait for input; a button is inert there.
+The same applies when the REPL is not attached to a terminal.
+
 ### Limitations
 
 - **Snapshot, not live.** Elements are plain data. There is no `mount`,
   `update` or `unmount`, no stable node identity, and no way to mutate an
   element after `render`. Render again from a later hook to show new content.
-- **Terminal only.** There is no web or other surface.
-- **Buttons do nothing.** They render as `[label]`. Input routing — clicks,
-  focus, key bindings, and the callback that would receive a button's `id` —
-  is not implemented. A button is a labelled affordance, not a control.
+- **Terminal only.** There is no web or other surface, and no mouse-click
+  routing: activation is keyboard focus plus `Enter`.
 - **One block per hook call.** The host renders a hook's tree on its own; it
   is not merged into the built-in panes.
 

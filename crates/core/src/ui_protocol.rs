@@ -5,9 +5,10 @@
 //! host, never a live JavaScript object. The host can therefore render it
 //! after the mod's worker has moved on, timed out, or been unloaded.
 //!
-//! Only terminal surfaces exist today. Buttons are labelled affordances: they
-//! carry an `id` for a future input-routing pass, but nothing dispatches a
-//! click yet.
+//! Only terminal surfaces exist today. A button is a labelled affordance with
+//! a stable `id`. The terminal can focus one and activate it, which delivers
+//! the id to the mod runtime's `$.ui.onActivate` handler; there is no mouse
+//! click routing.
 //!
 //! [`parse_ui_elements`] is the validating boundary for the JSON that crosses
 //! from the JavaScript runtime. It enforces types, non-empty button labels and
@@ -43,14 +44,15 @@ pub enum UiElement {
         /// Nested elements, rendered top to bottom.
         children: Vec<Self>,
     },
-    /// A labelled, non-interactive button affordance.
+    /// A labelled button affordance.
     ///
-    /// `id` is a stable identifier reserved for a future input-routing pass.
-    /// Current renderers show `[label]` and ignore the id.
+    /// `id` is what a focused activation sends to the mod runtime's
+    /// `$.ui.onActivate` handler. Renderers show `[label]`, marking the
+    /// focused one distinctly.
     Button {
         /// Text shown inside the brackets.
         label: String,
-        /// Stable identifier for a future click handler.
+        /// Stable identifier passed to the activation handler.
         id: String,
     },
 }

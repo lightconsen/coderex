@@ -45,8 +45,10 @@
 //! `$.ui.button` and stage it with `$.ui.render`. The tree crosses the worker
 //! boundary as a host-owned snapshot in
 //! [`HookFireResult`](coderex_core::hook_executor::HookFireResult) `ui`, and
-//! the engine emits it as `EngineEvent::ModUi` when non-empty. Rendering is
-//! terminal-only and buttons are non-interactive. See `docs/mods.md`.
+//! the engine emits it as `EngineEvent::ModUi` when non-empty. A button's id
+//! can be bound with `$.ui.onActivate(id, handler)`, and the terminal routes
+//! a focused activation to that handler through [`ModUiHandle`]. Rendering is
+//! terminal-only. See `docs/mods.md`.
 //!
 //! # Not yet
 //!
@@ -56,7 +58,7 @@ mod executor;
 mod runtime;
 mod transform;
 
-pub use executor::JsHookExecutor;
+pub use executor::{JsHookExecutor, ModUiHandle};
 pub use runtime::{
     ALLOWED_ENV_VARS, MODS_DIR_ENV, MODS_ENV, ModLimits, ModRuntime, ModRuntimeBuilder, ModSession,
     is_enabled, mods_dir,
