@@ -1641,6 +1641,60 @@ fn count_configured_hooks(value: &serde_json::Value) -> usize {
         .map_or(0, Vec::len)
 }
 
+/// Most loaded mods whose short hash is inlined in the startup line.
+///
+/// Above this count the line reports only the total: one line is the point,
+/// and a directory of many mods would turn it into a wall of hashes. The full
+/// list is always available from `ModRuntime::load_report`.
+const MOD_HASHES_INLINE_LIMIT: usize = 3;
+
+/// The one startup line that reports the mod load.
+///
+/// It names the count and directory, and says plainly that the SHA-256 values
+/// are informational: CodeRex has no signature or trust store, so a hash is
+/// not a verdict. For a small number of mods it also inlines a short hash per
+/// loaded file; otherwise the count alone keeps the line short.
+fn mods_startup_line(report: &[coderex_mods::ModInfo], dir: &std::path::Path) -> String {
+    use std::fmt::Write as _;
+
+    let loaded: Vec<&coderex_mods::ModInfo> = report.iter().filter(|info| info.loaded).collect();
+    let skipped: Vec<&coderex_mods::ModInfo> = report.iter().filter(|info| !info.loaded).collect();
+
+    let mut line = if skipped.is_empty() {
+        format!("mods: {} loaded from {}", loaded.len(), dir.display())
+    } else {
+        let names = skipped
+            .iter()
+            .map(|info| info.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "mods: {} of {} loaded from {} (skipped: {names})",
+            loaded.len(),
+            report.len(),
+            dir.display()
+        )
+    };
+
+    if !loaded.is_empty() && loaded.len() <= MOD_HASHES_INLINE_LIMIT {
+        let hashes = loaded
+            .iter()
+            .map(|info| {
+                let short = info.sha256.get(..12).unwrap_or(&info.sha256);
+                format!("{}={short}", info.name)
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let _ = write!(line, " [{hashes}]");
+    }
+
+    line.push_str(
+        "; sha256 is informational only (no signature or trust store); \
+         this code runs because you installed it",
+    );
+    line
+}
+
 /// Drop `type: "agent"` hook entries from a settings hooks document.
 ///
 /// Returns the filtered document and how many entries were removed. Both shapes
@@ -2005,6 +2059,9 @@ pub struct ReplLoop {
     /// Kept after the executor is installed so the terminal can press a
     /// button without reaching into the engine.
     mod_ui_handle: Option<coderex_mods::ModUiHandle>,
+    /// Whether the person has already been told that the timeout breaker
+    /// disabled mods. The breaker is sticky, so the message is shown once.
+    mods_disabled_reported: bool,
     /// Where the line-delimited protocol goes, when `--output-format
     /// stream-json` was asked for.
     ///
@@ -2330,6 +2387,7 @@ impl ReplLoop {
             hook_layers: None,
             active_hooks: 0,
             mod_ui_handle: None,
+            mods_disabled_reported: false,
             checkpoint_store: None,
             protocol_sink: None,
             headless_permission_control: false,
@@ -2728,6 +2786,7 @@ impl ReplLoop {
             hook_layers: None,
             active_hooks: 0,
             mod_ui_handle: None,
+            mods_disabled_reported: false,
             checkpoint_store,
             protocol_sink: None,
             headless_permission_control: false,
@@ -3765,6 +3824,15 @@ impl ReplLoop {
                                     as Arc<dyn coderex_core::hook_executor::HookExecutor>),
                             ) {
                                 Some(Ok(executor)) => {
+                                    // One startup line. The hashes come from
+                                    // the load report and are informational:
+                                    // there is no signature or trust store.
+                                    let line = mods_startup_line(
+                                        executor.load_report(),
+                                        executor.runtime().dir(),
+                                    );
+                                    tracing::info!("{line}");
+                                    eprintln!("{line}");
                                     self.mod_ui_handle = Some(executor.ui_handle());
                                     Arc::new(executor)
                                 }
@@ -4524,6 +4592,27 @@ impl ReplLoop {
         let result = loop {
             if !self.running {
                 break Ok(());
+            }
+
+            // The timeout circuit breaker is sticky. Tell the person once,
+            // without printing on every loop iteration, when it has tripped.
+            if !self.mods_disabled_reported {
+                let reason = self
+                    .mod_ui_handle
+                    .as_ref()
+                    .and_then(coderex_mods::ModUiHandle::disabled_reason);
+                if let Some(reason) = reason {
+                    self.mods_disabled_reported = true;
+                    tracing::warn!("{reason}");
+                    ui_state.messages.push(Message {
+                        role: MessageRole::System,
+                        content: reason.into(),
+                        tool_name: None,
+                        streaming: false,
+                        folded: false,
+                    });
+                    self.persist_interactive_snapshot(&ui_state);
+                }
             }
 
             // Sync statusline from REPL state
@@ -11745,6 +11834,72 @@ mod tests {
         let (filtered, skipped) = strip_agent_hooks(&doc);
         assert_eq!(skipped, 0);
         assert_eq!(filtered, doc);
+    }
+
+    #[test]
+    fn mods_startup_line_is_built_from_the_load_report() {
+        let directory = std::path::Path::new("/tmp/example-mods");
+        let report = vec![
+            coderex_mods::ModInfo {
+                name: "a.js".to_string(),
+                path: directory.join("a.js"),
+                sha256: "a".repeat(64),
+                loaded: true,
+                errors: Vec::new(),
+            },
+            coderex_mods::ModInfo {
+                name: "b.js".to_string(),
+                path: directory.join("b.js"),
+                sha256: "b".repeat(64),
+                loaded: true,
+                errors: Vec::new(),
+            },
+        ];
+
+        let line = mods_startup_line(&report, directory);
+
+        assert_eq!(line.lines().count(), 1, "one startup line: {line}");
+        assert!(
+            line.contains("mods: 2 loaded from /tmp/example-mods"),
+            "{line}"
+        );
+        assert!(line.contains("a.js=aaaaaaaaaaaa"), "{line}");
+        assert!(line.contains("b.js=bbbbbbbbbbbb"), "{line}");
+        assert!(line.contains("informational only"), "{line}");
+        assert!(line.contains("no signature or trust store"), "{line}");
+        assert!(
+            line.contains("this code runs because you installed it"),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn mods_startup_line_counts_skipped_mods_and_keeps_long_lists_short() {
+        let directory = std::path::Path::new("/tmp/many-mods");
+        let report: Vec<coderex_mods::ModInfo> = (0..5)
+            .map(|index| coderex_mods::ModInfo {
+                name: format!("m{index}.js"),
+                path: directory.join(format!("m{index}.js")),
+                sha256: "c".repeat(64),
+                loaded: index != 2,
+                errors: if index == 2 {
+                    vec!["register() failed".to_string()]
+                } else {
+                    Vec::new()
+                },
+            })
+            .collect();
+
+        let line = mods_startup_line(&report, directory);
+
+        assert_eq!(line.lines().count(), 1, "one startup line: {line}");
+        assert!(line.contains("mods: 4 of 5 loaded"), "{line}");
+        assert!(line.contains("skipped: m2.js"), "{line}");
+        assert!(
+            !line.contains("m0.js=c"),
+            "hashes must not be inlined above the limit: {line}"
+        );
+        assert!(line.contains("informational only"), "{line}");
     }
 
     /// The auto-dream manager is built before `--betas` is resolved, so the

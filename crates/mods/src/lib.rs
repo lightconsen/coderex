@@ -40,6 +40,18 @@
 //! as a hook error rather than hanging the agent. See [`ModLimits`] for the
 //! exact ceilings.
 //!
+//! A timed-out worker cannot be interrupted, so it is detached and a later
+//! call starts a new one. After [`DEFAULT_TIMEOUT_BREAKER_LIMIT`] such
+//! abandonments (overridable with `CODEREX_MODS_TIMEOUT_LIMIT`), the runtime's
+//! circuit breaker disables mods for the rest of the session: no worker is
+//! started again and a gating `fire` fails closed with an explanatory error.
+//! Only wall-clock timeouts count; ordinary hook errors do not. See
+//! [`ModRuntime::is_disabled`].
+//!
+//! [`ModRuntime::load_report`] returns a [`ModInfo`] per mod file with the
+//! SHA-256 of its original bytes. The hash is informational: there is no
+//! signature or trust store, and mods run because the person installed them.
+//!
 //! # UI
 //!
 //! A hook may build a declarative UI tree with `$.ui.text`, `$.ui.box`,
@@ -63,6 +75,7 @@ mod transform;
 
 pub use executor::{JsHookExecutor, ModUiHandle};
 pub use runtime::{
-    ALLOWED_ENV_VARS, MODS_DIR_ENV, MODS_ENV, ModLimits, ModRuntime, ModRuntimeBuilder, ModSession,
+    ALLOWED_ENV_VARS, DEFAULT_TIMEOUT_BREAKER_LIMIT, MODS_DIR_ENV, MODS_ENV,
+    MODS_TIMEOUT_LIMIT_ENV, ModInfo, ModLimits, ModRuntime, ModRuntimeBuilder, ModSession,
     is_enabled, mods_dir,
 };

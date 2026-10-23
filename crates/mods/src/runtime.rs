@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -21,6 +21,7 @@ use boa_engine::{
 };
 use coderex_core::hook_executor::{HookExecutor, HookFireResult};
 use coderex_core::ui_protocol::{UiElement, parse_ui_elements};
+use sha2::{Digest, Sha256};
 
 use crate::transform;
 
@@ -29,6 +30,17 @@ pub const MODS_ENV: &str = "CODEREX_MODS";
 
 /// Environment variable that overrides the mods directory.
 pub const MODS_DIR_ENV: &str = "CODEREX_MODS_DIR";
+
+/// Environment variable that overrides the timeout circuit-breaker threshold.
+///
+/// The value is a non-negative integer: how many wall-clock abandonments are
+/// tolerated before mods are disabled for the rest of the session. An invalid
+/// value falls back to [`DEFAULT_TIMEOUT_BREAKER_LIMIT`]; `0` disables the
+/// breaker (timeouts never disable mods).
+pub const MODS_TIMEOUT_LIMIT_ENV: &str = "CODEREX_MODS_TIMEOUT_LIMIT";
+
+/// How many wall-clock abandonments disable mods by default.
+pub const DEFAULT_TIMEOUT_BREAKER_LIMIT: usize = 3;
 
 /// Environment variables a mod may read through `$.env(name)`.
 ///
@@ -155,6 +167,28 @@ fn env_flag(name: &str) -> bool {
     })
 }
 
+/// What the runtime knows about one file in the mods directory.
+///
+/// A report entry exists for every `.js`, `.jsx`, `.ts` and `.tsx` file found,
+/// including the ones that were skipped. `loaded` means the file evaluated,
+/// defined `register(on, options)`, and registered without error; `errors`
+/// says why a skipped file was skipped. An empty `sha256` means the file could
+/// not be read, so there were no bytes to hash.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModInfo {
+    /// The file name, as loaded (`options.name`).
+    pub name: String,
+    /// The full path the file was read from.
+    pub path: PathBuf,
+    /// Lowercase hex SHA-256 of the **original file bytes**, before any
+    /// TypeScript/JSX transform. Informational only; see `docs/mods.md`.
+    pub sha256: String,
+    /// Whether the mod evaluated and registered.
+    pub loaded: bool,
+    /// Why the mod was skipped; empty when it loaded.
+    pub errors: Vec<String>,
+}
+
 /// One mod file to load into the worker.
 #[derive(Debug, Clone)]
 struct ModSource {
@@ -186,7 +220,11 @@ struct WorkerConfig {
 #[derive(Debug)]
 struct InitOutcome {
     hooks: Vec<WorkerHook>,
+    /// Every load error, formatted as `<path>: <reason>`.
     load_errors: Vec<String>,
+    /// Per-mod load errors, aligned with [`WorkerConfig::mods`]: `None` when
+    /// that mod loaded, `Some(reason)` when it was skipped.
+    mod_errors: Vec<Option<String>>,
 }
 
 /// A request from the caller to the worker.
@@ -229,6 +267,15 @@ pub struct ModRuntime {
     limits: ModLimits,
     hook_count: usize,
     load_errors: Vec<String>,
+    /// One entry per mod file found, including skipped files.
+    report: Vec<ModInfo>,
+    /// Wall-clock abandonments tolerated before the breaker trips. `0` means
+    /// the breaker is disabled.
+    timeout_breaker_limit: usize,
+    /// Hook calls abandoned because they exceeded the wall-clock budget.
+    timeout_abandonments: AtomicUsize,
+    /// Whether mods have been disabled for the rest of the session.
+    disabled: AtomicBool,
     config: Arc<WorkerConfig>,
     worker: Mutex<Option<WorkerHandle>>,
 }
@@ -265,11 +312,22 @@ impl ModRuntime {
 
         let mut load_errors = Vec::new();
         let mut mods = Vec::new();
+        let mut report = Vec::new();
+        // Report indexes of the files that reached the worker, so the worker's
+        // per-mod outcome can be folded into the report afterwards.
+        let mut worker_report_indices = Vec::new();
         for (name, file_path, kind) in files {
-            let source = match read_source(&file_path) {
-                Ok(source) => source,
+            let (source, sha256) = match read_source(&file_path) {
+                Ok(loaded) => loaded,
                 Err(error) => {
                     record_load_error(&mut load_errors, &file_path, &error);
+                    report.push(ModInfo {
+                        name,
+                        path: file_path,
+                        sha256: String::new(),
+                        loaded: false,
+                        errors: vec![error],
+                    });
                     continue;
                 }
             };
@@ -281,12 +339,27 @@ impl ModRuntime {
                     Ok(source) => source,
                     Err(error) => {
                         record_load_error(&mut load_errors, &file_path, &error);
+                        report.push(ModInfo {
+                            name,
+                            path: file_path,
+                            sha256,
+                            loaded: false,
+                            errors: vec![error],
+                        });
                         continue;
                     }
                 }
             } else {
                 source
             };
+            worker_report_indices.push(report.len());
+            report.push(ModInfo {
+                name: name.clone(),
+                path: file_path.clone(),
+                sha256,
+                loaded: false,
+                errors: Vec::new(),
+            });
             mods.push(ModSource {
                 name,
                 path: file_path,
@@ -305,12 +378,28 @@ impl ModRuntime {
         }
         load_errors.extend(outcome.load_errors);
 
+        for (worker_index, report_index) in worker_report_indices.iter().enumerate() {
+            let info = &mut report[*report_index];
+            match outcome
+                .mod_errors
+                .get(worker_index)
+                .and_then(Option::as_ref)
+            {
+                Some(error) => info.errors.push(error.clone()),
+                None => info.loaded = true,
+            }
+        }
+
         Ok(Self {
             dir: path.to_path_buf(),
             session,
             limits,
             hook_count: outcome.hooks.len(),
             load_errors,
+            report,
+            timeout_breaker_limit: configured_timeout_breaker_limit(),
+            timeout_abandonments: AtomicUsize::new(0),
+            disabled: AtomicBool::new(false),
             config,
             worker: Mutex::new(Some(WorkerHandle { sender })),
         })
@@ -357,6 +446,55 @@ impl ModRuntime {
         &self.load_errors
     }
 
+    /// One entry per mod file found, loaded or skipped.
+    ///
+    /// `sha256` hashes the original file bytes (not the transformed source)
+    /// and is informational only: there is no signature or trust store.
+    #[must_use]
+    pub fn load_report(&self) -> &[ModInfo] {
+        &self.report
+    }
+
+    /// Whether the timeout circuit breaker has disabled mods for the rest of
+    /// this session.
+    ///
+    /// Once this is `true` it stays `true`: no worker is started again, and
+    /// every gating `fire` fails closed until a new runtime (a new process or
+    /// session) is created.
+    #[must_use]
+    pub fn is_disabled(&self) -> bool {
+        self.disabled.load(Ordering::SeqCst)
+    }
+
+    /// How many hook calls have been abandoned on the wall-clock budget.
+    ///
+    /// Ordinary hook errors are not counted; only timeouts are.
+    #[must_use]
+    pub fn timeout_abandonments(&self) -> usize {
+        self.timeout_abandonments.load(Ordering::SeqCst)
+    }
+
+    /// The configured breaker threshold. `0` means the breaker is disabled.
+    #[must_use]
+    pub const fn timeout_breaker_limit(&self) -> usize {
+        self.timeout_breaker_limit
+    }
+
+    /// Why mods are disabled, or `None` while they are still enabled.
+    #[must_use]
+    pub fn disabled_reason(&self) -> Option<String> {
+        self.is_disabled().then(|| {
+            format!(
+                "mods are disabled for the rest of this session: {} hook call(s) exceeded the \
+                 {} ms wall-clock budget and each abandoned a worker thread (threshold {}); \
+                 restart CodeRex to re-enable mods",
+                self.timeout_abandonments(),
+                self.limits.hook_timeout.as_millis(),
+                self.timeout_breaker_limit,
+            )
+        })
+    }
+
     /// Fire `event` against every matching hook and merge what they return,
     /// with no downstream executor installed.
     ///
@@ -394,6 +532,12 @@ impl ModRuntime {
     /// `UserPromptSubmit`) a failure also sets `stop`, so a broken hook cannot
     /// read as an allow. The wall-clock budget covers the whole call,
     /// including any downstream run.
+    ///
+    /// Once the timeout circuit breaker has tripped (see
+    /// [`is_disabled`](Self::is_disabled)), no worker is contacted. The call
+    /// records an error and fails closed on a gating event; on a non-gating
+    /// event it still delegates to `inner`, so settings hooks keep working
+    /// while mods are off.
     #[must_use]
     pub fn fire_with_inner(
         &self,
@@ -402,6 +546,20 @@ impl ModRuntime {
         context: &HashMap<String, String>,
         inner: Option<Arc<dyn HookExecutor>>,
     ) -> HookFireResult {
+        if let Some(reason) = self.disabled_reason() {
+            let mut result = failure_result(event, reason);
+            // A gating event is already denied; do not run the downstream
+            // hooks behind a closed gate. For anything else, behave as if the
+            // mods were not installed: run the inner executor unchanged.
+            if !result.stop {
+                if let Some(inner) = inner {
+                    let inner_result = run_inner_blocking(&inner, event, input, context);
+                    result = merge_with_inner(result, inner_result);
+                }
+            }
+            return result;
+        }
+
         let (reply, reply_receiver) = mpsc::sync_channel(1);
         let request = Request {
             event: event.to_string(),
@@ -430,6 +588,9 @@ impl ModRuntime {
     /// Returns the handler's error message when it throws, returns invalid
     /// elements, or exceeds the wall-clock budget.
     pub fn activate(&self, id: &str) -> Result<Vec<UiElement>, String> {
+        if let Some(reason) = self.disabled_reason() {
+            return Err(reason);
+        }
         let (reply, reply_receiver) = mpsc::sync_channel(1);
         let sender = self.worker_sender()?;
         sender
@@ -442,6 +603,7 @@ impl ModRuntime {
         match reply_receiver.recv_timeout(self.limits.hook_timeout) {
             Ok(result) => result,
             Err(RecvTimeoutError::Timeout) => {
+                self.record_timeout_abandonment();
                 self.abandon_worker();
                 Err(format!(
                     "the activation handler exceeded its {} ms wall-clock budget",
@@ -468,6 +630,7 @@ impl ModRuntime {
         match reply_receiver.recv_timeout(self.limits.hook_timeout) {
             Ok(result) => Ok(result),
             Err(RecvTimeoutError::Timeout) => {
+                self.record_timeout_abandonment();
                 self.abandon_worker();
                 Err(format!(
                     "the hook exceeded its {} ms wall-clock budget",
@@ -492,6 +655,11 @@ impl ModRuntime {
             .worker
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Read the breaker under the worker lock: once it trips, no caller may
+        // start a replacement worker.
+        if let Some(reason) = self.disabled_reason() {
+            return Err(reason);
+        }
         if let Some(handle) = worker.as_ref() {
             return Ok(handle.sender.clone());
         }
@@ -505,6 +673,25 @@ impl ModRuntime {
         Ok(sender)
     }
 
+    /// Count one wall-clock abandonment and trip the breaker at the threshold.
+    ///
+    /// Only timeouts call this; an ordinary hook error, a disconnected worker
+    /// or an engine-limit error does not. A threshold of `0` disables the
+    /// breaker.
+    fn record_timeout_abandonment(&self) {
+        if self.timeout_breaker_limit == 0 {
+            return;
+        }
+        let count = self.timeout_abandonments.fetch_add(1, Ordering::SeqCst) + 1;
+        if count >= self.timeout_breaker_limit && !self.disabled.swap(true, Ordering::SeqCst) {
+            tracing::error!(
+                abandonments = count,
+                threshold = self.timeout_breaker_limit,
+                "mods disabled for the rest of the session after repeated hook timeouts"
+            );
+        }
+    }
+
     /// Drop the worker handle. The detached worker exits when its request
     /// channel closes, which happens as soon as the engine returns.
     fn abandon_worker(&self) {
@@ -513,6 +700,42 @@ impl ModRuntime {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         *worker = None;
+    }
+}
+
+/// Resolve the breaker threshold from the environment, falling back to the
+/// default. A value of `0` disables the breaker.
+fn configured_timeout_breaker_limit() -> usize {
+    std::env::var(MODS_TIMEOUT_LIMIT_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(DEFAULT_TIMEOUT_BREAKER_LIMIT)
+}
+
+/// Run the downstream executor once while mods are disabled.
+///
+/// The normal path runs the inner executor on the worker's own current-thread
+/// runtime. With the worker gone, the calling thread supplies one instead. The
+/// callers of [`ModRuntime::fire_with_inner`] are blocking contexts (the async
+/// adapter uses `spawn_blocking`), so this does not nest inside a runtime.
+fn run_inner_blocking(
+    inner: &Arc<dyn HookExecutor>,
+    event: &str,
+    input: &str,
+    context: &HashMap<String, String>,
+) -> HookFireResult {
+    match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime.block_on(inner.fire_hook(event, input, context)),
+        Err(error) => HookFireResult {
+            failed: true,
+            errors: vec![format!(
+                "mods are disabled and the downstream hooks could not be run: {error}"
+            )],
+            ..HookFireResult::default()
+        },
     }
 }
 
@@ -631,7 +854,12 @@ fn record_load_error(errors: &mut Vec<String>, path: &Path, error: &str) {
     errors.push(message);
 }
 
-fn read_source(path: &Path) -> Result<String, String> {
+/// Read one mod file and hash its original bytes.
+///
+/// Returns the source and the lowercase hex SHA-256 of the bytes on disk. The
+/// hash is taken before any TypeScript/JSX lowering, so it identifies the file
+/// the person installed rather than the runtime's transformed copy.
+fn read_source(path: &Path) -> Result<(String, String), String> {
     let metadata =
         std::fs::metadata(path).map_err(|error| format!("could not inspect the file: {error}"))?;
     if metadata.len() > MAX_MOD_BYTES {
@@ -639,7 +867,11 @@ fn read_source(path: &Path) -> Result<String, String> {
             "the file is larger than the {MAX_MOD_BYTES}-byte limit"
         ));
     }
-    std::fs::read_to_string(path).map_err(|error| format!("could not read the file: {error}"))
+    let bytes = std::fs::read(path).map_err(|error| format!("could not read the file: {error}"))?;
+    let sha256 = hex::encode(Sha256::digest(&bytes));
+    let source = String::from_utf8(bytes)
+        .map_err(|_| "could not read the file: the file is not valid UTF-8".to_string())?;
+    Ok((source, sha256))
 }
 
 /// Start a worker thread and wait until it has loaded the mods.
@@ -689,6 +921,7 @@ fn worker_main(
     let outcome = InitOutcome {
         hooks: state.hooks.clone(),
         load_errors: state.load_errors.clone(),
+        mod_errors: state.mod_errors.clone(),
     };
     if init.send(Ok(outcome)).is_err() {
         return;
@@ -714,6 +947,8 @@ struct WorkerState {
     runtime: Arc<tokio::runtime::Runtime>,
     hooks: Vec<WorkerHook>,
     load_errors: Vec<String>,
+    /// Per-mod load errors, aligned with the configured mod order.
+    mod_errors: Vec<Option<String>>,
     mod_names: Vec<String>,
 }
 
@@ -749,6 +984,7 @@ impl WorkerState {
 
         let mut hooks = Vec::new();
         let mut load_errors = Vec::new();
+        let mut mod_errors = Vec::new();
         let mut mod_names = Vec::new();
 
         for source in &config.mods {
@@ -804,9 +1040,11 @@ impl WorkerState {
                         });
                     }
                     mod_names.push(source.name.clone());
+                    mod_errors.push(None);
                 }
                 Err(error) => {
                     load_errors.push(format!("{}: {error}", source.path.display()));
+                    mod_errors.push(Some(error));
                 }
             }
         }
@@ -816,6 +1054,7 @@ impl WorkerState {
             runtime,
             hooks,
             load_errors,
+            mod_errors,
             mod_names,
         })
     }
@@ -2762,6 +3001,208 @@ mod tests {
             result.errors
         );
         assert!(elapsed < Duration::from_secs(2), "took {elapsed:?}");
+    }
+
+    #[test]
+    fn the_timeout_breaker_trips_at_the_threshold_and_then_stops_the_worker() {
+        let limits = ModLimits {
+            // Only the wall-clock watchdog can stop this hook.
+            max_loop_iterations: u64::MAX,
+            hook_timeout: Duration::from_millis(200),
+            ..ModLimits::default()
+        };
+        let runtime = load_with(
+            "function register(on) { on('*', '*', function () { while (true) {} }); }",
+            limits,
+        );
+
+        for attempt in 1..=DEFAULT_TIMEOUT_BREAKER_LIMIT {
+            let result = runtime.fire("PostToolUse", "Bash", &HashMap::new());
+            assert!(result.failed, "attempt {attempt}: {result:?}");
+            assert!(!result.stop, "PostToolUse is not a gating event");
+            assert!(
+                result
+                    .errors
+                    .iter()
+                    .any(|error| error.contains("wall-clock budget")),
+                "attempt {attempt}: {:?}",
+                result.errors
+            );
+            assert_eq!(runtime.timeout_abandonments(), attempt);
+            assert_eq!(
+                runtime.is_disabled(),
+                attempt == DEFAULT_TIMEOUT_BREAKER_LIMIT,
+                "the breaker must trip exactly at the threshold"
+            );
+        }
+
+        // Disabled: no worker is started, so this returns without waiting for
+        // the infinite loop's budget. The downstream executor still runs on a
+        // non-gating event, so settings hooks keep working.
+        let inner = Arc::new(RecordingInner::answering(HookFireResult {
+            updated_input: Some("from-inner".to_string()),
+            ..HookFireResult::default()
+        }));
+        let started = std::time::Instant::now();
+        let post = fire_with(&runtime, "PostToolUse", "Bash", Arc::clone(&inner) as _);
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < Duration::from_millis(150),
+            "a disabled runtime must not start a worker; took {elapsed:?}"
+        );
+        assert_eq!(inner.calls().len(), 1, "the downstream executor still runs");
+        assert_eq!(post.updated_input.as_deref(), Some("from-inner"));
+        assert!(post.failed, "{post:?}");
+        assert!(!post.stop, "PostToolUse is not a gating event");
+        assert!(
+            post.errors
+                .iter()
+                .any(|error| error.contains("disabled for the rest of this session")),
+            "{:?}",
+            post.errors
+        );
+
+        let inner = Arc::new(RecordingInner::answering(HookFireResult::default()));
+        let pre = fire_with(&runtime, "PreToolUse", "Bash", Arc::clone(&inner) as _);
+        assert!(pre.stop, "a gating event fails closed: {pre:?}");
+        assert_eq!(
+            inner.calls().len(),
+            0,
+            "the downstream hooks must not run behind a closed gate"
+        );
+        assert!(
+            pre.errors.iter().any(|error| error.contains("disabled")),
+            "{:?}",
+            pre.errors
+        );
+    }
+
+    #[test]
+    fn ordinary_hook_errors_do_not_count_toward_the_breaker() {
+        let runtime = load(
+            "function register(on) { on('PreToolUse', 'Bash', function () { \
+             throw new Error('broken'); }); }",
+        );
+
+        for _ in 0..(DEFAULT_TIMEOUT_BREAKER_LIMIT + 2) {
+            let result = runtime.fire("PreToolUse", "Bash", &HashMap::new());
+            assert!(result.failed && result.stop, "{result:?}");
+        }
+        assert_eq!(runtime.timeout_abandonments(), 0);
+        assert!(!runtime.is_disabled());
+    }
+
+    #[test]
+    fn engine_limit_errors_do_not_count_toward_the_breaker() {
+        let limits = ModLimits {
+            max_loop_iterations: 10_000,
+            ..ModLimits::default()
+        };
+        let runtime = load_with(
+            "function register(on) { on('PostToolUse', '*', function () { while (true) {} }); }",
+            limits,
+        );
+
+        for _ in 0..=DEFAULT_TIMEOUT_BREAKER_LIMIT {
+            let result = runtime.fire("PostToolUse", "Bash", &HashMap::new());
+            assert!(result.failed, "{result:?}");
+            assert!(
+                result
+                    .errors
+                    .iter()
+                    .any(|error| error.contains("loop iteration limit")),
+                "{:?}",
+                result.errors
+            );
+        }
+        assert_eq!(runtime.timeout_abandonments(), 0);
+        assert!(!runtime.is_disabled());
+    }
+
+    #[test]
+    fn the_load_report_hashes_the_original_file_bytes() {
+        let directory = tempfile::tempdir().unwrap();
+        let original =
+            "function register(on: unknown) { on('PostToolUse', '*', function () {}); }\n";
+        std::fs::write(directory.path().join("typed.ts"), original).unwrap();
+
+        let runtime = ModRuntime::load_dir(directory.path(), session()).unwrap();
+        let report = runtime.load_report();
+
+        assert_eq!(report.len(), 1, "{report:?}");
+        let info = &report[0];
+        assert_eq!(info.name, "typed.ts");
+        assert!(info.loaded, "{info:?}");
+        assert!(info.errors.is_empty(), "{info:?}");
+        assert_eq!(
+            info.sha256,
+            hex::encode(Sha256::digest(original.as_bytes())),
+            "the hash must cover the bytes on disk, not the transformed source"
+        );
+    }
+
+    #[test]
+    fn mod_hashes_are_stable_and_change_with_content() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("a.js");
+        std::fs::write(&path, "function register(on) {}").unwrap();
+
+        let first = ModRuntime::load_dir(directory.path(), session()).unwrap();
+        let first_hash = first.load_report()[0].sha256.clone();
+        let second = ModRuntime::load_dir(directory.path(), session()).unwrap();
+        assert_eq!(
+            first_hash,
+            second.load_report()[0].sha256,
+            "the same bytes must hash the same"
+        );
+        assert_eq!(first_hash.len(), 64, "SHA-256 is 32 bytes of hex");
+
+        std::fs::write(
+            &path,
+            "function register(on) { on('PostToolUse', '*', function () {}); }",
+        )
+        .unwrap();
+        let changed = ModRuntime::load_dir(directory.path(), session()).unwrap();
+        assert_ne!(
+            first_hash,
+            changed.load_report()[0].sha256,
+            "different bytes must hash differently"
+        );
+    }
+
+    #[test]
+    fn the_load_report_records_skipped_mods_and_their_errors() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("broken.js"),
+            "function register(on) { this is not JavaScript }",
+        )
+        .unwrap();
+        std::fs::write(
+            directory.path().join("good.js"),
+            "function register(on) { on('PreToolUse', 'Bash', function () { return { stop: true }; }); }",
+        )
+        .unwrap();
+
+        let runtime = ModRuntime::load_dir(directory.path(), session()).unwrap();
+        let report = runtime.load_report();
+
+        assert_eq!(report.len(), 2, "{report:?}");
+        let broken = report
+            .iter()
+            .find(|info| info.name == "broken.js")
+            .expect("the skipped file is in the report");
+        assert!(!broken.loaded, "{broken:?}");
+        assert!(!broken.errors.is_empty(), "{broken:?}");
+        assert_eq!(broken.sha256.len(), 64, "readable bytes are still hashed");
+
+        let good = report
+            .iter()
+            .find(|info| info.name == "good.js")
+            .expect("the loaded file is in the report");
+        assert!(good.loaded, "{good:?}");
+        assert!(good.errors.is_empty(), "{good:?}");
     }
 
     #[test]

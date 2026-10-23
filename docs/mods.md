@@ -16,8 +16,9 @@ The runtime is opt-in. Without the environment variable below, CodeRex does not
 load mods at all and behaves exactly as before.
 
 ```
-CODEREX_MODS=1          # opt in
-CODEREX_MODS_DIR=...    # optional directory override
+CODEREX_MODS=1                  # opt in
+CODEREX_MODS_DIR=...            # optional directory override
+CODEREX_MODS_TIMEOUT_LIMIT=3    # optional timeout-breaker threshold
 ```
 
 `CODEREX_MODS` accepts `1`, `true`, `yes` or `on` (case-insensitive). Setting
@@ -408,7 +409,8 @@ what lets `JsHookExecutor` be shared as `Arc<dyn HookExecutor>`.
 the matching JavaScript hooks and any nested `next` calls as one chain, then
 (unless a hook called `next` or stopped the event) the downstream executor. A
 timeout does not stop the engine; the caller detaches the worker and reports a
-hook error. The next `fire` starts a fresh worker, which reloads the mods.
+hook error. Until the breaker below trips, the next `fire` starts a fresh
+worker, which reloads the mods.
 
 | Limit | Default | Behaviour |
 | --- | --- | --- |
@@ -420,6 +422,7 @@ hook error. The next `fire` starts a fresh worker, which reloads the mods.
 | Mod file size | 1 MiB | Larger files are skipped with a load error. |
 | Hooks per mod | 256 | `on` throws when the cap is reached. |
 | Activation handlers per mod | 256 | `$.ui.onActivate` throws when the cap is reached. |
+| Timeout abandonments | 3 per session | The circuit breaker disables mods for the rest of the session. See below. |
 
 A file that fails to read, transform, parse, evaluate or register is reported
 **once** at load (`tracing::warn!`, plus `ModRuntime::load_errors`) and
@@ -440,6 +443,85 @@ worker is detached; the engine limits make it terminate shortly afterwards. A
 hook that blocked inside a native call, or a downstream executor that never
 resolves, would outlive the timeout until that work returned. Requests are
 serialized by the worker, so a detached runaway delays only its own runtime.
+
+### Timeout circuit breaker
+
+A detached worker cannot be killed, so every wall-clock timeout leaves a thread
+that may still be running. CodeRex counts those abandonments per runtime (one
+runtime per session) and stops feeding the problem after a small threshold.
+
+- **What counts:** only a call that exceeds the wall-clock budget — a hook
+  `fire`, a nested `next`, or a UI activation handler. Ordinary hook
+  exceptions, engine-limit errors (loop, recursion, stack) and a worker that
+  disconnects do **not** count.
+- **Threshold:** `3` by default. `CODEREX_MODS_TIMEOUT_LIMIT` overrides it with
+  a non-negative integer; `0` disables the breaker, and an invalid value falls
+  back to `3`.
+- **What happens at the threshold:** mods are disabled for the rest of the
+  session. The state is sticky — re-enabling requires a new process/session.
+  No new worker is started, so no further mod code runs.
+- **What a call returns while disabled:** the result carries `failed: true` and
+  an error explaining the shutdown. On a gating event (`PreToolUse`,
+  `UserPromptSubmit`) it also sets `stop`, so a disabled runtime fails closed.
+  On a non-gating event `stop` is unchanged (`false`), and the downstream
+  settings hooks still run normally: disabling mods does not disable the
+  configured hooks. `activate` returns the reason as an error instead.
+- **Telling the person:** `ModRuntime::is_disabled()` and
+  `disabled_reason()` expose the state; `JsHookExecutor` and `ModUiHandle`
+  forward them. The interactive CLI shows the reason once, in the transcript.
+  `timeout_abandonments()` reports the count so far.
+
+```rust
+// The threshold in force; 0 means "never disable".
+runtime.timeout_breaker_limit();
+// Once true, it stays true for this runtime.
+runtime.is_disabled();
+// Some("mods are disabled ...") after the breaker trips.
+runtime.disabled_reason();
+```
+
+## Mod file hashes and the load report
+
+`ModRuntime::load_report()` returns one `ModInfo` per `.js`, `.jsx`, `.ts` and
+`.tsx` file found:
+
+```rust
+pub struct ModInfo {
+    pub name: String,       // file name, also `options.name`
+    pub path: PathBuf,      // full path read
+    pub sha256: String,     // lowercase hex, original file bytes
+    pub loaded: bool,       // evaluated, registered, no error
+    pub errors: Vec<String>,// why a skipped file was skipped
+}
+```
+
+**What is hashed.** The SHA-256 covers the **original bytes on disk**, before
+TypeScript stripping or JSX lowering. That is the file the person installed,
+not the runtime's transformed copy. The hash is empty when the file could not
+be read (there are no bytes to hash); a file that read but failed to transform
+or evaluate still has its hash.
+
+**What the hash does not establish.** It is an integrity fingerprint, not a
+trust decision. CodeRex has **no signature scheme and no trust store**, and
+does not compare hashes against any allowlist. A hash proves only that two
+byte sequences are the same; it says nothing about who wrote them or whether
+they are safe. Mods are trusted because the person chose to put the files in
+their own mods directory. A changed hash across runs means the file changed —
+not that the change is malicious, and not that an unchanged hash means the
+code is trustworthy. The runtime also has no way to know that the bytes it
+hashed are the bytes that ran if the file is replaced mid-session: the report
+describes the load, not a live guarantee.
+
+**The startup line.** When mods are enabled, the CLI prints one line at
+startup: how many loaded, from which directory, and that the hashes are
+informational. With at most three loaded mods it also inlines a short
+(12-character) hash per file; above that it reports only the count, so a large
+directory does not turn startup into a wall of hashes. The full report is
+always available programmatically.
+
+```text
+mods: 2 loaded from /home/you/.coderex/mods [guard.js=1f2e3d4c5b6a, fmt.js=9a8b7c6d5e4f]; sha256 is informational only (no signature or trust store); this code runs because you installed it
+```
 
 ## Composing with settings hooks
 

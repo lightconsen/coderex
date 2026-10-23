@@ -7,7 +7,7 @@ use std::sync::Arc;
 use coderex_core::hook_executor::{HookExecutor, HookFireResult};
 use coderex_core::ui_protocol::UiElement;
 
-use crate::runtime::{ModRuntime, ModSession, is_gating_event};
+use crate::runtime::{ModInfo, ModRuntime, ModSession, is_gating_event};
 
 /// A cloneable handle to a runtime's UI activation channel.
 ///
@@ -32,6 +32,19 @@ impl ModUiHandle {
     /// elements, or exceeds the wall-clock budget.
     pub fn activate(&self, id: &str) -> Result<Vec<UiElement>, String> {
         self.runtime.activate(id)
+    }
+
+    /// Whether the timeout circuit breaker has disabled mods for the rest of
+    /// the session.
+    #[must_use]
+    pub fn is_disabled(&self) -> bool {
+        self.runtime.is_disabled()
+    }
+
+    /// Why mods are disabled, or `None` while they are enabled.
+    #[must_use]
+    pub fn disabled_reason(&self) -> Option<String> {
+        self.runtime.disabled_reason()
     }
 }
 
@@ -107,6 +120,18 @@ impl JsHookExecutor {
     #[must_use]
     pub fn runtime(&self) -> &ModRuntime {
         &self.runtime
+    }
+
+    /// One entry per mod file found, with its original-bytes SHA-256.
+    #[must_use]
+    pub fn load_report(&self) -> &[ModInfo] {
+        self.runtime.load_report()
+    }
+
+    /// Whether the timeout circuit breaker has disabled mods.
+    #[must_use]
+    pub fn is_disabled(&self) -> bool {
+        self.runtime.is_disabled()
     }
 
     /// A handle for delivering UI button activations to the same worker.
@@ -371,7 +396,7 @@ mod tests {
              $.ui.onActivate('run', function ($, event) { \
                return [$.ui.text(event.id + ' ran')]; }); }",
         ));
-        let handle = executor.ui_handle().clone();
+        let handle = executor.ui_handle();
 
         let elements = handle.activate("run").expect("the handler succeeds");
 
