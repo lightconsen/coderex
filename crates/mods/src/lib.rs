@@ -19,10 +19,22 @@
 //! deduplicated. A single call may nest at most 64 `next` levels.
 //!
 //! The host API exposed to a mod is deliberately small: `$.session` (read
-//! only facts plus `notify(text)`, a short display-only notice),
+//! only facts plus `notify(text)`, a short display-only notice, and
+//! `submit(text)`, which queues a user message for after the current turn),
 //! `$.log(message)` and `$.env(name)` over a fixed allowlist. Mods get no
 //! tools, no filesystem, no network and no engine object; `next` only runs the
 //! host's existing chain and downstream executor.
+//!
+//! `$.session.submit(text)` never calls the engine. It stages text on the
+//! worker; the chain merges what matching hooks submitted (deduplicating
+//! identical consecutive messages) into
+//! [`HookFireResult::pending_prompts`](coderex_core::hook_executor::HookFireResult::pending_prompts),
+//! and the runtime also pushes them onto a [`ModSubmitQueue`]. The engine
+//! ignores the field; the turn-loop owner (the CLI) drains the queue when the
+//! turn is idle and submits each message as an ordinary user turn, through
+//! the same permission pipeline as typed input. Caps: two submissions per
+//! hook call, eight queued messages per turn. Overflow is dropped, counted,
+//! and reported in the hook result's UI.
 //!
 //! The runtime is opt-in. It is constructed only when [`is_enabled`] is true,
 //! which means `CODEREX_MODS` is truthy or `CODEREX_MODS_DIR` is set. The
@@ -75,7 +87,7 @@ mod transform;
 
 pub use executor::{JsHookExecutor, ModUiHandle};
 pub use runtime::{
-    ALLOWED_ENV_VARS, DEFAULT_TIMEOUT_BREAKER_LIMIT, MODS_DIR_ENV, MODS_ENV,
-    MODS_TIMEOUT_LIMIT_ENV, ModInfo, ModLimits, ModRuntime, ModRuntimeBuilder, ModSession,
-    is_enabled, mods_dir,
+    ALLOWED_ENV_VARS, DEFAULT_TIMEOUT_BREAKER_LIMIT, MAX_PENDING_PROMPTS_PER_TURN,
+    MAX_SUBMISSIONS_PER_HOOK_CALL, MODS_DIR_ENV, MODS_ENV, MODS_TIMEOUT_LIMIT_ENV, ModInfo,
+    ModLimits, ModRuntime, ModRuntimeBuilder, ModSession, ModSubmitQueue, is_enabled, mods_dir,
 };

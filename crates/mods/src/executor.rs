@@ -141,6 +141,16 @@ impl JsHookExecutor {
             runtime: Arc::clone(&self.runtime),
         }
     }
+
+    /// A handle to the user messages mods queued with `$.session.submit`.
+    ///
+    /// The engine does not drain this queue. The owner of the turn loop takes
+    /// from it once the turn is idle and submits each message as an ordinary
+    /// user turn.
+    #[must_use]
+    pub fn submit_queue(&self) -> crate::ModSubmitQueue {
+        self.runtime.submit_queue()
+    }
 }
 
 #[async_trait::async_trait]
@@ -411,6 +421,26 @@ mod tests {
             handle.activate("missing").expect("a miss is not an error"),
             Vec::<UiElement>::new()
         );
+    }
+
+    #[tokio::test]
+    async fn submissions_reach_the_executors_queue() {
+        let executor = JsHookExecutor::new(runtime_with(
+            "function register(on) { on('PostToolUse', '*', function ($) { \
+             $.session.submit('queued for later'); }); }",
+        ));
+
+        let result = executor
+            .fire_hook("PostToolUse", "Bash", &HashMap::new())
+            .await;
+
+        assert_eq!(result.pending_prompts, vec!["queued for later"]);
+        assert_eq!(
+            executor.submit_queue().take(),
+            vec!["queued for later"],
+            "the turn loop drains the same messages"
+        );
+        assert!(executor.submit_queue().is_empty());
     }
 
     #[tokio::test]

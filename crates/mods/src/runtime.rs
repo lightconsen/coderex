@@ -20,7 +20,7 @@ use boa_engine::{
     js_string, object::ObjectInitializer, object::builtins::JsArray, property::Attribute,
 };
 use coderex_core::hook_executor::{HookExecutor, HookFireResult};
-use coderex_core::ui_protocol::{UiElement, parse_ui_elements};
+use coderex_core::ui_protocol::{UiElement, UiStyle, parse_ui_elements};
 use sha2::{Digest, Sha256};
 
 use crate::transform;
@@ -71,6 +71,20 @@ const MAX_HOOKS_PER_MOD: usize = 256;
 /// Most UI activation handlers a single mod may register.
 const MAX_ACTIVATIONS_PER_MOD: usize = 256;
 
+/// Most `$.session.submit` calls one hook invocation may make.
+///
+/// A call beyond the cap is dropped and counted; the hook result carries one
+/// dim notice saying how many were lost.
+pub const MAX_SUBMISSIONS_PER_HOOK_CALL: usize = 2;
+
+/// Most queued user messages a single turn may leave for the driver to drain.
+///
+/// `$.session.submit(text)` queues a message for after the current turn. A
+/// turn can fire many hooks (and each hook call may submit twice), so this
+/// bounds what one turn can accumulate. Submissions beyond the cap are
+/// dropped, counted, and reported as one dim notice in the hook result's UI.
+pub const MAX_PENDING_PROMPTS_PER_TURN: usize = 8;
+
 /// Most nested `next(e)` calls one [`ModRuntime::fire`] may perform.
 ///
 /// Each `next(e)` continues the chain after the calling hook, so the depth is
@@ -91,6 +105,63 @@ pub struct ModSession {
     pub model: String,
     /// The session's permission mode.
     pub permission_mode: String,
+}
+
+/// A cloneable handle to the user messages mods queued with
+/// `$.session.submit(text)`.
+///
+/// The queue belongs to the [`ModRuntime`], not to a worker, so a fresh worker
+/// started after a timeout still shares the same pending messages. The runtime
+/// fills it after each hook call; the caller that owns the turn loop (the CLI)
+/// takes them once the turn is idle. Taking is the turn boundary: the queue is
+/// capped at [`MAX_PENDING_PROMPTS_PER_TURN`] while it waits.
+#[derive(Clone, Debug, Default)]
+pub struct ModSubmitQueue {
+    pending: Arc<Mutex<Vec<String>>>,
+}
+
+impl ModSubmitQueue {
+    /// Take every queued message, in submission order, leaving the queue empty.
+    #[must_use]
+    pub fn take(&self) -> Vec<String> {
+        let mut pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::mem::take(&mut *pending)
+    }
+
+    /// Whether no message is waiting.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// How many messages are waiting.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    }
+
+    /// Append messages and return how many were dropped by the per-turn cap.
+    fn push_all(&self, prompts: &[String]) -> usize {
+        let mut pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut dropped = 0;
+        for prompt in prompts {
+            if pending.len() >= MAX_PENDING_PROMPTS_PER_TURN {
+                dropped += 1;
+            } else {
+                pending.push(prompt.clone());
+            }
+        }
+        dropped
+    }
 }
 
 /// Limits every hook call is held to.
@@ -276,6 +347,11 @@ pub struct ModRuntime {
     timeout_abandonments: AtomicUsize,
     /// Whether mods have been disabled for the rest of the session.
     disabled: AtomicBool,
+    /// Messages mods queued with `$.session.submit(text)`.
+    ///
+    /// Filled after every hook call and drained by the caller that owns the
+    /// turn loop. The engine never reads it.
+    submissions: ModSubmitQueue,
     config: Arc<WorkerConfig>,
     worker: Mutex<Option<WorkerHandle>>,
 }
@@ -400,6 +476,7 @@ impl ModRuntime {
             timeout_breaker_limit: configured_timeout_breaker_limit(),
             timeout_abandonments: AtomicUsize::new(0),
             disabled: AtomicBool::new(false),
+            submissions: ModSubmitQueue::default(),
             config,
             worker: Mutex::new(Some(WorkerHandle { sender })),
         })
@@ -426,6 +503,12 @@ impl ModRuntime {
     #[must_use]
     pub const fn session(&self) -> &ModSession {
         &self.session
+    }
+
+    /// A handle to the messages mods queued for after the current turn.
+    #[must_use]
+    pub fn submit_queue(&self) -> ModSubmitQueue {
+        self.submissions.clone()
     }
 
     /// The limits in force.
@@ -546,7 +629,7 @@ impl ModRuntime {
         context: &HashMap<String, String>,
         inner: Option<Arc<dyn HookExecutor>>,
     ) -> HookFireResult {
-        if let Some(reason) = self.disabled_reason() {
+        let result = if let Some(reason) = self.disabled_reason() {
             let mut result = failure_result(event, reason);
             // A gating event is already denied; do not run the downstream
             // hooks behind a closed gate. For anything else, behave as if the
@@ -557,22 +640,43 @@ impl ModRuntime {
                     result = merge_with_inner(result, inner_result);
                 }
             }
-            return result;
-        }
+            result
+        } else {
+            let (reply, reply_receiver) = mpsc::sync_channel(1);
+            let request = Request {
+                event: event.to_string(),
+                input: input.to_string(),
+                context: context.clone(),
+                inner,
+                reply,
+            };
 
-        let (reply, reply_receiver) = mpsc::sync_channel(1);
-        let request = Request {
-            event: event.to_string(),
-            input: input.to_string(),
-            context: context.clone(),
-            inner,
-            reply,
+            match self.dispatch(request, &reply_receiver) {
+                Ok(result) => result,
+                Err(error) => failure_result(event, error),
+            }
         };
+        self.stage_prompts(result)
+    }
 
-        match self.dispatch(request, &reply_receiver) {
-            Ok(result) => result,
-            Err(error) => failure_result(event, error),
+    /// Queue the messages a hook call submitted and report any drops.
+    ///
+    /// The queue, not this call's result, is what the CLI drains after the
+    /// turn. A drop notice is appended to the result's UI so the person sees
+    /// why a submission did not arrive. The engine ignores
+    /// [`HookFireResult::pending_prompts`] itself.
+    fn stage_prompts(&self, mut result: HookFireResult) -> HookFireResult {
+        let dropped = self.submissions.push_all(&result.pending_prompts);
+        if dropped > 0 {
+            result.ui.push(UiElement::Text {
+                text: format!(
+                    "[{dropped} mod submission(s) dropped: at most \
+                     {MAX_PENDING_PROMPTS_PER_TURN} queued messages per turn]"
+                ),
+                style: UiStyle::Dim,
+            });
         }
+        result
     }
 
     /// Deliver a button activation to the worker and return the elements its
@@ -957,7 +1061,16 @@ impl WorkerState {
     fn load(config: &WorkerConfig, runtime: Arc<tokio::runtime::Runtime>) -> Result<Self, String> {
         let mut context = Context::default();
         apply_limits(&mut context, &config.limits);
-        let harness = MAIN_HARNESS.replace("@@MAX_CHAIN_DEPTH@@", &MAX_CHAIN_DEPTH.to_string());
+        let harness = MAIN_HARNESS
+            .replace("@@MAX_CHAIN_DEPTH@@", &MAX_CHAIN_DEPTH.to_string())
+            .replace(
+                "@@MAX_SUBMISSIONS_PER_CALL@@",
+                &MAX_SUBMISSIONS_PER_HOOK_CALL.to_string(),
+            )
+            .replace(
+                "@@MAX_PENDING_PROMPTS@@",
+                &MAX_PENDING_PROMPTS_PER_TURN.to_string(),
+            );
         context
             .eval(Source::from_bytes(harness.as_bytes()))
             .map_err(|error| format!("could not install the runtime harness: {error}"))?;
@@ -1334,6 +1447,7 @@ fn inner_entry(
         "errors": result.errors,
         "failed": result.failed,
         "ui": result.ui,
+        "pendingPrompts": result.pending_prompts,
     });
     Ok(JsString::from(value.to_string()).into())
 }
@@ -1385,6 +1499,7 @@ fn parse_chain_result(value: &JsValue, context: &mut Context) -> Result<HookFire
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false),
         ui,
+        pending_prompts: strings("pendingPrompts"),
     })
 }
 
@@ -1414,6 +1529,8 @@ fn merge_with_inner(js: HookFireResult, inner: HookFireResult) -> HookFireResult
     errors.extend(inner.errors);
     let mut ui = js.ui;
     ui.extend(inner.ui);
+    let mut pending_prompts = js.pending_prompts;
+    pending_prompts.extend(inner.pending_prompts);
 
     HookFireResult {
         stop: js.stop || inner.stop,
@@ -1423,6 +1540,7 @@ fn merge_with_inner(js: HookFireResult, inner: HookFireResult) -> HookFireResult
         failed: js.failed || inner.failed,
         watch_paths: dedupe_paths(watch_paths),
         ui,
+        pending_prompts,
     }
 }
 
@@ -1495,7 +1613,11 @@ fn install_host_api(context: &mut Context, session: &ModSession, name: &str) -> 
         dollar,
         Attribute::READONLY | Attribute::NON_ENUMERABLE,
     )?;
-    context.eval(Source::from_bytes(HOST_UI_API.as_bytes()))?;
+    let host_api = HOST_UI_API.replace(
+        "@@MAX_SUBMISSIONS_PER_CALL@@",
+        &MAX_SUBMISSIONS_PER_HOOK_CALL.to_string(),
+    );
+    context.eval(Source::from_bytes(host_api.as_bytes()))?;
     context.eval(Source::from_bytes(JSX_RUNTIME.as_bytes()))?;
 
     let on = NativeFunction::from_fn_ptr(on_hook).to_js_function(context.realm());
@@ -1528,10 +1650,23 @@ const HOST_UI_API: &str = r#"
   // dropped, and one summary element reports how many were lost.
   const MAX_NOTICE_LENGTH = 2048;
   const MAX_NOTICES_PER_CALL = 16;
+  // `$.session.submit` limits. The text is capped before it is staged; the
+  // per-call cap keeps one hook from flooding the next turn. Further calls are
+  // dropped, and one summary element reports how many were lost. The runtime
+  // additionally caps what a whole turn may leave queued.
+  const MAX_SUBMISSION_LENGTH = 8192;
+  const MAX_SUBMISSIONS_PER_CALL = @@MAX_SUBMISSIONS_PER_CALL@@;
   const TRUNCATION_MARKER = '…';
   const staging = [];
   const notices = [];
+  // One array per hook call. A hook that calls `next()` runs later hooks
+  // synchronously inside its own call, so a nested call pushes a fresh frame
+  // and restores the outer one on return; without that, the inner call's reset
+  // would discard what the outer hook had already submitted.
+  let submissions = [];
+  const submissionFrames = [];
   let droppedNotices = 0;
+  let droppedSubmissions = 0;
 
   function notify(text) {
     if (typeof text !== 'string') {
@@ -1548,6 +1683,28 @@ const HOST_UI_API: &str = r#"
       ? text.slice(0, MAX_NOTICE_LENGTH) + TRUNCATION_MARKER
       : text;
     notices.push({ type: 'text', text: value, style: 'notice' });
+    return undefined;
+  }
+
+  // Queue a user message for after the current turn. This never touches the
+  // engine: it only stages text here. The turn loop drains it when idle and
+  // submits it as an ordinary user turn, so it goes through the same
+  // permission pipeline as anything a person types.
+  function submit(text) {
+    if (typeof text !== 'string') {
+      throw new TypeError('$.session.submit(text): text must be a string');
+    }
+    if (text.length === 0) {
+      throw new TypeError('$.session.submit(text): text must be a non-empty string');
+    }
+    if (submissions.length >= MAX_SUBMISSIONS_PER_CALL) {
+      droppedSubmissions += 1;
+      return undefined;
+    }
+    const value = text.length > MAX_SUBMISSION_LENGTH
+      ? text.slice(0, MAX_SUBMISSION_LENGTH) + TRUNCATION_MARKER
+      : text;
+    submissions.push(value);
     return undefined;
   }
 
@@ -1677,6 +1834,28 @@ const HOST_UI_API: &str = r#"
       notices.length = 0;
       droppedNotices = 0;
     },
+    // Start a hook call's submission frame. `__resetUi` deliberately leaves
+    // submissions alone: a call nested by `next(e)` must not clear its parent.
+    __beginCall: function () {
+      submissionFrames.push({ prompts: submissions, dropped: droppedSubmissions });
+      submissions = [];
+      droppedSubmissions = 0;
+    },
+    // The dispatcher takes submissions separately from rendered elements: they
+    // are not displayed, they are handed to the turn loop. Taking also closes
+    // the frame and restores the caller's submissions.
+    __takeSubmissions: function () {
+      const taken = { prompts: submissions.slice(), dropped: droppedSubmissions };
+      const parent = submissionFrames.pop();
+      if (parent) {
+        submissions = parent.prompts;
+        droppedSubmissions = parent.dropped;
+      } else {
+        submissions = [];
+        droppedSubmissions = 0;
+      }
+      return taken;
+    },
     // Notices are prepended in emission order, so `$.session.notify` output
     // always appears before anything the same hook call staged with
     // `$.ui.render`.
@@ -1700,6 +1879,13 @@ const HOST_UI_API: &str = r#"
 
   Object.defineProperty($.session, 'notify', {
     value: notify,
+    writable: false,
+    enumerable: true,
+    configurable: false
+  });
+
+  Object.defineProperty($.session, 'submit', {
+    value: submit,
     writable: false,
     enumerable: true,
     configurable: false
@@ -1888,17 +2074,38 @@ globalThis.__coderExCall = function (modIndex, hookIndex, event, input, contextJ
   const host = registration.host;
   const ui = host && host.ui;
   if (ui && typeof ui.__resetUi === 'function') ui.__resetUi();
+  if (ui && typeof ui.__beginCall === 'function') ui.__beginCall();
 
   try {
     const value = registration.hook(host, eventObject, nextFn);
     // Take whatever `$.ui.render` staged, even when the hook returns nothing:
-    // rendering is itself the result.
+    // rendering is itself the result. Submissions live beside the UI staging
+    // area: they are not rendered, they cross the worker boundary as text for
+    // the turn loop to drain. A call that went over the per-hook cap gets one
+    // dim notice, as `notify` does for its own overflow.
     const staged = (ui && typeof ui.__takeUi === 'function') ? ui.__takeUi() : [];
+    const submitted = (ui && typeof ui.__takeSubmissions === 'function')
+      ? ui.__takeSubmissions()
+      : { prompts: [], dropped: 0 };
+    if (submitted.dropped > 0) {
+      staged.push({
+        type: 'text',
+        text: '[' + submitted.dropped + ' mod submission(s) dropped: at most '
+          + __coderExMaxSubmissionsPerCall + ' per hook call]',
+        style: 'dim'
+      });
+    }
     if (value !== null && typeof value === 'object' && typeof value.then === 'function') {
       return JSON.stringify({ ok: false, error: 'async hooks are not supported yet; return a value synchronously' });
     }
-    return JSON.stringify({ ok: true, result: __coderExNormalize(value), ui: staged });
+    return JSON.stringify({
+      ok: true,
+      result: __coderExNormalize(value),
+      ui: staged,
+      submissions: submitted.prompts
+    });
   } catch (error) {
+    if (ui && typeof ui.__takeSubmissions === 'function') ui.__takeSubmissions();
     if (ui && typeof ui.__takeUi === 'function') ui.__takeUi();
     const message = (error && error.message) ? String(error.message) : String(error);
     return JSON.stringify({ ok: false, error: message });
@@ -1924,6 +2131,10 @@ globalThis.__coderExActivate = function (id, eventJson) {
   const host = chosen.host;
   const ui = host && host.ui;
   if (ui && typeof ui.__resetUi === 'function') ui.__resetUi();
+  // An activation handler cannot submit a prompt, but it can call submit();
+  // the frame exists so those calls are discarded rather than leaking into the
+  // next hook call.
+  if (ui && typeof ui.__beginCall === 'function') ui.__beginCall();
 
   try {
     let event = {};
@@ -1942,6 +2153,8 @@ globalThis.__coderExActivate = function (id, eventJson) {
 
     const value = chosen.handler(host, event);
     const staged = (ui && typeof ui.__takeUi === 'function') ? ui.__takeUi() : [];
+    // Close the submission frame; an activation cannot start a turn.
+    if (ui && typeof ui.__takeSubmissions === 'function') ui.__takeSubmissions();
     if (value !== null && typeof value === 'object' && typeof value.then === 'function') {
       return JSON.stringify({
         found: true,
@@ -1958,6 +2171,7 @@ globalThis.__coderExActivate = function (id, eventJson) {
     }
     return JSON.stringify({ found: true, ok: true, ui: staged.concat(returned) });
   } catch (error) {
+    if (ui && typeof ui.__takeSubmissions === 'function') ui.__takeSubmissions();
     if (ui && typeof ui.__takeUi === 'function') ui.__takeUi();
     const message = (error && error.message) ? String(error.message) : String(error);
     return JSON.stringify({ found: true, ok: false, error: message, ui: [] });
@@ -1984,8 +2198,21 @@ globalThis.__coderExEmptyResult = function () {
     watchPaths: [],
     errors: [],
     failed: false,
-    ui: []
+    ui: [],
+    pendingPrompts: []
   };
+};
+
+// Submissions merge in call order. Identical adjacent messages are folded:
+// two hooks that independently queue the same text should submit it once.
+globalThis.__coderExDedupePrompts = function (prompts) {
+  const unique = [];
+  for (let index = 0; index < prompts.length; index++) {
+    if (unique.length === 0 || unique[unique.length - 1] !== prompts[index]) {
+      unique.push(prompts[index]);
+    }
+  }
+  return unique;
 };
 
 globalThis.__coderExDedupe = function (paths) {
@@ -2018,7 +2245,9 @@ globalThis.__coderExPublicResult = function (result) {
 
 // The calling hook's non-null fields win; `stop` is OR-ed; watch paths are
 // combined and deduplicated; downstream errors and failure state are carried.
-globalThis.__coderExMergeEffect = function (effect, ui, downstream) {
+// The calling hook's submissions happened before it called `next`, so they
+// precede everything the downstream chain queued.
+globalThis.__coderExMergeEffect = function (effect, ui, submissions, downstream) {
   const ownWatchPaths = (effect !== null && Array.isArray(effect.watchPaths))
     ? effect.watchPaths
     : [];
@@ -2033,11 +2262,12 @@ globalThis.__coderExMergeEffect = function (effect, ui, downstream) {
     errors: downstream.errors.slice(),
     failed: downstream.failed,
     watchPaths: __coderExDedupe(ownWatchPaths.concat(downstream.watchPaths)),
-    ui: ui.concat(downstream.ui)
+    ui: ui.concat(downstream.ui),
+    pendingPrompts: submissions.concat(downstream.pendingPrompts)
   };
 };
 
-globalThis.__coderExApplyEffect = function (combined, effect, ui) {
+globalThis.__coderExApplyEffect = function (combined, effect, ui, submissions) {
   if (effect !== null) {
     if (effect.stop === true) combined.stop = true;
     if (effect.updatedInput !== undefined) combined.updatedInput = effect.updatedInput;
@@ -2045,6 +2275,7 @@ globalThis.__coderExApplyEffect = function (combined, effect, ui) {
     if (Array.isArray(effect.watchPaths)) combined.watchPaths = combined.watchPaths.concat(effect.watchPaths);
   }
   combined.ui = combined.ui.concat(ui);
+  combined.pendingPrompts = combined.pendingPrompts.concat(submissions);
 };
 
 globalThis.__coderExApplyResult = function (combined, result) {
@@ -2059,6 +2290,7 @@ globalThis.__coderExApplyResult = function (combined, result) {
   combined.failed = combined.failed || result.failed;
   combined.errors = combined.errors.concat(result.errors);
   combined.ui = combined.ui.concat(result.ui);
+  combined.pendingPrompts = combined.pendingPrompts.concat(result.pendingPrompts);
 };
 
 // The inner executor ran second, so it wins an updated-value conflict; a side
@@ -2075,7 +2307,8 @@ globalThis.__coderExMergeWithInner = function (js, inner) {
     errors: js.errors.concat(inner.errors),
     failed: js.failed || inner.failed,
     watchPaths: __coderExDedupe(js.watchPaths.concat(inner.watchPaths)),
-    ui: js.ui.concat(inner.ui)
+    ui: js.ui.concat(inner.ui),
+    pendingPrompts: js.pendingPrompts.concat(inner.pendingPrompts)
   };
 };
 
@@ -2125,10 +2358,14 @@ globalThis.__coderExChain = function (hooks, start, event, input, contextJson, i
     closed = true;
 
     if (reply.ok) {
+      const submissions = Array.isArray(reply.submissions) ? reply.submissions : [];
       if (downstream !== null) {
-        __coderExApplyResult(combined, __coderExMergeEffect(reply.result, reply.ui, downstream));
+        __coderExApplyResult(
+          combined,
+          __coderExMergeEffect(reply.result, reply.ui, submissions, downstream)
+        );
       } else {
-        __coderExApplyEffect(combined, reply.result, reply.ui);
+        __coderExApplyEffect(combined, reply.result, reply.ui, submissions);
       }
     } else {
       if (downstream !== null) {
@@ -2159,6 +2396,19 @@ globalThis.__coderExChain = function (hooks, start, event, input, contextJson, i
     result = __coderExMergeWithInner(combined, JSON.parse(innerFn(event, innerInput, contextJson)));
   }
   result.watchPaths = __coderExDedupe(result.watchPaths);
+  result.pendingPrompts = __coderExDedupePrompts(result.pendingPrompts);
+  // Only the outermost call finalizes: a deeper level would otherwise add the
+  // same drop notice again after the outer level merges it back in.
+  if (depth === 0 && result.pendingPrompts.length > __coderExMaxPendingPrompts) {
+    const dropped = result.pendingPrompts.length - __coderExMaxPendingPrompts;
+    result.pendingPrompts = result.pendingPrompts.slice(0, __coderExMaxPendingPrompts);
+    result.ui.push({
+      type: 'text',
+      text: '[' + dropped + ' mod submission(s) dropped: at most '
+        + __coderExMaxPendingPrompts + ' queued messages per hook firing]',
+      style: 'dim'
+    });
+  }
   return result;
 };
 
@@ -2169,6 +2419,8 @@ globalThis.__coderExRun = function (chainJson, event, input, contextJson, innerF
 };
 
 globalThis.__coderExMaxChainDepth = @@MAX_CHAIN_DEPTH@@;
+globalThis.__coderExMaxSubmissionsPerCall = @@MAX_SUBMISSIONS_PER_CALL@@;
+globalThis.__coderExMaxPendingPrompts = @@MAX_PENDING_PROMPTS@@;
 "#;
 
 /// The per-mod harness: `on` and the registration array it fills.
@@ -4023,5 +4275,112 @@ mod tests {
             Some("<not jsx> !== type"),
             "the .js file keeps its original source"
         );
+    }
+
+    #[test]
+    fn submit_stages_messages_in_order_and_caps_a_hook_at_two() {
+        let runtime = load(
+            "function register(on) { on('PostToolUse', '*', function ($) { \
+             $.session.submit('first'); $.session.submit('second'); \
+             $.session.submit('third'); }); }",
+        );
+
+        let result = runtime.fire("PostToolUse", "Bash", &HashMap::new());
+
+        assert_eq!(result.pending_prompts, vec!["first", "second"]);
+        assert!(
+            result.ui.iter().any(|element| matches!(
+                element,
+                UiElement::Text { text, style: UiStyle::Dim } if text.contains("1 mod submission(s) dropped")
+            )),
+            "the over-cap call is reported: {:?}",
+            result.ui
+        );
+    }
+
+    #[test]
+    fn submit_truncates_long_text_with_a_marker() {
+        let runtime = load(
+            "function register(on) { on('PostToolUse', '*', function ($) { \
+             $.session.submit('x'.repeat(9000)); }); }",
+        );
+
+        let result = runtime.fire("PostToolUse", "Bash", &HashMap::new());
+
+        assert_eq!(result.pending_prompts.len(), 1);
+        let prompt = &result.pending_prompts[0];
+        assert_eq!(prompt.chars().count(), 8193, "8192 chars plus the marker");
+        assert!(prompt.ends_with('…'));
+    }
+
+    #[test]
+    fn submit_rejects_an_empty_string_and_a_non_string() {
+        for call in ["$.session.submit('')", "$.session.submit(42)"] {
+            let runtime = load(&format!(
+                "function register(on) {{ on('PostToolUse', '*', function ($) {{ {call}; }}); }}"
+            ));
+
+            let result = runtime.fire("PostToolUse", "Bash", &HashMap::new());
+
+            assert!(result.failed, "{call} should fail the hook");
+            assert!(result.pending_prompts.is_empty());
+        }
+    }
+
+    #[test]
+    fn the_chain_merges_submissions_in_order_and_dedupes_adjacent_ones() {
+        let runtime = load(
+            "function register(on) { \
+             on('PostToolUse', 'Bash', function ($) { \
+               $.session.submit('one'); $.session.submit('two'); }); \
+             on('PostToolUse', 'Bash', function ($) { \
+               $.session.submit('two'); $.session.submit('three'); }); }",
+        );
+
+        let result = runtime.fire("PostToolUse", "Bash", &HashMap::new());
+
+        assert_eq!(result.pending_prompts, vec!["one", "two", "three"]);
+    }
+
+    #[test]
+    fn the_runtime_queue_caps_a_turn_at_eight_and_reports_the_drop() {
+        let runtime = load(
+            "function register(on) { on('PostToolUse', '*', function ($) { \
+             $.session.submit('a'); $.session.submit('b'); }); }",
+        );
+
+        let mut last = HookFireResult::default();
+        for _ in 0..5 {
+            last = runtime.fire("PostToolUse", "Bash", &HashMap::new());
+        }
+        let queued = runtime.submit_queue().take();
+
+        assert_eq!(queued.len(), MAX_PENDING_PROMPTS_PER_TURN);
+        assert_eq!(queued[0], "a");
+        assert_eq!(queued[MAX_PENDING_PROMPTS_PER_TURN - 1], "b");
+        assert!(
+            last.ui.iter().any(|element| matches!(
+                element,
+                UiElement::Text { text, style: UiStyle::Dim } if text.contains("dropped")
+            )),
+            "the fifth call's two messages are dropped and reported: {:?}",
+            last.ui
+        );
+        assert!(runtime.submit_queue().is_empty(), "taking drains the queue");
+    }
+
+    #[test]
+    fn the_chain_carries_submissions_across_next() {
+        let inner = Arc::new(RecordingInner::answering(HookFireResult::default()));
+        let runtime = load(
+            "function register(on) { \
+             on('PostToolUse', '*', function ($, e, next) { \
+               $.session.submit('outer'); next(); }); \
+             on('PostToolUse', '*', function ($) { $.session.submit('inner'); }); }",
+        );
+
+        let result = fire_with(&runtime, "PostToolUse", "Bash", inner);
+
+        assert_eq!(result.pending_prompts, vec!["outer", "inner"]);
     }
 }

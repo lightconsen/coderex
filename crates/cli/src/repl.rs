@@ -2059,6 +2059,19 @@ pub struct ReplLoop {
     /// Kept after the executor is installed so the terminal can press a
     /// button without reaching into the engine.
     mod_ui_handle: Option<coderex_mods::ModUiHandle>,
+    /// Messages mods queued with `$.session.submit(text)`.
+    ///
+    /// The engine never drains this queue. The turn loop takes from it at an
+    /// idle boundary and submits each message as an ordinary user turn. When
+    /// mods are not installed it stays empty.
+    mod_submit_queue: coderex_mods::ModSubmitQueue,
+    /// Consecutive mod-submitted turns since the last person-initiated prompt.
+    ///
+    /// The loop guard reads this through [`plan_mod_drain`]. Reset when a
+    /// person submits a prompt.
+    mod_auto_turns: usize,
+    /// Mod messages already drained since the last person-initiated prompt.
+    mod_prompts_this_turn: usize,
     /// Whether the person has already been told that the timeout breaker
     /// disabled mods. The breaker is sticky, so the message is shown once.
     mods_disabled_reported: bool,
@@ -2387,6 +2400,9 @@ impl ReplLoop {
             hook_layers: None,
             active_hooks: 0,
             mod_ui_handle: None,
+            mod_submit_queue: coderex_mods::ModSubmitQueue::default(),
+            mod_auto_turns: 0,
+            mod_prompts_this_turn: 0,
             mods_disabled_reported: false,
             checkpoint_store: None,
             protocol_sink: None,
@@ -2786,6 +2802,9 @@ impl ReplLoop {
             hook_layers: None,
             active_hooks: 0,
             mod_ui_handle: None,
+            mod_submit_queue: coderex_mods::ModSubmitQueue::default(),
+            mod_auto_turns: 0,
+            mod_prompts_this_turn: 0,
             mods_disabled_reported: false,
             checkpoint_store,
             protocol_sink: None,
@@ -3834,6 +3853,7 @@ impl ReplLoop {
                                     tracing::info!("{line}");
                                     eprintln!("{line}");
                                     self.mod_ui_handle = Some(executor.ui_handle());
+                                    self.mod_submit_queue = executor.submit_queue();
                                     Arc::new(executor)
                                 }
                                 Some(Err(error)) => {
@@ -4585,6 +4605,10 @@ impl ReplLoop {
             handler.set_tui_sender(mcp_elicit_tx);
         }
         let mut queued_prompts = std::collections::VecDeque::<String>::new();
+        // Mod submissions taken from the runtime queue but not yet submitted.
+        // They live here across iterations so a queue accumulated during one
+        // turn is drained one auto-turn at a time rather than all at once.
+        let mut mod_pending = std::collections::VecDeque::<String>::new();
         let mut pending_confirmation: Option<ConfirmationRequest> = None;
         let mut mod_ui_focus = ModUiFocus::default();
         let mut last_stream_snapshot = Instant::now();
@@ -4612,6 +4636,107 @@ impl ReplLoop {
                         folded: false,
                     });
                     self.persist_interactive_snapshot(&ui_state);
+                }
+            }
+
+            // ── The idle boundary ───────────────────────────────────────────
+            // Nothing is running here: the turn's task has handed the engine
+            // back, and no overlay or confirmation owns the input. This is the
+            // only place mod submissions become turns. Scheduling them from
+            // the hook itself would re-enter the engine mid-turn.
+            //
+            // A person's queued prompt wins over a mod's and resets the loop
+            // guard. Otherwise the mod queue is drained under
+            // `plan_mod_drain`: at most three consecutive auto-turns, eight
+            // messages per person-initiated turn, and a system notice for
+            // anything the guard drops.
+            if !thinking
+                && query_done_rx.is_none()
+                && pending_confirmation.is_none()
+                && self.pending_elicitation.is_none()
+                && self.engine.is_some()
+                && !ui_state.overlays.is_active()
+            {
+                if let Some(person_prompt) = queued_prompts.pop_front() {
+                    // The person's message was added when they typed it; do
+                    // not add a second copy here. Their prompt resets the
+                    // loop guard.
+                    self.mod_auto_turns = 0;
+                    self.mod_prompts_this_turn = 0;
+                    self.start_tui_query(
+                        person_prompt,
+                        &mut ui_state,
+                        &mut thinking,
+                        &mut phase,
+                        &mut query_done_rx,
+                        &mut elicit_rx,
+                        &mut tui_elicit_rx,
+                    );
+                    continue;
+                }
+
+                mod_pending.extend(self.mod_submit_queue.take());
+                if !mod_pending.is_empty() {
+                    let actions = plan_mod_drain(
+                        &mut mod_pending,
+                        self.mod_auto_turns,
+                        self.mod_prompts_this_turn,
+                    );
+                    let mut submissions = Vec::new();
+                    for action in actions {
+                        match action {
+                            ModDrainAction::Submit(text) => submissions.push(text),
+                            ModDrainAction::Notice(text) => {
+                                ui_state.messages.push(Message {
+                                    role: MessageRole::System,
+                                    content: text.into(),
+                                    tool_name: None,
+                                    streaming: false,
+                                    folded: false,
+                                });
+                            }
+                        }
+                    }
+                    // The plan may allow more than one turn; hold the extras
+                    // until this one finishes so the transcript stays ordered.
+                    if !submissions.is_empty() {
+                        let next = submissions.remove(0);
+                        for extra in submissions.into_iter().rev() {
+                            mod_pending.push_front(extra);
+                        }
+                        self.mod_auto_turns += 1;
+                        self.mod_prompts_this_turn += 1;
+                        ui_state.messages.push(Message {
+                            role: MessageRole::System,
+                            content: format!(
+                                "[mod] Auto-submitted turn {}/{} from a queued message",
+                                self.mod_auto_turns, MAX_AUTO_MOD_TURNS
+                            )
+                            .into(),
+                            tool_name: None,
+                            streaming: false,
+                            folded: false,
+                        });
+                        // Mark the message itself too: on resume the prefix is
+                        // the only thing distinguishing it from typed input.
+                        ui_state.messages.push(Message {
+                            role: MessageRole::User,
+                            content: format!("[mod] {next}").into(),
+                            tool_name: None,
+                            streaming: false,
+                            folded: false,
+                        });
+                        self.start_tui_query(
+                            next,
+                            &mut ui_state,
+                            &mut thinking,
+                            &mut phase,
+                            &mut query_done_rx,
+                            &mut elicit_rx,
+                            &mut tui_elicit_rx,
+                        );
+                        continue;
+                    }
                 }
             }
 
@@ -5722,18 +5847,8 @@ impl ReplLoop {
                     }
 
                     self.persist_interactive_snapshot(&ui_state);
-
-                    if let Some(next_prompt) = queued_prompts.pop_front() {
-                            self.start_tui_query(
-                                next_prompt,
-                                &mut ui_state,
-                                &mut thinking,
-                                &mut phase,
-                                &mut query_done_rx,
-                                &mut elicit_rx,
-                                &mut tui_elicit_rx,
-                            );
-                    }
+                    // The top of the loop picks up a person's queued prompt or
+                    // a mod submission now that this turn is idle.
                 }
 
                 Some((job_id, prompt)) = async {
@@ -5932,7 +6047,64 @@ impl ReplLoop {
                 Err(error) => tracing::warn!(%error, "plugin monitors were not started"),
             }
         }
-        let result = self.run_headless_turn(prompt).await;
+        let mut result = self.run_headless_turn(prompt).await;
+
+        // Mod submissions become ordinary turns after the person's turn. The
+        // same loop guard as the interactive path applies: submit what was
+        // queued, up to three consecutive auto-turns and eight messages, then
+        // stop. `plan_mod_drain` also reports a drop instead of draining a
+        // backlog forever.
+        if let Ok(first) = &result {
+            let mut output = first.clone();
+            let mut failure = None;
+            let mut pending: std::collections::VecDeque<String> =
+                self.mod_submit_queue.take().into();
+            let mut auto_turns = 0usize;
+            let mut submitted = 0usize;
+            loop {
+                pending.extend(self.mod_submit_queue.take());
+                let mut submissions = Vec::new();
+                for action in plan_mod_drain(&mut pending, auto_turns, submitted) {
+                    match action {
+                        ModDrainAction::Submit(text) => submissions.push(text),
+                        ModDrainAction::Notice(text) => {
+                            tracing::warn!("{text}");
+                            eprintln!("{text}");
+                        }
+                    }
+                }
+                let Some(next) = submissions.first().cloned() else {
+                    break;
+                };
+                for extra in submissions.into_iter().skip(1).rev() {
+                    pending.push_front(extra);
+                }
+                auto_turns += 1;
+                submitted += 1;
+                let marker = format!(
+                    "[mod] Auto-submitted turn {auto_turns}/{MAX_AUTO_MOD_TURNS} \
+                     from a queued message"
+                );
+                tracing::info!("{marker}");
+                eprintln!("{marker}");
+                match self.run_headless_turn(&next).await {
+                    Ok(more) => {
+                        if !more.is_empty() {
+                            if !output.is_empty() && !output.ends_with('\n') {
+                                output.push('\n');
+                            }
+                            output.push_str(&more);
+                        }
+                    }
+                    Err(error) => {
+                        failure = Some(error);
+                        break;
+                    }
+                }
+            }
+            result = failure.map_or(Ok(output), Err);
+        }
+
         // Headless runs used to leave no transcript behind, so `--print`
         // sessions could not be resumed or found by `/resume`. Persist what
         // the turn produced; slash-command-only runs are covered too.
@@ -6060,6 +6232,73 @@ fn append_mod_ui_block(output: &mut String, elements: &[coderex_core::ui_protoco
     }
     output.push_str(&rendered);
     output.push('\n');
+}
+
+/// Most consecutive auto-submitted turns one person-initiated turn may spawn.
+///
+/// A mod can queue a message with `$.session.submit(text)`; the turn loop
+/// submits it as a normal user turn once the current one is idle. That turn
+/// can itself fire hooks that queue more. This is the loop guard: a mod must
+/// not be able to keep the session running forever. The counter resets when a
+/// person submits a prompt.
+const MAX_AUTO_MOD_TURNS: usize = 3;
+
+/// Most queued mod messages drained in one person-initiated turn.
+const MAX_MOD_PROMPTS_PER_TURN: usize = 8;
+
+/// One thing the turn loop should do with mod submissions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ModDrainAction {
+    /// Submit this text as a user turn.
+    Submit(String),
+    /// Tell the person (as a system message) why nothing further is submitted.
+    Notice(String),
+}
+
+/// Decide what to do with queued mod messages at an idle boundary.
+///
+/// Pure so the queue and the loop guard can be tested without a turn loop.
+/// `auto_turns` counts consecutive turns already auto-submitted since the last
+/// person-initiated prompt; `submitted_this_turn` counts messages already
+/// drained in that same window. At most `MAX_AUTO_MOD_TURNS` submissions are
+/// planned; a queue that cannot be drained is discarded with one notice, so a
+/// mod cannot leave an unbounded backlog that replays later.
+fn plan_mod_drain(
+    queue: &mut std::collections::VecDeque<String>,
+    auto_turns: usize,
+    submitted_this_turn: usize,
+) -> Vec<ModDrainAction> {
+    let mut actions = Vec::new();
+    if queue.is_empty() {
+        return actions;
+    }
+
+    let auto_remaining = MAX_AUTO_MOD_TURNS.saturating_sub(auto_turns);
+    let prompt_remaining = MAX_MOD_PROMPTS_PER_TURN.saturating_sub(submitted_this_turn);
+    if auto_remaining == 0 || prompt_remaining == 0 {
+        let dropped = queue.len();
+        queue.clear();
+        let reason = if auto_remaining == 0 {
+            format!(
+                "mod auto-turn limit reached ({MAX_AUTO_MOD_TURNS} consecutive \
+                 auto-submitted turns)"
+            )
+        } else {
+            format!("mod submission limit reached ({MAX_MOD_PROMPTS_PER_TURN} per turn)")
+        };
+        actions.push(ModDrainAction::Notice(format!(
+            "{reason}; {dropped} queued mod message(s) dropped."
+        )));
+        return actions;
+    }
+
+    let take = auto_remaining.min(prompt_remaining).min(queue.len());
+    for _ in 0..take {
+        if let Some(text) = queue.pop_front() {
+            actions.push(ModDrainAction::Submit(text));
+        }
+    }
+    actions
 }
 
 /// What the terminal does with a key while a mod UI button is focused.
@@ -7840,6 +8079,9 @@ impl ReplLoop {
             // Execute the command directly
             self.execute_and_display_command(cmd_name, &args, ui_state);
         } else if self.engine.is_some() {
+            // A person submitted a prompt: the auto-turn chain starts over.
+            self.mod_auto_turns = 0;
+            self.mod_prompts_this_turn = 0;
             self.start_tui_query(
                 text.to_string(),
                 ui_state,
@@ -7850,6 +8092,10 @@ impl ReplLoop {
                 tui_elicit_rx,
             );
         } else if *thinking || query_done_rx.is_some() {
+            // A person submitted a prompt, even though it waits for the
+            // running turn; it resets the loop guard when it is started.
+            self.mod_auto_turns = 0;
+            self.mod_prompts_this_turn = 0;
             queued_prompts.push_back(text.to_string());
             ui_state.messages.push(coderex_ui::message_list::Message {
                 role: coderex_ui::message_list::MessageRole::System,
@@ -12397,5 +12643,107 @@ mod tests {
         );
         assert!(command.output.contains("[assistant]\n[image: image/png]"));
         assert!(!command.output.contains("AAAA"));
+    }
+
+    // ── Mod submissions ─────────────────────────────────────────────────────
+
+    #[test]
+    fn mod_drain_is_a_no_op_with_an_empty_queue() {
+        let mut queue = std::collections::VecDeque::new();
+
+        assert_eq!(
+            plan_mod_drain(&mut queue, 0, 0),
+            Vec::<ModDrainAction>::new()
+        );
+    }
+
+    #[test]
+    fn mod_drain_submits_queued_messages_in_order() {
+        let mut queue =
+            std::collections::VecDeque::from(["first".to_string(), "second".to_string()]);
+
+        assert_eq!(
+            plan_mod_drain(&mut queue, 0, 0),
+            vec![
+                ModDrainAction::Submit("first".to_string()),
+                ModDrainAction::Submit("second".to_string()),
+            ]
+        );
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn mod_drain_stops_after_three_consecutive_auto_turns() {
+        let mut queue = std::collections::VecDeque::from([
+            "a".to_string(),
+            "b".to_string(),
+            "c".to_string(),
+            "d".to_string(),
+        ]);
+
+        // The first idle boundary plans three turns and keeps the fourth.
+        assert_eq!(
+            plan_mod_drain(&mut queue, 0, 0),
+            vec![
+                ModDrainAction::Submit("a".to_string()),
+                ModDrainAction::Submit("b".to_string()),
+                ModDrainAction::Submit("c".to_string()),
+            ]
+        );
+        assert_eq!(queue, std::collections::VecDeque::from(["d".to_string()]));
+
+        // Once three auto-turns have run, the guard drops the rest with one
+        // system notice instead of starting a fourth.
+        let actions = plan_mod_drain(&mut queue, MAX_AUTO_MOD_TURNS, MAX_AUTO_MOD_TURNS);
+        assert_eq!(actions.len(), 1);
+        match &actions[0] {
+            ModDrainAction::Notice(text) => {
+                assert!(text.contains("auto-turn limit"), "{text}");
+                assert!(text.contains("1 queued mod message(s) dropped"), "{text}");
+            }
+            other => panic!("expected a notice, got {other:?}"),
+        }
+        assert!(queue.is_empty(), "the dropped backlog must not replay");
+    }
+
+    #[test]
+    fn mod_drain_enforces_the_per_turn_submission_cap() {
+        let mut queue: std::collections::VecDeque<String> =
+            (0..10).map(|index| format!("message {index}")).collect();
+
+        let plan = plan_mod_drain(&mut queue, 0, MAX_MOD_PROMPTS_PER_TURN - 1);
+        assert_eq!(
+            plan,
+            vec![ModDrainAction::Submit("message 0".to_string())],
+            "only the remaining slot is used"
+        );
+        assert_eq!(queue.len(), 9);
+
+        let actions = plan_mod_drain(&mut queue, 1, MAX_MOD_PROMPTS_PER_TURN);
+        assert_eq!(actions.len(), 1);
+        match &actions[0] {
+            ModDrainAction::Notice(text) => {
+                assert!(text.contains("submission limit"), "{text}");
+            }
+            other => panic!("expected a notice, got {other:?}"),
+        }
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn headless_drain_uses_the_same_auto_turn_cap() {
+        // Headless and interactive share `plan_mod_drain`; a ten-message queue
+        // still yields at most three turns before the guard stops it.
+        let mut queue: std::collections::VecDeque<String> =
+            (0..10).map(|index| format!("message {index}")).collect();
+
+        let plan = plan_mod_drain(&mut queue, 0, 0);
+
+        assert_eq!(plan.len(), MAX_AUTO_MOD_TURNS);
+        assert!(
+            plan.iter()
+                .all(|action| matches!(action, ModDrainAction::Submit(_)))
+        );
+        assert_eq!(queue.len(), 7, "the rest waits for a later idle boundary");
     }
 }

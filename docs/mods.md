@@ -342,7 +342,7 @@ and the inner executor. See [Limits and isolation](#limits-and-isolation).
 
 | Member | Meaning |
 | --- | --- |
-| `$.session` | Frozen `{ cwd, model, permission_mode }`, captured when the runtime was constructed. Also carries `$.session.notify(text)`. See [Notices](#sessionnotifytext). |
+| `$.session` | Frozen `{ cwd, model, permission_mode }`, captured when the runtime was constructed. Also carries `$.session.notify(text)` and `$.session.submit(text)`. See [Notices](#sessionnotifytext) and [Queued user messages](#sessionsubmittext). |
 | `$.log(message)` | Writes a line at `info` under the `coderex_mods` tracing target. |
 | `$.env(name)` | The value of an allowlisted environment variable, or `null`. |
 | `$.ui` | Build and render a declarative UI tree, and register button handlers. See [UI elements](#ui-elements). |
@@ -384,6 +384,49 @@ on('PostToolUse', 'Read', function ($, e) {
   `EngineEvent::ModUi`, exactly like a rendered element: no new event is
   generated and the notice cannot re-enter the hook system.
 
+### `$.session.submit(text)`
+
+Queues a **user message** to be submitted **after the current turn finishes**.
+It returns immediately and never calls the engine, so a hook cannot re-enter the
+engine while it is running a turn.
+
+```js
+on('PostToolUse', 'Bash', function ($, e) {
+  // After this turn, ask the model to look at what the command changed.
+  $.session.submit('Review the files the last command touched.');
+});
+```
+
+- `text` must be a non-empty string. Anything else — including `''` — throws a
+  `TypeError` at the call site, which becomes an ordinary hook error.
+- The text is capped at **8192 characters**. A longer string is truncated and a
+  `…` marker is appended.
+- One hook call may submit at most **2 messages**. Further calls are dropped and
+  counted; one `dim` line in the hook result reports how many were dropped.
+- One turn may leave at most **8 queued messages** in total across every hook
+  call it fires. Further submissions are dropped, counted, and reported the same
+  way.
+- Messages merge **in call order**. Identical adjacent messages are folded, so
+  two matching hooks that queue the same text submit it once.
+- The queued text travels in
+  `HookFireResult::pending_prompts`; the engine ignores that field. The CLI
+  drains the runtime's queue when the turn is idle and submits each message as
+  a normal user turn. It goes through the **same permission pipeline** as
+  anything a person types: permission rules, `PreToolUse` / `UserPromptSubmit`
+  hooks, and any confirmation dialogs all apply.
+- Auto-submitted turns are marked in the transcript (`[mod] Auto-submitted turn
+  N/3 …`) and the user message is prefixed with `[mod]`. Headless runs log the
+  same information and append each auto turn's text to the run's output.
+- **Loop guard:** at most **3 consecutive auto-submitted turns** per
+  person-initiated turn. Once three have run, further queued messages are
+  dropped and a system notice says so. The counter resets when the person
+  submits a prompt. This prevents a mod from keeping the session in an endless
+  turn loop.
+- Submissions are never started while a turn is running, while an overlay or
+  confirmation is active, or from inside a hook. In headless mode the queued
+  prompts are drained after the prompt's turn, up to the same caps, and then the
+  run exits normally.
+
 There is no `$.tools`, `$.files`, `$.engine`, `$`-level filesystem, `require`,
 `process`, `fetch`, `XMLHttpRequest`, timer or network access. `next` is the
 only capability added on top of the phase-1 surface, and it only continues the
@@ -422,6 +465,9 @@ worker, which reloads the mods.
 | Mod file size | 1 MiB | Larger files are skipped with a load error. |
 | Hooks per mod | 256 | `on` throws when the cap is reached. |
 | Activation handlers per mod | 256 | `$.ui.onActivate` throws when the cap is reached. |
+| Submissions per hook call | 2 | Further `$.session.submit` calls are dropped and one `dim` notice reports the count. |
+| Queued messages per turn | 8 | The runtime drops further submissions for that turn and reports the count. |
+| Consecutive auto-turns | 3 per person-initiated turn | The CLI stops draining, drops the rest with a system notice, and resets the counter at the next person prompt. |
 | Timeout abandonments | 3 per session | The circuit breaker disables mods for the rest of the session. See below. |
 
 A file that fails to read, transform, parse, evaluate or register is reported
