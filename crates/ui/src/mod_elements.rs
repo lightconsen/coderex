@@ -49,6 +49,7 @@ pub const fn ui_style(style: UiStyle) -> Style {
         UiStyle::Dim => Style::new().add_modifier(Modifier::DIM),
         UiStyle::Warning => Style::new().fg(Color::Yellow),
         UiStyle::Error => Style::new().fg(Color::Red),
+        UiStyle::Notice => Style::new().fg(Color::Cyan),
     }
 }
 
@@ -524,6 +525,20 @@ mod tests {
         assert!(ui_style(UiStyle::Dim).add_modifier.contains(Modifier::DIM));
         assert_eq!(ui_style(UiStyle::Warning).fg, Some(Color::Yellow));
         assert_eq!(ui_style(UiStyle::Error).fg, Some(Color::Red));
+        assert_eq!(ui_style(UiStyle::Notice).fg, Some(Color::Cyan));
+    }
+
+    #[test]
+    fn a_notice_renders_as_its_text_with_the_notice_style() {
+        let lines = render_mod_ui(
+            &[UiElement::Text {
+                text: "heads up".to_string(),
+                style: UiStyle::Notice,
+            }],
+            20,
+        );
+        assert_eq!(line_text(&lines[0]), "heads up");
+        assert_eq!(lines[0].spans[0].style.fg, Some(Color::Cyan));
     }
 
     #[test]

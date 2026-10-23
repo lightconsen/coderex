@@ -1268,17 +1268,49 @@ fn install_host_api(context: &mut Context, session: &ModSession, name: &str) -> 
     Ok(())
 }
 
-/// The `$.ui` host API, installed in each mod's realm before the mod runs.
+/// The `$.ui` host API and `$.session.notify`, installed in each mod's realm
+/// before the mod runs.
 ///
 /// The constructors return plain, JSON-shaped descriptors; `render` stages
 /// them and the main-realm dispatcher drains the staging area after each hook
 /// call. Validation happens here (so the mod gets a JavaScript error at the
 /// call site) and again in [`parse_ui_elements`] at the boundary.
+///
+/// `notify` stages a [`UiStyle::Notice`](coderex_core::ui_protocol::UiStyle)
+/// text element in a separate list. The drain prepends that list to the
+/// rendered elements, so notices always appear before `$.ui.render` output
+/// from the same hook call.
 const HOST_UI_API: &str = r#"
 'use strict';
 (function () {
-  const STYLES = ['plain', 'bold', 'dim', 'warning', 'error'];
+  const STYLES = ['plain', 'bold', 'dim', 'warning', 'error', 'notice'];
+  // `$.session.notify` limits. The text is capped before it is staged; the
+  // per-call cap keeps a loop from flooding the transcript. Further calls are
+  // dropped, and one summary element reports how many were lost.
+  const MAX_NOTICE_LENGTH = 2048;
+  const MAX_NOTICES_PER_CALL = 16;
+  const TRUNCATION_MARKER = '…';
   const staging = [];
+  const notices = [];
+  let droppedNotices = 0;
+
+  function notify(text) {
+    if (typeof text !== 'string') {
+      throw new TypeError('$.session.notify(text): text must be a string');
+    }
+    if (text.length === 0) {
+      throw new TypeError('$.session.notify(text): text must be a non-empty string');
+    }
+    if (notices.length >= MAX_NOTICES_PER_CALL) {
+      droppedNotices += 1;
+      return undefined;
+    }
+    const value = text.length > MAX_NOTICE_LENGTH
+      ? text.slice(0, MAX_NOTICE_LENGTH) + TRUNCATION_MARKER
+      : text;
+    notices.push({ type: 'text', text: value, style: 'notice' });
+    return undefined;
+  }
 
   function styleName(style) {
     if (style === undefined || style === null) return 'plain';
@@ -1401,9 +1433,38 @@ const HOST_UI_API: &str = r#"
     },
     // Host plumbing: the dispatcher clears and drains this area around each
     // hook call. Mods have no reason to call these.
-    __resetUi: function () { staging.length = 0; },
-    __takeUi: function () { const taken = staging.slice(); staging.length = 0; return taken; }
+    __resetUi: function () {
+      staging.length = 0;
+      notices.length = 0;
+      droppedNotices = 0;
+    },
+    // Notices are prepended in emission order, so `$.session.notify` output
+    // always appears before anything the same hook call staged with
+    // `$.ui.render`.
+    __takeUi: function () {
+      const taken = notices.concat(staging);
+      notices.length = 0;
+      staging.length = 0;
+      if (droppedNotices > 0) {
+        const dropped = droppedNotices;
+        droppedNotices = 0;
+        taken.push({
+          type: 'text',
+          text: '[' + dropped + ' notification(s) dropped: at most '
+            + MAX_NOTICES_PER_CALL + ' per hook call]',
+          style: 'dim'
+        });
+      }
+      return taken;
+    }
   };
+
+  Object.defineProperty($.session, 'notify', {
+    value: notify,
+    writable: false,
+    enumerable: true,
+    configurable: false
+  });
 
   Object.freeze(ui);
   $.ui = ui;
@@ -3018,6 +3079,148 @@ mod tests {
                 },
             ]
         );
+    }
+
+    // ── Notifications ───────────────────────────────────────────────────────
+
+    #[test]
+    fn a_hook_that_only_notifies_still_contributes_ui() {
+        let runtime = load(
+            "function register(on) { on('PostToolUse', '*', function ($) { \
+             $.session.notify('heads up'); }); }",
+        );
+
+        let result = runtime.fire("PostToolUse", "Read", &HashMap::new());
+
+        assert!(!result.failed, "{result:?}");
+        assert_eq!(
+            result.ui,
+            vec![UiElement::Text {
+                text: "heads up".to_string(),
+                style: UiStyle::Notice,
+            }]
+        );
+    }
+
+    #[test]
+    fn notices_are_staged_before_rendered_elements_in_emission_order() {
+        let runtime = load(
+            "function register(on) { on('PostToolUse', '*', function ($) { \
+             $.ui.render($.ui.text('rendered')); \
+             $.session.notify('first'); \
+             $.session.notify('second'); }); }",
+        );
+
+        let result = runtime.fire("PostToolUse", "Read", &HashMap::new());
+
+        assert_eq!(
+            result.ui,
+            vec![
+                UiElement::Text {
+                    text: "first".to_string(),
+                    style: UiStyle::Notice,
+                },
+                UiElement::Text {
+                    text: "second".to_string(),
+                    style: UiStyle::Notice,
+                },
+                UiElement::Text {
+                    text: "rendered".to_string(),
+                    style: UiStyle::Plain,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn the_notice_cap_drops_further_calls_and_reports_how_many() {
+        let runtime = load(
+            "function register(on) { on('PostToolUse', '*', function ($) { \
+             for (let index = 0; index < 20; index++) { \
+               $.session.notify('n' + index); } }); }",
+        );
+
+        let result = runtime.fire("PostToolUse", "Read", &HashMap::new());
+
+        assert!(!result.failed, "{result:?}");
+        assert_eq!(result.ui.len(), 17, "16 notices plus one drop summary");
+        let notices: Vec<_> = result.ui[..16]
+            .iter()
+            .map(|element| match element {
+                UiElement::Text { text, style } => {
+                    assert_eq!(*style, UiStyle::Notice);
+                    text.clone()
+                }
+                other => panic!("expected a notice, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            notices,
+            (0..16).map(|index| format!("n{index}")).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            result.ui[16],
+            UiElement::Text {
+                text: "[4 notification(s) dropped: at most 16 per hook call]".to_string(),
+                style: UiStyle::Dim,
+            }
+        );
+    }
+
+    #[test]
+    fn notify_rejects_non_string_and_empty_text() {
+        let cases = [
+            ("$.session.notify(42);", "text must be a string"),
+            ("$.session.notify('');", "text must be a non-empty string"),
+        ];
+
+        for (statement, expected) in cases {
+            let runtime = load(&format!(
+                "function register(on) {{ on('PostToolUse', '*', function ($) {{ {statement} }}); }}"
+            ));
+            let result = runtime.fire("PostToolUse", "Read", &HashMap::new());
+
+            assert!(result.failed, "{statement} was accepted: {result:?}");
+            assert!(
+                result.errors.iter().any(|error| error.contains(expected)),
+                "{statement}: expected {expected:?} in {:?}",
+                result.errors
+            );
+            assert!(result.ui.is_empty(), "{statement} staged something");
+        }
+    }
+
+    #[test]
+    fn an_oversized_notice_is_truncated_with_a_marker() {
+        let runtime = load(
+            "function register(on) { on('PostToolUse', '*', function ($) { \
+             $.session.notify('x'.repeat(3000)); }); }",
+        );
+
+        let result = runtime.fire("PostToolUse", "Read", &HashMap::new());
+
+        assert!(!result.failed, "{result:?}");
+        let [UiElement::Text { text, style }] = result.ui.as_slice() else {
+            panic!("expected one notice, got {:?}", result.ui);
+        };
+        assert_eq!(*style, UiStyle::Notice);
+        assert_eq!(text.chars().count(), 2049, "2048 chars plus the marker");
+        assert!(text.ends_with('…'), "{text:?}");
+    }
+
+    #[test]
+    fn notice_staging_is_cleared_between_hook_calls() {
+        let runtime = load(
+            "let calls = 0; \
+             function register(on) { on('PostToolUse', '*', function ($) { \
+             if (calls++ === 0) { $.session.notify('once'); } }); }",
+        );
+
+        let first = runtime.fire("PostToolUse", "Read", &HashMap::new());
+        let second = runtime.fire("PostToolUse", "Read", &HashMap::new());
+
+        assert_eq!(first.ui.len(), 1, "the first call notified once");
+        assert!(second.ui.is_empty(), "the second call notified nothing");
     }
 
     // ── UI activation ───────────────────────────────────────────────────────

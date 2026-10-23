@@ -19,9 +19,10 @@
 //! deduplicated. A single call may nest at most 64 `next` levels.
 //!
 //! The host API exposed to a mod is deliberately small: `$.session` (read
-//! only), `$.log(message)` and `$.env(name)` over a fixed allowlist. Mods get
-//! no tools, no filesystem, no network and no engine object; `next` only runs
-//! the host's existing chain and downstream executor.
+//! only facts plus `notify(text)`, a short display-only notice),
+//! `$.log(message)` and `$.env(name)` over a fixed allowlist. Mods get no
+//! tools, no filesystem, no network and no engine object; `next` only runs the
+//! host's existing chain and downstream executor.
 //!
 //! The runtime is opt-in. It is constructed only when [`is_enabled`] is true,
 //! which means `CODEREX_MODS` is truthy or `CODEREX_MODS_DIR` is set. The
@@ -42,13 +43,15 @@
 //! # UI
 //!
 //! A hook may build a declarative UI tree with `$.ui.text`, `$.ui.box`,
-//! `$.ui.button` and stage it with `$.ui.render`. The tree crosses the worker
-//! boundary as a host-owned snapshot in
+//! `$.ui.button` and stage it with `$.ui.render`, or stage a short notice with
+//! `$.session.notify(text)`. Both cross the worker boundary as a host-owned
+//! snapshot in
 //! [`HookFireResult`](coderex_core::hook_executor::HookFireResult) `ui`, and
-//! the engine emits it as `EngineEvent::ModUi` when non-empty. A button's id
-//! can be bound with `$.ui.onActivate(id, handler)`, and the terminal routes
-//! a focused activation to that handler through [`ModUiHandle`]. Rendering is
-//! terminal-only. See `docs/mods.md`.
+//! the engine emits it as `EngineEvent::ModUi` when non-empty. Notices are
+//! `UiStyle::Notice` text elements, ordered before the same call's rendered
+//! elements. A button's id can be bound with `$.ui.onActivate(id, handler)`,
+//! and the terminal routes a focused activation to that handler through
+//! [`ModUiHandle`]. Rendering is terminal-only. See `docs/mods.md`.
 //!
 //! # Not yet
 //!

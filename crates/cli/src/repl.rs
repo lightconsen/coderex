@@ -10275,6 +10275,28 @@ mod tests {
         assert!(output.ends_with('\n'), "{output:?}");
     }
 
+    /// A notice staged by a mod is a text element and reaches headless output
+    /// through the same `ModUi` path as a rendered UI block.
+    #[tokio::test]
+    async fn headless_output_contains_a_mod_notice() {
+        let mut repl = ReplLoop::new("/src".into(), ModelId::sonnet());
+        let (tx, rx) = mpsc::unbounded_channel();
+        repl.event_rx = Some(rx);
+        tx.send(EngineEvent::ModUi(vec![
+            coderex_core::ui_protocol::UiElement::Text {
+                text: "the mod noticed something".to_string(),
+                style: coderex_core::ui_protocol::UiStyle::Notice,
+            },
+        ]))
+        .unwrap();
+
+        let mut output = String::new();
+        repl.drain_events(&mut output);
+
+        assert!(output.contains("the mod noticed something"), "{output:?}");
+        assert!(output.ends_with('\n'), "{output:?}");
+    }
+
     /// Headless output must be exactly what the model produced. The old path
     /// read the file named in the prompt and either appended its content or
     /// rewrote the model's bytes to strip a duplicate of it; a prompt naming a

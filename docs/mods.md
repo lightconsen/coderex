@@ -341,7 +341,7 @@ and the inner executor. See [Limits and isolation](#limits-and-isolation).
 
 | Member | Meaning |
 | --- | --- |
-| `$.session` | Frozen `{ cwd, model, permission_mode }`, captured when the runtime was constructed. |
+| `$.session` | Frozen `{ cwd, model, permission_mode }`, captured when the runtime was constructed. Also carries `$.session.notify(text)`. See [Notices](#sessionnotifytext). |
 | `$.log(message)` | Writes a line at `info` under the `coderex_mods` tracing target. |
 | `$.env(name)` | The value of an allowlisted environment variable, or `null`. |
 | `$.ui` | Build and render a declarative UI tree, and register button handlers. See [UI elements](#ui-elements). |
@@ -356,6 +356,32 @@ TERM  TERM_PROGRAM  TERM_PROGRAM_VERSION  OS  CI
 Credentials, tokens, keys, passwords, `HOME`, `PATH`, user names, working
 directories and every `CODEREX_*` variable are not readable. The session facts
 a mod legitimately needs come from `$.session`.
+
+### `$.session.notify(text)`
+
+Stages a short, non-blocking notice for the person using the session. It is
+**display-only**: there is no button, no interaction, no engine access, and it
+cannot change the hook result.
+
+```js
+on('PostToolUse', 'Read', function ($, e) {
+  $.session.notify('read ' + e.input);
+  $.ui.render($.ui.text('details below', 'dim'));
+});
+```
+
+- `text` must be a non-empty string. Anything else — including `''` — throws a
+  `TypeError` at the call site, which becomes an ordinary hook error.
+- The text is capped at **2048 characters**. A longer string is truncated and
+  a `…` marker is appended, so the displayed value is at most 2049 characters.
+- One hook call may emit at most **16 notices**. Further calls are dropped and
+  counted; one `dim` line reports how many were dropped.
+- Notices appear in emission order, **before** anything the same hook call
+  stages with `$.ui.render`.
+- A notice renders as `UiStyle::Notice` (cyan) in the transcript and in
+  headless output. It travels through `HookFireResult.ui` and
+  `EngineEvent::ModUi`, exactly like a rendered element: no new event is
+  generated and the notice cannot re-enter the hook system.
 
 There is no `$.tools`, `$.files`, `$.engine`, `$`-level filesystem, `require`,
 `process`, `fetch`, `XMLHttpRequest`, timer or network access. `next` is the
@@ -457,8 +483,10 @@ on('PostToolUse', 'Read', function ($, e) {
 ### `$.ui.text(text, style?)`
 
 Returns a text element. `text` must be a string. `style` is optional and one
-of `plain` (the default), `bold`, `dim`, `warning` or `error`
+of `plain` (the default), `bold`, `dim`, `warning`, `error` or `notice`
 (case-insensitive). An unknown style throws a `TypeError` at the call site.
+`notice` is the style `$.session.notify` uses; a mod may also select it
+explicitly.
 
 ### `$.ui.box(options?, children...)`
 
@@ -524,7 +552,10 @@ The elements travel in `HookFireResult.ui`, and the engine emits
 nothing). The terminal REPL renders the block into the transcript as a system
 message; a headless run appends it to the turn's output. Boxes render with
 nested borders and titles, text uses the terminal style vocabulary, and
-buttons render as `[label]`.
+buttons render as `[label]`. A `$.session.notify` notice is an ordinary
+`notice`-styled text element on this same path, so it needs no separate
+rendering. A hook that only notifies still produces a block; an all-`notice`
+block contains no buttons, so it is inert.
 
 ### Interaction
 

@@ -60,7 +60,8 @@ pub enum UiElement {
 /// Emphasis for [`UiElement::Text`].
 ///
 /// The variants map onto the terminal UI's existing style vocabulary: bold and
-/// dim modifiers, and the warning/error colors. `Plain` adds nothing.
+/// dim modifiers, and the warning/error colors. `Plain` adds nothing, and
+/// `Notice` uses the cyan reserved for short informational notices.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum UiStyle {
@@ -75,6 +76,9 @@ pub enum UiStyle {
     Warning,
     /// Text that reports an error.
     Error,
+    /// A short notice from `$.session.notify`, shown distinctly from ordinary
+    /// text but without the urgency of a warning or error.
+    Notice,
 }
 
 /// Parse a JSON array of UI elements, validating every node.
@@ -207,6 +211,7 @@ fn parse_style(name: &str) -> Option<UiStyle> {
         "dim" => Some(UiStyle::Dim),
         "warning" => Some(UiStyle::Warning),
         "error" => Some(UiStyle::Error),
+        "notice" => Some(UiStyle::Notice),
         _ => None,
     }
 }
@@ -275,6 +280,21 @@ mod tests {
             vec![UiElement::Text {
                 text: "hi".to_string(),
                 style: UiStyle::Plain,
+            }]
+        );
+    }
+
+    #[test]
+    fn the_notice_style_round_trips() {
+        let parsed = parse_ui_elements(&serde_json::json!([
+            {"type": "text", "text": "heads up", "style": "notice"}
+        ]))
+        .expect("the tree is valid");
+        assert_eq!(
+            parsed,
+            vec![UiElement::Text {
+                text: "heads up".to_string(),
+                style: UiStyle::Notice,
             }]
         );
     }
