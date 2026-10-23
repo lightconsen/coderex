@@ -2,9 +2,9 @@
 //!
 //! `.ts`, `.tsx` and `.jsx` files are parsed with oxc, TypeScript types are
 //! stripped, JSX is lowered to the classic runtime (`h(...)` and `Fragment`),
-//! and the result is printed back to JavaScript for `boa_engine`. The work
-//! happens at load time on the loading thread, so a syntax error is reported
-//! once with its file and line and the mod is skipped.
+//! and the result is printed back to JavaScript for the JavaScript runtime.
+//! The work happens at load time on the loading thread, so a syntax error is
+//! reported once with its file and line and the mod is skipped.
 //!
 //! The JSX configuration is built in source rather than read from a
 //! `tsconfig.json`: classic runtime, `pragma: "h"`, `pragmaFrag: "Fragment"`.

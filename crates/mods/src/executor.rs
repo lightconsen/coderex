@@ -362,13 +362,9 @@ mod tests {
         // chain still runs.
         let inner = Arc::new(Inner::answering(HookFireResult::default()));
         let executor = JsHookExecutor::with_inner(
-            runtime_with_limits(
-                "function register(on) { on('PostToolUse', '*', function () { while (true) {} }); }",
-                ModLimits {
-                    max_loop_iterations: 10_000,
-                    hook_timeout: std::time::Duration::from_secs(5),
-                    ..ModLimits::default()
-                },
+            runtime_with(
+                "function register(on) { on('PostToolUse', '*', function () { \
+                 throw new Error('broken'); }); }",
             ),
             Arc::clone(&inner) as Arc<dyn HookExecutor>,
         );

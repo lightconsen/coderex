@@ -19,6 +19,7 @@ load mods at all and behaves exactly as before.
 CODEREX_MODS=1                  # opt in
 CODEREX_MODS_DIR=...            # optional directory override
 CODEREX_MODS_TIMEOUT_LIMIT=3    # optional timeout-breaker threshold
+CODEREX_MODS_MEMORY_LIMIT=64m   # optional JavaScript heap cap per runtime
 ```
 
 `CODEREX_MODS` accepts `1`, `true`, `yes` or `on` (case-insensitive). Setting
@@ -141,7 +142,7 @@ Every mod file is picked by extension:
 The transform is built in source; there is no `tsconfig.json` to supply. It
 uses the classic JSX runtime with `pragma: "h"` and
 `pragmaFrag: "Fragment"`, and TypeScript syntax is enabled. The lowered
-JavaScript is then evaluated by the same `boa_engine` realm as a `.js` mod, so
+JavaScript is then evaluated in the same per-mod realm as a `.js` mod, so
 everything else in this document applies unchanged.
 
 A transform or parse failure is reported **once** at load as
@@ -435,13 +436,13 @@ object.
 
 ## Limits and isolation
 
-A `boa_engine::Context` is neither `Send` nor interruptible from another
-thread, and `next` must resume in the same context that called it. Each
-`ModRuntime` therefore owns:
+A QuickJS runtime and its contexts are confined to one thread, and `next` must
+resume in the same realm that called it. Each `ModRuntime` therefore owns:
 
 - **one worker thread**, created when the runtime is constructed;
-- **one `Context`** on that thread;
-- **one realm per loaded mod**, created at load;
+- **one QuickJS runtime** on that thread, with the heap, stack and interrupt
+  limits installed;
+- **one context (realm) per loaded mod**, created at load;
 - **one small current-thread `tokio` runtime** on the worker, used only to
   `block_on` the downstream executor when the chain reaches it.
 
@@ -450,56 +451,64 @@ what lets `JsHookExecutor` be shared as `Arc<dyn HookExecutor>`.
 
 `fire` sends a request to the worker and waits for its reply. The worker runs
 the matching JavaScript hooks and any nested `next` calls as one chain, then
-(unless a hook called `next` or stopped the event) the downstream executor. A
-timeout does not stop the engine; the caller detaches the worker and reports a
-hook error. Until the breaker below trips, the next `fire` starts a fresh
-worker, which reloads the mods.
+(unless a hook called `next` or stopped the event) the downstream executor.
+
+Three limits are enforced by the engine itself:
+
+- **heap:** `JS_SetMemoryLimit` caps every allocation the runtime makes,
+  including one large `ArrayBuffer` or `String.prototype.repeat`;
+- **stack:** `JS_SetMaxStackSize` makes a runaway recursion throw a catchable
+  `RangeError` instead of overflowing the native stack;
+- **interrupt:** `JS_SetInterruptHandler` runs periodically while JavaScript
+  executes. The handler compares the current time with the call's deadline and,
+  once it passes, makes QuickJS raise an uncatchable exception and return
+  control to the worker. The hook is reported as a timeout, the engine is
+  discarded, and the next call rebuilds the runtime and reloads the mods, so a
+  half-mutated realm cannot affect it.
+
+The calling thread also keeps its own deadline, 100 ms later than the engine's.
+It is only a backstop for work QuickJS cannot interrupt — a downstream executor
+blocked in a native call, or one that never resolves. When that backstop fires
+the worker is detached, as before. Requests are serialized, so a detached
+runaway delays only its own runtime.
 
 | Limit | Default | Behaviour |
 | --- | --- | --- |
-| Wall clock | 5 s per call | Covers every matching JavaScript hook, every nested `next` **and** the downstream run. The calling thread stops waiting and reports a hook error. |
+| Wall clock | 5 s per call | Covers every matching JavaScript hook, every nested `next` **and** the downstream run. The engine interrupts JavaScript at the deadline; the caller's backstop detaches the worker only if that cannot stop the work. |
+| Heap | 64 MiB | `JS_SetMemoryLimit`. An over-limit allocation throws an out-of-memory error, reported as a hook error. `CODEREX_MODS_MEMORY_LIMIT` overrides it (bytes, or `k`/`m`/`g` with optional `i`/`b`); values below 4 MiB are clamped up. |
+| Stack | 4 MiB | `JS_SetMaxStackSize`, clamped to 256 KiB..=8 MiB. A runaway recursion throws a `RangeError`. The worker thread's native stack is 16 MiB so QuickJS can raise that error before the process aborts. |
+| GC threshold | 2 MiB | `JS_SetGCThreshold`, clamped below the heap cap. |
 | Chain depth | 64 nested `next(e)` calls per call | The 65th `next` throws a `RangeError`; uncaught, it marks that hook failed. |
-| Loop iterations | 10,000,000 per frame | `while (true) {}` throws an engine runtime-limit error. |
-| Recursion | 512 nested calls | A runaway recursive hook throws instead of overflowing the stack. One `next` level uses about four frames, so this ceiling is above the chain limit's frames. |
-| Stack values | 10,240 | The engine's stack ceiling. |
 | Mod file size | 1 MiB | Larger files are skipped with a load error. |
 | Hooks per mod | 256 | `on` throws when the cap is reached. |
 | Activation handlers per mod | 256 | `$.ui.onActivate` throws when the cap is reached. |
 | Submissions per hook call | 2 | Further `$.session.submit` calls are dropped and one `dim` notice reports the count. |
 | Queued messages per turn | 8 | The runtime drops further submissions for that turn and reports the count. |
 | Consecutive auto-turns | 3 per person-initiated turn | The CLI stops draining, drops the rest with a system notice, and resets the counter at the next person prompt. |
-| Timeout abandonments | 3 per session | The circuit breaker disables mods for the rest of the session. See below. |
+| Timeouts | 3 per session | The circuit breaker disables mods for the rest of the session. See below. |
 
 A file that fails to read, transform, parse, evaluate or register is reported
 **once** at load (`tracing::warn!`, plus `ModRuntime::load_errors`) and
 skipped. The remaining mods still load. A TypeScript/JSX transform error
-includes its line and column.
+includes its line and column. Top-level code gets the same wall-clock budget as
+a hook call, so a mod that loops forever while loading is skipped instead of
+hanging the session.
 
-**Memory caveat.** `boa_engine` 0.20 exposes no heap or allocation limit. The
-wall clock and loop ceiling bound ordinary runaway code, and recursion/stack
-limits bound call depth, but a single native allocation (for example a very
-large `String.prototype.repeat`) can still allocate before either limit fires.
-Do not load untrusted mods; the directory is for code the person chose to
-install. A hard memory cap needs either a future boa API or a container/process
-boundary.
-
-The wall-clock budget is enforced by the caller, not by the engine: boa 0.20
-has no interrupt hook. When the budget expires the call is reported and the
-worker is detached; the engine limits make it terminate shortly afterwards. A
-hook that blocked inside a native call, or a downstream executor that never
-resolves, would outlive the timeout until that work returned. Requests are
-serialized by the worker, so a detached runaway delays only its own runtime.
+The heap cap is not a full sandbox. It bounds what the script can allocate for
+itself, but QuickJS still runs in the CodeRex process; do not load untrusted
+mods. The directory is for code the person chose to install.
 
 ### Timeout circuit breaker
 
-A detached worker cannot be killed, so every wall-clock timeout leaves a thread
-that may still be running. CodeRex counts those abandonments per runtime (one
-runtime per session) and stops feeding the problem after a small threshold.
+Every wall-clock timeout counts, whether the engine's interrupt handler stopped
+the JavaScript or the caller's backstop had to detach the worker. CodeRex
+counts them per runtime (one runtime per session) and stops feeding the problem
+after a small threshold.
 
 - **What counts:** only a call that exceeds the wall-clock budget — a hook
   `fire`, a nested `next`, or a UI activation handler. Ordinary hook
-  exceptions, engine-limit errors (loop, recursion, stack) and a worker that
-  disconnects do **not** count.
+  exceptions, heap and stack errors, and a worker that disconnects do **not**
+  count.
 - **Threshold:** `3` by default. `CODEREX_MODS_TIMEOUT_LIMIT` overrides it with
   a non-negative integer; `0` disables the breaker, and an invalid value falls
   back to `3`.

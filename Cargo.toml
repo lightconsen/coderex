@@ -37,8 +37,10 @@ async-trait = "0.1"
 pin-project = "1"
 async-stream = "0.3"
 
-# JavaScript engine — in-process workflow scripts and extension hooks
+# JavaScript engines — `boa_engine` for in-process workflow scripts and
+# `rquickjs` for extension hooks (it exposes heap, stack and interrupt limits).
 boa_engine = "0.20"
+rquickjs = "0.14"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

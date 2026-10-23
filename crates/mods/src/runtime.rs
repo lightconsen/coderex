@@ -1,11 +1,17 @@
 //! Loading mods and firing their hooks on a long-lived worker.
 //!
-//! A `boa_engine::Context` is neither `Send` nor safe to share, and `next(e)`
-//! needs the same context to resume in after the downstream chain has run.
-//! Each [`ModRuntime`] therefore owns one worker thread, one `Context`, and one
-//! realm per loaded mod for as long as it lives. [`ModRuntime::fire`] sends a
-//! request over a channel, waits for the reply under the wall-clock budget, and
-//! never touches the engine directly.
+//! A QuickJS runtime and its contexts are confined to one thread, and `next(e)`
+//! needs the same realm to resume in after the downstream chain has run. Each
+//! [`ModRuntime`] therefore owns one worker thread, one QuickJS runtime, and
+//! one [`Context`] (a realm) per loaded mod for as long as it lives.
+//! [`ModRuntime::fire`] sends a request over a channel, waits for the reply
+//! under the wall-clock budget, and never touches the engine directly.
+//!
+//! Unlike boa, QuickJS lets the host cap the heap and interrupt the engine from
+//! inside it: the runtime has a memory limit, a maximum stack size and an
+//! interrupt handler that runs periodically while JavaScript executes. The
+//! handler is driven by a per-request deadline, so a runaway hook is stopped
+//! at the wall-clock budget instead of being left to run.
 
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -13,14 +19,15 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use boa_engine::{
-    Context, Finalize, JsObject, JsResult, JsString, JsValue, NativeFunction, Source, Trace,
-    js_string, object::ObjectInitializer, object::builtins::JsArray, property::Attribute,
-};
 use coderex_core::hook_executor::{HookExecutor, HookFireResult};
 use coderex_core::ui_protocol::{UiElement, UiStyle, parse_ui_elements};
+use rquickjs::function::Opt;
+use rquickjs::object::Property;
+use rquickjs::{
+    Array, Context, Ctx, Function, IntoJs, Object, Persistent, Runtime as QuickJsRuntime, Value,
+};
 use sha2::{Digest, Sha256};
 
 use crate::transform;
@@ -33,13 +40,36 @@ pub const MODS_DIR_ENV: &str = "CODEREX_MODS_DIR";
 
 /// Environment variable that overrides the timeout circuit-breaker threshold.
 ///
-/// The value is a non-negative integer: how many wall-clock abandonments are
+/// The value is a non-negative integer: how many wall-clock timeouts are
 /// tolerated before mods are disabled for the rest of the session. An invalid
 /// value falls back to [`DEFAULT_TIMEOUT_BREAKER_LIMIT`]; `0` disables the
 /// breaker (timeouts never disable mods).
 pub const MODS_TIMEOUT_LIMIT_ENV: &str = "CODEREX_MODS_TIMEOUT_LIMIT";
 
-/// How many wall-clock abandonments disable mods by default.
+/// Environment variable that overrides the JavaScript heap cap.
+///
+/// The value is a byte count with an optional binary suffix (`k`, `m`, `g`,
+/// each optionally followed by `i` and/or `b`, case-insensitively), for
+/// example `33554432`, `32m` or `32MiB`. Values below
+/// [`MIN_MEMORY_LIMIT`] are clamped up to it. An unparseable value falls back
+/// to [`DEFAULT_MEMORY_LIMIT`].
+pub const MODS_MEMORY_LIMIT_ENV: &str = "CODEREX_MODS_MEMORY_LIMIT";
+
+/// The default JavaScript heap cap: 64 MiB.
+pub const DEFAULT_MEMORY_LIMIT: usize = 64 * 1024 * 1024;
+
+/// The smallest JavaScript heap cap that still leaves room for a runtime, its
+/// per-mod realms and the harness (4 MiB).
+pub const MIN_MEMORY_LIMIT: usize = 4 * 1024 * 1024;
+
+/// The smallest engine stack accepted (256 KiB, QuickJS's own default).
+const MIN_STACK_SIZE: usize = 256 * 1024;
+
+/// The largest engine stack accepted (8 MiB), leaving room on the worker's
+/// 16 MiB native stack for Rust frames around the interpreter.
+const MAX_STACK_SIZE: usize = 8 * 1024 * 1024;
+
+/// How many wall-clock timeouts disable mods by default.
 pub const DEFAULT_TIMEOUT_BREAKER_LIMIT: usize = 3;
 
 /// Environment variables a mod may read through `$.env(name)`.
@@ -91,6 +121,10 @@ pub const MAX_PENDING_PROMPTS_PER_TURN: usize = 8;
 /// the number of chained hooks plus the final one. Without this bound a mod
 /// could build an unbounded `next` recursion; exceeding it is a hook error.
 const MAX_CHAIN_DEPTH: usize = 64;
+
+/// Extra time the calling thread waits past the engine's deadline, so an
+/// interrupted hook can report its error before the worker is detached.
+const TIMEOUT_REPLY_GRACE: Duration = Duration::from_millis(100);
 
 /// The session facts a mod may read through `$.session`.
 ///
@@ -165,46 +199,99 @@ impl ModSubmitQueue {
 }
 
 /// Limits every hook call is held to.
+///
+/// All three engine limits are installed on the QuickJS runtime the worker
+/// owns, so they apply to every realm and every `next(e)` level.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ModLimits {
     /// Wall-clock budget for one [`ModRuntime::fire`] call.
     ///
     /// The budget covers the whole chain: every matching JavaScript hook and,
     /// when a hook calls `next`, the downstream (inner) executor as well.
-    /// `boa_engine` 0.20 has no interrupt API, so this is enforced by the
-    /// calling thread: when the budget expires the call is reported as an
-    /// error and the worker is detached. The engine limits below are what
-    /// guarantee that it eventually terminates.
+    /// QuickJS's interrupt handler is driven by this budget, so a JavaScript
+    /// loop that never returns is stopped at the deadline rather than left to
+    /// run. The calling thread keeps a small grace period as a backstop for
+    /// work the engine cannot interrupt (a downstream executor blocked in a
+    /// native call); if that backstop fires, the worker is detached.
     pub hook_timeout: Duration,
-    /// Most loop iterations one JavaScript frame may perform.
+    /// Most heap bytes the QuickJS runtime may allocate.
     ///
-    /// This is the engine's instruction-shaped ceiling and the reason an
-    /// infinite loop terminates even when the wall-clock budget has not fired.
-    pub max_loop_iterations: u64,
-    /// Most nested JavaScript calls.
+    /// Enforced by `JS_SetMemoryLimit`. An allocation past the cap throws an
+    /// out-of-memory exception, which a hook sees as an ordinary error.
+    /// [`DEFAULT_MEMORY_LIMIT`] unless overridden with
+    /// [`MODS_MEMORY_LIMIT_ENV`]; never below [`MIN_MEMORY_LIMIT`].
+    pub memory_limit: usize,
+    /// Most stack bytes the engine may use.
     ///
-    /// One `next(e)` level uses about four frames, so this must stay above
-    /// [`MAX_CHAIN_DEPTH`]'s frames for a bounded chain to reach the chain's
-    /// own error rather than an engine runtime-limit error.
-    pub recursion_limit: usize,
-    /// Most values one JavaScript stack may hold.
-    pub stack_size_limit: usize,
+    /// Enforced by `JS_SetMaxStackSize`; a runaway recursion throws a
+    /// `RangeError` instead of overflowing the native stack. One `next(e)`
+    /// level uses roughly four JavaScript frames, so this must leave room for
+    /// [`MAX_CHAIN_DEPTH`] levels. Clamped to 256 KiB..=8 MiB; the worker
+    /// thread's native stack is 16 MiB.
+    pub max_stack_size: usize,
+    /// Heap growth between automatic garbage collections.
+    ///
+    /// Enforced by `JS_SetGCThreshold`; clamped below `memory_limit`.
+    pub gc_threshold: usize,
 }
 
 impl Default for ModLimits {
     fn default() -> Self {
         Self {
             hook_timeout: Duration::from_secs(5),
-            max_loop_iterations: 10_000_000,
-            // One `next` level costs roughly four JavaScript frames
-            // (`__coderExChain` → `__coderExCall` → hook → `next`), so the
-            // engine ceiling must stay above [`MAX_CHAIN_DEPTH`]'s frames or
-            // a bounded chain would die as a runtime-limit error before the
-            // chain's own limit fires.
-            recursion_limit: 512,
-            stack_size_limit: 10 * 1024,
+            memory_limit: configured_memory_limit(),
+            // QuickJS defaults to a 256 KiB stack. A full `next` chain is
+            // deeply nested JavaScript (the harness chain runner, the hook and
+            // its `next` closure at every level), so 4 MiB leaves room for all
+            // 64 links while still failing a runaway recursion quickly.
+            // QuickJS treats values above 16 MiB as "unlimited".
+            max_stack_size: 4 * 1024 * 1024,
+            gc_threshold: 2 * 1024 * 1024,
         }
     }
+}
+
+/// Resolve the heap cap from [`MODS_MEMORY_LIMIT_ENV`], clamped to the sane
+/// minimum. An unset or unparseable value yields [`DEFAULT_MEMORY_LIMIT`].
+fn configured_memory_limit() -> usize {
+    std::env::var(MODS_MEMORY_LIMIT_ENV)
+        .ok()
+        .and_then(|value| parse_memory_limit(&value))
+        .unwrap_or(DEFAULT_MEMORY_LIMIT)
+        .max(MIN_MEMORY_LIMIT)
+}
+
+/// Parse a byte count with an optional binary suffix.
+///
+/// Accepts `33554432`, `32768k`, `32m`, `1g`, and the `KiB`/`MiB`/`GiB`
+/// spellings. Returns `None` for an empty, malformed or overflowing value.
+fn parse_memory_limit(value: &str) -> Option<usize> {
+    let value = value.trim().to_ascii_lowercase();
+    if value.is_empty() {
+        return None;
+    }
+    // Longest spelling first: `mib` before `mb` and `m`.
+    let (digits, multiplier) = [
+        ("kib", 1024usize),
+        ("kb", 1024),
+        ("k", 1024),
+        ("mib", 1024 * 1024),
+        ("mb", 1024 * 1024),
+        ("m", 1024 * 1024),
+        ("gib", 1024 * 1024 * 1024),
+        ("gb", 1024 * 1024 * 1024),
+        ("g", 1024 * 1024 * 1024),
+        ("b", 1),
+    ]
+    .into_iter()
+    .find_map(|(suffix, multiplier)| {
+        value
+            .strip_suffix(suffix)
+            .map(|digits| (digits, multiplier))
+    })
+    .unwrap_or((value.as_str(), 1));
+    let digits: usize = digits.trim().parse().ok()?;
+    digits.checked_mul(multiplier)
 }
 
 /// Whether the in-process runtime should be constructed.
@@ -304,13 +391,31 @@ struct Request {
     input: String,
     context: HashMap<String, String>,
     inner: Option<Arc<dyn HookExecutor>>,
-    reply: mpsc::SyncSender<HookFireResult>,
+    reply: mpsc::SyncSender<Reply>,
 }
 
 /// A UI activation request from the caller to the worker.
 struct ActivateRequest {
     id: String,
-    reply: mpsc::SyncSender<Result<Vec<UiElement>, String>>,
+    reply: mpsc::SyncSender<ActivateReply>,
+}
+
+/// A worker result plus whether the engine, not the caller's backstop, stopped
+/// the call at the wall-clock deadline.
+///
+/// The distinction matters for the circuit breaker: every timeout counts, but
+/// only a timeout that the engine could not interrupt (for example a
+/// downstream executor blocked in a native call) forces the caller to detach
+/// the worker.
+struct Reply {
+    result: HookFireResult,
+    timed_out: bool,
+}
+
+/// The activation counterpart of [`Reply`].
+struct ActivateReply {
+    result: Result<Vec<UiElement>, String>,
+    timed_out: bool,
 }
 
 /// Any work the worker accepts, in the order it arrives.
@@ -328,9 +433,9 @@ struct WorkerHandle {
 /// Loads mods and fires their hooks.
 ///
 /// The JavaScript engine lives on a dedicated worker thread that owns one
-/// `Context` and one realm per mod for the lifetime of the runtime. What
-/// remains here is strings, configuration and a channel, which is what lets
-/// [`JsHookExecutor`](crate::JsHookExecutor) be `Send + Sync`.
+/// QuickJS runtime and one context (realm) per mod for the lifetime of the
+/// runtime. What remains here is strings, configuration and a channel, which
+/// is what lets [`JsHookExecutor`](crate::JsHookExecutor) be `Send + Sync`.
 #[derive(Debug)]
 pub struct ModRuntime {
     dir: PathBuf,
@@ -340,10 +445,11 @@ pub struct ModRuntime {
     load_errors: Vec<String>,
     /// One entry per mod file found, including skipped files.
     report: Vec<ModInfo>,
-    /// Wall-clock abandonments tolerated before the breaker trips. `0` means
-    /// the breaker is disabled.
+    /// Wall-clock timeouts tolerated before the breaker trips. `0` means the
+    /// breaker is disabled.
     timeout_breaker_limit: usize,
-    /// Hook calls abandoned because they exceeded the wall-clock budget.
+    /// Hook calls that exceeded the wall-clock budget, whether the engine
+    /// interrupted them or the caller's backstop detached the worker.
     timeout_abandonments: AtomicUsize,
     /// Whether mods have been disabled for the rest of the session.
     disabled: AtomicBool,
@@ -549,9 +655,11 @@ impl ModRuntime {
         self.disabled.load(Ordering::SeqCst)
     }
 
-    /// How many hook calls have been abandoned on the wall-clock budget.
+    /// How many hook calls have exceeded the wall-clock budget.
     ///
-    /// Ordinary hook errors are not counted; only timeouts are.
+    /// Ordinary hook errors are not counted; only timeouts are. The name is
+    /// historical: since the engine now interrupts itself, most timeouts stop
+    /// the JavaScript and leave the worker usable.
     #[must_use]
     pub fn timeout_abandonments(&self) -> usize {
         self.timeout_abandonments.load(Ordering::SeqCst)
@@ -569,8 +677,7 @@ impl ModRuntime {
         self.is_disabled().then(|| {
             format!(
                 "mods are disabled for the rest of this session: {} hook call(s) exceeded the \
-                 {} ms wall-clock budget and each abandoned a worker thread (threshold {}); \
-                 restart CodeRex to re-enable mods",
+                 {} ms wall-clock budget (threshold {}); restart CodeRex to re-enable mods",
                 self.timeout_abandonments(),
                 self.limits.hook_timeout.as_millis(),
                 self.timeout_breaker_limit,
@@ -704,10 +811,15 @@ impl ModRuntime {
             }))
             .map_err(|_| "the mod worker stopped before the activation could run".to_string())?;
 
-        match reply_receiver.recv_timeout(self.limits.hook_timeout) {
-            Ok(result) => result,
+        match reply_receiver.recv_timeout(self.reply_budget()) {
+            Ok(reply) => {
+                if reply.timed_out {
+                    self.record_timeout();
+                }
+                reply.result
+            }
             Err(RecvTimeoutError::Timeout) => {
-                self.record_timeout_abandonment();
+                self.record_timeout();
                 self.abandon_worker();
                 Err(format!(
                     "the activation handler exceeded its {} ms wall-clock budget",
@@ -721,20 +833,37 @@ impl ModRuntime {
         }
     }
 
+    /// How long the calling thread waits for the worker's reply.
+    ///
+    /// The engine is given the full `hook_timeout` and stops JavaScript from
+    /// inside its own interrupt handler. The extra grace lets that interrupted
+    /// call travel back over the channel before the caller gives up on the
+    /// worker. The caller-side deadline remains the backstop for work QuickJS
+    /// cannot interrupt, such as a downstream executor blocked in a native
+    /// call.
+    const fn reply_budget(&self) -> Duration {
+        self.limits.hook_timeout.saturating_add(TIMEOUT_REPLY_GRACE)
+    }
+
     fn dispatch(
         &self,
         request: Request,
-        reply_receiver: &mpsc::Receiver<HookFireResult>,
+        reply_receiver: &mpsc::Receiver<Reply>,
     ) -> Result<HookFireResult, String> {
         let sender = self.worker_sender()?;
         sender
             .send(WorkerRequest::Fire(request))
             .map_err(|_| "the mod worker stopped before the hook could run".to_string())?;
 
-        match reply_receiver.recv_timeout(self.limits.hook_timeout) {
-            Ok(result) => Ok(result),
+        match reply_receiver.recv_timeout(self.reply_budget()) {
+            Ok(reply) => {
+                if reply.timed_out {
+                    self.record_timeout();
+                }
+                Ok(reply.result)
+            }
             Err(RecvTimeoutError::Timeout) => {
-                self.record_timeout_abandonment();
+                self.record_timeout();
                 self.abandon_worker();
                 Err(format!(
                     "the hook exceeded its {} ms wall-clock budget",
@@ -777,19 +906,20 @@ impl ModRuntime {
         Ok(sender)
     }
 
-    /// Count one wall-clock abandonment and trip the breaker at the threshold.
+    /// Count one wall-clock timeout and trip the breaker at the threshold.
     ///
-    /// Only timeouts call this; an ordinary hook error, a disconnected worker
-    /// or an engine-limit error does not. A threshold of `0` disables the
-    /// breaker.
-    fn record_timeout_abandonment(&self) {
+    /// Only timeouts call this, whether the engine interrupted the hook or the
+    /// caller's backstop detached the worker. An ordinary hook error, a
+    /// disconnected worker or a memory/stack error does not. A threshold of
+    /// `0` disables the breaker.
+    fn record_timeout(&self) {
         if self.timeout_breaker_limit == 0 {
             return;
         }
         let count = self.timeout_abandonments.fetch_add(1, Ordering::SeqCst) + 1;
         if count >= self.timeout_breaker_limit && !self.disabled.swap(true, Ordering::SeqCst) {
             tracing::error!(
-                abandonments = count,
+                timeouts = count,
                 threshold = self.timeout_breaker_limit,
                 "mods disabled for the rest of the session after repeated hook timeouts"
             );
@@ -851,17 +981,12 @@ pub struct ModRuntimeBuilder {
 }
 
 impl ModRuntimeBuilder {
-    /// Start with the given session snapshot.
+    /// Start with the given session snapshot and the default limits.
     #[must_use]
-    pub const fn new(session: ModSession) -> Self {
+    pub fn new(session: ModSession) -> Self {
         Self {
             session,
-            limits: ModLimits {
-                hook_timeout: Duration::from_secs(5),
-                max_loop_iterations: 10_000_000,
-                recursion_limit: 512,
-                stack_size_limit: 10 * 1024,
-            },
+            limits: ModLimits::default(),
         }
     }
 
@@ -986,7 +1111,12 @@ fn spawn_worker(
     let (init_sender, init_receiver) = mpsc::sync_channel(1);
     std::thread::Builder::new()
         .name("coderex-mods".to_string())
-        .spawn(move || worker_main(&config, &receiver, &init_sender))
+        // The engine's stack limit is checked against the thread's stack, so
+        // the thread must be comfortably larger than `max_stack_size` (4 MiB
+        // by default). Rust's 2 MiB default would abort before QuickJS could
+        // raise its catchable "stack size exceeded" error.
+        .stack_size(16 * 1024 * 1024)
+        .spawn(move || worker_main(config, &receiver, &init_sender))
         .map_err(|error| format!("could not start the mod worker: {error}"))?;
 
     match init_receiver.recv() {
@@ -997,7 +1127,7 @@ fn spawn_worker(
 }
 
 fn worker_main(
-    config: &WorkerConfig,
+    config: Arc<WorkerConfig>,
     receiver: &mpsc::Receiver<WorkerRequest>,
     init: &mpsc::SyncSender<Result<InitOutcome, String>>,
 ) {
@@ -1034,126 +1164,172 @@ fn worker_main(
     while let Ok(request) = receiver.recv() {
         match request {
             WorkerRequest::Fire(request) => {
-                let result = state.fire(&request);
-                let _ = request.reply.send(result);
+                let reply = state.fire(&request);
+                let _ = request.reply.send(reply);
             }
             WorkerRequest::Activate(request) => {
-                let result = state.activate(&request.id);
-                let _ = request.reply.send(result);
+                let reply = state.activate(&request.id);
+                let _ = request.reply.send(reply);
             }
         }
     }
 }
 
-/// The worker thread's engine state.
-struct WorkerState {
-    context: Context,
-    runtime: Arc<tokio::runtime::Runtime>,
+/// The interrupt deadline shared by the caller and the engine.
+///
+/// The worker sets it before each call and clears it afterwards. While it is
+/// set, QuickJS calls [`Deadline::expired`] periodically; the first call that
+/// is past the deadline makes QuickJS raise an uncatchable exception and
+/// return control to the worker, which reports the timeout.
+#[derive(Debug, Clone, Default)]
+struct Deadline(Arc<Mutex<DeadlineState>>);
+
+#[derive(Debug, Default)]
+struct DeadlineState {
+    deadline: Option<Instant>,
+    /// Set by the interrupt handler; read after the engine returns.
+    interrupted: bool,
+}
+
+impl Deadline {
+    /// Start a call with `budget` of wall-clock time.
+    fn begin(&self, budget: Duration) {
+        let mut state = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.deadline = Instant::now().checked_add(budget);
+        state.interrupted = false;
+    }
+
+    /// The interrupt handler's check. Returns `true` once the deadline passes.
+    fn expired(&self) -> bool {
+        let mut state = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let expired = state
+            .deadline
+            .is_some_and(|deadline| Instant::now() >= deadline);
+        if expired {
+            state.interrupted = true;
+        }
+        expired
+    }
+
+    /// Finish a call and report whether the engine interrupted it.
+    fn end(&self) -> bool {
+        let mut state = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.deadline = None;
+        std::mem::take(&mut state.interrupted)
+    }
+}
+
+/// The engine (one QuickJS runtime and one realm per mod) confined to the
+/// worker thread.
+///
+/// Fields drop in declaration order, so the contexts (and the values they
+/// own) are released before the runtime that created them.
+struct Engine {
+    main: Context,
+    /// Keeps each mod's realm alive: the main harness stores functions that
+    /// were created in those realms.
+    #[allow(dead_code)]
+    mods: Vec<Context>,
+    /// Owns the runtime. The contexts hold clones, so this field is what keeps
+    /// it alive until they have all been dropped.
+    #[allow(dead_code)]
+    js: QuickJsRuntime,
+}
+
+/// Everything a successful load produced.
+struct EngineLoad {
+    engine: Engine,
     hooks: Vec<WorkerHook>,
     load_errors: Vec<String>,
-    /// Per-mod load errors, aligned with the configured mod order.
     mod_errors: Vec<Option<String>>,
     mod_names: Vec<String>,
 }
 
-impl WorkerState {
-    /// Build one context, one realm per mod, and the flattened hook list.
-    fn load(config: &WorkerConfig, runtime: Arc<tokio::runtime::Runtime>) -> Result<Self, String> {
-        let mut context = Context::default();
-        apply_limits(&mut context, &config.limits);
-        let harness = MAIN_HARNESS
-            .replace("@@MAX_CHAIN_DEPTH@@", &MAX_CHAIN_DEPTH.to_string())
-            .replace(
-                "@@MAX_SUBMISSIONS_PER_CALL@@",
-                &MAX_SUBMISSIONS_PER_HOOK_CALL.to_string(),
-            )
-            .replace(
-                "@@MAX_PENDING_PROMPTS@@",
-                &MAX_PENDING_PROMPTS_PER_TURN.to_string(),
-            );
-        context
-            .eval(Source::from_bytes(harness.as_bytes()))
+impl Engine {
+    /// Create the runtime, apply its limits, and load every mod in its own
+    /// realm.
+    ///
+    /// A per-mod failure is reported in [`EngineLoad`] and does not fail the
+    /// whole load. Fatal failures (the runtime cannot start, the main harness
+    /// cannot be installed, or a registration array cannot be stored) abort.
+    fn build(config: &WorkerConfig, deadline: &Deadline) -> Result<EngineLoad, String> {
+        let js = QuickJsRuntime::new()
+            .map_err(|error| format!("could not start the JavaScript runtime: {error}"))?;
+        // The heap cap is the one limit the engine enforces on every
+        // allocation, including a single large native one.
+        let memory_limit = config.limits.memory_limit.max(MIN_MEMORY_LIMIT);
+        js.set_memory_limit(memory_limit);
+        // Keep the engine's stack well below the worker thread's native stack
+        // (16 MiB). QuickJS treats a limit above 16 MiB as "unlimited".
+        let stack = config
+            .limits
+            .max_stack_size
+            .clamp(MIN_STACK_SIZE, MAX_STACK_SIZE);
+        js.set_max_stack_size(stack);
+        if config.limits.gc_threshold > 0 {
+            // Keep the GC threshold below the heap cap, or the engine could hit
+            // the cap between collections.
+            let gc = config
+                .limits
+                .gc_threshold
+                .min(memory_limit / 2)
+                .max(64 * 1024);
+            js.set_gc_threshold(gc);
+        }
+        let interrupt = deadline.clone();
+        js.set_interrupt_handler(Some(Box::new(move || interrupt.expired())));
+
+        let main = Context::full(&js)
+            .map_err(|error| format!("could not create the JavaScript context: {error}"))?;
+        main.with(|ctx| install_main_harness(&ctx))
             .map_err(|error| format!("could not install the runtime harness: {error}"))?;
 
-        let registry = context
-            .global_object()
-            .get(js_string!("__coderExMods"), &mut context)
-            .map_err(|error| format!("could not read the runtime harness: {error}"))?;
-        let registry = registry
-            .as_object()
-            .cloned()
-            .and_then(|object| JsArray::from_object(object).ok())
-            .ok_or_else(|| "the runtime harness registry is missing".to_string())?;
-
-        let activation_registry = context
-            .global_object()
-            .get(js_string!("__coderExActivations"), &mut context)
-            .map_err(|error| format!("could not read the runtime harness: {error}"))?;
-        let activation_registry = activation_registry
-            .as_object()
-            .cloned()
-            .and_then(|object| JsArray::from_object(object).ok())
-            .ok_or_else(|| "the runtime activation registry is missing".to_string())?;
-
+        let mut mods = Vec::new();
         let mut hooks = Vec::new();
         let mut load_errors = Vec::new();
         let mut mod_errors = Vec::new();
         let mut mod_names = Vec::new();
 
         for source in &config.mods {
-            match load_mod(&mut context, source, &config.session) {
+            let mod_context =
+                Context::full(&js).map_err(|error| format!("could not create a realm: {error}"))?;
+            // Loading runs mod top-level code, so it gets the same wall-clock
+            // protection as a hook. A top-level infinite loop is skipped as a
+            // load error instead of hanging the session.
+            deadline.begin(config.limits.hook_timeout);
+            let loaded = mod_context.with(|ctx| load_mod_in_realm(&ctx, source, &config.session));
+            let load_timed_out = deadline.end();
+            let loaded = if load_timed_out {
+                Err(budget_error(&config.limits, "mod load"))
+            } else {
+                loaded
+            };
+            match loaded {
                 Ok(loaded) => {
-                    registry
-                        .push(loaded.registrations.clone(), &mut context)
-                        .map_err(|error| {
-                            format!("could not register {}: {error}", source.path.display())
-                        })?;
-                    activation_registry
-                        .push(loaded.activations.clone(), &mut context)
-                        .map_err(|error| {
-                            format!(
-                                "could not register {}'s UI handlers: {error}",
-                                source.path.display()
-                            )
-                        })?;
-                    let array = loaded
-                        .registrations
-                        .as_object()
-                        .cloned()
-                        .and_then(|object| JsArray::from_object(object).ok())
-                        .ok_or_else(|| {
-                            format!(
-                                "{}: register() left an unreadable registration list",
-                                source.path.display()
-                            )
-                        })?;
-                    let length = array.length(&mut context).map_err(|error| {
-                        format!("could not read {}: {error}", source.path.display())
-                    })?;
-
                     let mod_index = mod_names.len();
-                    for hook_index in 0..length {
-                        let Ok(hook_index) = i64::try_from(hook_index) else {
-                            continue;
-                        };
-                        let entry = array.at(hook_index, &mut context).map_err(|error| {
-                            format!("could not read {}: {error}", source.path.display())
-                        })?;
-                        let (Some(event), Some(matcher)) = (
-                            js_string_field(&entry, "event", &mut context),
-                            js_string_field(&entry, "matcher", &mut context),
-                        ) else {
-                            continue;
-                        };
+                    push_registrations(&main, &loaded)?;
+                    // `hook_index` is the index within the mod's registration
+                    // array, which the harness uses to look the hook up again.
+                    for (hook_index, (event, matcher)) in loaded.hooks.into_iter().enumerate() {
                         hooks.push(WorkerHook {
                             mod_index,
-                            hook_index: usize::try_from(hook_index).unwrap_or_default(),
+                            hook_index,
                             event,
                             matcher,
                         });
                     }
                     mod_names.push(source.name.clone());
                     mod_errors.push(None);
+                    mods.push(mod_context);
                 }
                 Err(error) => {
                     load_errors.push(format!("{}: {error}", source.path.display()));
@@ -1162,23 +1338,108 @@ impl WorkerState {
             }
         }
 
-        Ok(Self {
-            context,
-            runtime,
+        Ok(EngineLoad {
+            engine: Self { main, mods, js },
             hooks,
             load_errors,
             mod_errors,
             mod_names,
         })
     }
+}
+
+/// Store one mod's registration and activation arrays in the main realm's
+/// registry.
+fn push_registrations(main: &Context, loaded: &LoadedMod) -> Result<(), String> {
+    main.with(|ctx| {
+        let registry: Array = ctx
+            .globals()
+            .get("__coderExMods")
+            .map_err(|error| format!("could not read the runtime harness: {error}"))?;
+        let registrations = loaded
+            .registrations
+            .clone()
+            .restore(&ctx)
+            .map_err(|error| format!("could not register a mod: {error}"))?;
+        registry
+            .set(registry.len(), registrations)
+            .map_err(|error| format!("could not register a mod: {error}"))?;
+
+        let activation_registry: Array = ctx
+            .globals()
+            .get("__coderExActivations")
+            .map_err(|error| format!("could not read the runtime activation registry: {error}"))?;
+        let activations = loaded
+            .activations
+            .clone()
+            .restore(&ctx)
+            .map_err(|error| format!("could not register a mod's UI handlers: {error}"))?;
+        activation_registry
+            .set(activation_registry.len(), activations)
+            .map_err(|error| format!("could not register a mod's UI handlers: {error}"))?;
+        Ok(())
+    })
+}
+
+/// The worker thread's engine state.
+struct WorkerState {
+    config: Arc<WorkerConfig>,
+    runtime: Arc<tokio::runtime::Runtime>,
+    deadline: Deadline,
+    /// `None` after the engine was interrupted (or failed to rebuild), so the
+    /// next request starts from a fresh runtime and reloads the mods.
+    engine: Option<Engine>,
+    hooks: Vec<WorkerHook>,
+    load_errors: Vec<String>,
+    /// Per-mod load errors, aligned with the configured mod order.
+    mod_errors: Vec<Option<String>>,
+    mod_names: Vec<String>,
+}
+
+impl WorkerState {
+    /// Build the runtime, one realm per mod, and the flattened hook list.
+    fn load(
+        config: Arc<WorkerConfig>,
+        runtime: Arc<tokio::runtime::Runtime>,
+    ) -> Result<Self, String> {
+        let deadline = Deadline::default();
+        let loaded = Engine::build(&config, &deadline)?;
+        Ok(Self {
+            config,
+            runtime,
+            deadline,
+            engine: Some(loaded.engine),
+            hooks: loaded.hooks,
+            load_errors: loaded.load_errors,
+            mod_errors: loaded.mod_errors,
+            mod_names: loaded.mod_names,
+        })
+    }
+
+    /// Make sure an engine is installed, rebuilding it after an interrupt.
+    ///
+    /// QuickJS can be reused after an interrupt, but the interrupted hook may
+    /// have left its own realm half-mutated. Rebuilding gives the next call a
+    /// clean heap and fresh mod state, and makes the recovery explicit. The
+    /// loaded hook metadata is unchanged: the same files are loaded from the
+    /// same configuration.
+    fn ensure_engine(&mut self) -> Result<(), String> {
+        if self.engine.is_none() {
+            let loaded = Engine::build(&self.config, &self.deadline)?;
+            self.engine = Some(loaded.engine);
+        }
+        Ok(())
+    }
 
     /// Run every matching JavaScript hook for one request.
-    ///
-    /// The chain itself lives in the main-realm harness: each hook's `next(e)`
-    /// calls back into it for the hooks registered after that hook, then the
-    /// inner executor. All this function does is hand the matching hooks to
-    /// [`__coderExRun`] and read the merged result back.
-    fn fire(&mut self, request: &Request) -> HookFireResult {
+    fn fire(&mut self, request: &Request) -> Reply {
+        if let Err(error) = self.ensure_engine() {
+            return Reply {
+                result: failure_result(&request.event, error),
+                timed_out: false,
+            };
+        }
+
         let context_json = serde_json::to_string(&request.context).unwrap_or_else(|_| "{}".into());
         let chain = self.chain_json(request);
         let inner = Arc::new(InnerCall {
@@ -1186,76 +1447,86 @@ impl WorkerState {
             inner: request.inner.clone(),
             called: AtomicBool::new(false),
         });
-        match self.run_chain(&chain, &context_json, request, &inner) {
+
+        self.deadline.begin(self.config.limits.hook_timeout);
+        let outcome = {
+            let engine = self.engine.as_ref().expect("engine was just ensured");
+            engine
+                .main
+                .with(|ctx| run_chain(&ctx, &chain, &context_json, request, &inner))
+        };
+        let timed_out = self.deadline.end();
+        if timed_out {
+            self.engine = None;
+        }
+
+        match outcome {
             Ok(mut result) => {
                 if result.failed && is_gating_event(&request.event) {
                     result.stop = true;
                 }
-                result
+                Reply { result, timed_out }
             }
             Err(error) => {
-                let mut result = failure_result(&request.event, error);
-                // An engine-limit error aborts the whole harness call, so the
-                // chain could not reach its inner-executor step. Preserve the
-                // old behaviour for a non-gating event: when the inner
-                // executor never ran, run it once with the request input.
-                if !result.stop && !inner.called.load(Ordering::SeqCst) {
-                    if let Some(executor) = &request.inner {
-                        let inner_result = self.runtime.block_on(executor.fire_hook(
-                            &request.event,
-                            &request.input,
-                            &request.context,
-                        ));
-                        result = merge_with_inner(result, inner_result);
-                    }
+                let message = if timed_out {
+                    budget_error(&self.config.limits, "hook")
+                } else {
+                    error
+                };
+                let mut result = failure_result(&request.event, message);
+                // An engine error aborts the whole harness call, so the chain
+                // may not have reached its inner-executor step. Preserve the
+                // old behaviour for a non-gating event: run the downstream
+                // executor once with the request input when it never ran.
+                // A timeout does not: the downstream work is what may have
+                // outlived the budget, and re-running it would ignore that.
+                if !timed_out
+                    && !result.stop
+                    && !inner.called.load(Ordering::SeqCst)
+                    && let Some(executor) = &request.inner
+                {
+                    let inner_result = self.runtime.block_on(executor.fire_hook(
+                        &request.event,
+                        &request.input,
+                        &request.context,
+                    ));
+                    result = merge_with_inner(result, inner_result);
                 }
-                result
+                Reply { result, timed_out }
             }
         }
     }
 
     /// Run the handler registered for one button id.
-    ///
-    /// An id with no handler is not an error: the handler registry is looked
-    /// up in the main realm, and a miss is reported as a warning so a stale
-    /// button cannot make a session fail.
-    fn activate(&mut self, id: &str) -> Result<Vec<UiElement>, String> {
-        let activate = self
-            .context
-            .global_object()
-            .get(js_string!("__coderExActivate"), &mut self.context)
-            .map_err(|error| format!("could not read the runtime harness: {error}"))?;
-        let activate = activate
-            .as_callable()
-            .cloned()
-            .ok_or_else(|| "the runtime harness is missing".to_string())?;
+    fn activate(&mut self, id: &str) -> ActivateReply {
+        if let Err(error) = self.ensure_engine() {
+            return ActivateReply {
+                result: Err(error),
+                timed_out: false,
+            };
+        }
 
-        let event = serde_json::json!({ "id": id }).to_string();
-        let args = [JsString::from(id).into(), JsString::from(event).into()];
-        let value = activate
-            .call(&JsValue::undefined(), &args, &mut self.context)
-            .map_err(|error| format!("the activation handler could not be called: {error}"))?;
-        let text = value
-            .to_string(&mut self.context)
-            .map_err(|error| format!("could not read the activation result: {error}"))?
-            .to_std_string_escaped();
-        let reply: serde_json::Value = serde_json::from_str(&text).map_err(|error| {
-            format!("the activation handler returned unreadable output: {error}")
-        })?;
+        self.deadline.begin(self.config.limits.hook_timeout);
+        let outcome = {
+            let engine = self.engine.as_ref().expect("engine was just ensured");
+            engine.main.with(|ctx| run_activation(&ctx, id))
+        };
+        let timed_out = self.deadline.end();
+        if timed_out {
+            self.engine = None;
+        }
 
-        if reply.get("found").and_then(serde_json::Value::as_bool) == Some(false) {
-            tracing::warn!(id = %id, "no onActivate handler is registered for this UI button");
-            return Ok(Vec::new());
-        }
-        if reply.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
-            return Err(string_field(&reply, "error")
-                .unwrap_or_else(|| "the activation handler failed".to_string()));
-        }
-        match reply.get("ui") {
-            None | Some(serde_json::Value::Null) => Ok(Vec::new()),
-            Some(value) => parse_ui_elements(value)
-                .map_err(|error| format!("the activation handler returned invalid UI: {error}")),
-        }
+        let result = match outcome {
+            // `Ok(Err(..))` is the handler's own error message, already
+            // formatted by the harness.
+            Ok(result) => result,
+            Err(error) => Err(if timed_out {
+                budget_error(&self.config.limits, "activation handler")
+            } else {
+                error
+            }),
+        };
+        ActivateReply { result, timed_out }
     }
 
     /// The matching hooks, in registration order, as the harness reads them.
@@ -1280,118 +1551,111 @@ impl WorkerState {
             .collect();
         serde_json::to_string(&hooks).unwrap_or_else(|_| "[]".to_string())
     }
-
-    /// Call the harness chain runner with one native inner-executor function.
-    fn run_chain(
-        &mut self,
-        chain: &str,
-        context_json: &str,
-        request: &Request,
-        inner_call: &Arc<InnerCall>,
-    ) -> Result<HookFireResult, String> {
-        // The chain calls this at its end; it owns only Rust state, which is
-        // why the capture can leave it untraced.
-        let inner = NativeFunction::from_copy_closure_with_captures(
-            inner_entry,
-            InnerCapture {
-                call: Arc::clone(inner_call),
-            },
-        );
-        let realm = self.context.realm().clone();
-        let inner = JsValue::from(JsObject::from(inner.to_js_function(&realm)));
-
-        let runner = self
-            .context
-            .global_object()
-            .get(js_string!("__coderExRun"), &mut self.context)
-            .map_err(|error| format!("could not read the runtime harness: {error}"))?;
-        let runner = runner
-            .as_callable()
-            .cloned()
-            .ok_or_else(|| "the runtime harness is missing".to_string())?;
-
-        let args = [
-            JsString::from(chain).into(),
-            JsString::from(request.event.clone()).into(),
-            JsString::from(request.input.clone()).into(),
-            JsString::from(context_json).into(),
-            inner,
-            JsValue::from(is_gating_event(&request.event)),
-        ];
-        let value = runner
-            .call(&JsValue::undefined(), &args, &mut self.context)
-            .map_err(|error| format!("the hook chain could not be called: {error}"))?;
-        parse_chain_result(&value, &mut self.context)
-    }
 }
 
 /// What one evaluated mod left behind in its realm.
 struct LoadedMod {
     /// The mod's `on(...)` registrations.
-    registrations: JsValue,
+    registrations: Persistent<Array<'static>>,
     /// The mod's `$.ui.onActivate(...)` registrations.
-    activations: JsValue,
+    activations: Persistent<Array<'static>>,
+    /// `(event, matcher)` per registration, in registration order.
+    hooks: Vec<(String, String)>,
 }
 
-/// Evaluate one mod in its own realm and return its registrations.
-fn load_mod(
-    context: &mut Context,
-    source: &ModSource,
-    session: &ModSession,
-) -> Result<LoadedMod, String> {
-    let realm = context
-        .create_realm()
-        .map_err(|error| format!("could not create a realm: {error}"))?;
-    let previous = context.enter_realm(realm);
-    let result = load_mod_in_realm(context, source, session);
-    context.enter_realm(previous);
-    result
+/// Install the main harness in the main realm.
+fn install_main_harness(ctx: &Ctx<'_>) -> Result<(), String> {
+    let harness = MAIN_HARNESS
+        .replace("@@MAX_CHAIN_DEPTH@@", &MAX_CHAIN_DEPTH.to_string())
+        .replace(
+            "@@MAX_SUBMISSIONS_PER_CALL@@",
+            &MAX_SUBMISSIONS_PER_HOOK_CALL.to_string(),
+        )
+        .replace(
+            "@@MAX_PENDING_PROMPTS@@",
+            &MAX_PENDING_PROMPTS_PER_TURN.to_string(),
+        );
+    ctx.eval::<(), _>(harness.as_str())
+        .map_err(|error| js_error(ctx, error))?;
+    let _: Array = ctx
+        .globals()
+        .get("__coderExMods")
+        .map_err(|error| js_error(ctx, error))?;
+    let _: Array = ctx
+        .globals()
+        .get("__coderExActivations")
+        .map_err(|error| js_error(ctx, error))?;
+    Ok(())
 }
 
+/// Evaluate one mod in its own realm and collect its registrations.
 fn load_mod_in_realm(
-    context: &mut Context,
+    ctx: &Ctx<'_>,
     source: &ModSource,
     session: &ModSession,
 ) -> Result<LoadedMod, String> {
-    install_host_api(context, session, &source.name)
+    install_host_api(ctx, session, &source.name)
         .map_err(|error| format!("could not install the host API: {error}"))?;
 
-    context
-        .eval(Source::from_bytes(source.source.as_bytes()))
-        .map_err(|error| format!("could not evaluate the mod: {error}"))?;
+    // Boa evaluated mod files as sloppy-mode scripts (a mod's own
+    // `'use strict'` directive still applies); keep that.
+    let mut options = rquickjs::context::EvalOptions::default();
+    options.strict = false;
+    ctx.eval_with_options::<(), _>(source.source.as_str(), options)
+        .map_err(|error| format!("could not evaluate the mod: {}", js_error(ctx, error)))?;
 
-    install_mod_harness(context)
+    install_mod_harness(ctx)
         .map_err(|error| format!("could not install the runtime harness: {error}"))?;
 
-    let has_register = context
-        .eval(Source::from_bytes("typeof register === 'function'"))
-        .map_err(|error| format!("could not inspect the mod: {error}"))?
-        .to_boolean();
+    let has_register: bool = ctx
+        .eval("typeof register === 'function'")
+        .map_err(|error| format!("could not inspect the mod: {}", js_error(ctx, error)))?;
     if !has_register {
         return Err("the mod does not define a global register(on, options) function".to_string());
     }
 
     let options = js_string_literal(&source.name);
-    context
-        .eval(Source::from_bytes(
-            format!("register(on, Object.freeze({{ name: {options} }}))").as_bytes(),
-        ))
-        .map_err(|error| format!("register() failed: {error}"))?;
+    ctx.eval::<(), _>(format!("register(on, Object.freeze({{ name: {options} }}))").as_str())
+        .map_err(|error| format!("register() failed: {}", js_error(ctx, error)))?;
 
-    let registrations = context
-        .eval(Source::from_bytes("__coderExRegs"))
-        .map_err(|error| {
-            format!("register() did not leave readable hook registrations: {error}")
-        })?;
-    let activations = context
-        .eval(Source::from_bytes("__coderExHandlers"))
-        .map_err(|error| {
-            format!("register() did not leave readable activation registrations: {error}")
-        })?;
+    let registrations: Array = ctx.globals().get("__coderExRegs").map_err(|error| {
+        format!(
+            "register() did not leave readable hook registrations: {}",
+            js_error(ctx, error)
+        )
+    })?;
+    let activations: Array = ctx.globals().get("__coderExHandlers").map_err(|error| {
+        format!(
+            "register() did not leave readable activation registrations: {}",
+            js_error(ctx, error)
+        )
+    })?;
+
+    let mut hooks = Vec::new();
+    for index in 0..registrations.len() {
+        let Ok(entry) = registrations.get::<Object>(index) else {
+            continue;
+        };
+        let (Some(event), Some(matcher)) = (
+            string_property(&entry, "event"),
+            string_property(&entry, "matcher"),
+        ) else {
+            continue;
+        };
+        hooks.push((event, matcher));
+    }
+
     Ok(LoadedMod {
-        registrations,
-        activations,
+        registrations: Persistent::save(ctx, registrations),
+        activations: Persistent::save(ctx, activations),
+        hooks,
     })
+}
+
+/// Read a string property, or `None` when it is missing or not a string.
+fn string_property(object: &Object<'_>, name: &str) -> Option<String> {
+    let value = object.get::<_, Option<Value>>(name).ok().flatten()?;
+    value.as_string().and_then(|string| string.to_string().ok())
 }
 
 /// The inner executor the JavaScript chain runs at its end.
@@ -1403,43 +1667,20 @@ struct InnerCall {
     called: AtomicBool,
 }
 
-/// The capture stored in the native inner-executor function.
-///
-/// The chain is JavaScript; only the host executor is native. The capture holds
-/// Rust-owned state (an `Arc`), never a garbage-collected handle, so it is safe
-/// to leave untraced.
-#[derive(Finalize, Trace)]
-struct InnerCapture {
-    #[unsafe_ignore_trace]
-    call: Arc<InnerCall>,
-}
-
 /// The body of the chain's final step: run the inner executor synchronously
 /// and return its result as JSON for the harness to merge.
-#[allow(clippy::unnecessary_wraps)] // `NativeFunction` requires a `JsResult`.
-fn inner_entry(
-    _this: &JsValue,
-    args: &[JsValue],
-    capture: &InnerCapture,
-    _context: &mut Context,
-) -> JsResult<JsValue> {
-    let event = string_arg(args, 0);
-    let input = string_arg(args, 1);
-    let context_json = string_arg(args, 2);
+fn inner_entry(event: &str, input: &str, context_json: &str, call: &Arc<InnerCall>) -> String {
     let inner_context: HashMap<String, String> =
-        serde_json::from_str(&context_json).unwrap_or_default();
-    capture.call.called.store(true, Ordering::SeqCst);
-    let result = capture
-        .call
+        serde_json::from_str(context_json).unwrap_or_default();
+    call.called.store(true, Ordering::SeqCst);
+    let result = call
         .inner
         .as_ref()
         .map_or_else(HookFireResult::default, |inner| {
-            capture
-                .call
-                .runtime
-                .block_on(inner.fire_hook(&event, &input, &inner_context))
+            call.runtime
+                .block_on(inner.fire_hook(event, input, &inner_context))
         });
-    let value = serde_json::json!({
+    serde_json::json!({
         "stop": result.stop,
         "updatedInput": result.updated_input,
         "updatedToolOutput": result.updated_tool_output,
@@ -1448,23 +1689,80 @@ fn inner_entry(
         "failed": result.failed,
         "ui": result.ui,
         "pendingPrompts": result.pending_prompts,
-    });
-    Ok(JsString::from(value.to_string()).into())
+    })
+    .to_string()
 }
 
-fn string_arg(args: &[JsValue], index: usize) -> String {
-    args.get(index)
-        .and_then(JsValue::as_string)
-        .map_or_else(String::new, JsString::to_std_string_escaped)
+/// Call the harness chain runner with one native inner-executor function.
+fn run_chain(
+    ctx: &Ctx<'_>,
+    chain: &str,
+    context_json: &str,
+    request: &Request,
+    inner_call: &Arc<InnerCall>,
+) -> Result<HookFireResult, String> {
+    let captured = Arc::clone(inner_call);
+    let inner = Function::new(
+        ctx.clone(),
+        move |event: String, input: String, context_json: String| -> String {
+            inner_entry(&event, &input, &context_json, &captured)
+        },
+    )
+    .map_err(|error| {
+        format!(
+            "could not install the downstream executor: {}",
+            js_error(ctx, error)
+        )
+    })?;
+
+    let runner: Function = ctx.globals().get("__coderExRun").map_err(|error| {
+        format!(
+            "could not read the runtime harness: {}",
+            js_error(ctx, error)
+        )
+    })?;
+    let text: String = runner
+        .call((
+            chain,
+            request.event.clone(),
+            request.input.clone(),
+            context_json,
+            inner,
+            is_gating_event(&request.event),
+        ))
+        .map_err(|error| {
+            format!(
+                "the hook chain could not be called: {}",
+                js_error(ctx, error)
+            )
+        })?;
+    parse_chain_result(&text)
+}
+
+/// Run the handler registered for one button id.
+///
+/// The outer `Result` is a harness/engine failure; the inner one is the
+/// handler's own error message, which is not a failure of the worker.
+fn run_activation(ctx: &Ctx<'_>, id: &str) -> Result<Result<Vec<UiElement>, String>, String> {
+    let activate: Function = ctx.globals().get("__coderExActivate").map_err(|error| {
+        format!(
+            "could not read the runtime harness: {}",
+            js_error(ctx, error)
+        )
+    })?;
+    let event = serde_json::json!({ "id": id }).to_string();
+    let text: String = activate.call((id, event)).map_err(|error| {
+        format!(
+            "the activation handler could not be called: {}",
+            js_error(ctx, error)
+        )
+    })?;
+    parse_activation_result(&text)
 }
 
 /// Read the harness chain's merged result back.
-fn parse_chain_result(value: &JsValue, context: &mut Context) -> Result<HookFireResult, String> {
-    let text = value
-        .to_string(context)
-        .map_err(|error| format!("could not read the hook chain result: {error}"))?
-        .to_std_string_escaped();
-    let reply: serde_json::Value = serde_json::from_str(&text)
+fn parse_chain_result(text: &str) -> Result<HookFireResult, String> {
+    let reply: serde_json::Value = serde_json::from_str(text)
         .map_err(|error| format!("the hook chain returned unreadable output: {error}"))?;
 
     let ui = match reply.get("ui") {
@@ -1501,6 +1799,34 @@ fn parse_chain_result(value: &JsValue, context: &mut Context) -> Result<HookFire
         ui,
         pending_prompts: strings("pendingPrompts"),
     })
+}
+
+/// Read the harness activation result back.
+fn parse_activation_result(text: &str) -> Result<Result<Vec<UiElement>, String>, String> {
+    let reply: serde_json::Value = serde_json::from_str(text)
+        .map_err(|error| format!("the activation handler returned unreadable output: {error}"))?;
+
+    if reply.get("found").and_then(serde_json::Value::as_bool) == Some(false) {
+        return Ok(Ok(Vec::new()));
+    }
+    if reply.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
+        return Ok(Err(string_field(&reply, "error")
+            .unwrap_or_else(|| "the activation handler failed".to_string())));
+    }
+    match reply.get("ui") {
+        None | Some(serde_json::Value::Null) => Ok(Ok(Vec::new())),
+        Some(value) => parse_ui_elements(value)
+            .map(Ok)
+            .map_err(|error| format!("the activation handler returned invalid UI: {error}")),
+    }
+}
+
+/// The wall-clock error text shared by the hook and activation paths.
+fn budget_error(limits: &ModLimits, what: &str) -> String {
+    format!(
+        "the {what} exceeded its {} ms wall-clock budget",
+        limits.hook_timeout.as_millis()
+    )
 }
 
 /// A result that reports `error` as a hook failure, fail-closed on a gate.
@@ -1562,70 +1888,107 @@ fn string_field(value: &serde_json::Value, name: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Read a string property from a JavaScript value.
-fn js_string_field(value: &JsValue, name: &str, context: &mut Context) -> Option<String> {
-    let object = value.as_object()?;
-    let field = object.get(JsString::from(name), context).ok()?;
-    field.as_string().map(JsString::to_std_string_escaped)
-}
-
-fn apply_limits(context: &mut Context, limits: &ModLimits) {
-    let mut engine_limits = context.runtime_limits();
-    engine_limits.set_loop_iteration_limit(limits.max_loop_iterations);
-    engine_limits.set_recursion_limit(limits.recursion_limit);
-    engine_limits.set_stack_size_limit(limits.stack_size_limit);
-    context.set_runtime_limits(engine_limits);
+/// Format a QuickJS error, reading the pending exception when there is one.
+///
+/// Taking the error by value keeps the common
+/// `.map_err(|error| js_error(ctx, error))` call sites direct; the value is
+/// only inspected.
+#[allow(clippy::needless_pass_by_value)]
+fn js_error(ctx: &Ctx<'_>, error: rquickjs::Error) -> String {
+    if matches!(error, rquickjs::Error::Exception) {
+        let value = ctx.catch();
+        if let Some(exception) = value.as_exception() {
+            return exception
+                .message()
+                .unwrap_or_else(|| "JavaScript exception".to_string());
+        }
+        return value
+            .into_string()
+            .and_then(|text| text.to_string().ok())
+            .unwrap_or_else(|| "JavaScript exception".to_string());
+    }
+    error.to_string()
 }
 
 /// Put `$` and `on` into the realm before the mod runs.
-fn install_host_api(context: &mut Context, session: &ModSession, name: &str) -> JsResult<()> {
-    context.register_global_property(
-        js_string!("__coderExModName"),
-        JsString::from(name),
-        Attribute::READONLY,
-    )?;
+///
+/// `$` and `$.session` are ordinary objects whose properties are installed
+/// read-only; `HOST_UI_API` adds `$.ui`, `notify` and `submit` and then freezes
+/// both objects, so a mod cannot replace them.
+fn install_host_api<'js>(ctx: &Ctx<'js>, session: &ModSession, name: &str) -> Result<(), String> {
+    let globals = ctx.globals();
+    let module_name =
+        rquickjs::String::from_str(ctx.clone(), name).map_err(|error| js_error(ctx, error))?;
+    globals
+        .prop("__coderExModName", Property::from(module_name))
+        .map_err(|error| js_error(ctx, error))?;
 
-    let session_object = ObjectInitializer::new(context)
-        .property(
-            js_string!("cwd"),
-            JsString::from(session.cwd.clone()),
-            Attribute::READONLY,
-        )
-        .property(
-            js_string!("model"),
-            JsString::from(session.model.clone()),
-            Attribute::READONLY,
-        )
-        .property(
-            js_string!("permission_mode"),
-            JsString::from(session.permission_mode.clone()),
-            Attribute::READONLY,
-        )
-        .build();
+    let session_object = Object::new(ctx.clone()).map_err(|error| js_error(ctx, error))?;
+    for (key, value) in [
+        ("cwd", session.cwd.as_str()),
+        ("model", session.model.as_str()),
+        ("permission_mode", session.permission_mode.as_str()),
+    ] {
+        session_object
+            .prop(key, Property::from(value))
+            .map_err(|error| js_error(ctx, error))?;
+    }
 
-    let dollar = ObjectInitializer::new(context)
-        .property(js_string!("session"), session_object, Attribute::READONLY)
-        .function(NativeFunction::from_fn_ptr(mod_log), js_string!("log"), 1)
-        .function(NativeFunction::from_fn_ptr(mod_env), js_string!("env"), 1)
-        .build();
-    context.register_global_property(
-        js_string!("$"),
-        dollar,
-        Attribute::READONLY | Attribute::NON_ENUMERABLE,
-    )?;
+    let dollar = Object::new(ctx.clone()).map_err(|error| js_error(ctx, error))?;
+    dollar
+        .prop("session", Property::from(session_object))
+        .map_err(|error| js_error(ctx, error))?;
+
+    let module = name.to_string();
+    let log = Function::new(ctx.clone(), move |message: Opt<Value>| {
+        let message = message.0.map_or_else(String::new, |value| {
+            value
+                .into_string()
+                .and_then(|text| text.to_string().ok())
+                .unwrap_or_default()
+        });
+        tracing::info!(target: "coderex_mods", module = %module, "{message}");
+    })
+    .map_err(|error| js_error(ctx, error))?;
+    dollar
+        .set("log", log)
+        .map_err(|error| js_error(ctx, error))?;
+
+    let env = Function::new(
+        ctx.clone(),
+        move |ctx: Ctx<'js>, name: Opt<Value<'js>>| -> Value<'js> {
+            let Some(name) = name.0 else {
+                return Value::new_null(ctx);
+            };
+            let Some(name) = name.as_string().and_then(|string| string.to_string().ok()) else {
+                return Value::new_null(ctx);
+            };
+            if !ALLOWED_ENV_VARS.contains(&name.as_str()) {
+                return Value::new_null(ctx);
+            }
+            match std::env::var(&name) {
+                Ok(value) => value.into_js(&ctx).unwrap_or_else(|_| Value::new_null(ctx)),
+                Err(_) => Value::new_null(ctx),
+            }
+        },
+    )
+    .map_err(|error| js_error(ctx, error))?;
+    dollar
+        .set("env", env)
+        .map_err(|error| js_error(ctx, error))?;
+
+    globals
+        .prop("$", Property::from(dollar))
+        .map_err(|error| js_error(ctx, error))?;
+
     let host_api = HOST_UI_API.replace(
         "@@MAX_SUBMISSIONS_PER_CALL@@",
         &MAX_SUBMISSIONS_PER_HOOK_CALL.to_string(),
     );
-    context.eval(Source::from_bytes(host_api.as_bytes()))?;
-    context.eval(Source::from_bytes(JSX_RUNTIME.as_bytes()))?;
-
-    let on = NativeFunction::from_fn_ptr(on_hook).to_js_function(context.realm());
-    context.register_global_property(
-        js_string!("on"),
-        on,
-        Attribute::READONLY | Attribute::NON_ENUMERABLE,
-    )?;
+    ctx.eval::<(), _>(host_api.as_str())
+        .map_err(|error| js_error(ctx, error))?;
+    ctx.eval::<(), _>(JSX_RUNTIME)
+        .map_err(|error| js_error(ctx, error))?;
     Ok(())
 }
 
@@ -2424,10 +2787,10 @@ globalThis.__coderExMaxPendingPrompts = @@MAX_PENDING_PROMPTS@@;
 "#;
 
 /// The per-mod harness: `on` and the registration array it fills.
-fn install_mod_harness(context: &mut Context) -> JsResult<()> {
+fn install_mod_harness(ctx: &Ctx<'_>) -> Result<(), String> {
     let max_hooks = MAX_HOOKS_PER_MOD;
     let max_activations = MAX_ACTIVATIONS_PER_MOD;
-    context.eval(Source::from_bytes(
+    ctx.eval::<(), _>(
         format!(
             r"
 'use strict';
@@ -2466,57 +2829,20 @@ globalThis.__coderExOnActivate = function (id, handler) {{
   __coderExHandlers.push({{ id: id, handler: handler, host: $ }});
   return undefined;
 }};
+Object.defineProperty(globalThis, 'on', {{
+  value: function (event, matcher, hook) {{
+    return __coderExOn(event, matcher, hook);
+  }},
+  writable: false,
+  enumerable: false,
+  configurable: false
+}});
 ",
         )
-        .as_bytes(),
-    ))?;
-    Ok(())
-}
-
-fn on_hook(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
-    call_helper(context, "__coderExOn", args)
-}
-
-fn mod_log(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
-    let message = match args.first() {
-        Some(value) => value.to_string(context)?.to_std_string_escaped(),
-        None => String::new(),
-    };
-    let module = global_string(context, "__coderExModName").unwrap_or_default();
-    tracing::info!(target: "coderex_mods", module = %module, "{message}");
-    Ok(JsValue::undefined())
-}
-
-#[allow(clippy::unnecessary_wraps)] // `NativeFunction` requires a `JsResult`.
-fn mod_env(_this: &JsValue, args: &[JsValue], _context: &mut Context) -> JsResult<JsValue> {
-    let Some(name) = args.first().and_then(JsValue::as_string) else {
-        return Ok(JsValue::null());
-    };
-    let name = name.to_std_string_escaped();
-    if !ALLOWED_ENV_VARS.contains(&name.as_str()) {
-        return Ok(JsValue::null());
-    }
-    std::env::var(&name).map_or_else(
-        |_| Ok(JsValue::null()),
-        |value| Ok(JsString::from(value).into()),
+        .as_str(),
     )
-}
-
-fn call_helper(context: &mut Context, name: &str, args: &[JsValue]) -> JsResult<JsValue> {
-    let helper = context.global_object().get(JsString::from(name), context)?;
-    let function = helper.as_callable().ok_or_else(|| {
-        boa_engine::JsNativeError::typ()
-            .with_message(format!("the runtime helper {name} is missing"))
-    })?;
-    function.call(&JsValue::undefined(), args, context)
-}
-
-fn global_string(context: &mut Context, name: &str) -> Option<String> {
-    let value = context
-        .global_object()
-        .get(JsString::from(name), context)
-        .ok()?;
-    Some(value.to_string(context).ok()?.to_std_string_escaped())
+    .map_err(|error| js_error(ctx, error))?;
+    Ok(())
 }
 
 fn js_string_literal(value: &str) -> String {
@@ -3193,14 +3519,18 @@ mod tests {
     }
 
     #[test]
-    fn an_infinite_loop_hits_the_engine_limit_and_is_reported() {
+    fn an_endless_loop_is_interrupted_at_the_wall_clock() {
+        // The interrupt handler stops the interpreter itself. The caller gets
+        // the error well before its own backstop, the engine stays usable,
+        // and the timeout still counts toward the breaker.
         let limits = ModLimits {
-            max_loop_iterations: 100_000,
-            hook_timeout: Duration::from_secs(5),
+            hook_timeout: Duration::from_millis(100),
             ..ModLimits::default()
         };
         let runtime = load_with(
-            "function register(on) { on('PreToolUse', 'Bash', function () { while (true) {} }); }",
+            "function register(on) { \
+             on('PreToolUse', 'Bash', function () { while (true) {} }); \
+             on('SessionStart', '*', function () { return { updatedInput: 'alive' }; }); }",
             limits,
         );
 
@@ -3213,7 +3543,7 @@ mod tests {
             result
                 .errors
                 .iter()
-                .any(|error| error.contains("loop iteration limit")),
+                .any(|error| error.contains("wall-clock budget")),
             "{:?}",
             result.errors
         );
@@ -3221,16 +3551,69 @@ mod tests {
             result.stop,
             "a failure on a gating event must fail closed: {result:?}"
         );
-        assert!(elapsed < Duration::from_secs(4), "took {elapsed:?}");
+        assert!(elapsed < Duration::from_secs(2), "took {elapsed:?}");
+        assert_eq!(
+            runtime.timeout_abandonments(),
+            1,
+            "an engine-interrupted timeout is still a timeout"
+        );
+        assert!(
+            !runtime.is_disabled(),
+            "one timeout is below the default breaker threshold"
+        );
+
+        // The interrupted engine was discarded, so the next request starts a
+        // fresh runtime and reloads the mods. The worker itself is still
+        // usable.
+        let recovered = runtime.fire("SessionStart", "", &HashMap::new());
+        assert!(!recovered.failed, "{recovered:?}");
+        assert_eq!(recovered.updated_input.as_deref(), Some("alive"));
+    }
+
+    #[test]
+    fn a_memory_bomb_hits_the_heap_limit() {
+        // QuickJS accounts every allocation, including the backing store of a
+        // single ArrayBuffer, against the runtime's memory limit.
+        let limits = ModLimits {
+            memory_limit: 8 * 1024 * 1024,
+            hook_timeout: Duration::from_secs(5),
+            ..ModLimits::default()
+        };
+        let runtime = load_with(
+            "function register(on) { on('PostToolUse', '*', function () { \
+             const chunks = []; \
+             while (true) { chunks.push(new ArrayBuffer(1024 * 1024)); } }); }",
+            limits,
+        );
+
+        let started = std::time::Instant::now();
+        let result = runtime.fire("PostToolUse", "Bash", &HashMap::new());
+        let elapsed = started.elapsed();
+
+        assert!(result.failed, "{result:?}");
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|error| error.to_lowercase().contains("memory")),
+            "the heap limit must be reported: {:?}",
+            result.errors
+        );
+        assert!(
+            elapsed < Duration::from_secs(4),
+            "the heap limit must fire before the wall clock; took {elapsed:?}"
+        );
+        assert_eq!(
+            runtime.timeout_abandonments(),
+            0,
+            "a heap limit is not a wall-clock timeout"
+        );
+        assert!(!runtime.is_disabled());
     }
 
     #[test]
     fn a_hook_over_its_wall_clock_budget_is_reported() {
-        // No engine loop cap: this exercises the watchdog path specifically.
-        // The worker is detached when the budget expires and the test process
-        // kills it on exit.
         let limits = ModLimits {
-            max_loop_iterations: u64::MAX,
             hook_timeout: Duration::from_millis(50),
             ..ModLimits::default()
         };
@@ -3258,8 +3641,7 @@ mod tests {
     #[test]
     fn the_timeout_breaker_trips_at_the_threshold_and_then_stops_the_worker() {
         let limits = ModLimits {
-            // Only the wall-clock watchdog can stop this hook.
-            max_loop_iterations: u64::MAX,
+            // Only the wall clock can stop this hook.
             hook_timeout: Duration::from_millis(200),
             ..ModLimits::default()
         };
@@ -3346,13 +3728,14 @@ mod tests {
     }
 
     #[test]
-    fn engine_limit_errors_do_not_count_toward_the_breaker() {
+    fn heap_limit_errors_do_not_count_toward_the_breaker() {
         let limits = ModLimits {
-            max_loop_iterations: 10_000,
+            memory_limit: 8 * 1024 * 1024,
             ..ModLimits::default()
         };
         let runtime = load_with(
-            "function register(on) { on('PostToolUse', '*', function () { while (true) {} }); }",
+            "function register(on) { on('PostToolUse', '*', function () { \
+             return { updatedInput: new ArrayBuffer(64 * 1024 * 1024) ? 'allocated' : 'no' }; }); }",
             limits,
         );
 
@@ -3363,7 +3746,7 @@ mod tests {
                 result
                     .errors
                     .iter()
-                    .any(|error| error.contains("loop iteration limit")),
+                    .any(|error| error.to_lowercase().contains("memory")),
                 "{:?}",
                 result.errors
             );
@@ -3494,6 +3877,44 @@ mod tests {
         assert_eq!(runtime.load_errors().len(), 1);
         assert!(runtime.load_errors()[0].contains("register(on, options)"));
         assert_eq!(runtime.hook_count(), 0);
+    }
+
+    #[test]
+    fn the_memory_limit_accepts_byte_counts_and_binary_suffixes() {
+        assert_eq!(parse_memory_limit("67108864"), Some(64 * 1024 * 1024));
+        assert_eq!(parse_memory_limit("64k"), Some(64 * 1024));
+        assert_eq!(parse_memory_limit("64KiB"), Some(64 * 1024));
+        assert_eq!(parse_memory_limit("64mb"), Some(64 * 1024 * 1024));
+        assert_eq!(parse_memory_limit("2g"), Some(2 * 1024 * 1024 * 1024));
+        assert_eq!(parse_memory_limit(""), None);
+        assert_eq!(parse_memory_limit("lots"), None);
+        assert_eq!(parse_memory_limit("12x"), None);
+    }
+
+    #[test]
+    fn a_top_level_endless_loop_is_skipped_at_the_wall_clock() {
+        let limits = ModLimits {
+            hook_timeout: Duration::from_millis(100),
+            ..ModLimits::default()
+        };
+
+        let started = std::time::Instant::now();
+        let runtime = load_with("while (true) {}", limits);
+        let elapsed = started.elapsed();
+
+        assert_eq!(runtime.hook_count(), 0);
+        assert_eq!(
+            runtime.load_errors().len(),
+            1,
+            "{:?}",
+            runtime.load_errors()
+        );
+        assert!(
+            runtime.load_errors()[0].contains("wall-clock budget"),
+            "{:?}",
+            runtime.load_errors()
+        );
+        assert!(elapsed < Duration::from_secs(2), "took {elapsed:?}");
     }
 
     #[test]
@@ -4323,7 +4744,7 @@ mod tests {
             let result = runtime.fire("PostToolUse", "Bash", &HashMap::new());
 
             assert!(result.failed, "{call} should fail the hook");
-            assert!(result.pending_prompts.is_empty());
+            assert_eq!(result.pending_prompts, Vec::<String>::new());
         }
     }
 

@@ -42,23 +42,29 @@
 //!
 //! # Isolation
 //!
-//! A `boa_engine` [`Context`](boa_engine::Context) is neither `Send` nor
-//! interruptible from another thread, and `next` must resume in the context
-//! that called it. Each [`ModRuntime`] therefore owns one long-lived worker
-//! thread with one context and one realm per mod. [`ModRuntime::fire`] sends a
-//! request over a channel and waits under a wall-clock budget that covers the
-//! whole chain, including any downstream run. boa's loop-iteration, recursion
-//! and stack limits bound a runaway mod. A mod that loops forever is reported
-//! as a hook error rather than hanging the agent. See [`ModLimits`] for the
-//! exact ceilings.
+//! A QuickJS runtime and its contexts are confined to one thread, and `next`
+//! must resume in the realm that called it. Each [`ModRuntime`] therefore owns
+//! one long-lived worker thread with one runtime and one context (realm) per
+//! mod. [`ModRuntime::fire`] sends a request over a channel and waits under a
+//! wall-clock budget that covers the whole chain, including any downstream
+//! run.
 //!
-//! A timed-out worker cannot be interrupted, so it is detached and a later
-//! call starts a new one. After [`DEFAULT_TIMEOUT_BREAKER_LIMIT`] such
-//! abandonments (overridable with `CODEREX_MODS_TIMEOUT_LIMIT`), the runtime's
-//! circuit breaker disables mods for the rest of the session: no worker is
-//! started again and a gating `fire` fails closed with an explanatory error.
-//! Only wall-clock timeouts count; ordinary hook errors do not. See
-//! [`ModRuntime::is_disabled`].
+//! The engine enforces the limits itself: a heap cap (`set_memory_limit`), a
+//! maximum stack (`set_max_stack_size`) and an interrupt handler driven by the
+//! call's deadline. A mod that loops forever is **stopped inside the engine**
+//! at the wall-clock budget and reported as a hook error; the worker then
+//! rebuilds the runtime and reloads the mods so the next call starts from a
+//! clean heap. The calling thread's own deadline is only a backstop for work
+//! QuickJS cannot interrupt, such as a downstream executor blocked in a native
+//! call; that path still detaches the worker. See [`ModLimits`] for the exact
+//! ceilings and [`MODS_MEMORY_LIMIT_ENV`] for the heap override.
+//!
+//! After [`DEFAULT_TIMEOUT_BREAKER_LIMIT`] wall-clock timeouts (overridable
+//! with `CODEREX_MODS_TIMEOUT_LIMIT`), the runtime's circuit breaker disables
+//! mods for the rest of the session: no worker is started again and a gating
+//! `fire` fails closed with an explanatory error. Engine interruption and the
+//! caller backstop both count; ordinary hook errors and heap/stack errors do
+//! not. See [`ModRuntime::is_disabled`].
 //!
 //! [`ModRuntime::load_report`] returns a [`ModInfo`] per mod file with the
 //! SHA-256 of its original bytes. The hash is informational: there is no
@@ -87,7 +93,8 @@ mod transform;
 
 pub use executor::{JsHookExecutor, ModUiHandle};
 pub use runtime::{
-    ALLOWED_ENV_VARS, DEFAULT_TIMEOUT_BREAKER_LIMIT, MAX_PENDING_PROMPTS_PER_TURN,
-    MAX_SUBMISSIONS_PER_HOOK_CALL, MODS_DIR_ENV, MODS_ENV, MODS_TIMEOUT_LIMIT_ENV, ModInfo,
-    ModLimits, ModRuntime, ModRuntimeBuilder, ModSession, ModSubmitQueue, is_enabled, mods_dir,
+    ALLOWED_ENV_VARS, DEFAULT_MEMORY_LIMIT, DEFAULT_TIMEOUT_BREAKER_LIMIT,
+    MAX_PENDING_PROMPTS_PER_TURN, MAX_SUBMISSIONS_PER_HOOK_CALL, MIN_MEMORY_LIMIT, MODS_DIR_ENV,
+    MODS_ENV, MODS_MEMORY_LIMIT_ENV, MODS_TIMEOUT_LIMIT_ENV, ModInfo, ModLimits, ModRuntime,
+    ModRuntimeBuilder, ModSession, ModSubmitQueue, is_enabled, mods_dir,
 };
