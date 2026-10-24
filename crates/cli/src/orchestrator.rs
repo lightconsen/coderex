@@ -2578,6 +2578,37 @@ impl StartupOrchestrator {
         context
     }
 
+    /// Offer the session's model to MCP servers when sampling was opted into.
+    ///
+    /// The manager already has the elicitation handler installed; this wraps
+    /// it so `sampling/createMessage` reaches the CLI handler and every other
+    /// method still reaches the elicitation handler. Without the opt-in,
+    /// nothing changes and sampling stays refused by default.
+    fn install_sampling_handler(&self, client: &dyn ApiClient, model: &ModelId) {
+        let Some(manager) = &self.ctx.mcp_manager else {
+            return;
+        };
+        let Some(sampling) =
+            crate::mcp_sampling::handler_from_env(client.clone_box(), model.clone())
+        else {
+            return;
+        };
+        let other = self
+            .ctx
+            .mcp_elicitation
+            .as_ref()
+            .map(SessionElicitationHandler::inbound);
+        manager.set_inbound_handler(Arc::new(coderex_mcp::elicitation::McpRequestRouter::new(
+            Some(sampling),
+            other,
+        )));
+        tracing::info!(
+            model = %model.0,
+            "MCP sampling enabled by {}",
+            coderex_mcp::elicitation::SAMPLING_OPT_IN_ENV
+        );
+    }
+
     /// Build and configure a REPL loop for a model.
     ///
     /// The one-retry `--fallback-model` behaviour lives in the engine, so this
@@ -2594,6 +2625,7 @@ impl StartupOrchestrator {
         let mut repl =
             if let Some(api_client) = Self::try_create_api_client(api_key, prompt_caching) {
                 let api_client = Self::apply_effort(api_client, self.ctx.effort.as_deref());
+                self.install_sampling_handler(api_client.as_ref(), &model);
                 crate::repl::ReplLoop::with_engine(api_client, cwd.to_string(), model)
             } else {
                 crate::repl::ReplLoop::new(cwd.to_string(), model)
@@ -3622,6 +3654,7 @@ impl StartupOrchestrator {
         let mut repl =
             if let Some(api_client) = Self::try_create_api_client(api_key, prompt_caching) {
                 let api_client = Self::apply_effort(api_client, self.ctx.effort.as_deref());
+                self.install_sampling_handler(api_client.as_ref(), &model);
                 crate::repl::ReplLoop::with_engine(api_client, cwd.to_string(), model)
             } else {
                 crate::repl::ReplLoop::new(cwd.to_string(), model)

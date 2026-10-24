@@ -21,6 +21,7 @@ Terminal user interface via ratatui. Renders messages, statusline, input line, c
 - **`OverlayStack`** (`overlay.rs`) — Modal dialog stack: PermissionDialog, Notification, CommandPalette, Confirm.
 - **`VimState`** (`vim.rs`) — Vim mode state machine: Normal, Insert, Visual (`v`) and Visual-line (`V`). Selection anchors and the selected text live in `InputBuffer` (`input.rs`), which is the layer that knows the buffer contents.
 - **`Theme`** (`themes.rs`) — Color scheme definitions.
+- **`mod_elements`** (`mod_elements.rs`) — Pure renderer for the UI tree a mod contributes (`UiElement` from `coderex_core::ui_protocol`). `render_mod_ui` returns styled `Line`s and `render_mod_ui_text` returns the plain block used by the transcript and headless output. Boxes nest with box-drawing borders and titles, `UiStyle` maps to the existing modifiers/colors, and buttons render as `[label]`. `render_mod_ui_with_focus` / `render_mod_ui_text_with_focus` mark one button as `> [label] <` with reversed emphasis. The renderer keeps no TUI state: focus is an argument, so a tree can be rendered after the mod runtime is gone. `render_mod_ui_with_hits` / `render_mod_ui_with_focus_and_hits` return the same lines plus `ButtonHit { id, row, col_start, col_end }` positions relative to the block; `button_at(rect, scroll_offset, column, row, hits)` is the pure click mapping (the focus marker is included in the rendered width, so it cannot shift a hit). Interactive key routing (Tab/Shift+Tab, Enter, Esc) and click routing live in `repl.rs`; headless output is not interactive.
 
 ### Layout (bottom-up)
 
@@ -75,6 +76,32 @@ CODEREX_KEYBOARD_PROTOCOL=legacy         # force the terminal default
 - **Control chords are case-insensitive.** Depending on the active enhancement flags, `Ctrl+Shift+C` is reported as `'c'` or `'C'` with CONTROL; both mean the same key.
 - **Control characters are never inserted.** CSI-u can deliver `Char('\n')` where the legacy encoding delivered a named key. A single-line buffer must never take one.
 
+### Mouse input
+
+`TerminalUi::enter` enables mouse capture (`EnableMouseCapture`) and `exit`
+disables it, so crossterm delivers wheel and button events. Wheel events scroll
+the transcript in `repl.rs`.
+
+Mod UI buttons are clickable. Before each draw the REPL passes a
+`ModUiBlockSpec` for the newest block (message index, live `UiElement` tree and
+focused id) to `TerminalUi::draw_with_mod_ui`. The transcript renderer
+(`terminal.rs`) re-renders that block with
+`render_mod_ui_with_focus_and_hits` at the message pane's actual content width,
+draws those lines with the system-message prefix, and records a
+`ModUiHitRegion` — the block's absolute `rect`, the number of block rows
+clipped above it (`scroll_offset`), and its `ButtonHit`s — for the frame that
+was just drawn. On `MouseEventKind::Down(MouseButton::Left)` the REPL asks
+`mod_elements::button_at` to map the screen coordinates; a hit runs the same
+activation path as `Enter`. Clicks are dropped while an overlay, a permission
+confirmation or an MCP form owns the screen, and a stale spec is ignored when
+its message content no longer matches (after `/clear`, rewind or resume). The
+compact transcript (message pane under ten rows) truncates blocks to one line
+and records no hit regions, so clicks are not routed there.
+
+Keyboard focus is unchanged: `Tab`/`Shift+Tab`/`Enter`/`Esc` work in every
+terminal, and they are the fallback where the terminal does not report mouse
+events.
+
 ### Not handled
 
 - **VS Code GPU acceleration.** Claude Code disables VS Code's GPU acceleration; CodeRex does not. There is no way to do it from inside the process — `terminal.integrated.gpuAcceleration` is a VS Code setting that requires editing `settings.json` and reloading the window. Shipping a flag that only pretends to change it would be worse than not shipping one, so VS Code is detected and nothing further is claimed.
@@ -109,4 +136,4 @@ The `coderex-ui` crate has no stubs. The integration gap below is real, and the 
 
 Known integration gap (owned by `crates/cli/src/repl.rs`, not this crate): the REPL matches key events inline rather than routing every key through `input::key_event_to_action`. The two safety properties that matter are nevertheless applied at the boundary: `repl.rs` calls `input::key_press` on every incoming event (release events are dropped), and `InputBuffer::apply(InsertChar)` rejects control characters, as does the REPL's Vim-insert path. `TerminalUi::profile()` is still not surfaced in the UI.
 
-Tests: `cargo test -p coderex-ui` (174 passing).
+Tests: `cargo test -p coderex-ui` (248 passing).

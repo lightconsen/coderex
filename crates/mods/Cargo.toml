@@ -1,0 +1,35 @@
+[package]
+name = "coderex-mods"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "In-process JavaScript extension hooks — a read-only host API and bounded execution"
+
+[lints]
+workspace = true
+
+[dependencies]
+coderex-core = { path = "../core" }
+coderex-config = { path = "../config" }
+
+async-trait.workspace = true
+rquickjs.workspace = true
+# TypeScript stripping and JSX lowering. See `src/transform.rs`.
+oxc_allocator = "0.155"
+oxc_codegen = "0.155"
+oxc_diagnostics = "0.155"
+oxc_parser = "0.155"
+oxc_semantic = "0.155"
+oxc_span = "0.155"
+oxc_transformer = "0.155"
+hex.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+coderex-ui = { path = "../ui" }
+tempfile.workspace = true

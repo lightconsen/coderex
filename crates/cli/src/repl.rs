@@ -6,7 +6,7 @@ use anyhow::Result;
 use coderex_agents::manager::{
     AgentManager, AgentSubscription, ParentContextSnapshot, TeammateEvent,
 };
-use coderex_commands::registry::{CommandContext, CommandRegistry, CommandResult};
+use coderex_commands::registry::{CommandContext, CommandRegistry, CommandResult, SlashCommand};
 use coderex_commands::{CommandHistory, MacroRegistry};
 use coderex_core::api_client::ApiClient;
 use coderex_core::confirmation_bus::{ConfirmationBus, ConfirmationRequest, ConfirmationResponse};
@@ -200,12 +200,70 @@ impl McpResourceToolState {
     }
 }
 
+/// One row from [`McpPromptToolState::list`]:
+/// `(server, name, description, arguments)` where each argument is
+/// `(name, description, required)`.
+type McpPromptRow = (
+    String,
+    String,
+    Option<String>,
+    Vec<(String, Option<String>, bool)>,
+);
+
+/// MCP prompt access backed by the session's live manager.
+///
+/// Discovery fills the manager's prompt registry; resolving a prompt issues a
+/// live `prompts/get` and renders its messages as text.
+pub(crate) struct McpPromptToolState {
+    slot: McpManagerSlot,
+}
+
+impl McpPromptToolState {
+    fn list(&self) -> Vec<McpPromptRow> {
+        let Some(manager) = self.slot.read().unwrap().as_ref().cloned() else {
+            return Vec::new();
+        };
+        manager
+            .list_prompts()
+            .into_iter()
+            .map(|entry| {
+                let arguments = entry
+                    .prompt
+                    .arguments
+                    .into_iter()
+                    .map(|argument| (argument.name, argument.description, argument.required))
+                    .collect();
+                (
+                    entry.server,
+                    entry.prompt.name,
+                    entry.prompt.description,
+                    arguments,
+                )
+            })
+            .collect()
+    }
+
+    async fn get(
+        &self,
+        server: &str,
+        name: &str,
+        arguments: serde_json::Map<String, serde_json::Value>,
+    ) -> Result<String, String> {
+        let Some(manager) = self.slot.read().unwrap().as_ref().cloned() else {
+            return Err("no MCP manager is attached to this session".to_string());
+        };
+        let result = manager.get_prompt(server, name, arguments).await?;
+        Ok(result.render_text())
+    }
+}
+
 /// Concrete handles for the baseline tools that need runtime state.
 #[derive(Clone)]
 pub(crate) struct RuntimeToolHandles {
     pub(crate) team: Arc<TeamToolState>,
     pub(crate) worktree: Arc<WorktreeToolState>,
     pub(crate) mcp: Arc<McpResourceToolState>,
+    pub(crate) mcp_prompts: Arc<McpPromptToolState>,
 }
 
 impl RuntimeToolHandles {
@@ -214,6 +272,9 @@ impl RuntimeToolHandles {
             team: Arc::new(TeamToolState::default()),
             worktree: Arc::new(WorktreeToolState::new(std::path::Path::new(cwd))),
             mcp: Arc::new(McpResourceToolState {
+                slot: Arc::clone(mcp_slot),
+            }),
+            mcp_prompts: Arc::new(McpPromptToolState {
                 slot: Arc::clone(mcp_slot),
             }),
         }
@@ -258,6 +319,18 @@ impl RuntimeToolHandles {
             Arc::new(ReadMcpResourceWithState {
                 original,
                 state: Arc::clone(&self.mcp),
+            })
+        });
+        Self::replace(registry, "ListMcpPrompts", |original| {
+            Arc::new(ListMcpPromptsWithState {
+                original,
+                state: Arc::clone(&self.mcp_prompts),
+            })
+        });
+        Self::replace(registry, "GetMcpPrompt", |original| {
+            Arc::new(GetMcpPromptWithState {
+                original,
+                state: Arc::clone(&self.mcp_prompts),
             })
         });
     }
@@ -591,6 +664,189 @@ impl coderex_tools::Tool for ReadMcpResourceWithState {
             images: Vec::new(),
         })
     }
+}
+
+struct ListMcpPromptsWithState {
+    original: Arc<dyn coderex_tools::Tool>,
+    state: Arc<McpPromptToolState>,
+}
+
+#[async_trait::async_trait]
+impl coderex_tools::Tool for ListMcpPromptsWithState {
+    fn descriptor(&self) -> coderex_tools::ToolDescriptor {
+        self.original.descriptor()
+    }
+
+    fn capabilities(&self) -> coderex_tools::ToolCapabilities {
+        self.original.capabilities()
+    }
+
+    fn rule_exemptions_for(&self, input: &serde_json::Value) -> coderex_tools::ToolRuleExemptions {
+        self.original.rule_exemptions_for(input)
+    }
+
+    async fn execute(
+        &self,
+        _input: coderex_tools::ToolInput,
+        _ctx: coderex_tools::ToolContext<'_>,
+    ) -> Result<coderex_tools::ToolOutput, coderex_tools::ToolError> {
+        let prompts: Vec<_> = self
+            .state
+            .list()
+            .into_iter()
+            .map(|(server, name, description, arguments)| {
+                let arguments: Vec<_> = arguments
+                    .into_iter()
+                    .map(|(name, description, required)| {
+                        serde_json::json!({
+                            "name": name,
+                            "description": description,
+                            "required": required,
+                        })
+                    })
+                    .collect();
+                serde_json::json!({
+                    "server": server,
+                    "name": name,
+                    "description": description,
+                    "arguments": arguments,
+                })
+            })
+            .collect();
+        Ok(coderex_tools::ToolOutput {
+            output: serde_json::to_string_pretty(&prompts).unwrap_or_else(|_| "[]".into()),
+            is_display: true,
+            images: Vec::new(),
+        })
+    }
+}
+
+struct GetMcpPromptWithState {
+    original: Arc<dyn coderex_tools::Tool>,
+    state: Arc<McpPromptToolState>,
+}
+
+#[async_trait::async_trait]
+impl coderex_tools::Tool for GetMcpPromptWithState {
+    fn descriptor(&self) -> coderex_tools::ToolDescriptor {
+        self.original.descriptor()
+    }
+
+    fn capabilities(&self) -> coderex_tools::ToolCapabilities {
+        self.original.capabilities()
+    }
+
+    fn rule_exemptions_for(&self, input: &serde_json::Value) -> coderex_tools::ToolRuleExemptions {
+        self.original.rule_exemptions_for(input)
+    }
+
+    async fn execute(
+        &self,
+        input: coderex_tools::ToolInput,
+        _ctx: coderex_tools::ToolContext<'_>,
+    ) -> Result<coderex_tools::ToolOutput, coderex_tools::ToolError> {
+        let server = input
+            .arguments
+            .get("server")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| coderex_tools::ToolError::InvalidInput {
+                message: "missing required field: server".into(),
+            })?;
+        let name = input
+            .arguments
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| coderex_tools::ToolError::InvalidInput {
+                message: "missing required field: name".into(),
+            })?;
+        let arguments = match input.arguments.get("arguments") {
+            None | Some(serde_json::Value::Null) => serde_json::Map::new(),
+            Some(serde_json::Value::Object(arguments)) => arguments.clone(),
+            Some(_) => {
+                return Err(coderex_tools::ToolError::InvalidInput {
+                    message: "'arguments' must be an object".into(),
+                });
+            }
+        };
+        let content = self
+            .state
+            .get(server, name, arguments)
+            .await
+            .map_err(|message| coderex_tools::ToolError::InvalidInput { message })?;
+        Ok(coderex_tools::ToolOutput {
+            output: content,
+            is_display: true,
+            images: Vec::new(),
+        })
+    }
+}
+
+/// The slash-command name for a prompt: `mcp__<server>__<prompt>`.
+///
+/// The server and prompt components are sanitised; the raw names stay with the
+/// handler and are what `prompts/get` sends.
+fn prompt_command_name(server: &str, prompt: &str) -> String {
+    format!(
+        "mcp__{}__{}",
+        sanitize_prompt_component(server),
+        sanitize_prompt_component(prompt)
+    )
+}
+
+/// Replace every character that is not an ASCII letter, digit, or `_`.
+fn sanitize_prompt_component(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || character == '_' {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// Run an `mcp__…` prompt command.
+///
+/// The registry's handler interface is synchronous, while `prompts/get` is a
+/// request over the live channel. The CLI runs on a multi-threaded Tokio
+/// runtime, so `block_in_place` keeps the worker's other tasks running while
+/// this one waits for the server.
+fn execute_mcp_prompt_command(
+    slot: &McpManagerSlot,
+    server: &str,
+    prompt: &str,
+    declared: &[coderex_mcp::prompts::McpPromptArgument],
+    args: &[String],
+) -> CommandResult {
+    let arguments = match coderex_mcp::prompts::parse_prompt_arguments(args, declared) {
+        Ok(arguments) => arguments,
+        Err(error) => return CommandResult::error(error),
+    };
+
+    let Some(manager) = slot
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+        .cloned()
+    else {
+        return CommandResult::error("no MCP manager is attached to this session");
+    };
+
+    let result = tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(manager.get_prompt(server, prompt, arguments))
+    });
+
+    match result {
+        Ok(result) => prompt_result_command(&result),
+        Err(error) => CommandResult::error(error),
+    }
+}
+
+/// The command result for a resolved prompt.
+fn prompt_result_command(result: &coderex_mcp::prompts::McpPromptResult) -> CommandResult {
+    CommandResult::success(result.render_text())
 }
 
 /// Translate a teammate callback event into the parent engine's lifecycle
@@ -1385,6 +1641,60 @@ fn count_configured_hooks(value: &serde_json::Value) -> usize {
         .map_or(0, Vec::len)
 }
 
+/// Most loaded mods whose short hash is inlined in the startup line.
+///
+/// Above this count the line reports only the total: one line is the point,
+/// and a directory of many mods would turn it into a wall of hashes. The full
+/// list is always available from `ModRuntime::load_report`.
+const MOD_HASHES_INLINE_LIMIT: usize = 3;
+
+/// The one startup line that reports the mod load.
+///
+/// It names the count and directory, and says plainly that the SHA-256 values
+/// are informational: CodeRex has no signature or trust store, so a hash is
+/// not a verdict. For a small number of mods it also inlines a short hash per
+/// loaded file; otherwise the count alone keeps the line short.
+fn mods_startup_line(report: &[coderex_mods::ModInfo], dir: &std::path::Path) -> String {
+    use std::fmt::Write as _;
+
+    let loaded: Vec<&coderex_mods::ModInfo> = report.iter().filter(|info| info.loaded).collect();
+    let skipped: Vec<&coderex_mods::ModInfo> = report.iter().filter(|info| !info.loaded).collect();
+
+    let mut line = if skipped.is_empty() {
+        format!("mods: {} loaded from {}", loaded.len(), dir.display())
+    } else {
+        let names = skipped
+            .iter()
+            .map(|info| info.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "mods: {} of {} loaded from {} (skipped: {names})",
+            loaded.len(),
+            report.len(),
+            dir.display()
+        )
+    };
+
+    if !loaded.is_empty() && loaded.len() <= MOD_HASHES_INLINE_LIMIT {
+        let hashes = loaded
+            .iter()
+            .map(|info| {
+                let short = info.sha256.get(..12).unwrap_or(&info.sha256);
+                format!("{}={short}", info.name)
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let _ = write!(line, " [{hashes}]");
+    }
+
+    line.push_str(
+        "; sha256 is informational only (no signature or trust store); \
+         this code runs because you installed it",
+    );
+    line
+}
+
 /// Drop `type: "agent"` hook entries from a settings hooks document.
 ///
 /// Returns the filtered document and how many entries were removed. Both shapes
@@ -1744,6 +2054,27 @@ pub struct ReplLoop {
     /// `/hooks` and `/status` used to read `CommandContext.active_hooks`,
     /// which nothing ever assigned, so they always reported zero.
     active_hooks: usize,
+    /// Handle for delivering mod UI button activations to the mod worker.
+    ///
+    /// Kept after the executor is installed so the terminal can press a
+    /// button without reaching into the engine.
+    mod_ui_handle: Option<coderex_mods::ModUiHandle>,
+    /// Messages mods queued with `$.session.submit(text)`.
+    ///
+    /// The engine never drains this queue. The turn loop takes from it at an
+    /// idle boundary and submits each message as an ordinary user turn. When
+    /// mods are not installed it stays empty.
+    mod_submit_queue: coderex_mods::ModSubmitQueue,
+    /// Consecutive mod-submitted turns since the last person-initiated prompt.
+    ///
+    /// The loop guard reads this through [`plan_mod_drain`]. Reset when a
+    /// person submits a prompt.
+    mod_auto_turns: usize,
+    /// Mod messages already drained since the last person-initiated prompt.
+    mod_prompts_this_turn: usize,
+    /// Whether the person has already been told that the timeout breaker
+    /// disabled mods. The breaker is sticky, so the message is shown once.
+    mods_disabled_reported: bool,
     /// Where the line-delimited protocol goes, when `--output-format
     /// stream-json` was asked for.
     ///
@@ -1784,6 +2115,13 @@ pub struct ReplLoop {
     /// built before the MCP servers are attached, and reads this when it later
     /// builds a child registry.
     mcp_manager: Arc<std::sync::RwLock<Option<Arc<coderex_mcp::manager::McpManager>>>>,
+    /// Slash-command names already registered for discovered MCP prompts.
+    ///
+    /// The command registry is append-only, so a refresh records what it has
+    /// already added instead of registering the same prompt twice. A prompt
+    /// that disappears from a server keeps its command; invoking it fails with
+    /// that server's error.
+    mcp_prompt_commands: std::collections::HashSet<String>,
     /// Session handler for questions MCP servers ask, when one was installed.
     ///
     /// The manager already holds the inbound half; the TUI needs the same
@@ -2061,6 +2399,11 @@ impl ReplLoop {
             hooks_settings: None,
             hook_layers: None,
             active_hooks: 0,
+            mod_ui_handle: None,
+            mod_submit_queue: coderex_mods::ModSubmitQueue::default(),
+            mod_auto_turns: 0,
+            mod_prompts_this_turn: 0,
+            mods_disabled_reported: false,
             checkpoint_store: None,
             protocol_sink: None,
             headless_permission_control: false,
@@ -2072,6 +2415,7 @@ impl ReplLoop {
             parent_context_snapshot: Arc::new(std::sync::Mutex::new(None)),
             agent_observable_rx: None,
             mcp_manager: Arc::new(std::sync::RwLock::new(None)),
+            mcp_prompt_commands: std::collections::HashSet::new(),
             mcp_elicitation: None,
             artifact_server: None,
             artifact_store_root: None,
@@ -2244,6 +2588,7 @@ impl ReplLoop {
         let runtime_handles = RuntimeToolHandles::new(&cwd, &mcp_slot);
         let subagent_team = Arc::clone(&runtime_handles.team);
         let subagent_mcp = Arc::clone(&runtime_handles.mcp);
+        let subagent_mcp_prompts = Arc::clone(&runtime_handles.mcp_prompts);
         // Background tools run inside a sub-agent's turn too, and a job record
         // written there must still name the session that owns it.
         let subagent_session_id = session_id.to_string();
@@ -2257,6 +2602,7 @@ impl ReplLoop {
                 team: Arc::clone(&subagent_team),
                 worktree: Arc::new(WorktreeToolState::new(&cwd)),
                 mcp: Arc::clone(&subagent_mcp),
+                mcp_prompts: Arc::clone(&subagent_mcp_prompts),
             }
             .install(&mut registry);
             let executor = Arc::new(ToolsExecutor::new(ExecutionConfig::default()));
@@ -2455,6 +2801,11 @@ impl ReplLoop {
             hooks_settings: None,
             hook_layers: None,
             active_hooks: 0,
+            mod_ui_handle: None,
+            mod_submit_queue: coderex_mods::ModSubmitQueue::default(),
+            mod_auto_turns: 0,
+            mod_prompts_this_turn: 0,
+            mods_disabled_reported: false,
             checkpoint_store,
             protocol_sink: None,
             headless_permission_control: false,
@@ -2466,6 +2817,7 @@ impl ReplLoop {
             parent_context_snapshot: Arc::clone(&parent_context_snapshot),
             agent_observable_rx,
             mcp_manager: mcp_slot,
+            mcp_prompt_commands: std::collections::HashSet::new(),
             mcp_elicitation: None,
             artifact_server: None,
             artifact_store_root: None,
@@ -2603,6 +2955,142 @@ impl ReplLoop {
             mcp_manager.register_tools_into(dispatcher.registry());
         }
         *self.mcp_manager.write().expect("MCP slot poisoned") = Some(mcp_manager);
+        // The manager has already run `start_all` (and therefore discovery) by
+        // the time the session attaches it, so the first registration is free.
+        self.refresh_mcp_prompt_commands();
+    }
+
+    /// Register a slash command for every prompt the manager has discovered.
+    ///
+    /// Commands are named `mcp__<server>__<prompt>`, with any character that
+    /// is not an ASCII identifier character replaced by `_`. The raw server
+    /// and prompt names are captured for `prompts/get`; only the command name
+    /// is sanitised. Registration is idempotent.
+    ///
+    /// Called when the manager is attached and again, lazily, before an
+    /// `/mcp` or `mcp__…` command runs. A `prompts/list_changed` notification
+    /// updates the manager's registry from the stream task; the next such
+    /// command therefore picks up prompts added after connection. A prompt a
+    /// server stops offering keeps its command and reports the server's error
+    /// when invoked, because the command registry has no removal operation.
+    fn refresh_mcp_prompt_commands(&mut self) {
+        // `--disable-slash-commands` clears the registry; registering prompt
+        // commands here anyway would resurrect them behind the flag's back.
+        if self.no_slash_commands {
+            return;
+        }
+        let Some(manager) = self
+            .mcp_manager
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .cloned()
+        else {
+            return;
+        };
+
+        for entry in manager.list_prompts() {
+            let command_name = prompt_command_name(&entry.server, &entry.prompt.name);
+            if self.mcp_prompt_commands.contains(&command_name) {
+                continue;
+            }
+            if self.commands.find(&command_name).is_some() {
+                // Somebody else already owns this name; leave it alone but do
+                // not try to register it on every refresh.
+                self.mcp_prompt_commands.insert(command_name);
+                continue;
+            }
+
+            let description = entry.prompt.description.clone().unwrap_or_else(|| {
+                format!("MCP prompt '{}' from '{}'", entry.prompt.name, entry.server)
+            });
+            let name_static: &'static str = Box::leak(command_name.clone().into_boxed_str());
+            let description_static: &'static str = Box::leak(description.into_boxed_str());
+            let slot = Arc::clone(&self.mcp_manager);
+            let server = entry.server.clone();
+            let prompt_name = entry.prompt.name.clone();
+            let declared = entry.prompt.arguments.clone();
+            let handler = Arc::new(move |_ctx: &CommandContext, args: &[String]| {
+                execute_mcp_prompt_command(&slot, &server, &prompt_name, &declared, args)
+            });
+
+            self.commands.register(SlashCommand::local(
+                name_static,
+                description_static,
+                true,
+                true,
+                true,
+                handler,
+            ));
+            self.mcp_prompt_commands.insert(command_name);
+        }
+    }
+
+    /// The `/mcp` registry output with the discovered prompts appended under
+    /// the server that offers them.
+    fn run_mcp_command(&self, args: &[String]) -> CommandResult {
+        let ctx = self.build_context();
+        let mut result = self.commands.execute("mcp", &ctx, args);
+        let listing = self.mcp_prompt_listing();
+        if !listing.is_empty() {
+            if !result.output.is_empty() {
+                result.output.push('\n');
+            }
+            result.output.push_str(&listing);
+        }
+        result
+    }
+
+    /// Render discovered prompts grouped by server for `/mcp`.
+    fn mcp_prompt_listing(&self) -> String {
+        let Some(manager) = self
+            .mcp_manager
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .cloned()
+        else {
+            return String::new();
+        };
+
+        let mut by_server: std::collections::BTreeMap<String, Vec<_>> =
+            std::collections::BTreeMap::new();
+        for entry in manager.list_prompts() {
+            by_server
+                .entry(entry.server.clone())
+                .or_default()
+                .push(entry);
+        }
+        if by_server.is_empty() {
+            return String::new();
+        }
+
+        let mut output = String::from("Prompts:");
+        for (server, entries) in by_server {
+            output.push_str("\n  ");
+            output.push_str(&server);
+            output.push(':');
+            for entry in entries {
+                output.push_str("\n    /");
+                output.push_str(&prompt_command_name(&server, &entry.prompt.name));
+                if let Some(ref description) = entry.prompt.description {
+                    output.push_str(" - ");
+                    output.push_str(description);
+                }
+                if !entry.prompt.arguments.is_empty() {
+                    let names: Vec<String> = entry
+                        .prompt
+                        .arguments
+                        .iter()
+                        .map(coderex_mcp::prompts::McpPromptArgument::display)
+                        .collect();
+                    output.push_str(" (args: ");
+                    output.push_str(&names.join(", "));
+                    output.push(')');
+                }
+            }
+        }
+        output
     }
 
     /// Give the TUI a way to answer questions from MCP servers.
@@ -3325,6 +3813,17 @@ impl ReplLoop {
                         let session_cwd = engine.session().cwd.clone();
                         let session_id = engine.session().session_id.to_string();
                         let session_model = engine.model().clone();
+                        // Captured before the two values move into the request
+                        // handler: a mod's read-only `$` sees these facts.
+                        let permission_mode = engine.permission_checker().lock().map_or_else(
+                            |poisoned| poisoned.into_inner().mode(),
+                            |checker| checker.mode(),
+                        );
+                        let mod_session = coderex_mods::ModSession {
+                            cwd: session_cwd.to_string_lossy().to_string(),
+                            model: session_model.0.clone(),
+                            permission_mode: format!("{permission_mode:?}"),
+                        };
                         registry.set_request_handler(Arc::new(
                             crate::hook_actions::SessionHookRequestHandler::new(
                                 session_cwd,
@@ -3333,7 +3832,37 @@ impl ReplLoop {
                                 engine.permission_checker(),
                             ),
                         ));
-                        engine.set_hooks(registry.into_executor());
+                        // In-process JavaScript mods (opt-in via `CODEREX_MODS`
+                        // or `CODEREX_MODS_DIR`): their hooks run first, then
+                        // the hooks from settings.
+                        let inner = registry.into_executor();
+                        engine.set_hooks(
+                            match coderex_mods::JsHookExecutor::load_from_env(
+                                mod_session,
+                                Some(Arc::clone(&inner)
+                                    as Arc<dyn coderex_core::hook_executor::HookExecutor>),
+                            ) {
+                                Some(Ok(executor)) => {
+                                    // One startup line. The hashes come from
+                                    // the load report and are informational:
+                                    // there is no signature or trust store.
+                                    let line = mods_startup_line(
+                                        executor.load_report(),
+                                        executor.runtime().dir(),
+                                    );
+                                    tracing::info!("{line}");
+                                    eprintln!("{line}");
+                                    self.mod_ui_handle = Some(executor.ui_handle());
+                                    self.mod_submit_queue = executor.submit_queue();
+                                    Arc::new(executor)
+                                }
+                                Some(Err(error)) => {
+                                    tracing::warn!("mods were not loaded: {error}");
+                                    inner
+                                }
+                                None => inner,
+                            },
+                        );
                         installed_hook_count = hook_count;
                     }
                     Err(e) => tracing::warn!("hooks in settings were not loaded: {e}"),
@@ -3895,7 +4424,7 @@ impl ReplLoop {
         use coderex_ui::state::{UiState, ViewMode};
         use coderex_ui::terminal::TerminalUi;
         use coderex_ui::vim::{VimAction, VimMode, VimState};
-        use crossterm::event::{Event, KeyCode, KeyModifiers, MouseEventKind};
+        use crossterm::event::{Event, KeyCode, KeyModifiers, MouseButton, MouseEventKind};
         use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
         use std::fmt::Write as _;
         use std::time::{Duration, Instant};
@@ -4076,12 +4605,139 @@ impl ReplLoop {
             handler.set_tui_sender(mcp_elicit_tx);
         }
         let mut queued_prompts = std::collections::VecDeque::<String>::new();
+        // Mod submissions taken from the runtime queue but not yet submitted.
+        // They live here across iterations so a queue accumulated during one
+        // turn is drained one auto-turn at a time rather than all at once.
+        let mut mod_pending = std::collections::VecDeque::<String>::new();
         let mut pending_confirmation: Option<ConfirmationRequest> = None;
+        let mut mod_ui_focus = ModUiFocus::default();
         let mut last_stream_snapshot = Instant::now();
 
         let result = loop {
             if !self.running {
                 break Ok(());
+            }
+
+            // The timeout circuit breaker is sticky. Tell the person once,
+            // without printing on every loop iteration, when it has tripped.
+            if !self.mods_disabled_reported {
+                let reason = self
+                    .mod_ui_handle
+                    .as_ref()
+                    .and_then(coderex_mods::ModUiHandle::disabled_reason);
+                if let Some(reason) = reason {
+                    self.mods_disabled_reported = true;
+                    tracing::warn!("{reason}");
+                    ui_state.messages.push(Message {
+                        role: MessageRole::System,
+                        content: reason.into(),
+                        tool_name: None,
+                        streaming: false,
+                        folded: false,
+                    });
+                    self.persist_interactive_snapshot(&ui_state);
+                }
+            }
+
+            // ── The idle boundary ───────────────────────────────────────────
+            // Nothing is running here: the turn's task has handed the engine
+            // back, and no overlay or confirmation owns the input. This is the
+            // only place mod submissions become turns. Scheduling them from
+            // the hook itself would re-enter the engine mid-turn.
+            //
+            // A person's queued prompt wins over a mod's and resets the loop
+            // guard. Otherwise the mod queue is drained under
+            // `plan_mod_drain`: at most three consecutive auto-turns, eight
+            // messages per person-initiated turn, and a system notice for
+            // anything the guard drops.
+            if !thinking
+                && query_done_rx.is_none()
+                && pending_confirmation.is_none()
+                && self.pending_elicitation.is_none()
+                && self.engine.is_some()
+                && !ui_state.overlays.is_active()
+            {
+                if let Some(person_prompt) = queued_prompts.pop_front() {
+                    // The person's message was added when they typed it; do
+                    // not add a second copy here. Their prompt resets the
+                    // loop guard.
+                    self.mod_auto_turns = 0;
+                    self.mod_prompts_this_turn = 0;
+                    self.start_tui_query(
+                        person_prompt,
+                        &mut ui_state,
+                        &mut thinking,
+                        &mut phase,
+                        &mut query_done_rx,
+                        &mut elicit_rx,
+                        &mut tui_elicit_rx,
+                    );
+                    continue;
+                }
+
+                mod_pending.extend(self.mod_submit_queue.take());
+                if !mod_pending.is_empty() {
+                    let actions = plan_mod_drain(
+                        &mut mod_pending,
+                        self.mod_auto_turns,
+                        self.mod_prompts_this_turn,
+                    );
+                    let mut submissions = Vec::new();
+                    for action in actions {
+                        match action {
+                            ModDrainAction::Submit(text) => submissions.push(text),
+                            ModDrainAction::Notice(text) => {
+                                ui_state.messages.push(Message {
+                                    role: MessageRole::System,
+                                    content: text.into(),
+                                    tool_name: None,
+                                    streaming: false,
+                                    folded: false,
+                                });
+                            }
+                        }
+                    }
+                    // The plan may allow more than one turn; hold the extras
+                    // until this one finishes so the transcript stays ordered.
+                    if !submissions.is_empty() {
+                        let next = submissions.remove(0);
+                        for extra in submissions.into_iter().rev() {
+                            mod_pending.push_front(extra);
+                        }
+                        self.mod_auto_turns += 1;
+                        self.mod_prompts_this_turn += 1;
+                        ui_state.messages.push(Message {
+                            role: MessageRole::System,
+                            content: format!(
+                                "[mod] Auto-submitted turn {}/{} from a queued message",
+                                self.mod_auto_turns, MAX_AUTO_MOD_TURNS
+                            )
+                            .into(),
+                            tool_name: None,
+                            streaming: false,
+                            folded: false,
+                        });
+                        // Mark the message itself too: on resume the prefix is
+                        // the only thing distinguishing it from typed input.
+                        ui_state.messages.push(Message {
+                            role: MessageRole::User,
+                            content: format!("[mod] {next}").into(),
+                            tool_name: None,
+                            streaming: false,
+                            folded: false,
+                        });
+                        self.start_tui_query(
+                            next,
+                            &mut ui_state,
+                            &mut thinking,
+                            &mut phase,
+                            &mut query_done_rx,
+                            &mut elicit_rx,
+                            &mut tui_elicit_rx,
+                        );
+                        continue;
+                    }
+                }
             }
 
             // Sync statusline from REPL state
@@ -4166,8 +4822,11 @@ impl ReplLoop {
                 }
             }
 
-            // Draw frame
-            if let Err(e) = terminal_ui.draw(&mut ui_state) {
+            // Draw frame. The block spec lets the transcript render the live
+            // mod UI tree at the pane's width and record where each button
+            // landed, so the mouse handler can hit-test the frame the user saw.
+            let mod_ui_block = mod_ui_focus.spec();
+            if let Err(e) = terminal_ui.draw_with_mod_ui(&mut ui_state, mod_ui_block.as_slice()) {
                 tracing::warn!("TUI draw error: {e}");
             }
 
@@ -4226,6 +4885,51 @@ impl ReplLoop {
                                 && key.modifiers.contains(KeyModifiers::CONTROL)
                             {
                                 break Ok(());
+                            }
+
+                            // A mod UI block owns Tab/Shift+Tab, Enter and Esc
+                            // only when it has focus and no overlay is asking
+                            // for the keyboard. Ordinary characters are never
+                            // consumed here, so typing still reaches the line.
+                            if !ui_state.overlays.is_active() && pending_confirmation.is_none() {
+                                if let Some(action) = mod_ui_key_action(
+                                    key.code,
+                                    key.modifiers,
+                                    mod_ui_focus.focused,
+                                    mod_ui_focus.button_count(),
+                                ) {
+                                    match action {
+                                        ModUiKeyAction::FocusNext
+                                        | ModUiKeyAction::FocusPrevious => {
+                                            mod_ui_focus
+                                                .cycle(matches!(action, ModUiKeyAction::FocusNext));
+                                            self.redraw_mod_ui_focus(
+                                                &mut ui_state,
+                                                &mut mod_ui_focus,
+                                            );
+                                        }
+                                        ModUiKeyAction::ClearFocus => {
+                                            mod_ui_focus.clear_focus();
+                                            self.redraw_mod_ui_focus(
+                                                &mut ui_state,
+                                                &mut mod_ui_focus,
+                                            );
+                                        }
+                                        ModUiKeyAction::Activate => {
+                                            if let Some(id) =
+                                                mod_ui_focus.focused_id().map(str::to_string)
+                                            {
+                                                self.activate_mod_ui_button(
+                                                    &mut ui_state,
+                                                    &mut mod_ui_focus,
+                                                    id,
+                                                )
+                                                .await;
+                                            }
+                                        }
+                                    }
+                                    continue;
+                                }
                             }
 
                             // Shift+Tab: cycle permission mode
@@ -4824,9 +5528,42 @@ impl ReplLoop {
                             }
                         }
                         Event::Mouse(mouse) => {
+                            // Wheel scrolling keeps working everywhere. A left
+                            // click reaches the transcript only while no modal
+                            // or confirmation owns the screen.
                             match mouse.kind {
                                 MouseEventKind::ScrollUp => ui_state.messages.scroll_up(3),
-                                MouseEventKind::ScrollDown => ui_state.messages.scroll_down_by(3),
+                                MouseEventKind::ScrollDown => {
+                                    ui_state.messages.scroll_down_by(3);
+                                }
+                                MouseEventKind::Down(MouseButton::Left)
+                                    if !ui_state.overlays.is_active()
+                                        && pending_confirmation.is_none()
+                                        && self.pending_mcp_form.is_none() =>
+                                {
+                                    let target = terminal_ui
+                                        .mod_ui_hit_regions()
+                                        .iter()
+                                        .rev()
+                                        .find_map(|region| {
+                                            coderex_ui::mod_elements::button_at(
+                                                region.rect,
+                                                region.scroll_offset,
+                                                mouse.column,
+                                                mouse.row,
+                                                &region.hits,
+                                            )
+                                            .map(str::to_string)
+                                        });
+                                    if let Some(id) = target {
+                                        self.activate_mod_ui_button(
+                                            &mut ui_state,
+                                            &mut mod_ui_focus,
+                                            id,
+                                        )
+                                        .await;
+                                    }
+                                }
                                 _ => {}
                             }
                         }
@@ -4928,6 +5665,32 @@ impl ReplLoop {
                         EngineEvent::AgentEvent { agent_id, event } => {
                             apply_agent_event(&mut ui_state, &agent_id, &event);
                             self.persist_interactive_snapshot(&ui_state);
+                        }
+                        EngineEvent::ModUi(elements) => {
+                            // A mod rendered UI during a hook. The tree is a
+                            // snapshot, so it renders here without touching
+                            // the mod runtime. It belongs in the transcript,
+                            // not on stdout interleaved with the turn.
+                            let rendered = coderex_ui::mod_elements::render_mod_ui_text(
+                                &elements,
+                                coderex_ui::mod_elements::MOD_UI_DEFAULT_WIDTH,
+                            );
+                            if rendered.is_empty() {
+                                // An empty tree clears what was focusable: there
+                                // is no block to route input to.
+                                mod_ui_focus = ModUiFocus::default();
+                            } else {
+                                ui_state.messages.push(Message {
+                                    role: MessageRole::System,
+                                    content: rendered.into(),
+                                    tool_name: None,
+                                    streaming: false,
+                                    folded: false,
+                                });
+                                let index = ui_state.messages.messages.len().saturating_sub(1);
+                                mod_ui_focus.reset(&elements, index);
+                                self.persist_interactive_snapshot(&ui_state);
+                            }
                         }
                         EngineEvent::PermissionExplanation { tool, explanation } => {
                             if let Some(detail) = ui_state.permission_detail.as_mut() {
@@ -5084,18 +5847,8 @@ impl ReplLoop {
                     }
 
                     self.persist_interactive_snapshot(&ui_state);
-
-                    if let Some(next_prompt) = queued_prompts.pop_front() {
-                            self.start_tui_query(
-                                next_prompt,
-                                &mut ui_state,
-                                &mut thinking,
-                                &mut phase,
-                                &mut query_done_rx,
-                                &mut elicit_rx,
-                                &mut tui_elicit_rx,
-                            );
-                    }
+                    // The top of the loop picks up a person's queued prompt or
+                    // a mod submission now that this turn is idle.
                 }
 
                 Some((job_id, prompt)) = async {
@@ -5294,7 +6047,64 @@ impl ReplLoop {
                 Err(error) => tracing::warn!(%error, "plugin monitors were not started"),
             }
         }
-        let result = self.run_headless_turn(prompt).await;
+        let mut result = self.run_headless_turn(prompt).await;
+
+        // Mod submissions become ordinary turns after the person's turn. The
+        // same loop guard as the interactive path applies: submit what was
+        // queued, up to three consecutive auto-turns and eight messages, then
+        // stop. `plan_mod_drain` also reports a drop instead of draining a
+        // backlog forever.
+        if let Ok(first) = &result {
+            let mut output = first.clone();
+            let mut failure = None;
+            let mut pending: std::collections::VecDeque<String> =
+                self.mod_submit_queue.take().into();
+            let mut auto_turns = 0usize;
+            let mut submitted = 0usize;
+            loop {
+                pending.extend(self.mod_submit_queue.take());
+                let mut submissions = Vec::new();
+                for action in plan_mod_drain(&mut pending, auto_turns, submitted) {
+                    match action {
+                        ModDrainAction::Submit(text) => submissions.push(text),
+                        ModDrainAction::Notice(text) => {
+                            tracing::warn!("{text}");
+                            eprintln!("{text}");
+                        }
+                    }
+                }
+                let Some(next) = submissions.first().cloned() else {
+                    break;
+                };
+                for extra in submissions.into_iter().skip(1).rev() {
+                    pending.push_front(extra);
+                }
+                auto_turns += 1;
+                submitted += 1;
+                let marker = format!(
+                    "[mod] Auto-submitted turn {auto_turns}/{MAX_AUTO_MOD_TURNS} \
+                     from a queued message"
+                );
+                tracing::info!("{marker}");
+                eprintln!("{marker}");
+                match self.run_headless_turn(&next).await {
+                    Ok(more) => {
+                        if !more.is_empty() {
+                            if !output.is_empty() && !output.ends_with('\n') {
+                                output.push('\n');
+                            }
+                            output.push_str(&more);
+                        }
+                    }
+                    Err(error) => {
+                        failure = Some(error);
+                        break;
+                    }
+                }
+            }
+            result = failure.map_or(Ok(output), Err);
+        }
+
         // Headless runs used to leave no transcript behind, so `--print`
         // sessions could not be resumed or found by `/resume`. Persist what
         // the turn produced; slash-command-only runs are covered too.
@@ -5394,11 +6204,336 @@ impl ReplLoop {
             .unwrap_or_default();
         for event in events {
             self.record_engine_event_telemetry(&event);
-            if let EngineEvent::TextDelta(delta) = event {
-                output.push_str(&delta);
+            match event {
+                EngineEvent::TextDelta(delta) => output.push_str(&delta),
+                EngineEvent::ModUi(elements) => append_mod_ui_block(output, &elements),
+                _ => {}
             }
         }
         self.drain_agent_observable_events();
+    }
+}
+
+/// Append a rendered mod UI block to a headless turn's output.
+///
+/// Headless runs have no transcript pane; the block joins the turn's output
+/// rather than being printed live from the event loop. A blank line separates
+/// it from model text when the preceding output did not end with one.
+fn append_mod_ui_block(output: &mut String, elements: &[coderex_core::ui_protocol::UiElement]) {
+    let rendered = coderex_ui::mod_elements::render_mod_ui_text(
+        elements,
+        coderex_ui::mod_elements::MOD_UI_DEFAULT_WIDTH,
+    );
+    if rendered.is_empty() {
+        return;
+    }
+    if !output.is_empty() && !output.ends_with('\n') {
+        output.push('\n');
+    }
+    output.push_str(&rendered);
+    output.push('\n');
+}
+
+/// Most consecutive auto-submitted turns one person-initiated turn may spawn.
+///
+/// A mod can queue a message with `$.session.submit(text)`; the turn loop
+/// submits it as a normal user turn once the current one is idle. That turn
+/// can itself fire hooks that queue more. This is the loop guard: a mod must
+/// not be able to keep the session running forever. The counter resets when a
+/// person submits a prompt.
+const MAX_AUTO_MOD_TURNS: usize = 3;
+
+/// Most queued mod messages drained in one person-initiated turn.
+const MAX_MOD_PROMPTS_PER_TURN: usize = 8;
+
+/// One thing the turn loop should do with mod submissions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ModDrainAction {
+    /// Submit this text as a user turn.
+    Submit(String),
+    /// Tell the person (as a system message) why nothing further is submitted.
+    Notice(String),
+}
+
+/// Decide what to do with queued mod messages at an idle boundary.
+///
+/// Pure so the queue and the loop guard can be tested without a turn loop.
+/// `auto_turns` counts consecutive turns already auto-submitted since the last
+/// person-initiated prompt; `submitted_this_turn` counts messages already
+/// drained in that same window. At most `MAX_AUTO_MOD_TURNS` submissions are
+/// planned; a queue that cannot be drained is discarded with one notice, so a
+/// mod cannot leave an unbounded backlog that replays later.
+fn plan_mod_drain(
+    queue: &mut std::collections::VecDeque<String>,
+    auto_turns: usize,
+    submitted_this_turn: usize,
+) -> Vec<ModDrainAction> {
+    let mut actions = Vec::new();
+    if queue.is_empty() {
+        return actions;
+    }
+
+    let auto_remaining = MAX_AUTO_MOD_TURNS.saturating_sub(auto_turns);
+    let prompt_remaining = MAX_MOD_PROMPTS_PER_TURN.saturating_sub(submitted_this_turn);
+    if auto_remaining == 0 || prompt_remaining == 0 {
+        let dropped = queue.len();
+        queue.clear();
+        let reason = if auto_remaining == 0 {
+            format!(
+                "mod auto-turn limit reached ({MAX_AUTO_MOD_TURNS} consecutive \
+                 auto-submitted turns)"
+            )
+        } else {
+            format!("mod submission limit reached ({MAX_MOD_PROMPTS_PER_TURN} per turn)")
+        };
+        actions.push(ModDrainAction::Notice(format!(
+            "{reason}; {dropped} queued mod message(s) dropped."
+        )));
+        return actions;
+    }
+
+    let take = auto_remaining.min(prompt_remaining).min(queue.len());
+    for _ in 0..take {
+        if let Some(text) = queue.pop_front() {
+            actions.push(ModDrainAction::Submit(text));
+        }
+    }
+    actions
+}
+
+/// What the terminal does with a key while a mod UI button is focused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModUiKeyAction {
+    FocusNext,
+    FocusPrevious,
+    Activate,
+    ClearFocus,
+}
+
+/// Map a key to a mod UI action.
+///
+/// Ordinary typing returns `None`, so every character still reaches the input
+/// line. With buttons present, `Tab` starts focus on the first button; once a
+/// button is focused, `Tab`/`Shift+Tab` cycle, `Enter` activates and `Esc`
+/// clears. While nothing is focused, `Shift+Tab` is left to the permission-mode
+/// binding and `Enter` to the normal submit path.
+fn mod_ui_key_action(
+    code: crossterm::event::KeyCode,
+    modifiers: crossterm::event::KeyModifiers,
+    focused: Option<usize>,
+    button_count: usize,
+) -> Option<ModUiKeyAction> {
+    use crossterm::event::{KeyCode, KeyModifiers};
+
+    if button_count == 0 {
+        return None;
+    }
+    let shift_tab = matches!(code, KeyCode::BackTab)
+        || (matches!(code, KeyCode::Tab) && modifiers.contains(KeyModifiers::SHIFT));
+    match code {
+        KeyCode::BackTab | KeyCode::Tab if shift_tab => {
+            focused.is_some().then_some(ModUiKeyAction::FocusPrevious)
+        }
+        KeyCode::Tab => Some(ModUiKeyAction::FocusNext),
+        KeyCode::Enter => focused.is_some().then_some(ModUiKeyAction::Activate),
+        KeyCode::Esc => focused.is_some().then_some(ModUiKeyAction::ClearFocus),
+        _ => None,
+    }
+}
+
+/// The next focused index after cycling around `count` buttons.
+///
+/// `None` starts at the first button going forward and the last going
+/// backwards. Callers guard against `count == 0`.
+fn cycle_mod_ui_focus(current: Option<usize>, count: usize, forward: bool) -> usize {
+    debug_assert!(count > 0);
+    match (current, forward) {
+        (None, true) => 0,
+        (None, false) => count - 1,
+        (Some(index), true) => (index + 1) % count,
+        (Some(index), false) => (index + count - 1) % count,
+    }
+}
+
+/// The button ids in one mod UI tree, in render order.
+fn collect_button_ids(elements: &[coderex_core::ui_protocol::UiElement]) -> Vec<String> {
+    fn walk(elements: &[coderex_core::ui_protocol::UiElement], ids: &mut Vec<String>) {
+        for element in elements {
+            match element {
+                coderex_core::ui_protocol::UiElement::Button { id, .. } => ids.push(id.clone()),
+                coderex_core::ui_protocol::UiElement::Box { children, .. } => walk(children, ids),
+                coderex_core::ui_protocol::UiElement::Text { .. } => {}
+            }
+        }
+    }
+
+    let mut ids = Vec::new();
+    walk(elements, &mut ids);
+    ids
+}
+
+/// Which button in the most recent mod UI block is focused.
+///
+/// Focus is terminal state, not part of the host-owned tree, and it lives with
+/// the interactive loop. The tree and the transcript index are kept together
+/// so a focus change can redraw exactly the message the tree came from.
+#[derive(Debug, Default)]
+struct ModUiFocus {
+    elements: Vec<coderex_core::ui_protocol::UiElement>,
+    button_ids: Vec<String>,
+    focused: Option<usize>,
+    message_index: Option<usize>,
+    /// The block's last rendered transcript text, used to confirm that the
+    /// message at `message_index` is still this block after a `/clear` or a
+    /// session restore.
+    rendered: Option<String>,
+}
+
+impl ModUiFocus {
+    /// Adopt a newly rendered block, with no button focused yet.
+    fn reset(&mut self, elements: &[coderex_core::ui_protocol::UiElement], message_index: usize) {
+        self.elements = elements.to_vec();
+        self.button_ids = collect_button_ids(elements);
+        self.focused = None;
+        self.message_index = (!self.button_ids.is_empty()).then_some(message_index);
+        self.rendered = Some(coderex_ui::mod_elements::render_mod_ui_text(
+            elements,
+            coderex_ui::mod_elements::MOD_UI_DEFAULT_WIDTH,
+        ));
+    }
+
+    /// Drop focus without forgetting the block.
+    const fn clear_focus(&mut self) {
+        self.focused = None;
+    }
+
+    /// The id of the focused button, if any.
+    fn focused_id(&self) -> Option<&str> {
+        self.focused
+            .and_then(|index| self.button_ids.get(index))
+            .map(String::as_str)
+    }
+
+    /// Move focus forward or backward around the buttons.
+    fn cycle(&mut self, forward: bool) {
+        if self.button_ids.is_empty() {
+            self.focused = None;
+            return;
+        }
+        self.focused = Some(cycle_mod_ui_focus(
+            self.focused,
+            self.button_ids.len(),
+            forward,
+        ));
+    }
+
+    /// The number of focusable buttons.
+    fn button_count(&self) -> usize {
+        self.button_ids.len()
+    }
+
+    /// What the transcript needs to draw and hit-test this block.
+    ///
+    /// A block without buttons owns no focus and no interactive region, so it
+    /// needs no spec.
+    fn spec(&self) -> Option<coderex_ui::terminal::ModUiBlockSpec> {
+        Some(coderex_ui::terminal::ModUiBlockSpec {
+            message_index: self.message_index?,
+            content: self.rendered.clone()?,
+            elements: self.elements.clone(),
+            focused: self.focused_id().map(str::to_string),
+        })
+    }
+}
+
+impl ReplLoop {
+    /// Run a mod UI button's activation handler and append the result.
+    ///
+    /// Keyboard activation and mouse clicks share this path, so both render the
+    /// mod's next UI snapshot (or the failure) the same way.
+    async fn activate_mod_ui_button(
+        &self,
+        ui_state: &mut coderex_ui::state::UiState,
+        focus: &mut ModUiFocus,
+        id: String,
+    ) {
+        let outcome = match self.mod_ui_handle.clone() {
+            Some(handle) => match tokio::task::spawn_blocking(move || handle.activate(&id)).await {
+                Ok(result) => result,
+                Err(error) => Err(format!("the activation task failed: {error}")),
+            },
+            None => Err("mod UI activation is unavailable in this session".to_string()),
+        };
+        match outcome {
+            Ok(elements) => {
+                let rendered = coderex_ui::mod_elements::render_mod_ui_text(
+                    &elements,
+                    coderex_ui::mod_elements::MOD_UI_DEFAULT_WIDTH,
+                );
+                let content = if rendered.is_empty() {
+                    "Mod UI action completed with no elements.".to_string()
+                } else {
+                    rendered
+                };
+                ui_state.messages.push(coderex_ui::message_list::Message {
+                    role: coderex_ui::message_list::MessageRole::System,
+                    content: content.into(),
+                    tool_name: None,
+                    streaming: false,
+                    folded: false,
+                });
+                let index = ui_state.messages.messages.len().saturating_sub(1);
+                focus.reset(&elements, index);
+            }
+            Err(error) => {
+                ui_state.messages.push(coderex_ui::message_list::Message {
+                    role: coderex_ui::message_list::MessageRole::System,
+                    content: format!("Mod UI action failed: {error}").into(),
+                    tool_name: None,
+                    streaming: false,
+                    folded: false,
+                });
+            }
+        }
+        self.persist_interactive_snapshot(ui_state);
+    }
+
+    /// Redraw the transcript block that owns the focused mod UI button.
+    ///
+    /// The transcript stores rendered text, so focus is applied by rendering
+    /// the snapshot again rather than by mutating a live widget.
+    fn redraw_mod_ui_focus(
+        &self,
+        ui_state: &mut coderex_ui::state::UiState,
+        focus: &mut ModUiFocus,
+    ) {
+        let Some(index) = focus.message_index else {
+            return;
+        };
+        let Some(message) = ui_state.messages.messages.get_mut(index) else {
+            focus.message_index = None;
+            focus.focused = None;
+            focus.rendered = None;
+            return;
+        };
+        // The transcript index is only meaningful while the message still
+        // holds the block this focus belongs to. A `/clear`, a resume or a
+        // rewind can replace it; in that case forget the block rather than
+        // rewrite an unrelated message.
+        if focus.rendered.as_deref() != Some(message.content.as_str()) {
+            focus.message_index = None;
+            focus.focused = None;
+            focus.rendered = None;
+            return;
+        }
+        let rendered = coderex_ui::mod_elements::render_mod_ui_text_with_focus(
+            &focus.elements,
+            coderex_ui::mod_elements::MOD_UI_DEFAULT_WIDTH,
+            focus.focused_id(),
+        );
+        message.content = rendered.clone().into();
+        focus.rendered = Some(rendered);
+        self.persist_interactive_snapshot(ui_state);
     }
 
     /// Record a tool event for telemetry, when the session opted in.
@@ -6284,6 +7419,9 @@ impl ReplLoop {
                 if let EngineEvent::TextDelta(delta) = &event {
                     output.push_str(delta);
                 }
+                if let EngineEvent::ModUi(elements) = &event {
+                    append_mod_ui_block(&mut output, elements);
+                }
             }
             Some(request) = elicit_rx.recv() => {
                 for (i, q) in request.questions.iter().enumerate() {
@@ -6696,6 +7834,13 @@ impl ReplLoop {
             // only saw registry commands left out half of what people type.
             self.command_history.append(cmd_name, &args);
 
+            // Servers can discover prompts after they connect (and push
+            // `prompts/list_changed`). Pick those up before resolving anything
+            // that could name one.
+            if cmd_name == "mcp" || cmd_name.starts_with("mcp__") {
+                self.refresh_mcp_prompt_commands();
+            }
+
             // Built-in REPL commands that bypass the registry. With slash
             // commands disabled none of these run either: they are still slash
             // commands, and executing them anyway made the flag only hide
@@ -6708,6 +7853,17 @@ impl ReplLoop {
                     }
                     "tokens" => {
                         self.execute_and_display_command("usage", &[], ui_state);
+                        return;
+                    }
+                    "mcp" => {
+                        let result = self.run_mcp_command(&args);
+                        ui_state.messages.push(coderex_ui::message_list::Message {
+                            role: coderex_ui::message_list::MessageRole::System,
+                            content: result.output.into(),
+                            tool_name: None,
+                            streaming: false,
+                            folded: false,
+                        });
                         return;
                     }
                     "compact" => {
@@ -6923,6 +8079,9 @@ impl ReplLoop {
             // Execute the command directly
             self.execute_and_display_command(cmd_name, &args, ui_state);
         } else if self.engine.is_some() {
+            // A person submitted a prompt: the auto-turn chain starts over.
+            self.mod_auto_turns = 0;
+            self.mod_prompts_this_turn = 0;
             self.start_tui_query(
                 text.to_string(),
                 ui_state,
@@ -6933,6 +8092,10 @@ impl ReplLoop {
                 tui_elicit_rx,
             );
         } else if *thinking || query_done_rx.is_some() {
+            // A person submitted a prompt, even though it waits for the
+            // running turn; it resets the loop guard when it is started.
+            self.mod_auto_turns = 0;
+            self.mod_prompts_this_turn = 0;
             queued_prompts.push_back(text.to_string());
             ui_state.messages.push(coderex_ui::message_list::Message {
                 role: coderex_ui::message_list::MessageRole::System,
@@ -7262,6 +8425,9 @@ impl ReplLoop {
                 .map(std::string::ToString::to_string)
                 .collect();
             self.command_history.append(cmd_name, &args);
+            if cmd_name.starts_with("mcp__") {
+                self.refresh_mcp_prompt_commands();
+            }
             let ctx = self.build_context();
             let result = self.commands.execute(cmd_name, &ctx, &args);
             self.sync_command_state(cmd_name, &result);
@@ -7361,6 +8527,12 @@ impl ReplLoop {
         // history that only recorded registry commands was missing them.
         self.command_history.append(cmd_name, &args);
 
+        // Pick up prompts discovered after the manager was attached (a fresh
+        // connection or a `prompts/list_changed` notification).
+        if cmd_name == "mcp" || cmd_name.starts_with("mcp__") {
+            self.refresh_mcp_prompt_commands();
+        }
+
         // Check for macro expansion. A macro expands into slash commands, so
         // it follows the same switch as the built-ins below.
         if !self.no_slash_commands && self.macro_registry.has(cmd_name) {
@@ -7389,6 +8561,11 @@ impl ReplLoop {
                 }
                 "help" => {
                     self.show_help(stdout)?;
+                    return Ok(());
+                }
+                "mcp" => {
+                    let result = self.run_mcp_command(&args);
+                    writeln!(stdout, "{}", result.output)?;
                     return Ok(());
                 }
                 "cancel" => {
@@ -7705,6 +8882,9 @@ impl ReplLoop {
                 .collect();
 
             self.command_history.append(cmd_name, &args);
+            if cmd_name == "mcp" || cmd_name.starts_with("mcp__") {
+                self.refresh_mcp_prompt_commands();
+            }
 
             let mut ctx = self.build_context();
             ctx.pipe_input = pipe_input.take();
@@ -8495,6 +9675,133 @@ mod tests {
     };
     use coderex_core::types::{ToolResult, UsageSummary};
 
+    // ── Mod UI focus ────────────────────────────────────────────────────────
+
+    #[test]
+    fn mod_ui_keys_map_to_focus_and_activation_only_when_focused() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        assert_eq!(
+            mod_ui_key_action(KeyCode::Tab, KeyModifiers::NONE, None, 2),
+            Some(ModUiKeyAction::FocusNext),
+            "Tab starts focus on the first button"
+        );
+        assert_eq!(
+            mod_ui_key_action(KeyCode::Tab, KeyModifiers::NONE, Some(0), 2),
+            Some(ModUiKeyAction::FocusNext)
+        );
+        assert_eq!(
+            mod_ui_key_action(KeyCode::BackTab, KeyModifiers::SHIFT, Some(0), 2),
+            Some(ModUiKeyAction::FocusPrevious)
+        );
+        assert_eq!(
+            mod_ui_key_action(KeyCode::Tab, KeyModifiers::SHIFT, Some(1), 2),
+            Some(ModUiKeyAction::FocusPrevious)
+        );
+        assert_eq!(
+            mod_ui_key_action(KeyCode::Enter, KeyModifiers::NONE, Some(1), 2),
+            Some(ModUiKeyAction::Activate)
+        );
+        assert_eq!(
+            mod_ui_key_action(KeyCode::Esc, KeyModifiers::NONE, Some(1), 2),
+            Some(ModUiKeyAction::ClearFocus)
+        );
+    }
+
+    #[test]
+    fn mod_ui_keys_leave_ordinary_typing_alone() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        assert_eq!(
+            mod_ui_key_action(KeyCode::Char('a'), KeyModifiers::NONE, Some(0), 2),
+            None,
+            "typing must reach the input line"
+        );
+        assert_eq!(
+            mod_ui_key_action(KeyCode::Backspace, KeyModifiers::NONE, Some(0), 2),
+            None
+        );
+        assert_eq!(
+            mod_ui_key_action(KeyCode::Enter, KeyModifiers::NONE, None, 2),
+            None,
+            "Enter submits when no button is focused"
+        );
+        assert_eq!(
+            mod_ui_key_action(KeyCode::Esc, KeyModifiers::NONE, None, 2),
+            None
+        );
+        assert_eq!(
+            mod_ui_key_action(KeyCode::BackTab, KeyModifiers::SHIFT, None, 2),
+            None,
+            "unfocused Shift+Tab still belongs to the permission bar"
+        );
+        assert_eq!(
+            mod_ui_key_action(KeyCode::Tab, KeyModifiers::NONE, Some(0), 0),
+            None,
+            "a block with no buttons has no focus"
+        );
+    }
+
+    #[test]
+    fn focus_cycles_and_wraps() {
+        assert_eq!(cycle_mod_ui_focus(None, 3, true), 0);
+        assert_eq!(cycle_mod_ui_focus(None, 3, false), 2);
+        assert_eq!(cycle_mod_ui_focus(Some(2), 3, true), 0);
+        assert_eq!(cycle_mod_ui_focus(Some(0), 3, false), 2);
+    }
+
+    #[test]
+    fn mod_ui_focus_walks_nested_buttons_and_clears() {
+        use coderex_core::ui_protocol::UiElement;
+
+        let tree = vec![
+            UiElement::Box {
+                title: None,
+                children: vec![
+                    UiElement::Button {
+                        label: "A".to_string(),
+                        id: "a".to_string(),
+                    },
+                    UiElement::Button {
+                        label: "B".to_string(),
+                        id: "b".to_string(),
+                    },
+                ],
+            },
+            UiElement::Button {
+                label: "C".to_string(),
+                id: "c".to_string(),
+            },
+        ];
+
+        let mut focus = ModUiFocus::default();
+        focus.reset(&tree, 7);
+        assert_eq!(focus.button_count(), 3);
+        assert_eq!(focus.focused_id(), None);
+        assert_eq!(focus.message_index, Some(7));
+
+        focus.cycle(true);
+        assert_eq!(focus.focused_id(), Some("a"));
+        focus.cycle(false);
+        assert_eq!(focus.focused_id(), Some("c"));
+
+        focus.clear_focus();
+        assert_eq!(focus.focused_id(), None);
+
+        focus.reset(
+            &[UiElement::Text {
+                text: "nothing to press".to_string(),
+                style: coderex_core::ui_protocol::UiStyle::Plain,
+            }],
+            9,
+        );
+        assert_eq!(focus.button_count(), 0);
+        assert_eq!(
+            focus.message_index, None,
+            "a block without buttons owns no keyboard focus"
+        );
+    }
+
     /// A hook executor that records what fired, for the lifecycle tests.
     #[derive(Clone, Default)]
     struct RecordingHookExecutor {
@@ -9275,6 +10582,54 @@ mod tests {
         let mut loop_obj = ReplLoop::new("/src".into(), ModelId::sonnet());
         let result = loop_obj.run_headless("/help").await.unwrap();
         assert!(result.contains("System Status") || result.contains("Available"));
+    }
+
+    /// A mod's UI block joins the headless output at the point the event was
+    /// drained, instead of being printed live from the event loop.
+    #[tokio::test]
+    async fn headless_output_contains_a_rendered_mod_ui_block() {
+        let mut repl = ReplLoop::new("/src".into(), ModelId::sonnet());
+        let (tx, rx) = mpsc::unbounded_channel();
+        repl.event_rx = Some(rx);
+        tx.send(EngineEvent::ModUi(vec![
+            coderex_core::ui_protocol::UiElement::Box {
+                title: Some("Mods".to_string()),
+                children: vec![coderex_core::ui_protocol::UiElement::Button {
+                    label: "Retry".to_string(),
+                    id: "retry".to_string(),
+                }],
+            },
+        ]))
+        .unwrap();
+
+        let mut output = String::new();
+        repl.drain_events(&mut output);
+
+        assert!(output.contains("┌─ Mods"), "{output}");
+        assert!(output.contains("[Retry]"), "{output}");
+        assert!(output.ends_with('\n'), "{output:?}");
+    }
+
+    /// A notice staged by a mod is a text element and reaches headless output
+    /// through the same `ModUi` path as a rendered UI block.
+    #[tokio::test]
+    async fn headless_output_contains_a_mod_notice() {
+        let mut repl = ReplLoop::new("/src".into(), ModelId::sonnet());
+        let (tx, rx) = mpsc::unbounded_channel();
+        repl.event_rx = Some(rx);
+        tx.send(EngineEvent::ModUi(vec![
+            coderex_core::ui_protocol::UiElement::Text {
+                text: "the mod noticed something".to_string(),
+                style: coderex_core::ui_protocol::UiStyle::Notice,
+            },
+        ]))
+        .unwrap();
+
+        let mut output = String::new();
+        repl.drain_events(&mut output);
+
+        assert!(output.contains("the mod noticed something"), "{output:?}");
+        assert!(output.ends_with('\n'), "{output:?}");
     }
 
     /// Headless output must be exactly what the model produced. The old path
@@ -10727,6 +12082,72 @@ mod tests {
         assert_eq!(filtered, doc);
     }
 
+    #[test]
+    fn mods_startup_line_is_built_from_the_load_report() {
+        let directory = std::path::Path::new("/tmp/example-mods");
+        let report = vec![
+            coderex_mods::ModInfo {
+                name: "a.js".to_string(),
+                path: directory.join("a.js"),
+                sha256: "a".repeat(64),
+                loaded: true,
+                errors: Vec::new(),
+            },
+            coderex_mods::ModInfo {
+                name: "b.js".to_string(),
+                path: directory.join("b.js"),
+                sha256: "b".repeat(64),
+                loaded: true,
+                errors: Vec::new(),
+            },
+        ];
+
+        let line = mods_startup_line(&report, directory);
+
+        assert_eq!(line.lines().count(), 1, "one startup line: {line}");
+        assert!(
+            line.contains("mods: 2 loaded from /tmp/example-mods"),
+            "{line}"
+        );
+        assert!(line.contains("a.js=aaaaaaaaaaaa"), "{line}");
+        assert!(line.contains("b.js=bbbbbbbbbbbb"), "{line}");
+        assert!(line.contains("informational only"), "{line}");
+        assert!(line.contains("no signature or trust store"), "{line}");
+        assert!(
+            line.contains("this code runs because you installed it"),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn mods_startup_line_counts_skipped_mods_and_keeps_long_lists_short() {
+        let directory = std::path::Path::new("/tmp/many-mods");
+        let report: Vec<coderex_mods::ModInfo> = (0..5)
+            .map(|index| coderex_mods::ModInfo {
+                name: format!("m{index}.js"),
+                path: directory.join(format!("m{index}.js")),
+                sha256: "c".repeat(64),
+                loaded: index != 2,
+                errors: if index == 2 {
+                    vec!["register() failed".to_string()]
+                } else {
+                    Vec::new()
+                },
+            })
+            .collect();
+
+        let line = mods_startup_line(&report, directory);
+
+        assert_eq!(line.lines().count(), 1, "one startup line: {line}");
+        assert!(line.contains("mods: 4 of 5 loaded"), "{line}");
+        assert!(line.contains("skipped: m2.js"), "{line}");
+        assert!(
+            !line.contains("m0.js=c"),
+            "hashes must not be inlined above the limit: {line}"
+        );
+        assert!(line.contains("informational only"), "{line}");
+    }
+
     /// The auto-dream manager is built before `--betas` is resolved, so the
     /// `auto_dream` flag is applied at startup: with it off there is no
     /// manager and `/auto-dream` reports as much.
@@ -11127,5 +12548,202 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(listed.output, "[]");
+    }
+
+    #[test]
+    fn prompt_command_names_keep_only_identifier_characters() {
+        assert_eq!(
+            prompt_command_name("my server", "review/file"),
+            "mcp__my_server__review_file"
+        );
+        assert_eq!(
+            prompt_command_name("srv-1", "ask.questions"),
+            "mcp__srv_1__ask_questions"
+        );
+        assert_eq!(sanitize_prompt_component("a-b c"), "a_b_c");
+        assert_eq!(sanitize_prompt_component("keep_1"), "keep_1");
+    }
+
+    fn sample_prompt() -> coderex_mcp::prompts::ServerPrompt {
+        coderex_mcp::prompts::ServerPrompt {
+            server: "my server".into(),
+            prompt: coderex_mcp::prompts::McpPromptInfo {
+                name: "review/file".into(),
+                description: Some("Review a file".into()),
+                arguments: vec![coderex_mcp::prompts::McpPromptArgument {
+                    name: "path".into(),
+                    description: None,
+                    required: true,
+                }],
+            },
+        }
+    }
+
+    #[test]
+    fn prompt_commands_are_registered_for_discovered_prompts() {
+        let mut repl = ReplLoop::new("/tmp".into(), ModelId::sonnet());
+        let manager = Arc::new(coderex_mcp::manager::McpManager::new());
+        manager.register_prompt(sample_prompt());
+        repl.with_mcp_manager(manager);
+
+        let command = repl
+            .commands
+            .find("mcp__my_server__review_file")
+            .expect("the sanitised prompt command is registered");
+        assert_eq!(command.description, "Review a file");
+
+        // A second refresh must not register the same command twice.
+        let before = repl.commands.len();
+        repl.refresh_mcp_prompt_commands();
+        assert_eq!(repl.commands.len(), before);
+    }
+
+    #[test]
+    fn refresh_registers_prompts_discovered_after_the_manager_was_attached() {
+        let mut repl = ReplLoop::new("/tmp".into(), ModelId::sonnet());
+        let manager = Arc::new(coderex_mcp::manager::McpManager::new());
+        repl.with_mcp_manager(Arc::clone(&manager));
+        assert!(repl.commands.find("mcp__my_server__review_file").is_none());
+
+        // A server that connects (or pushes prompts/list_changed) updates the
+        // manager's registry; the next refresh exposes the command.
+        manager.register_prompt(sample_prompt());
+        repl.refresh_mcp_prompt_commands();
+        assert!(repl.commands.find("mcp__my_server__review_file").is_some());
+    }
+
+    #[test]
+    fn prompt_result_renders_messages_for_the_transcript() {
+        use coderex_mcp::prompts::{McpPromptContent, McpPromptMessage, McpPromptResult};
+
+        let result = McpPromptResult {
+            description: Some("Resolved".into()),
+            messages: vec![
+                McpPromptMessage {
+                    role: "user".into(),
+                    content: McpPromptContent::Text {
+                        text: "hello".into(),
+                    },
+                },
+                McpPromptMessage {
+                    role: "assistant".into(),
+                    content: McpPromptContent::Image {
+                        data: "AAAA".into(),
+                        mime_type: "image/png".into(),
+                    },
+                },
+            ],
+        };
+        let command = prompt_result_command(&result);
+        assert!(!command.state_changed);
+        assert!(
+            command.output.starts_with("Resolved\n[user]\nhello"),
+            "{}",
+            command.output
+        );
+        assert!(command.output.contains("[assistant]\n[image: image/png]"));
+        assert!(!command.output.contains("AAAA"));
+    }
+
+    // ── Mod submissions ─────────────────────────────────────────────────────
+
+    #[test]
+    fn mod_drain_is_a_no_op_with_an_empty_queue() {
+        let mut queue = std::collections::VecDeque::new();
+
+        assert_eq!(
+            plan_mod_drain(&mut queue, 0, 0),
+            Vec::<ModDrainAction>::new()
+        );
+    }
+
+    #[test]
+    fn mod_drain_submits_queued_messages_in_order() {
+        let mut queue =
+            std::collections::VecDeque::from(["first".to_string(), "second".to_string()]);
+
+        assert_eq!(
+            plan_mod_drain(&mut queue, 0, 0),
+            vec![
+                ModDrainAction::Submit("first".to_string()),
+                ModDrainAction::Submit("second".to_string()),
+            ]
+        );
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn mod_drain_stops_after_three_consecutive_auto_turns() {
+        let mut queue = std::collections::VecDeque::from([
+            "a".to_string(),
+            "b".to_string(),
+            "c".to_string(),
+            "d".to_string(),
+        ]);
+
+        // The first idle boundary plans three turns and keeps the fourth.
+        assert_eq!(
+            plan_mod_drain(&mut queue, 0, 0),
+            vec![
+                ModDrainAction::Submit("a".to_string()),
+                ModDrainAction::Submit("b".to_string()),
+                ModDrainAction::Submit("c".to_string()),
+            ]
+        );
+        assert_eq!(queue, std::collections::VecDeque::from(["d".to_string()]));
+
+        // Once three auto-turns have run, the guard drops the rest with one
+        // system notice instead of starting a fourth.
+        let actions = plan_mod_drain(&mut queue, MAX_AUTO_MOD_TURNS, MAX_AUTO_MOD_TURNS);
+        assert_eq!(actions.len(), 1);
+        match &actions[0] {
+            ModDrainAction::Notice(text) => {
+                assert!(text.contains("auto-turn limit"), "{text}");
+                assert!(text.contains("1 queued mod message(s) dropped"), "{text}");
+            }
+            other => panic!("expected a notice, got {other:?}"),
+        }
+        assert!(queue.is_empty(), "the dropped backlog must not replay");
+    }
+
+    #[test]
+    fn mod_drain_enforces_the_per_turn_submission_cap() {
+        let mut queue: std::collections::VecDeque<String> =
+            (0..10).map(|index| format!("message {index}")).collect();
+
+        let plan = plan_mod_drain(&mut queue, 0, MAX_MOD_PROMPTS_PER_TURN - 1);
+        assert_eq!(
+            plan,
+            vec![ModDrainAction::Submit("message 0".to_string())],
+            "only the remaining slot is used"
+        );
+        assert_eq!(queue.len(), 9);
+
+        let actions = plan_mod_drain(&mut queue, 1, MAX_MOD_PROMPTS_PER_TURN);
+        assert_eq!(actions.len(), 1);
+        match &actions[0] {
+            ModDrainAction::Notice(text) => {
+                assert!(text.contains("submission limit"), "{text}");
+            }
+            other => panic!("expected a notice, got {other:?}"),
+        }
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn headless_drain_uses_the_same_auto_turn_cap() {
+        // Headless and interactive share `plan_mod_drain`; a ten-message queue
+        // still yields at most three turns before the guard stops it.
+        let mut queue: std::collections::VecDeque<String> =
+            (0..10).map(|index| format!("message {index}")).collect();
+
+        let plan = plan_mod_drain(&mut queue, 0, 0);
+
+        assert_eq!(plan.len(), MAX_AUTO_MOD_TURNS);
+        assert!(
+            plan.iter()
+                .all(|action| matches!(action, ModDrainAction::Submit(_)))
+        );
+        assert_eq!(queue.len(), 7, "the rest waits for a later idle boundary");
     }
 }

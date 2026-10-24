@@ -83,6 +83,12 @@ pub struct McpServer {
     pub reconnect_count: usize,
     /// Maximum reconnection attempts.
     pub max_reconnects: usize,
+    /// Capabilities the server declared in its `initialize` result.
+    ///
+    /// Used to avoid probing a facility the server never advertised: an MCP
+    /// server is not obliged to answer a method it did not declare, so a blind
+    /// `prompts/list` can wait forever on a server that simply ignores it.
+    capabilities: Option<serde_json::Value>,
     /// JSON-RPC stdio channel (present when running).
     channel: Option<Arc<Mutex<JsonRpcChannel>>>,
     /// Answers requests this server makes of the client.
@@ -125,6 +131,7 @@ impl McpServer {
             status: ServerStatus::Stopped,
             reconnect_count: 0,
             max_reconnects: 3,
+            capabilities: None,
             channel: None,
             inbound_handler: crate::channel::SharedInboundHandler::new(),
             token_provider: None,
@@ -154,6 +161,7 @@ impl McpServer {
             status: ServerStatus::Stopped,
             reconnect_count: 0,
             max_reconnects: 3,
+            capabilities: None,
             channel: None,
             inbound_handler: crate::channel::SharedInboundHandler::new(),
             token_provider: None,
@@ -279,6 +287,7 @@ impl McpServer {
             });
         }
         self.status = ServerStatus::Starting;
+        self.capabilities = None;
 
         let mut channel = self.create_channel().map_err(|error| {
             self.status = ServerStatus::Errored;
@@ -298,7 +307,8 @@ impl McpServer {
 
         // Perform MCP initialize handshake
         match channel.initialize().await {
-            Ok(_) => {
+            Ok(response) => {
+                self.capabilities = response.get("capabilities").cloned();
                 tracing::debug!(server = %self.name, "MCP server initialized");
             }
             Err(e) => {
@@ -423,6 +433,95 @@ impl McpServer {
         result
     }
 
+    /// Whether the server advertised the `prompts` capability.
+    ///
+    /// A server that did not declare it is not required to answer
+    /// `prompts/list`, and a server that ignores an unknown method leaves the
+    /// request waiting. Discovery therefore treats "not advertised" as "no
+    /// prompts" instead of probing.
+    #[must_use]
+    pub fn supports_prompts(&self) -> bool {
+        self.capabilities
+            .as_ref()
+            .and_then(|capabilities| capabilities.get("prompts"))
+            .is_some()
+    }
+
+    /// Discover prompts from the MCP server.
+    ///
+    /// Returns the raw `prompts/list` JSON response. A server that did not
+    /// advertise the `prompts` capability is reported as having no prompts
+    /// without sending a request it may never answer.
+    pub async fn discover_prompts(&mut self) -> Result<serde_json::Value, McpServerError> {
+        if self.status != ServerStatus::Running {
+            return Err(McpServerError::HealthCheckFailed {
+                name: self.name.clone(),
+                reason: "server not running".to_string(),
+            });
+        }
+        if !self.supports_prompts() {
+            return Ok(serde_json::json!({"prompts": []}));
+        }
+
+        let channel_opt = self.channel.take();
+        let result = if let Some(ref channel) = channel_opt {
+            let mut ch = channel.lock().await;
+            ch.list_prompts()
+                .await
+                .map_err(|e| McpServerError::HealthCheckFailed {
+                    name: self.name.clone(),
+                    reason: e,
+                })
+        } else {
+            Err(McpServerError::HealthCheckFailed {
+                name: self.name.clone(),
+                reason: "no channel".to_string(),
+            })
+        };
+
+        if let Some(channel) = channel_opt {
+            self.channel = Some(channel);
+        }
+        result
+    }
+
+    /// Resolve one prompt on the MCP server.
+    ///
+    /// Returns the raw `prompts/get` JSON response.
+    pub async fn get_prompt(
+        &mut self,
+        name: &str,
+        arguments: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<serde_json::Value, McpServerError> {
+        if self.status != ServerStatus::Running {
+            return Err(McpServerError::HealthCheckFailed {
+                name: self.name.clone(),
+                reason: "server not running".to_string(),
+            });
+        }
+
+        let channel_opt = self.channel.take();
+        let result = if let Some(ref channel) = channel_opt {
+            let mut ch = channel.lock().await;
+            ch.get_prompt(name, arguments)
+                .await
+                .map_err(|e| McpServerError::HealthCheckFailed {
+                    name: self.name.clone(),
+                    reason: e,
+                })
+        } else {
+            Err(McpServerError::HealthCheckFailed {
+                name: self.name.clone(),
+                reason: "no channel".to_string(),
+            })
+        };
+
+        if let Some(channel) = channel_opt {
+            self.channel = Some(channel);
+        }
+        result
+    }
+
     /// Read one resource from the MCP server.
     ///
     /// Returns the raw `resources/read` JSON response.
@@ -467,6 +566,7 @@ impl McpServer {
         }
         self.reconnect_count += 1;
         self.status = ServerStatus::Starting;
+        self.capabilities = None;
 
         // Terminate old channel if present
         if let Some(ref channel) = self.channel {
@@ -494,7 +594,9 @@ impl McpServer {
         })?;
 
         match channel.initialize().await {
-            Ok(_) => {}
+            Ok(response) => {
+                self.capabilities = response.get("capabilities").cloned();
+            }
             Err(error) if self.transport == McpTransport::Sse => {
                 // The stream did not announce a message endpoint; the
                 // reconnected server cannot be used.
@@ -583,7 +685,7 @@ mod tests {
 
     #[tokio::test]
     async fn health_check_fails_when_stopped() {
-        let mut srv = sample_server();
+        let srv = sample_server();
         let result = srv.health_check().await;
         assert!(result.is_err());
     }

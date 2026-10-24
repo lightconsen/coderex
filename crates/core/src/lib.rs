@@ -54,6 +54,7 @@ pub mod team_context;
 pub mod tool_executor;
 pub mod tool_scheduler;
 pub mod types;
+pub mod ui_protocol;
 pub mod wire_adapter;
 pub mod wire_protocol;
 pub mod wire_transport;
@@ -140,6 +141,7 @@ pub use hook_security::{
 
 pub use shell_security::{BashAst, BashCommand, DestructiveLevel, Redirect, RedirectKind};
 
+pub use ui_protocol::{UiElement, UiStyle, parse_ui_elements};
 pub use wire_adapter::{
     DualEventSink, bridge_engine_to_wire, engine_event_to_wire, wire_event_to_engine,
 };

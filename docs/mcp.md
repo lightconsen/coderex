@@ -10,11 +10,12 @@ Model Context Protocol (MCP) support — enables CodeRex to act as an MCP client
 
 - **`McpManager`** (`manager.rs`) — Central coordinator for servers, tools, resources, OAuth, elicitation, and health monitoring. Uses `Arc<DashMap>` for concurrent server access.
 - **`McpServer`** (`server.rs`) — Server descriptor with full lifecycle: spawn, health check (immutable), reconnect (max 3), stop. Tracks 5 statuses: Stopped, Starting, Running, Unhealthy, Errored.
-- **`JsonRpcChannel`** (`channel.rs`) — JSON-RPC 2.0 stdio transport: `initialize()` (protocol 2024-11-05 + `initialized` notification), `send_request()`, `send_notification()`, `read_response()`, `list_tools()`, `list_resources()`.
+- **`JsonRpcChannel`** (`channel.rs`) — JSON-RPC 2.0 stdio transport: `initialize()` (protocol 2024-11-05 + `initialized` notification), `send_request()`, `send_notification()`, `read_response()`, `list_tools()`, `list_resources()`, `list_prompts()`, `get_prompt()`.
 - **`McpToolProxy`** (`proxy.rs`) — Tool call forwarding: `call(args)` sends `tools/call` over shared channel.
 - **`McpToolRegistry`** (`proxy.rs`) — HashMap-based tool registry with `McpToolInfo` (name, description, input_schema, server). Public names are `mcp__<server>__<tool>`, or the raw name when `CLAUDE_AGENT_SDK_MCP_NO_PREFIX` is set (see *Tool naming* below).
 - **`McpToolNameConflict`** (`proxy.rs`) — a raw name two servers both expose while the prefix is off. The later registration is refused and recorded via `McpToolRegistry::conflicts()`, because the name can only address one of them.
 - **`McpResource`** / **`McpResourceContent`** / **`McpResourceRegistry`** (`resources.rs`) — Resource listing and access with MIME-type filtering.
+- **`McpPromptInfo`** / **`McpPromptResult`** / **`ServerPrompt`** / **`McpPromptRegistry`** (`prompts.rs`) — Typed `prompts/list` and `prompts/get` results. `ServerPrompt` tags a prompt with the server that offered it; the registry can replace one server's prompts after a re-discovery without touching the others.
 - **`McpConfig`** / **`McpServerConfig`** (`config.rs`) — Configuration loading from `.mcp.json` or settings.json, with file persistence.
 - **`McpOAuthState`** / **`OAuthManager`** (`oauth.rs`) — token bookkeeping for MCP servers: access_token, refresh_token, expires_at, scopes, and the discovered `authorization_endpoint` / `token_endpoint` / `scopes_supported`. Expiry checking via `chrono`, persistence to `~/.coderex/mcp_tokens.json`, RFC 9728 Protected Resource Metadata (`OAuthManager::discover`), RFC 8414 and OpenID Connect authorization-server discovery, RFC 7591 dynamic client registration, and a real `grant_type=refresh_token` exchange (`OAuthManager::refresh`) against the discovered endpoint. Discovery first looks for the resource's protected-resource document (the `resource_metadata` URL from a `WWW-Authenticate` challenge when one is supplied, otherwise `{origin}/.well-known/oauth-protected-resource{path}`); the first `authorization_servers` entry becomes the issuer, so the MCP endpoint and its authorization server may live on different origins. It normalizes that issuer (query/fragment/trailing slash removed, path kept), tries the RFC 8414 path-insertion document first (`{origin}/.well-known/oauth-authorization-server{path}`), then the origin form, then the two OpenID Connect forms; it rejects a document whose `issuer` does not match and, when a document omits `issuer`, binds it to the configured issuer only when it was served from one of that issuer's own well-known URLs (an origin-level document with no `issuer` is rejected with a clear reason and the next candidate is tried); it caches the endpoints/scopes in an `issuer_metadata` map keyed by the normalized issuer, with an expiry from `Cache-Control: max-age`/`Expires` (one hour by default) and an `ETag` revalidated through `If-None-Match` (a `304` reuses the cached document). An expired document is re-fetched before a refresh. When no client id is configured and the server publishes `registration_endpoint`, a client is registered with the redirect URI, both grants, `response_types: ["code"]`, `code_challenge_method: S256`, and the strongest advertised `token_endpoint_auth_method`; the issued `client_id`/`client_secret` are stored and reused. The chosen method (`client_secret_basic`, `client_secret_post`, or `none` for a public PKCE client) is used for both the code exchange and refresh, and every authorize/token/refresh request carries the RFC 8707 `resource` indicator. Discovery refuses a server that advertises PKCE methods but not `S256`, and refuses a refresh when `grant_types_supported` excludes `refresh_token`. Near-expiry detection (5 min buffer) drives `OAuthManager::refresh_if_needed`, which is called by each server's token provider before every HTTP request; `OAuthManager::handle_unauthorized` implements the `401 invalid_token` policy (clear the token, re-fetch metadata if expired, then refresh once or delegate to the installed `ReauthHandler`). This module cannot *obtain* a first token itself — only the `McpAuth` tool can — but it can drive that tool through the handler; otherwise it keeps an existing session alive.
 - **`OAuthTokenProvider`** (`oauth.rs`) — implements `TokenProvider` (`http.rs`) on top of the manager's shared `OAuthManager`. `HttpChannel` consults it before every POST (requests, notifications, and answers to server-initiated requests), so a token that expires mid-session is refreshed on the next request. It also handles a `401` whose `WWW-Authenticate: Bearer` challenge names `invalid_token`: the transport asks the provider for a replacement once, retries the request exactly once with that token, and treats a second `401` as an error. When there is no refresh token, the manager invokes the installed `ReauthHandler` once instead. A failed refresh hands back no credential rather than failing the request; stdio channels ignore the provider.
@@ -34,7 +35,8 @@ Without the prefix a shared raw name cannot address both servers, so the second 
 ### Hooked Into CLI
 
 - **`StartupOrchestrator.phase_init_mcp()`** (`crates/cli/src/orchestrator.rs:1353`) — Loads `.mcp.json`, starts servers, discovers tools/resources, sets `mcp_ready`.
-- **`/mcp` commands** — Server listing and status via config extension commands.
+- **`/mcp` commands** — Server listing and status via config extension commands, with discovered prompts appended under each server (see *Prompts*).
+- **`/mcp__<server>__<prompt>`** — one slash command per discovered prompt; arguments are positional or `key=value`, and the resolved messages are printed as text (see *Prompts*).
 
 ### Architecture Patterns
 
@@ -47,13 +49,91 @@ Without the prefix a shared raw name cannot address both servers, so the second 
 - **Result adaptation** — MCP content arrays (text/image/resource) normalized to `ToolResult`.
 - **Resource caching** — In-memory TTL cache (default 60s) keyed by `(server_id, resource_uri)`.
 
+## Prompts
+
+MCP prompts are reusable, parameterised message templates a server offers for
+a person to invoke. They are separate from tools: the client does not choose
+one, the person does.
+
+### Protocol
+
+- **`prompts/list`** (no parameters) returns `{"prompts": [...]}`. Each entry
+  has `name`, optional `description`, and an optional `arguments` array whose
+  items carry `name`, optional `description`, and `required`. The client parses
+  it into `McpPromptInfo` / `McpPromptArgument`.
+- **`prompts/get`** takes `{"name": "...", "arguments": {...}}`; `arguments` is
+  always a JSON object (empty when there are none) and every value is a string.
+  The response is `{"description": "...", "messages": [{"role": "...",
+  "content": {...}}]}` and is parsed into `McpPromptResult` /
+  `McpPromptMessage`. Text is rendered as-is; image and audio blocks become
+  `[image: <mime>]` / `[audio: <mime>]`, embedded resources show their URI and
+  text, and an unknown block type renders as `[unsupported content]` rather
+  than failing the response.
+
+`McpManager::discover_all` calls `prompts/list` after tools and resources, but
+only for a server that advertised the `prompts` capability in its `initialize`
+result: a server is not required to answer a method it never declared, and one
+that silently ignores an unknown method would otherwise leave the request
+waiting. A server without the capability is treated as offering no prompts.
+`notifications/prompts/list_changed` triggers a fresh list for that server.
+Prompts are aggregated in `McpPromptRegistry` and tagged with their server;
+`prompts_for_server` and `prompt_info` expose the cached list, and
+`McpManager::get_prompt(server, name, arguments)` performs a live
+`prompts/get`.
+
+### Slash commands
+
+Every discovered prompt becomes a slash command:
+
+```
+/mcp__<server>__<prompt> [positional ... | key=value ...]
+```
+
+Characters in `<server>` and `<prompt>` that are not ASCII letters, digits, or
+`_` are replaced with `_` in the command name. The raw names are kept for the
+request, so a prompt named `review/file` is invoked as
+`/mcp__my_server__review_file` but asked for as `review/file`.
+
+Arguments can be passed positionally or as `key=value`:
+
+- Positional values fill the prompt's declared arguments in declaration order.
+- `key=value` names its argument explicitly; a positional value then skips any
+  argument already supplied by name.
+- Values are always strings (MCP's schema requires strings). Tokens are split
+  on whitespace by the REPL, so a value containing spaces needs to be supplied
+  by a server that takes it another way.
+- A missing required argument is refused locally with the argument names; extra
+  positional arguments and an empty `key=` name are also refused.
+
+`/mcp` lists the prompts under each server, with their command spelling,
+description, and declared arguments. Prompt commands are registered when the
+manager is attached and refreshed lazily before an `/mcp` or `mcp__…` command
+runs, which is how prompts discovered after connection (or announced by
+`prompts/list_changed`) become visible. The command registry is append-only, so
+a prompt a server stops offering keeps its command; invoking it reports that
+server's error.
+
+### Per-server errors
+
+Discovery and invocation are per server. If one server fails `prompts/list`,
+its previous prompts are left untouched (or it contributes none on first
+discovery), the failure is logged under that server's name, and the other
+servers' prompts are still discovered. A failing `prompts/get` is reported as
+`failed to get prompt '<name>' from server '<server>': …`; it is not turned
+into a global "MCP is broken" error. Naming an unattached server reports
+`MCP server '<name>' is not attached`.
+
+The same data is available to the model through the `ListMcpPrompts` and
+`GetMcpPrompt` baseline tools, which the CLI replaces with implementations
+backed by the live manager.
+
 ## Current Status
 
 ### What Works
 
 - Full JSON-RPC 2.0 stdio channel with `initialize()` handshake (protocol version 2024-11-05).
 - Server lifecycle: spawn, health check (immutable), reconnect (max 3), stop with status tracking.
-- Auto-discovery: `tools/list` and `resources/list` called after server spawn, results parsed and registered.
+- Auto-discovery: `tools/list`, `resources/list`, and `prompts/list` called after server spawn, results parsed and registered.
 - Tool proxy: `McpToolProxy.call(args)` sends `tools/call` over shared channel.
 - Tool registry: `McpToolRegistry` with register, get, unregister, list.
 - Resource types: `McpResource`, `McpResourceContent`, registry with MIME filtering.
@@ -69,13 +149,13 @@ Without the prefix a shared raw name cannot address both servers, so the second 
 - Server-initiated requests: messages from the server are told apart by shape (method+id is a request, method alone a notification, id alone a response). They are answered on every transport — the stdio read loop directly, the HTTP/SSE response stream incrementally, and the standalone `GET` stream — with HTTP answers sent as a separate POST so a server holding a response open cannot deadlock the client. The HTTP transport deduplicates every server message by its shape — `(session_id, request_id)` for a request, `(method, params)` for a notification — and, when the carrying SSE event has an id, by that id as well: a message that arrives again on the other stream (or after a reconnect/`Last-Event-ID` replay) is not acted on twice, and a short recent-answer cache lets a server retry and still receive the same answer. With no handler installed at all the answer remains a JSON-RPC `-32601` refusal rather than silence.
 - Legacy HTTP+SSE sessions (`"type": "sse"`): the client opens a long-lived `GET` with `Accept: text/event-stream`, waits for the server's `endpoint` event, resolves the announced POST URL relative to the configured URL, and sends every JSON-RPC message there. Responses and server-initiated requests arrive on the event stream and are correlated by id; auth headers, `Mcp-Session-Id`, `MCP-Protocol-Version`, 401 refresh, and graceful shutdown apply to both directions. A server that does not provide an event stream is reported as `Errored` instead of appearing to be running. `http`/`streamable-http` and `sse` are distinct transports selected by `type`, not aliases.
 - Streamable HTTP sessions: the negotiated protocol version is captured from the `initialize` result and sent as `MCP-Protocol-Version` on every later request; the `Mcp-Session-Id` header is remembered and sent on every later POST (requests, notifications, and answers). Responses may be plain JSON or an SSE stream; both are routed through the same incremental parser. After initialize each remote server gets one background `GET` stream (`Accept: text/event-stream`, session id, protocol version, current bearer token) which handles server requests and notifications from the same deduplicated pipeline, keeps `Last-Event-ID` across reconnects — advanced to the id of the last event actually processed, so a reconnect resumes past it rather than past the last one merely read — and reconnects with bounded exponential backoff plus jitter. If the failure or duration cap is reached the stream enters `Degraded` (observable via `McpServer::event_stream_state`) instead of retrying forever. A `404` means the session expired: the client clears it, re-runs `initialize` + `initialized` once, and resumes. A `405` means the server offers no standalone stream: the task stops permanently and quietly, and the server stays usable over POST. Shutdown cancels the stream task, drops the response body to close the connection, and awaits the task; inbound events flow through a bounded queue whose overflow also ends in `Degraded` rather than unbounded memory growth.
-- Server notifications: `notifications/tools/list_changed` triggers a fresh `tools/list` and re-registers that server's tools; `notifications/resources/updated` invalidates the affected resource in the cache (or all of that server's cached resources when no `uri` is given). Unknown notifications are still logged.
+- Server notifications: `notifications/tools/list_changed` triggers a fresh `tools/list` and re-registers that server's tools; `notifications/resources/updated` invalidates the affected resource in the cache (or all of that server's cached resources when no `uri` is given); `notifications/prompts/list_changed` re-runs `prompts/list` and replaces that server's prompts. Unknown notifications are still logged.
 - Config loading: `.mcp.json` file parsing + settings.json integration, save/load roundtrip.
 - Result adapter: `McpResultAdapter` converts MCP content (text, image, resource) to `ToolResult`.
 - Tool registration: discovered tools are `McpTool` entries in the shared `ToolRegistry` (`register_tools_into`); there is no separate MCP executor.
 - Health monitor: Background task checks all servers every 30s.
 - Startup wiring: `StartupOrchestrator` phase loads config, starts servers, discovers tools/resources, sets `mcp_ready`.
-- 231 tests: 159 unit tests plus 27 socket-level HTTP/SSE tests and 45 integration tests covering channel, server, proxy, config, OAuth, re-authorization, typed elicitation, notification handling, manager, result adapter, and tool executor.
+- 253 tests: 181 unit tests plus 27 socket-level HTTP/SSE tests and 45 integration tests covering channel, server, proxy, config, OAuth, re-authorization, typed elicitation, prompts, notification handling, manager, result adapter, and tool executor.
 
 ### What Is Stubbed/Partial
 
@@ -181,6 +261,40 @@ defaults, and `defaults` accepts only when every declared field has a default.
 question (one with no schema); it is read only under `allow`, and an unset or
 empty value leaves the question cancelled. See the elicitation note above for
 the validation rules.
+
+### Sampling
+
+MCP `sampling/createMessage` lets a server ask the *client's* model to
+generate text in the middle of a request. It is the server's conversation and
+the server's choice of prompt, but the completion is billed to the person
+running CodeRex. Sampling is therefore **denied by default**: without an
+explicit opt-in, the request is answered with a JSON-RPC `-32601` error whose
+message names the switch, rather than being silently ignored or forwarded.
+
+Set `CODEREX_MCP_SAMPLING=allow` to enable it. The value is matched
+case-insensitively; any other value (including `deny`) leaves sampling
+disabled and logs a warning. When enabled, CodeRex forwards the request to the
+session's own API client and model:
+
+- `maxTokens` is honoured only up to a ceiling: **4096** output tokens by
+  default. Raise or lower it with `CODEREX_MCP_SAMPLING_MAX_TOKENS` (a positive
+  integer; an invalid or zero value falls back to 4096).
+- A model named in `modelPreferences.hints` is used only when CodeRex knows it
+  (`opus`/`claude-opus-4-6`, `sonnet`/`claude-sonnet-4-6`,
+  `haiku`/`claude-haiku-4-5-20251001`). Any other hint is ignored and the
+  session's resolved model answers instead.
+- Only `text` content blocks are forwarded. A request whose messages are
+  empty, whose `maxTokens` is zero, or whose params do not parse is rejected
+  with `-32602` (invalid params); an unsupported content type or a provider
+  failure is returned as a JSON-RPC error, never a panic.
+
+The handler is installed by the REPL and one-shot runners after the session's
+API client exists. A headless run (`--print`, a piped prompt, or no terminal)
+keeps the deny default: with the opt-in absent, nothing is installed and
+sampling stays refused. With `CODEREX_MCP_SAMPLING=allow` a headless run uses
+the same clamped handler, because the environment variable is the explicit
+consent. Served sessions (`coderex serve`) install no sampling handler and
+therefore keep refusing.
 
 ### IDE tool whitelist
 

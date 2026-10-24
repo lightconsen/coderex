@@ -53,6 +53,22 @@ pub struct HookFireResult {
     /// The caller substitutes it for what the tool produced before the model
     /// sees the result.
     pub updated_tool_output: Option<String>,
+    /// UI elements a mod contributed during this hook call, in render order.
+    ///
+    /// The tree is a host-owned snapshot ([`UiElement`](crate::ui_protocol::UiElement)),
+    /// not a live JavaScript object. It is empty when no mod rendered anything,
+    /// and the engine emits no `ModUi` event for an empty tree.
+    pub ui: Vec<crate::ui_protocol::UiElement>,
+    /// User messages a mod queued with `$.session.submit(text)` during this
+    /// hook call, in submission order.
+    ///
+    /// The engine deliberately does not act on these: submitting one would
+    /// re-enter the engine while it is running a turn. A driver that owns the
+    /// turn loop (the CLI) drains them once the turn is idle and submits them
+    /// as ordinary user turns through the normal permission pipeline. A hook
+    /// call may contribute at most a small, fixed number; the runtime enforces
+    /// the caps and reports dropped calls separately.
+    pub pending_prompts: Vec<String>,
 }
 
 /// Abstract hook executor — implemented by `coderex-hooks::HookRegistry`.

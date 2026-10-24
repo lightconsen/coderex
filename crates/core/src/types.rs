@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use crate::ui_protocol::UiElement;
+
 /// Role of a message in the conversation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
@@ -848,6 +850,13 @@ pub enum EngineEvent {
         /// Notification message.
         message: String,
     },
+    /// A mod contributed a UI element tree during a hook call.
+    ///
+    /// Emitted only when the hook's aggregate result carried at least one
+    /// element. The tree is a host-owned snapshot ([`UiElement`]); the host
+    /// renders it without consulting the mod's runtime, so a slow or unloaded
+    /// mod cannot break rendering.
+    ModUi(Vec<UiElement>),
     /// A permission explanation was generated for a tool request.
     PermissionExplanation {
         /// Tool name.

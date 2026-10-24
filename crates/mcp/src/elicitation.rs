@@ -11,8 +11,287 @@ use std::sync::Arc;
 /// JSON-RPC's "invalid params" error code.
 pub const INVALID_PARAMS: i64 = -32602;
 
+/// JSON-RPC's "internal error" code.
+pub const INTERNAL_ERROR: i64 = -32603;
+
 /// The MCP method a server uses to ask the user a question.
 pub const ELICITATION_CREATE: &str = "elicitation/create";
+
+/// The MCP method a server uses to ask the client's model for text.
+pub const SAMPLING_CREATE: &str = "sampling/createMessage";
+
+/// The environment variable that opts a session into MCP sampling.
+///
+/// Sampling spends the person's tokens on a server's behalf, so it is denied
+/// unless this variable is exactly `allow`.
+pub const SAMPLING_OPT_IN_ENV: &str = "CODEREX_MCP_SAMPLING";
+
+/// The only value of [`SAMPLING_OPT_IN_ENV`] that enables sampling.
+pub const SAMPLING_OPT_IN_VALUE: &str = "allow";
+
+/// The error a client returns when sampling is not enabled.
+///
+/// The message names the opt-in so a server author can tell an unimplemented
+/// method apart from a deliberate refusal.
+#[must_use]
+pub fn sampling_disabled_error(method: &str) -> JsonRpcError {
+    JsonRpcError {
+        code: METHOD_NOT_FOUND,
+        message: format!(
+            "this client does not permit MCP sampling ('{method}'); set \
+             {SAMPLING_OPT_IN_ENV}={SAMPLING_OPT_IN_VALUE} to let a server spend the session's \
+             model tokens"
+        ),
+        data: None,
+    }
+}
+
+/// Who produced a sampling message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SamplingRole {
+    /// The server, or a person acting through it.
+    User,
+    /// The model.
+    Assistant,
+}
+
+impl SamplingRole {
+    /// The wire name of the role.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Assistant => "assistant",
+        }
+    }
+}
+
+/// One content block of a sampling message.
+///
+/// MCP allows text, image, and audio blocks. The fields are kept optional so a
+/// server that sends a content type this client does not forward still gets a
+/// clear error from the handler rather than a parse failure.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SamplingContent {
+    /// The MCP content type (`text`, `image`, or `audio`).
+    #[serde(rename = "type")]
+    pub kind: String,
+    /// The text, for a `text` block.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    /// Base64 data, for an image or audio block.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<String>,
+    /// MIME type of [`data`](Self::data), when present.
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "mimeType")]
+    pub mime_type: Option<String>,
+}
+
+impl SamplingContent {
+    /// Build a `text` content block.
+    #[must_use]
+    pub fn text(text: impl Into<String>) -> Self {
+        Self {
+            kind: "text".to_string(),
+            text: Some(text.into()),
+            data: None,
+            mime_type: None,
+        }
+    }
+
+    /// The text of a `text` block, or `None` for any other content type.
+    #[must_use]
+    pub fn as_text(&self) -> Option<&str> {
+        if self.kind == "text" {
+            self.text.as_deref()
+        } else {
+            None
+        }
+    }
+}
+
+/// One message in a sampling request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SamplingMessage {
+    /// Who produced the message.
+    pub role: SamplingRole,
+    /// The message content.
+    pub content: SamplingContent,
+}
+
+/// A model name the server suggests.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelHint {
+    /// The suggested model name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+/// The server's model preferences for a sampling request.
+///
+/// The hints are advisory: the client uses the first one that names a known
+/// model and otherwise answers with the session model.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ModelPreferences {
+    /// Suggested models, most preferred first.
+    #[serde(default)]
+    pub hints: Vec<ModelHint>,
+    /// How much the server cares about cost, from 0 to 1.
+    #[serde(default, rename = "costPriority")]
+    pub cost_priority: Option<f64>,
+    /// How much the server cares about speed, from 0 to 1.
+    #[serde(default, rename = "speedPriority")]
+    pub speed_priority: Option<f64>,
+    /// How much the server cares about model capability, from 0 to 1.
+    #[serde(default, rename = "intelligencePriority")]
+    pub intelligence_priority: Option<f64>,
+}
+
+/// Parameters of a `sampling/createMessage` request.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SamplingRequest {
+    /// The conversation the server wants continued.
+    #[serde(default)]
+    pub messages: Vec<SamplingMessage>,
+    /// The server's model preferences, when it expressed any.
+    #[serde(default, rename = "modelPreferences")]
+    pub model_preferences: Option<ModelPreferences>,
+    /// The most output tokens the server wants.
+    #[serde(rename = "maxTokens")]
+    pub max_tokens: u32,
+    /// A system prompt supplied by the server.
+    #[serde(default, rename = "systemPrompt")]
+    pub system_prompt: Option<String>,
+    /// Whether the server asked for other servers' context.
+    #[serde(default, rename = "includeContext")]
+    pub include_context: Option<String>,
+    /// Sampling temperature, when the server set one.
+    #[serde(default)]
+    pub temperature: Option<f64>,
+    /// Sequences that should stop generation.
+    #[serde(default, rename = "stopSequences")]
+    pub stop_sequences: Vec<String>,
+    /// Opaque metadata for the client.
+    #[serde(default)]
+    pub metadata: Option<Value>,
+}
+
+impl SamplingRequest {
+    /// Check the fields the protocol requires to be meaningful.
+    ///
+    /// A request with no messages or a zero token budget cannot be answered,
+    /// so it is refused as invalid params rather than passed to a handler.
+    fn validate(&self) -> Result<(), String> {
+        if self.messages.is_empty() {
+            return Err("'messages' must contain at least one message".to_string());
+        }
+        if self.max_tokens == 0 {
+            return Err("'maxTokens' must be greater than zero".to_string());
+        }
+        for (index, message) in self.messages.iter().enumerate() {
+            if message.content.kind.trim().is_empty() {
+                return Err(format!("message {index} has no content type"));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The client's answer to a `sampling/createMessage` request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SamplingResult {
+    /// Who produced the text. Always [`SamplingRole::Assistant`].
+    pub role: SamplingRole,
+    /// The generated text.
+    pub content: SamplingContent,
+    /// The model that generated it.
+    pub model: String,
+}
+
+/// Answers `sampling/createMessage` requests.
+///
+/// Installing one is an explicit decision: the default session has none, and
+/// its requests are refused. A handler can still fail a request — the error is
+/// returned to the server as a JSON-RPC error.
+#[async_trait::async_trait]
+pub trait SamplingHandler: Send + Sync + std::fmt::Debug {
+    /// Generate text for `request`, or say why it cannot.
+    async fn sample(&self, request: &SamplingRequest) -> Result<SamplingResult, JsonRpcError>;
+}
+
+/// Routes `sampling/createMessage` to a handler while leaving every other
+/// method to the session's existing handler.
+///
+/// This is installed on the MCP manager when sampling is enabled. Without a
+/// sampling handler, sampling is refused with a message that names the opt-in;
+/// when no other handler is installed, every other method is refused too.
+#[derive(Debug, Clone, Default)]
+pub struct McpRequestRouter {
+    sampling: Option<Arc<dyn SamplingHandler>>,
+    other: Option<Arc<dyn InboundRequestHandler>>,
+}
+
+impl McpRequestRouter {
+    /// Build a router.
+    #[must_use]
+    pub const fn new(
+        sampling: Option<Arc<dyn SamplingHandler>>,
+        other: Option<Arc<dyn InboundRequestHandler>>,
+    ) -> Self {
+        Self { sampling, other }
+    }
+
+    /// Route a sampling request.
+    async fn handle_sampling(&self, params: Option<&Value>) -> Result<Value, JsonRpcError> {
+        let request = parse_sampling_request(params)?;
+        let Some(handler) = &self.sampling else {
+            return Err(sampling_disabled_error(SAMPLING_CREATE));
+        };
+
+        let result = handler.sample(&request).await?;
+        serde_json::to_value(result).map_err(|error| JsonRpcError {
+            code: INTERNAL_ERROR,
+            message: format!("could not serialize the sampling answer: {error}"),
+            data: None,
+        })
+    }
+}
+
+/// Parse and validate the params of a `sampling/createMessage` request.
+fn parse_sampling_request(params: Option<&Value>) -> Result<SamplingRequest, JsonRpcError> {
+    let value = params.cloned().unwrap_or(Value::Null);
+    let request: SamplingRequest = serde_json::from_value(value).map_err(|error| JsonRpcError {
+        code: INVALID_PARAMS,
+        message: format!("invalid sampling/createMessage params: {error}"),
+        data: None,
+    })?;
+    request.validate().map_err(|error| JsonRpcError {
+        code: INVALID_PARAMS,
+        message: format!("invalid sampling/createMessage params: {error}"),
+        data: None,
+    })?;
+    Ok(request)
+}
+
+#[async_trait::async_trait]
+impl InboundRequestHandler for McpRequestRouter {
+    async fn handle(&self, method: &str, params: Option<&Value>) -> Result<Value, JsonRpcError> {
+        if method == SAMPLING_CREATE {
+            return self.handle_sampling(params).await;
+        }
+        match &self.other {
+            Some(handler) => handler.handle(method, params).await,
+            None => Err(JsonRpcError {
+                code: METHOD_NOT_FOUND,
+                message: format!(
+                    "this client has no handler for '{method}'; nothing here can answer it"
+                ),
+                data: None,
+            }),
+        }
+    }
+}
 
 /// An elicitation request from an MCP server.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -808,6 +1087,9 @@ fn finish(spec: &FormSpec, content: &mut Map<String, Value>) -> McpElicitationRe
 #[async_trait::async_trait]
 impl InboundRequestHandler for McpElicitationHandler {
     async fn handle(&self, method: &str, params: Option<&Value>) -> Result<Value, JsonRpcError> {
+        if method == SAMPLING_CREATE {
+            return Err(sampling_disabled_error(method));
+        }
         if method != ELICITATION_CREATE {
             return Err(JsonRpcError {
                 code: METHOD_NOT_FOUND,
@@ -1501,5 +1783,119 @@ mod tests {
         )
         .await;
         assert_eq!(one_of["action"], "decline");
+    }
+
+    #[derive(Debug)]
+    struct FixedSampling;
+
+    #[async_trait::async_trait]
+    impl SamplingHandler for FixedSampling {
+        async fn sample(&self, request: &SamplingRequest) -> Result<SamplingResult, JsonRpcError> {
+            assert_eq!(request.max_tokens, 32);
+            assert_eq!(request.system_prompt.as_deref(), Some("be brief"));
+            assert_eq!(
+                request
+                    .model_preferences
+                    .as_ref()
+                    .and_then(|preferences| preferences.hints.first())
+                    .and_then(|hint| hint.name.as_deref()),
+                Some("sonnet")
+            );
+            assert_eq!(request.messages.len(), 1);
+            assert_eq!(request.messages[0].content.as_text(), Some("hello"));
+            Ok(SamplingResult {
+                role: SamplingRole::Assistant,
+                content: SamplingContent::text("a sampled answer"),
+                model: "test-model".into(),
+            })
+        }
+    }
+
+    #[derive(Debug)]
+    struct EchoHandler;
+
+    #[async_trait::async_trait]
+    impl InboundRequestHandler for EchoHandler {
+        async fn handle(
+            &self,
+            method: &str,
+            _params: Option<&Value>,
+        ) -> Result<Value, JsonRpcError> {
+            Ok(serde_json::json!({"handled": method}))
+        }
+    }
+
+    fn sampling_params() -> Value {
+        serde_json::json!({
+            "messages": [{"role": "user", "content": {"type": "text", "text": "hello"}}],
+            "maxTokens": 32,
+            "systemPrompt": "be brief",
+            "modelPreferences": {"hints": [{"name": "sonnet"}]}
+        })
+    }
+
+    #[tokio::test]
+    async fn sampling_is_routed_to_an_installed_handler() {
+        let router = McpRequestRouter::new(Some(Arc::new(FixedSampling)), None);
+        let result = router
+            .handle(SAMPLING_CREATE, Some(&sampling_params()))
+            .await
+            .expect("the installed handler answers");
+
+        assert_eq!(result["role"], "assistant");
+        assert_eq!(result["content"]["type"], "text");
+        assert_eq!(result["content"]["text"], "a sampled answer");
+        assert_eq!(result["model"], "test-model");
+    }
+
+    #[tokio::test]
+    async fn sampling_without_a_handler_names_the_opt_in() {
+        let router = McpRequestRouter::new(None, None);
+        let error = router
+            .handle(SAMPLING_CREATE, Some(&sampling_params()))
+            .await
+            .expect_err("sampling is refused without a handler");
+
+        assert_eq!(error.code, METHOD_NOT_FOUND);
+        assert!(
+            error.message.contains("CODEREX_MCP_SAMPLING=allow"),
+            "the refusal must name the opt-in: {}",
+            error.message
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_sampling_params_are_invalid_params() {
+        let router = McpRequestRouter::new(Some(Arc::new(FixedSampling)), None);
+
+        for params in [
+            // `maxTokens` is required.
+            serde_json::json!({
+                "messages": [{"role": "user", "content": {"type": "text", "text": "hello"}}]
+            }),
+            // A zero budget cannot be answered.
+            serde_json::json!({"messages": [], "maxTokens": 0}),
+            // The conversation cannot be empty.
+            serde_json::json!({"messages": [], "maxTokens": 32}),
+            // Wrong types are malformed, not a handler decision.
+            serde_json::json!({"messages": "hello", "maxTokens": 32}),
+        ] {
+            let error = router
+                .handle(SAMPLING_CREATE, Some(&params))
+                .await
+                .expect_err("malformed params are refused");
+            assert_eq!(error.code, INVALID_PARAMS, "params: {params}");
+        }
+    }
+
+    #[tokio::test]
+    async fn other_methods_still_reach_the_existing_handler() {
+        let router =
+            McpRequestRouter::new(Some(Arc::new(FixedSampling)), Some(Arc::new(EchoHandler)));
+        let result = router
+            .handle(ELICITATION_CREATE, None)
+            .await
+            .expect("the wrapped handler answers");
+        assert_eq!(result["handled"], ELICITATION_CREATE);
     }
 }

@@ -15,6 +15,10 @@ export_env.*.sh
 # Local configuration and generated docs
 .coderex/
 .claude/settings.json
+# Local working checklists (diff.local.md, 11.local.md, ...). They are not part
+# of the project and may hold internal notes; the developer's global ignore is
+# not enough once the repository is shared or published.
+*.local.md
 
 # Agent and session worktrees
 .claude/worktrees/

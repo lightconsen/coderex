@@ -1,21 +1,56 @@
 //! Terminal UI rendering via ratatui.
 
 use crate::message_list::{Message, MessageRole};
+use crate::mod_elements::{ButtonHit, render_mod_ui_with_focus_and_hits};
 use crate::state::UiState;
 use crate::statusline::Statusline;
 use crate::terminal_profile::TerminalProfile;
 use crate::themes::Theme;
+use coderex_core::ui_protocol::UiElement;
 use crossterm::event::{PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags};
 use crossterm::queue;
 use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::Frame;
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Alignment, Constraint, Direction, Layout};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use std::io::Stdout;
 use std::sync::OnceLock;
+
+/// A mod UI block the interactive loop wants drawn and tracked for clicks.
+///
+/// The transcript stores a block as rendered text, but hit testing needs the
+/// live tree: the same tree renders the block at the message pane's width so
+/// the button positions match the screen exactly.
+#[derive(Debug, Clone)]
+pub struct ModUiBlockSpec {
+    /// Index of the message that holds this block.
+    pub message_index: usize,
+    /// The content the block was last rendered as. A mismatch means the index
+    /// no longer points at this block (after `/clear`, rewind or resume), so
+    /// the spec is ignored rather than drawing over an unrelated message.
+    pub content: String,
+    /// The host-owned UI tree snapshot.
+    pub elements: Vec<UiElement>,
+    /// The button that currently has keyboard focus, if any.
+    pub focused: Option<String>,
+}
+
+/// Where a mod UI block landed in the last drawn frame.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModUiHitRegion {
+    /// Index of the message the block was rendered from.
+    pub message_index: usize,
+    /// Absolute screen rect of the visible part of the block. `x` is the
+    /// block's first rendered column and `y` its first visible row.
+    pub rect: Rect,
+    /// Number of block rows clipped above `rect.y`.
+    pub scroll_offset: usize,
+    /// Button positions relative to the block's rendered lines.
+    pub hits: Vec<ButtonHit>,
+}
 
 /// Lazy-initialized syntax highlighter for the TUI.
 fn syntax_highlighter() -> &'static coderex_core::syntax::SyntaxHighlighter {
@@ -58,6 +93,7 @@ pub struct TerminalUi {
     alternate: bool,
     profile: TerminalProfile,
     keyboard_pushed: bool,
+    mod_ui_hit_regions: Vec<ModUiHitRegion>,
 }
 
 impl TerminalUi {
@@ -73,6 +109,7 @@ impl TerminalUi {
             alternate: false,
             profile: TerminalProfile::from_env(),
             keyboard_pushed: false,
+            mod_ui_hit_regions: Vec::new(),
         })
     }
 
@@ -111,8 +148,31 @@ impl TerminalUi {
 
     /// Draw a single frame.
     pub fn draw(&mut self, state: &mut UiState) -> std::io::Result<()> {
-        self.terminal.draw(|frame| render_frame(frame, state))?;
+        self.draw_with_mod_ui(state, &[])
+    }
+
+    /// Draw a frame, rendering interactive mod UI blocks from their live trees.
+    ///
+    /// The hit regions recorded here describe the frame that was just drawn, so
+    /// a caller that handles a mouse event before the next draw maps the click
+    /// against the screen the user actually saw.
+    pub fn draw_with_mod_ui(
+        &mut self,
+        state: &mut UiState,
+        mod_ui_blocks: &[ModUiBlockSpec],
+    ) -> std::io::Result<()> {
+        let mut mod_ui_hit_regions = Vec::new();
+        self.terminal.draw(|frame| {
+            render_frame(frame, state, mod_ui_blocks, &mut mod_ui_hit_regions);
+        })?;
+        self.mod_ui_hit_regions = mod_ui_hit_regions;
         Ok(())
+    }
+
+    /// The mod UI hit regions from the last successfully drawn frame.
+    #[must_use]
+    pub fn mod_ui_hit_regions(&self) -> &[ModUiHitRegion] {
+        &self.mod_ui_hit_regions
     }
 }
 
@@ -206,7 +266,12 @@ fn input_display_height(input: &crate::input::InputBuffer, pane_width: u16) -> u
 /// Separate from `draw` so a `TestBackend` can drive it: the pane indices
 /// below are the single place where layout order is decided, and getting one
 /// wrong makes a pane render into the wrong rect without any error.
-fn render_frame(frame: &mut Frame, state: &mut UiState) {
+fn render_frame(
+    frame: &mut Frame,
+    state: &mut UiState,
+    mod_ui_blocks: &[ModUiBlockSpec],
+    mod_ui_hit_regions: &mut Vec<ModUiHitRegion>,
+) {
     let area = frame.area();
     let is_compact = state.force_compact || area.height < 20;
 
@@ -259,9 +324,15 @@ fn render_frame(frame: &mut Frame, state: &mut UiState) {
         // Left pane: file/content viewer
         render_left_pane(frame, split_chunks[0], state);
         // Right pane: messages
-        render_messages(frame, split_chunks[1], state);
+        render_messages(
+            frame,
+            split_chunks[1],
+            state,
+            mod_ui_blocks,
+            mod_ui_hit_regions,
+        );
     } else {
-        render_messages(frame, msg_area, state);
+        render_messages(frame, msg_area, state, mod_ui_blocks, mod_ui_hit_regions);
     }
 
     // Inline palette (index 1)
@@ -510,7 +581,13 @@ fn highlight_spans(text: &str, base_style: Style) -> Vec<Span<'_>> {
     spans
 }
 
-fn render_messages(frame: &mut Frame, area: ratatui::layout::Rect, state: &mut UiState) {
+fn render_messages(
+    frame: &mut Frame,
+    area: Rect,
+    state: &mut UiState,
+    mod_ui_blocks: &[ModUiBlockSpec],
+    mod_ui_hit_regions: &mut Vec<ModUiHitRegion>,
+) {
     let width = area.width as usize;
     let viewport_height = area.height as usize;
     let is_compact = area.height < 10;
@@ -520,13 +597,24 @@ fn render_messages(frame: &mut Frame, area: ratatui::layout::Rect, state: &mut U
     state.notifications.cleanup();
 
     if state.messages.scroll_offset > 0 {
-        let signature = message_render_signature(&state.messages.messages, &state.theme);
-        let cache_valid = state.messages.render_cache.width == width
+        let signature =
+            message_render_signature(&state.messages.messages, &state.theme, mod_ui_blocks);
+        // A tracked block needs the render spans that the cache does not keep,
+        // so only reuse the cache when there is no block to hit-test.
+        let cache_valid = mod_ui_blocks.is_empty()
+            && state.messages.render_cache.width == width
             && state.messages.render_cache.is_compact == is_compact
             && state.messages.render_cache.signature == signature;
-        if !cache_valid {
-            let mut lines =
-                render_all_message_lines(&state.messages.messages, width, is_compact, &state.theme);
+        let block_spans = if cache_valid {
+            Vec::new()
+        } else {
+            let (mut lines, spans) = render_all_message_lines(
+                &state.messages.messages,
+                width,
+                is_compact,
+                &state.theme,
+                mod_ui_blocks,
+            );
             if lines.is_empty() {
                 lines.extend(render_welcome_art(&state.theme));
             }
@@ -534,7 +622,8 @@ fn render_messages(frame: &mut Frame, area: ratatui::layout::Rect, state: &mut U
             state.messages.render_cache.is_compact = is_compact;
             state.messages.render_cache.signature = signature;
             state.messages.render_cache.lines = lines;
-        }
+            spans
+        };
         state.messages.total_height = state.messages.render_cache.lines.len();
         let max_scroll = state
             .messages
@@ -543,11 +632,13 @@ fn render_messages(frame: &mut Frame, area: ratatui::layout::Rect, state: &mut U
             .len()
             .saturating_sub(viewport_height);
         state.messages.scroll_offset = state.messages.scroll_offset.min(max_scroll);
-        let lines = slice_lines_to_viewport_with_scroll(
-            &state.messages.render_cache.lines,
+        let (start, end) = scroll_slice_bounds(
+            state.messages.render_cache.lines.len(),
             viewport_height,
             state.messages.scroll_offset,
         );
+        let lines = state.messages.render_cache.lines[start..end].to_vec();
+        record_mod_ui_regions(area, &block_spans, start, end - start, mod_ui_hit_regions);
         let paragraph = Paragraph::new(lines).block(Block::default().borders(Borders::NONE));
         frame.render_widget(paragraph, area);
         return;
@@ -557,11 +648,17 @@ fn render_messages(frame: &mut Frame, area: ratatui::layout::Rect, state: &mut U
     // path above slices cached rendered lines directly, keeping wheel/PageUp
     // redraws independent of transcript size.
     let mut heights: Vec<usize> = Vec::with_capacity(state.messages.messages.len());
-    for msg in &state.messages.messages {
+    for (index, msg) in state.messages.messages.iter().enumerate() {
         if msg.folded {
             heights.push(1);
         } else {
-            heights.push(message_display_height(msg, width));
+            heights.push(message_render_height(
+                msg,
+                index,
+                width,
+                is_compact,
+                mod_ui_blocks,
+            ));
         }
     }
 
@@ -591,9 +688,21 @@ fn render_messages(frame: &mut Frame, area: ratatui::layout::Rect, state: &mut U
     state.messages.set_visible_count(visible_count);
     let visible = state.messages.visible();
     let mut lines: Vec<Line> = Vec::new();
+    let mut block_spans = Vec::new();
 
-    for msg in visible {
-        append_message_lines(&mut lines, msg, width, is_compact, &state.theme);
+    for (offset, msg) in visible.iter().enumerate() {
+        let index = state.messages.start + offset;
+        if let Some(span) = append_message_lines(
+            &mut lines,
+            msg,
+            index,
+            width,
+            is_compact,
+            &state.theme,
+            mod_ui_blocks,
+        ) {
+            block_spans.push(span);
+        }
     }
 
     // If no messages, show dynamic welcome art
@@ -602,10 +711,104 @@ fn render_messages(frame: &mut Frame, area: ratatui::layout::Rect, state: &mut U
     }
 
     state.messages.total_height = lines.len();
+    let untrimmed_len = lines.len();
     lines = trim_lines_to_viewport(lines, viewport_height);
+    let trimmed = untrimmed_len.saturating_sub(lines.len());
+    record_mod_ui_regions(area, &block_spans, trimmed, lines.len(), mod_ui_hit_regions);
 
     let paragraph = Paragraph::new(lines).block(Block::default().borders(Borders::NONE));
     frame.render_widget(paragraph, area);
+}
+
+/// The height of one message in the transcript.
+///
+/// A live mod UI block is measured from the same tree rendering used to draw
+/// it, so the layout window and the drawn rows cannot disagree.
+fn message_render_height(
+    msg: &Message,
+    index: usize,
+    width: usize,
+    is_compact: bool,
+    mod_ui_blocks: &[ModUiBlockSpec],
+) -> usize {
+    if !is_compact {
+        if let Some(spec) = matching_mod_ui_block(msg, index, mod_ui_blocks) {
+            let prefix_width = unicode_width::UnicodeWidthStr::width(message_prefix(msg.role));
+            let wrap_width = width.saturating_sub(prefix_width);
+            if let Some((lines, _)) = mod_ui_block_lines(spec, wrap_width) {
+                return lines.len();
+            }
+        }
+    }
+    message_display_height(msg, width)
+}
+
+fn matching_mod_ui_block<'a>(
+    msg: &Message,
+    index: usize,
+    blocks: &'a [ModUiBlockSpec],
+) -> Option<&'a ModUiBlockSpec> {
+    if msg.role != MessageRole::System {
+        return None;
+    }
+    blocks.iter().find(|block| {
+        block.message_index == index && block.content.as_str() == msg.content.as_str()
+    })
+}
+
+fn mod_ui_block_lines(
+    spec: &ModUiBlockSpec,
+    wrap_width: usize,
+) -> Option<(Vec<Line<'static>>, Vec<ButtonHit>)> {
+    let (lines, hits) = render_mod_ui_with_focus_and_hits(
+        &spec.elements,
+        wrap_width.max(1),
+        spec.focused.as_deref(),
+    );
+    (!lines.is_empty()).then_some((lines, hits))
+}
+
+/// A mod UI block rendered into the transcript, with its place in the line list.
+#[derive(Debug)]
+struct ModUiBlockSpan {
+    message_index: usize,
+    start: usize,
+    end: usize,
+    prefix_width: u16,
+    hits: Vec<ButtonHit>,
+}
+
+/// Translate rendered block spans into absolute screen hit regions.
+///
+/// `visible_start` is the index of the first line actually painted and
+/// `visible_len` how many lines follow it; a block can begin above the pane.
+fn record_mod_ui_regions(
+    area: Rect,
+    spans: &[ModUiBlockSpan],
+    visible_start: usize,
+    visible_len: usize,
+    regions: &mut Vec<ModUiHitRegion>,
+) {
+    let visible_end = visible_start.saturating_add(visible_len);
+    for span in spans {
+        let start = span.start.max(visible_start);
+        let end = span.end.min(visible_end);
+        if start >= end {
+            continue;
+        }
+        regions.push(ModUiHitRegion {
+            message_index: span.message_index,
+            rect: Rect::new(
+                area.x.saturating_add(span.prefix_width),
+                area.y
+                    .saturating_add(u16::try_from(start - visible_start).unwrap_or(u16::MAX)),
+                area.width.saturating_sub(span.prefix_width),
+                u16::try_from(end - start).unwrap_or(u16::MAX),
+            ),
+            scroll_offset: start - span.start,
+            hits: span.hits.clone(),
+        });
+    }
 }
 
 fn visible_message_window(
@@ -668,15 +871,31 @@ fn render_all_message_lines(
     width: usize,
     is_compact: bool,
     theme: &Theme,
-) -> Vec<Line<'static>> {
+    mod_ui_blocks: &[ModUiBlockSpec],
+) -> (Vec<Line<'static>>, Vec<ModUiBlockSpan>) {
     let mut lines = Vec::new();
-    for msg in messages {
-        append_message_lines(&mut lines, msg, width, is_compact, theme);
+    let mut block_spans = Vec::new();
+    for (index, msg) in messages.iter().enumerate() {
+        if let Some(span) = append_message_lines(
+            &mut lines,
+            msg,
+            index,
+            width,
+            is_compact,
+            theme,
+            mod_ui_blocks,
+        ) {
+            block_spans.push(span);
+        }
     }
-    lines
+    (lines, block_spans)
 }
 
-fn message_render_signature(messages: &[Message], theme: &Theme) -> u64 {
+fn message_render_signature(
+    messages: &[Message],
+    theme: &Theme,
+    mod_ui_blocks: &[ModUiBlockSpec],
+) -> u64 {
     let mut signature = (messages.len() as u64) ^ theme.render_signature();
     for (idx, msg) in messages.iter().enumerate() {
         signature = signature
@@ -692,16 +911,58 @@ fn message_render_signature(messages: &[Message], theme: &Theme) -> u64 {
                 .wrapping_add(tool.len() as u64);
         }
     }
+    // Focus and the tree itself are inputs to the block render, so a cache
+    // built under different ones must not be reused.
+    for block in mod_ui_blocks {
+        signature = signature
+            .wrapping_mul(16_777_619)
+            .wrapping_add(block.message_index as u64);
+        mix_text(&mut signature, &block.content);
+        if let Some(focused) = &block.focused {
+            mix_text(&mut signature, focused);
+        }
+        signature = mix_elements(signature, &block.elements);
+    }
+    signature
+}
+
+fn mix_text(signature: &mut u64, text: &str) {
+    for byte in text.bytes() {
+        *signature = signature
+            .wrapping_mul(16_777_619)
+            .wrapping_add(u64::from(byte));
+    }
+}
+
+fn mix_elements(mut signature: u64, elements: &[UiElement]) -> u64 {
+    for element in elements {
+        signature = signature.wrapping_mul(16_777_619);
+        match element {
+            UiElement::Text { text, .. } => mix_text(&mut signature, text),
+            UiElement::Button { label, id } => {
+                mix_text(&mut signature, label);
+                mix_text(&mut signature, id);
+            }
+            UiElement::Box { title, children } => {
+                if let Some(title) = title {
+                    mix_text(&mut signature, title);
+                }
+                signature = mix_elements(signature, children);
+            }
+        }
+    }
     signature
 }
 
 fn append_message_lines(
     lines: &mut Vec<Line<'static>>,
     msg: &Message,
+    index: usize,
     width: usize,
     is_compact: bool,
     theme: &Theme,
-) {
+    mod_ui_blocks: &[ModUiBlockSpec],
+) -> Option<ModUiBlockSpan> {
     if !is_compact
         && !lines.is_empty()
         && matches!(msg.role, MessageRole::User | MessageRole::Assistant)
@@ -724,7 +985,7 @@ fn append_message_lines(
             message_display_height(msg, width).saturating_sub(1)
         );
         lines.push(Line::from(Span::styled(fold_indicator, style)));
-        return;
+        return None;
     }
 
     let prefix = message_prefix(msg.role);
@@ -752,7 +1013,36 @@ fn append_message_lines(
             Span::styled(prefix, style),
             Span::styled(truncated, style.add_modifier(Modifier::DIM)),
         ]));
-        return;
+        return None;
+    }
+
+    // A live mod UI block is re-rendered from its tree at the pane's actual
+    // width. That keeps the drawn button columns identical to the hit columns
+    // even when the stored text was rendered at a different width.
+    if !is_compact {
+        if let Some(spec) = matching_mod_ui_block(msg, index, mod_ui_blocks) {
+            if let Some((block_lines, hits)) = mod_ui_block_lines(spec, wrap_width) {
+                let start = lines.len();
+                for (row, line) in block_lines.into_iter().enumerate() {
+                    let gutter = if row == 0 {
+                        prefix.to_string()
+                    } else {
+                        " ".repeat(prefix_width)
+                    };
+                    let mut spans = Vec::with_capacity(line.spans.len() + 1);
+                    spans.push(Span::styled(gutter, style));
+                    spans.extend(line.spans);
+                    lines.push(Line::from(spans));
+                }
+                return Some(ModUiBlockSpan {
+                    message_index: index,
+                    start,
+                    end: lines.len(),
+                    prefix_width: u16::try_from(prefix_width).unwrap_or(u16::MAX),
+                    hits,
+                });
+            }
+        }
     }
 
     // Use syntax highlighting for assistant messages that contain code blocks.
@@ -847,6 +1137,7 @@ fn append_message_lines(
             Style::default().fg(theme.dim),
         )));
     }
+    None
 }
 
 fn trim_lines_to_viewport(mut lines: Vec<Line>, viewport_height: usize) -> Vec<Line> {
@@ -856,21 +1147,18 @@ fn trim_lines_to_viewport(mut lines: Vec<Line>, viewport_height: usize) -> Vec<L
     lines.split_off(lines.len() - viewport_height)
 }
 
-fn slice_lines_to_viewport_with_scroll(
-    lines: &[Line<'static>],
-    viewport_height: usize,
-    scroll_offset: usize,
-) -> Vec<Line<'static>> {
-    if viewport_height == 0 || lines.len() <= viewport_height {
-        return lines.to_vec();
+/// The half-open line range shown by the scrollback viewport.
+fn scroll_slice_bounds(len: usize, viewport_height: usize, scroll_offset: usize) -> (usize, usize) {
+    if viewport_height == 0 || len <= viewport_height {
+        return (0, len);
     }
 
-    let end = lines
-        .len()
+    let end = len
         .saturating_sub(scroll_offset)
-        .max(viewport_height);
+        .max(viewport_height)
+        .min(len);
     let start = end.saturating_sub(viewport_height);
-    lines[start..end.min(lines.len())].to_vec()
+    (start, end)
 }
 
 /// Dynamic welcome art — cycles between T-Rex ASCII, tips, and hints.
@@ -1381,11 +1669,11 @@ mod tests {
             Line::from("line 4"),
             Line::from("line 5"),
         ];
-        let trimmed = slice_lines_to_viewport_with_scroll(&lines, 2, 2);
+        let (start, end) = scroll_slice_bounds(lines.len(), 2, 2);
 
-        assert_eq!(trimmed.len(), 2);
-        assert_eq!(trimmed[0].to_string(), "line 2");
-        assert_eq!(trimmed[1].to_string(), "line 3");
+        assert_eq!((start, end), (1, 3));
+        assert_eq!(lines[start].to_string(), "line 2");
+        assert_eq!(lines[start + 1].to_string(), "line 3");
     }
 
     #[test]
@@ -1408,7 +1696,7 @@ mod tests {
         ];
 
         let theme = Theme::dark();
-        let lines = render_all_message_lines(&messages, 80, false, &theme);
+        let (lines, _) = render_all_message_lines(&messages, 80, false, &theme, &[]);
 
         assert_eq!(lines[0].to_string(), "● hello");
         assert_eq!(lines[1].to_string(), "");
@@ -1471,7 +1759,7 @@ mod layout_tests {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).expect("test terminal");
         terminal
-            .draw(|frame| render_frame(frame, state))
+            .draw(|frame| render_frame(frame, state, &[], &mut Vec::new()))
             .expect("draw frame");
         terminal.backend().buffer().clone()
     }
@@ -1681,5 +1969,86 @@ mod layout_tests {
         let input_y = chunks_for(12, 0, false, false, 1, false)[INPUT_IDX].y;
         let row = row_text(&buffer, input_y);
         assert!(row.contains("❯ hello world"), "{row:?}");
+    }
+
+    /// The transcript records where a mod UI button actually landed, including
+    /// the system-message prefix and the box's border/padding columns.
+    #[test]
+    fn a_mod_ui_block_records_absolute_button_hits() {
+        use coderex_core::ui_protocol::UiElement;
+
+        let elements = vec![UiElement::Box {
+            title: None,
+            children: vec![UiElement::Button {
+                label: "Run".to_string(),
+                id: "run".to_string(),
+            }],
+        }];
+        let content = crate::mod_elements::render_mod_ui_text(&elements, 80);
+        let spec = ModUiBlockSpec {
+            message_index: 0,
+            content: content.clone(),
+            elements,
+            focused: None,
+        };
+        let mut state = UiState::default();
+        state.messages.push(Message {
+            role: MessageRole::System,
+            content: content.into(),
+            tool_name: None,
+            streaming: false,
+            folded: false,
+        });
+
+        let backend = TestBackend::new(40, 20);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let mut regions = Vec::new();
+        terminal
+            .draw(|frame| render_frame(frame, &mut state, &[spec], &mut regions))
+            .expect("draw frame");
+
+        assert_eq!(regions.len(), 1, "one interactive block");
+        let region = &regions[0];
+        assert_eq!(region.message_index, 0);
+        assert_eq!(region.scroll_offset, 0);
+        // The message area starts at the top; the "· " system prefix moves the
+        // block two columns right.
+        assert_eq!(region.rect.y, 0);
+        assert_eq!(region.rect.x, 2);
+        assert_eq!(region.rect.height, 3);
+        assert_eq!(region.hits.len(), 1);
+        let hit = &region.hits[0];
+        assert_eq!(hit.row, 1, "inside the box");
+        assert_eq!(hit.col_start, 2, "after the box's left border and padding");
+        assert_eq!(hit.col_end, 7, "[Run]");
+
+        let screen_col = region.rect.x + hit.col_start;
+        let screen_row = region.rect.y + hit.row;
+        // The recorded column is where the button was actually painted.
+        let painted = row_text(terminal.backend().buffer(), screen_row);
+        assert_eq!(
+            painted.chars().nth(usize::from(screen_col)),
+            Some('['),
+            "hit column does not match the drawn row: {painted:?}"
+        );
+        assert_eq!(
+            crate::mod_elements::button_at(
+                region.rect,
+                region.scroll_offset,
+                screen_col,
+                screen_row,
+                &region.hits,
+            ),
+            Some("run")
+        );
+        // The border column and the system prefix are not buttons.
+        assert_eq!(
+            crate::mod_elements::button_at(region.rect, 0, region.rect.x, screen_row, &region.hits,),
+            None
+        );
+        assert_eq!(
+            crate::mod_elements::button_at(region.rect, 0, 0, screen_row, &region.hits),
+            None
+        );
     }
 }

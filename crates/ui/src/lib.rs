@@ -5,6 +5,7 @@
 pub mod export;
 pub mod input;
 pub mod message_list;
+pub mod mod_elements;
 pub mod notification_center;
 pub mod overlay;
 pub mod permission_bar;

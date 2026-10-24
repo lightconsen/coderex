@@ -18,6 +18,7 @@ mod grep_tool;
 mod list_dir_tool;
 mod lsp_tool;
 mod mcp_auth_tool;
+mod mcp_prompt_tools;
 mod mcp_resource_tools;
 mod notebook_edit_tool;
 mod powershell_tool;
@@ -68,6 +69,7 @@ pub use mcp_auth_tool::{
     McpAuthTool, cache_discovery_at, default_token_path, persist_token_at,
     persist_token_with_endpoints_at,
 };
+pub use mcp_prompt_tools::{GetMcpPromptTool, ListMcpPromptsTool};
 pub use mcp_resource_tools::{ListMcpResourcesTool, ReadMcpResourceTool};
 pub use notebook_edit_tool::NotebookEditTool;
 pub use powershell_tool::PowerShellTool;
@@ -238,8 +240,8 @@ pub fn register_shell_tool(reg: &mut crate::registry::ToolRegistry) {
 
 /// Register all built-in tools into the given registry.
 ///
-/// This registers 44 baseline tools plus 6 feature-gated tools — the 5 Chrome
-/// DevTools tools and `WebFetch` — for 50 registrations in total. The platform
+/// This registers 46 baseline tools plus 6 feature-gated tools — the 5 Chrome
+/// DevTools tools and `WebFetch` — for 52 registrations in total. The platform
 /// registers one shell tool, so `Bash` and `PowerShell` are alternatives rather
 /// than two slots. No stub tools are registered: every tool here is one the
 /// model can actually use.
@@ -290,6 +292,8 @@ pub fn register_builtin_tools(reg: &mut crate::registry::ToolRegistry) {
     reg.register(Arc::new(ExitWorktreeTool));
     reg.register(Arc::new(ListMcpResourcesTool));
     reg.register(Arc::new(ReadMcpResourceTool));
+    reg.register(Arc::new(ListMcpPromptsTool));
+    reg.register(Arc::new(GetMcpPromptTool));
     reg.register(Arc::new(EchoTool));
     reg.register(Arc::new(NoOpTool));
 
@@ -614,8 +618,8 @@ mod tests {
         );
     }
 
-    /// The registry carries 44 baseline tools and 6 feature-gated tools — the
-    /// 5 Chrome DevTools tools and `WebFetch` (50 in total). Nothing is
+    /// The registry carries 46 baseline tools and 6 feature-gated tools — the
+    /// 5 Chrome DevTools tools and `WebFetch` (52 in total). Nothing is
     /// registered that the model cannot use: the former feature-gated stubs
     /// are gone, and every descriptor is enabled.
     #[test]
@@ -624,13 +628,13 @@ mod tests {
         register_builtin_tools(&mut registry);
         let descriptors = registry.all_descriptors();
 
-        assert_eq!(descriptors.len(), 50, "unexpected registration count");
+        assert_eq!(descriptors.len(), 52, "unexpected registration count");
         assert_eq!(
             descriptors
                 .iter()
                 .filter(|d| matches!(d.tier, ToolTier::Baseline))
                 .count(),
-            44,
+            46,
             "unexpected baseline tool count"
         );
         assert_eq!(

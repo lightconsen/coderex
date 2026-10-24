@@ -10,6 +10,7 @@ members = [
     "crates/hooks",
     "crates/memory",
     "crates/mcp",
+    "crates/mods",
     "crates/plugins",
     "crates/bridge",
     "crates/server",
@@ -35,6 +36,11 @@ futures-util = "0.3"
 async-trait = "0.1"
 pin-project = "1"
 async-stream = "0.3"
+
+# JavaScript engines — `boa_engine` for in-process workflow scripts and
+# `rquickjs` for extension hooks (it exposes heap, stack and interrupt limits).
+boa_engine = "0.20"
+rquickjs = "0.14"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -229,6 +235,6 @@ create-release = true
 
 [workspace.package]
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.87"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/coderex/coderex"
