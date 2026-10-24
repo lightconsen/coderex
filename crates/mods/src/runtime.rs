@@ -12,6 +12,12 @@
 //! interrupt handler that runs periodically while JavaScript executes. The
 //! handler is driven by a per-request deadline, so a runaway hook is stopped
 //! at the wall-clock budget instead of being left to run.
+//!
+//! The configured hooks that `next(e)` runs are native work. They may block
+//! their thread inside a single poll, which neither the interrupt handler nor
+//! a timer on this thread can stop, so they run on a separate runner thread
+//! (see `DownstreamPool`) and the worker waits for them under the same
+//! deadline.
 
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -459,6 +465,12 @@ pub struct ModRuntime {
     /// turn loop. The engine never reads it.
     submissions: ModSubmitQueue,
     config: Arc<WorkerConfig>,
+    /// Threads that run the configured hooks reached through `next()`.
+    ///
+    /// Shared with the worker so a downstream run happens off the thread that
+    /// owns QuickJS, and kept here so the callback path can still run the hooks
+    /// after the worker has been shut down.
+    downstream: Arc<DownstreamPool>,
     worker: Mutex<Option<WorkerHandle>>,
 }
 
@@ -554,7 +566,8 @@ impl ModRuntime {
             session: session.clone(),
             limits,
         });
-        let (sender, outcome) = spawn_worker(Arc::clone(&config))?;
+        let downstream = Arc::new(DownstreamPool::new());
+        let (sender, outcome) = spawn_worker(Arc::clone(&config), Arc::clone(&downstream))?;
         for error in &outcome.load_errors {
             tracing::warn!("{error}");
         }
@@ -584,6 +597,7 @@ impl ModRuntime {
             disabled: AtomicBool::new(false),
             submissions: ModSubmitQueue::default(),
             config,
+            downstream,
             worker: Mutex::new(Some(WorkerHandle { sender })),
         })
     }
@@ -743,7 +757,8 @@ impl ModRuntime {
             // mods were not installed: run the inner executor unchanged.
             if !result.stop {
                 if let Some(inner) = inner {
-                    let inner_result = run_inner_blocking(&inner, event, input, context);
+                    let inner_result =
+                        run_inner_without_worker(&self.downstream, &inner, event, input, context);
                     result = merge_with_inner(result, inner_result);
                 }
             }
@@ -899,7 +914,8 @@ impl ModRuntime {
 
         // The previous worker was abandoned (it timed out) or stopped. Start
         // a fresh realm; the load outcome is already recorded on this runtime.
-        let (sender, _outcome) = spawn_worker(Arc::clone(&self.config))?;
+        let (sender, _outcome) =
+            spawn_worker(Arc::clone(&self.config), Arc::clone(&self.downstream))?;
         *worker = Some(WorkerHandle {
             sender: sender.clone(),
         });
@@ -952,72 +968,217 @@ fn configured_timeout_breaker_limit() -> usize {
 /// executor directly; it still must not hang forever.
 const DOWNSTREAM_BUDGET_FALLBACK: Duration = Duration::from_secs(5);
 
-/// Run the inner executor, bounded by `budget`.
-///
-/// QuickJS interrupts JavaScript at the deadline, but a native `block_on` for
-/// the downstream executor is outside the engine. Bounding it here means the
-/// worker returns at the deadline (with a failed result) instead of leaving
-/// the caller to abandon the thread.
-///
-/// The timeout needs the executor's future to yield. An executor that blocks
-/// the worker thread inside a single poll cannot be cut off here; that case
-/// still falls back to the caller's reply budget, which abandons the worker.
-fn run_inner_bounded(
-    runtime: &tokio::runtime::Runtime,
-    budget: Duration,
-    inner: &Arc<dyn HookExecutor>,
-    event: &str,
-    input: &str,
-    context: &HashMap<String, String>,
-) -> HookFireResult {
-    // Build the timer inside `block_on`: `tokio::time::timeout` registers with
-    // the runtime's timer driver as soon as it is constructed.
-    runtime
-        .block_on(async {
-            tokio::time::timeout(budget, inner.fire_hook(event, input, context)).await
-        })
-        .unwrap_or_else(|_| HookFireResult {
-            failed: true,
-            errors: vec![
-                "the downstream hook executor did not finish within the wall-clock budget"
-                    .to_string(),
-            ],
-            ..HookFireResult::default()
-        })
+/// One downstream-executor call handed to a [`DownstreamPool`] runner.
+struct DownstreamJob {
+    inner: Arc<dyn HookExecutor>,
+    event: String,
+    input: String,
+    context: HashMap<String, String>,
+    reply: mpsc::SyncSender<HookFireResult>,
+    /// Fires when the caller's budget runs out. A yielding executor is
+    /// dropped at that point; one that blocks inside a single poll cannot be
+    /// stopped and is dropped when it eventually returns.
+    cancel: tokio::sync::oneshot::Receiver<()>,
 }
 
-/// Run the downstream executor once while mods are disabled.
+/// Runs downstream executors on threads this module owns.
 ///
-/// The normal path runs the inner executor on the worker's own current-thread
-/// runtime. With the worker gone, the calling thread supplies one instead. The
-/// callers of [`ModRuntime::fire_with_inner`] are blocking contexts (the async
-/// adapter uses `spawn_blocking`), so this does not nest inside a runtime.
-fn run_inner_blocking(
-    inner: &Arc<dyn HookExecutor>,
-    event: &str,
-    input: &str,
-    context: &HashMap<String, String>,
-) -> HookFireResult {
-    match tokio::runtime::Builder::new_current_thread()
+/// `next()` runs the configured settings hooks, which are native work outside
+/// QuickJS. The engine can interrupt JavaScript and a timer can stop a future
+/// that yields, but neither can stop a future that blocks the thread inside a
+/// single poll. Running the executor here means the worker thread only ever
+/// waits with a bounded `recv_timeout`: a downstream run that outlives the
+/// budget is abandoned on the runner thread, and the worker keeps its realm,
+/// its module state and its ability to answer later calls.
+///
+/// A runner is never shared with a call that may still be blocked: after a
+/// timeout the pool forgets it, so the next call starts a fresh thread instead
+/// of queueing behind a stuck one. A forgotten thread exits on its own once
+/// its blocking call returns.
+struct DownstreamPool {
+    runner: Mutex<Option<mpsc::Sender<DownstreamJob>>>,
+}
+
+impl std::fmt::Debug for DownstreamPool {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DownstreamPool")
+            .finish_non_exhaustive()
+    }
+}
+
+impl DownstreamPool {
+    const fn new() -> Self {
+        Self {
+            runner: Mutex::new(None),
+        }
+    }
+
+    /// Run `inner` on a runner thread, waiting at most `budget` for its reply.
+    fn run(
+        &self,
+        budget: Duration,
+        inner: &Arc<dyn HookExecutor>,
+        event: &str,
+        input: &str,
+        context: &HashMap<String, String>,
+    ) -> HookFireResult {
+        // Nothing would be left to wait for, and the job would run unobserved.
+        if budget.is_zero() {
+            return downstream_budget_failure();
+        }
+        let (reply_sender, reply_receiver) = mpsc::sync_channel(1);
+        let (cancel_sender, cancel_receiver) = tokio::sync::oneshot::channel();
+        let job = DownstreamJob {
+            inner: Arc::clone(inner),
+            event: event.to_string(),
+            input: input.to_string(),
+            context: context.clone(),
+            reply: reply_sender,
+            cancel: cancel_receiver,
+        };
+        if let Err(error) = self.dispatch(job) {
+            return HookFireResult {
+                failed: true,
+                errors: vec![error],
+                ..HookFireResult::default()
+            };
+        }
+
+        match reply_receiver.recv_timeout(budget) {
+            Ok(result) => result,
+            Err(RecvTimeoutError::Timeout) => {
+                // Let a cooperative executor stop where it is. The runner is
+                // not reused either way: it may be blocked on native code.
+                let _ = cancel_sender.send(());
+                self.forget_runner();
+                downstream_budget_failure()
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                self.forget_runner();
+                HookFireResult {
+                    failed: true,
+                    errors: vec![
+                        "the downstream hook executor stopped without reporting a result"
+                            .to_string(),
+                    ],
+                    ..HookFireResult::default()
+                }
+            }
+        }
+    }
+
+    /// Hand `job` to the live runner, replacing a runner that has exited.
+    fn dispatch(&self, job: DownstreamJob) -> Result<(), String> {
+        let mut runner = self
+            .runner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let job = match runner.as_ref() {
+            Some(sender) => match sender.send(job) {
+                Ok(()) => return Ok(()),
+                // The runner exited (or is exiting); its channel lost the job.
+                Err(mpsc::SendError(job)) => job,
+            },
+            None => job,
+        };
+        let result = Self::spawn_runner(&mut runner, job);
+        drop(runner);
+        result
+    }
+
+    /// Start a runner thread and queue `job` on it.
+    fn spawn_runner(
+        runner: &mut Option<mpsc::Sender<DownstreamJob>>,
+        job: DownstreamJob,
+    ) -> Result<(), String> {
+        let (sender, receiver) = mpsc::channel();
+        std::thread::Builder::new()
+            .name("coderex-mods-downstream".to_string())
+            .spawn(move || downstream_main(&receiver))
+            .map_err(|error| format!("could not start the downstream hook runner: {error}"))?;
+        sender.send(job).map_err(|_| {
+            "the downstream hook runner stopped before the call was sent".to_string()
+        })?;
+        *runner = Some(sender);
+        Ok(())
+    }
+
+    /// Stop reusing the current runner. It exits when its own call returns.
+    fn forget_runner(&self) {
+        let mut runner = self
+            .runner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *runner = None;
+    }
+}
+
+/// The runner thread: one current-thread runtime, one job at a time.
+fn downstream_main(receiver: &mpsc::Receiver<DownstreamJob>) {
+    let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
     {
-        Ok(runtime) => run_inner_bounded(
-            &runtime,
-            DOWNSTREAM_BUDGET_FALLBACK,
+        Ok(runtime) => runtime,
+        Err(error) => {
+            let message = format!("could not start the downstream hook runtime: {error}");
+            while let Ok(job) = receiver.recv() {
+                let _ = job.reply.send(HookFireResult {
+                    failed: true,
+                    errors: vec![message.clone()],
+                    ..HookFireResult::default()
+                });
+            }
+            return;
+        }
+    };
+
+    while let Ok(job) = receiver.recv() {
+        let DownstreamJob {
             inner,
             event,
             input,
             context,
-        ),
-        Err(error) => HookFireResult {
-            failed: true,
-            errors: vec![format!(
-                "mods are disabled and the downstream hooks could not be run: {error}"
-            )],
-            ..HookFireResult::default()
-        },
+            reply,
+            cancel,
+        } = job;
+        let result = runtime.block_on(async {
+            tokio::select! {
+                result = inner.fire_hook(&event, &input, &context) => Some(result),
+                _ = cancel => None,
+            }
+        });
+        if let Some(result) = result {
+            let _ = reply.send(result);
+        }
     }
+}
+
+fn downstream_budget_failure() -> HookFireResult {
+    HookFireResult {
+        failed: true,
+        errors: vec![
+            "the downstream hook executor did not finish within the wall-clock budget".to_string(),
+        ],
+        ..HookFireResult::default()
+    }
+}
+
+/// Run the downstream executor once while mods are disabled.
+///
+/// The normal path runs the inner executor through the worker's
+/// [`DownstreamPool`]. With the worker gone, the caller uses the runtime's own
+/// pool, so a blocked executor still cannot hold the calling thread past
+/// [`DOWNSTREAM_BUDGET_FALLBACK`].
+fn run_inner_without_worker(
+    downstream: &DownstreamPool,
+    inner: &Arc<dyn HookExecutor>,
+    event: &str,
+    input: &str,
+    context: &HashMap<String, String>,
+) -> HookFireResult {
+    downstream.run(DOWNSTREAM_BUDGET_FALLBACK, inner, event, input, context)
 }
 
 /// Builds a runtime with an explicit session and limits.
@@ -1153,6 +1314,7 @@ fn read_source(path: &Path) -> Result<(String, String), String> {
 /// Start a worker thread and wait until it has loaded the mods.
 fn spawn_worker(
     config: Arc<WorkerConfig>,
+    downstream: Arc<DownstreamPool>,
 ) -> Result<(mpsc::Sender<WorkerRequest>, InitOutcome), String> {
     let (sender, receiver) = mpsc::channel();
     let (init_sender, init_receiver) = mpsc::sync_channel(1);
@@ -1163,7 +1325,7 @@ fn spawn_worker(
         // by default). Rust's 2 MiB default would abort before QuickJS could
         // raise its catchable "stack size exceeded" error.
         .stack_size(16 * 1024 * 1024)
-        .spawn(move || worker_main(config, &receiver, &init_sender))
+        .spawn(move || worker_main(config, downstream, &receiver, &init_sender))
         .map_err(|error| format!("could not start the mod worker: {error}"))?;
 
     match init_receiver.recv() {
@@ -1175,23 +1337,11 @@ fn spawn_worker(
 
 fn worker_main(
     config: Arc<WorkerConfig>,
+    downstream: Arc<DownstreamPool>,
     receiver: &mpsc::Receiver<WorkerRequest>,
     init: &mpsc::SyncSender<Result<InitOutcome, String>>,
 ) {
-    let runtime = match tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-    {
-        Ok(runtime) => Arc::new(runtime),
-        Err(error) => {
-            let _ = init.send(Err(format!(
-                "could not start the mod worker runtime: {error}"
-            )));
-            return;
-        }
-    };
-
-    let mut state = match WorkerState::load(config, runtime) {
+    let mut state = match WorkerState::load(config, downstream) {
         Ok(state) => state,
         Err(error) => {
             let _ = init.send(Err(error));
@@ -1446,7 +1596,8 @@ fn push_registrations(main: &Context, loaded: &LoadedMod) -> Result<(), String> 
 /// The worker thread's engine state.
 struct WorkerState {
     config: Arc<WorkerConfig>,
-    runtime: Arc<tokio::runtime::Runtime>,
+    /// Runs the configured hooks reached through `next()`, off this thread.
+    downstream: Arc<DownstreamPool>,
     deadline: Deadline,
     /// `None` after the engine was interrupted (or failed to rebuild), so the
     /// next request starts from a fresh runtime and reloads the mods.
@@ -1460,15 +1611,12 @@ struct WorkerState {
 
 impl WorkerState {
     /// Build the runtime, one realm per mod, and the flattened hook list.
-    fn load(
-        config: Arc<WorkerConfig>,
-        runtime: Arc<tokio::runtime::Runtime>,
-    ) -> Result<Self, String> {
+    fn load(config: Arc<WorkerConfig>, downstream: Arc<DownstreamPool>) -> Result<Self, String> {
         let deadline = Deadline::default();
         let loaded = Engine::build(&config, &deadline)?;
         Ok(Self {
             config,
-            runtime,
+            downstream,
             deadline,
             engine: Some(loaded.engine),
             hooks: loaded.hooks,
@@ -1505,7 +1653,7 @@ impl WorkerState {
         let context_json = serde_json::to_string(&request.context).unwrap_or_else(|_| "{}".into());
         let chain = self.chain_json(request);
         let inner = Arc::new(InnerCall {
-            runtime: Arc::clone(&self.runtime),
+            downstream: Arc::clone(&self.downstream),
             inner: request.inner.clone(),
             deadline: self.deadline.clone(),
             called: AtomicBool::new(false),
@@ -1552,8 +1700,7 @@ impl WorkerState {
                         .deadline
                         .remaining()
                         .unwrap_or(DOWNSTREAM_BUDGET_FALLBACK);
-                    let inner_result = run_inner_bounded(
-                        &self.runtime,
+                    let inner_result = self.downstream.run(
                         budget,
                         executor,
                         &request.event,
@@ -1730,7 +1877,7 @@ fn string_property(object: &Object<'_>, name: &str) -> Option<String> {
 
 /// The inner executor the JavaScript chain runs at its end.
 struct InnerCall {
-    runtime: Arc<tokio::runtime::Runtime>,
+    downstream: Arc<DownstreamPool>,
     inner: Option<Arc<dyn HookExecutor>>,
     /// The call's shared deadline, so the native hop is bounded like the JS.
     deadline: Deadline,
@@ -1753,7 +1900,8 @@ fn inner_entry(event: &str, input: &str, context_json: &str, call: &Arc<InnerCal
         .inner
         .as_ref()
         .map_or_else(HookFireResult::default, |inner| {
-            run_inner_bounded(&call.runtime, budget, inner, event, input, &inner_context)
+            call.downstream
+                .run(budget, inner, event, input, &inner_context)
         });
     serde_json::json!({
         "stop": result.stop,
@@ -3023,6 +3171,23 @@ mod tests {
         }
     }
 
+    /// Blocks the calling thread without ever yielding, which is the case a
+    /// timer or an interrupt handler cannot cut off on that thread.
+    struct BlockingInner;
+
+    #[async_trait::async_trait]
+    impl HookExecutor for BlockingInner {
+        async fn fire_hook(
+            &self,
+            _event_name: &str,
+            _input: &str,
+            _context: &HashMap<String, String>,
+        ) -> HookFireResult {
+            std::thread::sleep(Duration::from_secs(3));
+            HookFireResult::default()
+        }
+    }
+
     fn session() -> ModSession {
         ModSession {
             cwd: "/work".to_string(),
@@ -3281,13 +3446,13 @@ mod tests {
     }
 
     #[test]
-    fn a_cut_off_downstream_run_does_not_abandon_the_worker() {
+    fn a_cut_off_downstream_run_does_not_stall_the_worker() {
         let limits = ModLimits {
             hook_timeout: Duration::from_millis(100),
             ..ModLimits::default()
         };
-        // `calls` lives in the mod's realm: a rebuilt worker would start at 1,
-        // so the follow-up call also proves the realm survived.
+        // `calls` lives in the mod's realm, so the follow-up also shows whether
+        // the realm survived the deadline.
         let runtime = load_with(
             "let calls = 0; \
              function register(on) { on('PostToolUse', '*', function ($, e, next) { \
@@ -3296,7 +3461,17 @@ mod tests {
             limits,
         );
 
-        let result = fire_with(&runtime, "PostToolUse", "Bash", Arc::new(SlowInner) as _);
+        // `BlockingInner` sleeps without ever yielding: no timer on the worker
+        // thread could stop it, so the executor must run on its own thread.
+        let started = std::time::Instant::now();
+        let result = fire_with(
+            &runtime,
+            "PostToolUse",
+            "Bash",
+            Arc::new(BlockingInner) as _,
+        );
+        let elapsed = started.elapsed();
+
         assert!(result.failed, "{result:?}");
         assert!(
             result
@@ -3306,26 +3481,63 @@ mod tests {
             "{:?}",
             result.errors
         );
-        assert_eq!(
-            runtime.timeout_abandonments(),
-            0,
-            "the bounded downstream hop returns to the caller; it must not be abandoned"
-        );
+        assert!(elapsed < Duration::from_secs(2), "took {elapsed:?}");
 
-        // The same worker and realm keep serving calls, and the downstream
-        // executor still runs on the next one.
+        // The worker thread was never the one blocked, so the next call is
+        // answered immediately and still reaches the downstream executor.
         let inner = Arc::new(RecordingInner::answering(HookFireResult {
             updated_input: Some("inner".to_string()),
             ..HookFireResult::default()
         }));
+        let started = std::time::Instant::now();
         let follow_up = fire_with(&runtime, "PostToolUse", "Bash", Arc::clone(&inner) as _);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "took {:?}",
+            started.elapsed()
+        );
         assert!(!follow_up.failed, "{follow_up:?}");
         assert_eq!(inner.calls().len(), 1);
-        assert_eq!(
-            follow_up.updated_input.as_deref(),
-            Some("2:inner"),
-            "the mod state from the first call must survive"
+        assert!(
+            follow_up
+                .updated_input
+                .as_deref()
+                .is_some_and(|value| value.ends_with(":inner")),
+            "{follow_up:?}"
         );
+    }
+
+    #[test]
+    fn the_downstream_pool_abandons_a_thread_blocking_executor() {
+        let pool = DownstreamPool::new();
+        let inner: Arc<dyn HookExecutor> = Arc::new(BlockingInner);
+
+        let started = std::time::Instant::now();
+        let result = pool.run(
+            Duration::from_millis(100),
+            &inner,
+            "PostToolUse",
+            "Bash",
+            &HashMap::new(),
+        );
+        assert!(result.failed, "{result:?}");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "took {:?}",
+            started.elapsed()
+        );
+
+        // The blocked runner is not reused: a fresh thread answers this call.
+        let inner: Arc<dyn HookExecutor> =
+            Arc::new(RecordingInner::answering(HookFireResult::default()));
+        let result = pool.run(
+            Duration::from_secs(2),
+            &inner,
+            "PostToolUse",
+            "Bash",
+            &HashMap::new(),
+        );
+        assert!(!result.failed, "{result:?}");
     }
 
     // ── Chaining: next runs the hooks after the current one ─────────────────
