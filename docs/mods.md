@@ -50,10 +50,10 @@ function register(on, options) {
   });
 
   // next() runs the hooks registered after this one, then the downstream
-  // chain (the settings hooks), and returns their combined result to this
-  // hook, which may rewrite it.
-  on('PostToolUse', 'Read', function ($, e, next) {
-    const downstream = next();
+  // chain (the settings hooks), and resolves with their combined result for
+  // this hook to rewrite. It returns a promise, so await it.
+  on('PostToolUse', 'Read', async function ($, e, next) {
+    const downstream = await next();
     if (!downstream.failed) {
       return { updatedToolOutput: '[mod] ' + downstream.updatedToolOutput };
     }
@@ -82,9 +82,9 @@ own realm, so two mods cannot see each other's globals.
   Each alternative is compared case-insensitively with the event input (the
   tool name for tool events). `on(event, hook)` is accepted as shorthand for
   `on(event, "*", hook)`.
-- `hook` — a **synchronous** function `hook($, e, next)`. `next` is always
-  supplied but may be ignored. An `async` function is rejected at call time
-  with an error, because there is no promise to await.
+- `hook` — a function `hook($, e, next)`. It may be `async`: the host awaits
+  its return value and drives any promise it yields under the call's deadline.
+  `next` is always supplied but may be ignored.
 
 Matching hooks run in load order (file name, then registration order). A mod
 may register at most 256 hooks.
@@ -215,16 +215,29 @@ runtime.
 Every hook receives `next` as its third argument:
 
 ```js
-on('PostToolUse', 'Read', function ($, e, next) {
-  const downstream = next();  // the hooks after this one, then the settings hooks
+on('PostToolUse', 'Read', async function ($, e, next) {
+  const downstream = await next();  // the hooks after this one, then the settings hooks
   if (downstream.stop) return { stop: true, updatedToolOutput: 'denied downstream' };
   return { updatedToolOutput: downstream.updatedToolOutput.toUpperCase() };
 });
 ```
 
-`next` is **synchronous**: it blocks the mod worker while the rest of the
-chain runs and returns the combined result to the JavaScript hook. The agent
-never blocks; it waits on the worker from its own thread.
+`next` returns a **promise**, and the hook must `await` it to read the result.
+The downstream chain ends in the configured settings hooks, which are
+asynchronous native work; the JavaScript thread is never blocked waiting for
+them. The host drives the promise, runs the engine's job queue between
+suspensions, and settles it when the downstream run answers or the budget
+expires. At the deadline the promise is rejected with the wall-clock message,
+so an `async` hook sees a normal exception at the `await`; catching it does not
+turn the call into a success — the call is still reported as timed out.
+
+A hook that calls `next()` without awaiting it still works: the level awaits
+the pending chain after the hook returns before merging, so the downstream
+chain and the inner executor run exactly once. The hook simply cannot use the
+downstream result in that case.
+
+This is a breaking change from the earlier synchronous `next`: a mod written
+for the old API must make its hook `async` and `await next()`.
 
 ### What it runs
 
@@ -272,7 +285,7 @@ returns their combined result with the empty downstream fields: `stop: false`,
 
 ### The result object
 
-`next` returns:
+The promise resolves with:
 
 ```js
 {
@@ -296,8 +309,8 @@ only be called once", and does **not** run the downstream chain again. The
 first result is unaffected. A hook may catch the error and carry on:
 
 ```js
-on('PostToolUse', '*', function ($, e, next) {
-  const first = next();
+on('PostToolUse', '*', async function ($, e, next) {
+  const first = await next();
   try { next(); } catch (error) { $.log(String(error.message)); }
   return { updatedToolOutput: first.updatedToolOutput };
 });
@@ -609,8 +622,11 @@ wrap the existing `HookRegistry`:
    the inner executor is not run again at the end. The settings hooks still
    ran inside `next` unless an earlier hook stopped that leg of the chain.
 
-The runtime is synchronous; `fire_hook` moves the blocking wait to
-`tokio::task::spawn_blocking`, so it does not block an async worker.
+`fire_hook` is still a blocking call from the caller's point of view and moves
+its wait to `tokio::task::spawn_blocking`, so it does not block an async worker.
+Inside the mod worker, `next()` is a promise: the thread that owns QuickJS
+returns to the host between suspensions instead of waiting on the native
+executor.
 
 ## UI elements
 
@@ -651,9 +667,9 @@ is what a focused activation sends to the handler registered with
 
 ### `$.ui.onActivate(id, handler)`
 
-Registers the handler for a button id. `handler($, event)` runs synchronously
-on the mod's worker, in the same realm, under the same wall-clock budget and
-engine limits as a hook. It may call `$.ui.render(...)` and/or return one
+Registers the handler for a button id. `handler($, event)` runs on the mod's
+worker, in the same realm, under the same wall-clock budget and engine limits
+as a hook, and may be `async`. It may call `$.ui.render(...)` and/or return one
 element or an array of elements; the host renders the staged elements followed
 by the returned ones.
 
@@ -678,7 +694,7 @@ function register(on) {
 - A thrown exception, an invalid returned tree or a timeout is reported as a
   system message in the terminal.
 - A mod may register at most 256 activation handlers.
-- An `async` handler is rejected: like a hook, it must return synchronously.
+- An `async` handler is awaited like an `async` hook, under the same budget.
 
 ### `$.ui.render(element(s))`
 
@@ -762,4 +778,8 @@ The same applies when the REPL is not attached to a terminal.
 
 ## Not yet
 
-There are no async hooks. An `async` hook is rejected at call time.
+- A promise a hook waits on that nothing in the runtime can settle (no
+  `next()`, no engine work) is reported as a hook error rather than hanging
+  until the deadline.
+- There is no timer API (`setTimeout`), so an `async` hook can only await its
+  own promises and `next()`.

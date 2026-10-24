@@ -22,7 +22,8 @@
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -970,15 +971,32 @@ const DOWNSTREAM_BUDGET_FALLBACK: Duration = Duration::from_secs(5);
 
 /// One downstream-executor call handed to a [`DownstreamPool`] runner.
 struct DownstreamJob {
+    /// Identifies the pending promise for [`Delivery::Shared`].
+    id: u64,
     inner: Arc<dyn HookExecutor>,
     event: String,
     input: String,
     context: HashMap<String, String>,
-    reply: mpsc::SyncSender<HookFireResult>,
+    delivery: Delivery,
     /// Fires when the caller's budget runs out. A yielding executor is
     /// dropped at that point; one that blocks inside a single poll cannot be
     /// stopped and is dropped when it eventually returns.
     cancel: tokio::sync::oneshot::Receiver<()>,
+}
+
+/// Where a finished downstream call is reported.
+enum Delivery {
+    /// A caller that is blocked on this one call (the disabled-mods path and
+    /// the fatal-harness fallback).
+    Direct(mpsc::SyncSender<HookFireResult>),
+    /// The worker's promise driver, keyed by [`DownstreamJob::id`].
+    Shared(mpsc::Sender<DownstreamCompletion>),
+}
+
+/// A finished downstream call waiting to be handed to a pending promise.
+struct DownstreamCompletion {
+    id: u64,
+    result: HookFireResult,
 }
 
 /// Runs downstream executors on threads this module owns.
@@ -997,6 +1015,8 @@ struct DownstreamJob {
 /// its blocking call returns.
 struct DownstreamPool {
     runner: Mutex<Option<mpsc::Sender<DownstreamJob>>>,
+    completions: mpsc::Sender<DownstreamCompletion>,
+    completed: Mutex<mpsc::Receiver<DownstreamCompletion>>,
 }
 
 impl std::fmt::Debug for DownstreamPool {
@@ -1008,10 +1028,47 @@ impl std::fmt::Debug for DownstreamPool {
 }
 
 impl DownstreamPool {
-    const fn new() -> Self {
+    fn new() -> Self {
+        let (completions, completed) = mpsc::channel();
         Self {
             runner: Mutex::new(None),
+            completions,
+            completed: Mutex::new(completed),
         }
+    }
+
+    /// Queue `inner` for the runner thread without waiting for it.
+    ///
+    /// Returns the cancel handle the caller keeps so it can stop a
+    /// cooperative executor at its deadline.
+    fn submit(
+        &self,
+        id: u64,
+        inner: &Arc<dyn HookExecutor>,
+        event: &str,
+        input: &str,
+        context: &HashMap<String, String>,
+    ) -> Result<tokio::sync::oneshot::Sender<()>, String> {
+        let (cancel_sender, cancel) = tokio::sync::oneshot::channel();
+        self.dispatch(DownstreamJob {
+            id,
+            inner: Arc::clone(inner),
+            event: event.to_string(),
+            input: input.to_string(),
+            context: context.clone(),
+            delivery: Delivery::Shared(self.completions.clone()),
+            cancel,
+        })?;
+        Ok(cancel_sender)
+    }
+
+    /// Wait at most `timeout` for any queued completion.
+    fn wait(&self, timeout: Duration) -> Option<DownstreamCompletion> {
+        let completed = self
+            .completed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        completed.recv_timeout(timeout).ok()
     }
 
     /// Run `inner` on a runner thread, waiting at most `budget` for its reply.
@@ -1030,11 +1087,12 @@ impl DownstreamPool {
         let (reply_sender, reply_receiver) = mpsc::sync_channel(1);
         let (cancel_sender, cancel_receiver) = tokio::sync::oneshot::channel();
         let job = DownstreamJob {
+            id: 0,
             inner: Arc::clone(inner),
             event: event.to_string(),
             input: input.to_string(),
             context: context.clone(),
-            reply: reply_sender,
+            delivery: Delivery::Direct(reply_sender),
             cancel: cancel_receiver,
         };
         if let Err(error) = self.dispatch(job) {
@@ -1124,11 +1182,12 @@ fn downstream_main(receiver: &mpsc::Receiver<DownstreamJob>) {
         Err(error) => {
             let message = format!("could not start the downstream hook runtime: {error}");
             while let Ok(job) = receiver.recv() {
-                let _ = job.reply.send(HookFireResult {
+                let result = HookFireResult {
                     failed: true,
                     errors: vec![message.clone()],
                     ..HookFireResult::default()
-                });
+                };
+                deliver(job.delivery, job.id, result);
             }
             return;
         }
@@ -1136,11 +1195,12 @@ fn downstream_main(receiver: &mpsc::Receiver<DownstreamJob>) {
 
     while let Ok(job) = receiver.recv() {
         let DownstreamJob {
+            id,
             inner,
             event,
             input,
             context,
-            reply,
+            delivery,
             cancel,
         } = job;
         let result = runtime.block_on(async {
@@ -1150,7 +1210,19 @@ fn downstream_main(receiver: &mpsc::Receiver<DownstreamJob>) {
             }
         });
         if let Some(result) = result {
+            deliver(delivery, id, result);
+        }
+    }
+}
+
+/// Report one finished call to whichever caller asked for it.
+fn deliver(delivery: Delivery, id: u64, result: HookFireResult) {
+    match delivery {
+        Delivery::Direct(reply) => {
             let _ = reply.send(result);
+        }
+        Delivery::Shared(completions) => {
+            let _ = completions.send(DownstreamCompletion { id, result });
         }
     }
 }
@@ -1429,6 +1501,20 @@ impl Deadline {
             .map(|deadline| deadline.saturating_duration_since(Instant::now()))
     }
 
+    /// Mark the call as over budget from the host side.
+    ///
+    /// Used when the worker is waiting on a native hop rather than running
+    /// JavaScript: the deadline has passed, so the next JavaScript the engine
+    /// executes must be interrupted, and the call is reported as timed out.
+    fn expire(&self) {
+        let mut state = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.deadline = Some(Instant::now());
+        state.interrupted = true;
+    }
+
     /// Finish a call and report whether the engine interrupted it.
     fn end(&self) -> bool {
         let mut state = self
@@ -1652,19 +1738,26 @@ impl WorkerState {
 
         let context_json = serde_json::to_string(&request.context).unwrap_or_else(|_| "{}".into());
         let chain = self.chain_json(request);
-        let inner = Arc::new(InnerCall {
+        let budget_message = budget_error(&self.config.limits, "hook");
+        let inner = Rc::new(InnerCall {
             downstream: Arc::clone(&self.downstream),
             inner: request.inner.clone(),
             deadline: self.deadline.clone(),
+            budget_message: budget_message.clone(),
             called: AtomicBool::new(false),
+            pending: PendingInner::default(),
         });
 
         self.deadline.begin(self.config.limits.hook_timeout);
         let outcome = {
             let engine = self.engine.as_ref().expect("engine was just ensured");
-            engine
-                .main
-                .with(|ctx| run_chain(&ctx, &chain, &context_json, request, &inner))
+            engine.main.with(|ctx| {
+                let outcome = run_chain(&ctx, &chain, &context_json, request, &inner);
+                // Drop any promise still held while the runtime is alive: a
+                // `Persistent` must not outlive its runtime.
+                inner.pending.cancel_all();
+                outcome
+            })
         };
         let timed_out = self.deadline.end();
         if timed_out {
@@ -1673,6 +1766,19 @@ impl WorkerState {
 
         match outcome {
             Ok(mut result) => {
+                // A hook that caught the deadline rejection and returned
+                // normally still exceeded the budget; do not let it look like
+                // a completed call.
+                if timed_out {
+                    result.failed = true;
+                    if !result
+                        .errors
+                        .iter()
+                        .any(|error| error.contains("wall-clock budget"))
+                    {
+                        result.errors.push(budget_message);
+                    }
+                }
                 if result.failed && is_gating_event(&request.event) {
                     result.stop = true;
                 }
@@ -1723,10 +1829,13 @@ impl WorkerState {
             };
         }
 
+        let budget_message = budget_error(&self.config.limits, "activation handler");
         self.deadline.begin(self.config.limits.hook_timeout);
         let outcome = {
             let engine = self.engine.as_ref().expect("engine was just ensured");
-            engine.main.with(|ctx| run_activation(&ctx, id))
+            engine.main.with(|ctx| {
+                run_activation(&ctx, id, &self.deadline, &self.downstream, &budget_message)
+            })
         };
         let timed_out = self.deadline.end();
         if timed_out {
@@ -1875,34 +1984,121 @@ fn string_property(object: &Object<'_>, name: &str) -> Option<String> {
     value.as_string().and_then(|string| string.to_string().ok())
 }
 
+/// One `next()` call the hook is waiting on.
+struct PendingEntry {
+    resolve: Persistent<Function<'static>>,
+    reject: Persistent<Function<'static>>,
+    /// Stops a cooperative downstream run when the budget expires.
+    cancel: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+/// The promises an in-flight chain is suspended on.
+#[derive(Default)]
+struct PendingInner {
+    next_id: AtomicU64,
+    entries: Mutex<HashMap<u64, PendingEntry>>,
+}
+
+impl PendingInner {
+    fn next_id(&self) -> u64 {
+        self.next_id.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    fn insert(
+        &self,
+        id: u64,
+        resolve: Persistent<Function<'static>>,
+        reject: Persistent<Function<'static>>,
+        cancel: tokio::sync::oneshot::Sender<()>,
+    ) {
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        entries.insert(
+            id,
+            PendingEntry {
+                resolve,
+                reject,
+                cancel: Some(cancel),
+            },
+        );
+    }
+
+    fn take(&self, id: u64) -> Option<PendingEntry> {
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        entries.remove(&id)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty()
+    }
+
+    /// Stop cooperative work and drop the promises without settling them.
+    ///
+    /// Used when the chain ends for a reason other than the deadline; the
+    /// caller's result already reports that failure.
+    fn cancel_all(&self) {
+        let entries = {
+            let mut entries = self
+                .entries
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            std::mem::take(&mut *entries)
+        };
+        for entry in entries.into_values() {
+            if let Some(cancel) = entry.cancel {
+                let _ = cancel.send(());
+            }
+        }
+    }
+
+    /// Reject every awaited call and stop cooperative work.
+    ///
+    /// The map is drained before any JavaScript runs, so a rejection handler
+    /// that calls `next()` again starts from a clean state.
+    fn reject_all(&self, ctx: &Ctx<'_>, message: &str) {
+        let entries = {
+            let mut entries = self
+                .entries
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            std::mem::take(&mut *entries)
+        };
+        for entry in entries.into_values() {
+            if let Some(cancel) = entry.cancel {
+                let _ = cancel.send(());
+            }
+            if let Ok(reject) = entry.reject.restore(ctx) {
+                let _ = reject.call::<_, ()>((message.to_string(),));
+            }
+        }
+    }
+}
+
 /// The inner executor the JavaScript chain runs at its end.
 struct InnerCall {
     downstream: Arc<DownstreamPool>,
     inner: Option<Arc<dyn HookExecutor>>,
     /// The call's shared deadline, so the native hop is bounded like the JS.
     deadline: Deadline,
+    /// The message a `next()` rejected at the deadline carries.
+    budget_message: String,
     /// Whether the executor was already reached, so a fatal harness error
     /// cannot make [`WorkerState::fire`] run it a second time.
     called: AtomicBool,
+    /// `next()` calls waiting on the downstream executor.
+    pending: PendingInner,
 }
 
-/// The body of the chain's final step: run the inner executor synchronously
-/// and return its result as JSON for the harness to merge.
-fn inner_entry(event: &str, input: &str, context_json: &str, call: &Arc<InnerCall>) -> String {
-    let inner_context: HashMap<String, String> =
-        serde_json::from_str(context_json).unwrap_or_default();
-    call.called.store(true, Ordering::SeqCst);
-    let budget = call
-        .deadline
-        .remaining()
-        .unwrap_or(DOWNSTREAM_BUDGET_FALLBACK);
-    let result = call
-        .inner
-        .as_ref()
-        .map_or_else(HookFireResult::default, |inner| {
-            call.downstream
-                .run(budget, inner, event, input, &inner_context)
-        });
+/// The result object shape the harness merges, as JSON.
+fn inner_result_json(result: &HookFireResult) -> String {
     serde_json::json!({
         "stop": result.stop,
         "updatedInput": result.updated_input,
@@ -1916,19 +2112,115 @@ fn inner_entry(event: &str, input: &str, context_json: &str, call: &Arc<InnerCal
     .to_string()
 }
 
-/// Call the harness chain runner with one native inner-executor function.
-fn run_chain(
+/// Queue the downstream executor and hand its promise back to JavaScript.
+///
+/// This is the native side of `next()`: it returns immediately, and the
+/// worker resolves the promise when the runner thread answers.
+fn start_inner<'js>(
+    ctx: &Ctx<'js>,
+    call: &Rc<InnerCall>,
+    event: &str,
+    input: &str,
+    context_json: &str,
+    resolve: Function<'js>,
+    reject: Function<'js>,
+) -> rquickjs::Result<()> {
+    call.called.store(true, Ordering::SeqCst);
+    let Some(inner) = call.inner.clone() else {
+        return resolve.call::<_, ()>((inner_result_json(&HookFireResult::default()),));
+    };
+    let context: HashMap<String, String> = serde_json::from_str(context_json).unwrap_or_default();
+    let id = call.pending.next_id();
+    match call.downstream.submit(id, &inner, event, input, &context) {
+        Ok(cancel) => {
+            call.pending.insert(
+                id,
+                Persistent::save(ctx, resolve),
+                Persistent::save(ctx, reject),
+                cancel,
+            );
+            Ok(())
+        }
+        Err(error) => reject.call::<_, ()>((error,)),
+    }
+}
+
+/// Drive a harness promise until it settles, running the job queue and
+/// answering `next()` from the downstream runner between suspensions.
+///
+/// The worker never blocks inside a JavaScript call: an `await` returns to
+/// this loop, which is the only place that waits, and it waits under the
+/// call's deadline.
+fn drive_promise(
     ctx: &Ctx<'_>,
+    promise: &rquickjs::Promise<'_>,
+    deadline: &Deadline,
+    downstream: &DownstreamPool,
+    pending: &PendingInner,
+    budget_message: &str,
+) -> Result<String, String> {
+    loop {
+        while ctx.execute_pending_job() {}
+        if let Some(result) = promise.result::<String>() {
+            return result.map_err(|error| js_error(ctx, error));
+        }
+        if pending.is_empty() {
+            return Err("the hook is waiting on a promise that nothing will settle".to_string());
+        }
+
+        let remaining = deadline.remaining().unwrap_or(Duration::ZERO);
+        if remaining.is_zero() {
+            deadline.expire();
+            downstream.forget_runner();
+            pending.reject_all(ctx, budget_message);
+            continue;
+        }
+
+        if let Some(completion) = downstream.wait(remaining) {
+            // A completion whose id is unknown belongs to a run that was
+            // already abandoned at an earlier deadline.
+            if let Some(entry) = pending.take(completion.id) {
+                if let Ok(resolve) = entry.resolve.restore(ctx) {
+                    let _ = resolve.call::<_, ()>((inner_result_json(&completion.result),));
+                }
+            }
+        } else {
+            deadline.expire();
+            downstream.forget_runner();
+            pending.reject_all(ctx, budget_message);
+        }
+    }
+}
+
+/// Install the native `next()` endpoint and run the chain to completion.
+fn run_chain<'js>(
+    ctx: &Ctx<'js>,
     chain: &str,
     context_json: &str,
     request: &Request,
-    inner_call: &Arc<InnerCall>,
+    inner_call: &Rc<InnerCall>,
 ) -> Result<HookFireResult, String> {
-    let captured = Arc::clone(inner_call);
-    let inner = Function::new(
+    let captured = Rc::clone(inner_call);
+    // The context arrives as a parameter instead of being captured: a `Ctx`
+    // held by a closure stored inside the context is a reference cycle.
+    let start = Function::new(
         ctx.clone(),
-        move |event: String, input: String, context_json: String| -> String {
-            inner_entry(&event, &input, &context_json, &captured)
+        move |start_ctx: Ctx<'js>,
+              event: String,
+              input: String,
+              context_json: String,
+              resolve: Function<'js>,
+              reject: Function<'js>|
+              -> rquickjs::Result<()> {
+            start_inner(
+                &start_ctx,
+                &captured,
+                &event,
+                &input,
+                &context_json,
+                resolve,
+                reject,
+            )
         },
     )
     .map_err(|error| {
@@ -1937,20 +2229,27 @@ fn run_chain(
             js_error(ctx, error)
         )
     })?;
+    ctx.globals()
+        .set("__coderExStartInner", start)
+        .map_err(|error| {
+            format!(
+                "could not install the downstream executor: {}",
+                js_error(ctx, error)
+            )
+        })?;
 
-    let runner: Function = ctx.globals().get("__coderExRun").map_err(|error| {
+    let runner: Function<'js> = ctx.globals().get("__coderExRun").map_err(|error| {
         format!(
             "could not read the runtime harness: {}",
             js_error(ctx, error)
         )
     })?;
-    let text: String = runner
+    let value: Value<'js> = runner
         .call((
             chain,
             request.event.clone(),
             request.input.clone(),
             context_json,
-            inner,
             is_gating_event(&request.event),
         ))
         .map_err(|error| {
@@ -1959,6 +2258,17 @@ fn run_chain(
                 js_error(ctx, error)
             )
         })?;
+    let promise = value
+        .into_promise()
+        .ok_or_else(|| "the hook chain did not return a promise".to_string())?;
+    let text = drive_promise(
+        ctx,
+        &promise,
+        &inner_call.deadline,
+        &inner_call.downstream,
+        &inner_call.pending,
+        &inner_call.budget_message,
+    )?;
     parse_chain_result(&text)
 }
 
@@ -1966,20 +2276,38 @@ fn run_chain(
 ///
 /// The outer `Result` is a harness/engine failure; the inner one is the
 /// handler's own error message, which is not a failure of the worker.
-fn run_activation(ctx: &Ctx<'_>, id: &str) -> Result<Result<Vec<UiElement>, String>, String> {
-    let activate: Function = ctx.globals().get("__coderExActivate").map_err(|error| {
+fn run_activation<'js>(
+    ctx: &Ctx<'js>,
+    id: &str,
+    deadline: &Deadline,
+    downstream: &DownstreamPool,
+    budget_message: &str,
+) -> Result<Result<Vec<UiElement>, String>, String> {
+    let activate: Function<'js> = ctx.globals().get("__coderExActivate").map_err(|error| {
         format!(
             "could not read the runtime harness: {}",
             js_error(ctx, error)
         )
     })?;
     let event = serde_json::json!({ "id": id }).to_string();
-    let text: String = activate.call((id, event)).map_err(|error| {
+    let value: Value<'js> = activate.call((id, event)).map_err(|error| {
         format!(
             "the activation handler could not be called: {}",
             js_error(ctx, error)
         )
     })?;
+    let promise = value
+        .into_promise()
+        .ok_or_else(|| "the activation handler did not return a promise".to_string())?;
+    let pending = PendingInner::default();
+    let text = drive_promise(
+        ctx,
+        &promise,
+        deadline,
+        downstream,
+        &pending,
+        budget_message,
+    )?;
     parse_activation_result(&text)
 }
 
@@ -2615,7 +2943,7 @@ globalThis.__coderExNormalize = function (value) {
   return normalized;
 };
 
-globalThis.__coderExCall = function (modIndex, hookIndex, event, input, contextJson, nextFn) {
+globalThis.__coderExCall = async function (modIndex, hookIndex, event, input, contextJson, nextFn) {
   const module = __coderExMods[modIndex];
   const registration = module !== undefined ? module[hookIndex] : undefined;
   if (!registration) {
@@ -2663,7 +2991,10 @@ globalThis.__coderExCall = function (modIndex, hookIndex, event, input, contextJ
   if (ui && typeof ui.__beginCall === 'function') ui.__beginCall();
 
   try {
-    const value = registration.hook(host, eventObject, nextFn);
+    // A hook may be `async` and may `await next(e)`. Awaiting here releases
+    // the worker's JavaScript stack; the host drives the promise to
+    // completion under the call's deadline.
+    const value = await registration.hook(host, eventObject, nextFn);
     // Take whatever `$.ui.render` staged, even when the hook returns nothing:
     // rendering is itself the result. Submissions live beside the UI staging
     // area: they are not rendered, they cross the worker boundary as text for
@@ -2680,9 +3011,6 @@ globalThis.__coderExCall = function (modIndex, hookIndex, event, input, contextJ
           + __coderExMaxSubmissionsPerCall + ' per hook call]',
         style: 'dim'
       });
-    }
-    if (value !== null && typeof value === 'object' && typeof value.then === 'function') {
-      return JSON.stringify({ ok: false, error: 'async hooks are not supported yet; return a value synchronously' });
     }
     return JSON.stringify({
       ok: true,
@@ -2702,7 +3030,7 @@ globalThis.__coderExCall = function (modIndex, hookIndex, event, input, contextJ
 // every mod (a later registration replaces an earlier one), calls it with its
 // own realm's `$`, and returns whatever it staged plus whatever elements it
 // returned. Validation of the returned tree happens at the Rust boundary.
-globalThis.__coderExActivate = function (id, eventJson) {
+globalThis.__coderExActivate = async function (id, eventJson) {
   let chosen = null;
   for (let modIndex = 0; modIndex < __coderExActivations.length; modIndex++) {
     const handlers = __coderExActivations[modIndex];
@@ -2737,18 +3065,10 @@ globalThis.__coderExActivate = function (id, eventJson) {
     event.id = id;
     event.surface = 'terminal';
 
-    const value = chosen.handler(host, event);
+    const value = await chosen.handler(host, event);
     const staged = (ui && typeof ui.__takeUi === 'function') ? ui.__takeUi() : [];
     // Close the submission frame; an activation cannot start a turn.
     if (ui && typeof ui.__takeSubmissions === 'function') ui.__takeSubmissions();
-    if (value !== null && typeof value === 'object' && typeof value.then === 'function') {
-      return JSON.stringify({
-        found: true,
-        ok: false,
-        error: 'async activation handlers are not supported yet; return elements synchronously',
-        ui: staged
-      });
-    }
     let returned = [];
     if (Array.isArray(value)) {
       returned = value;
@@ -2898,13 +3218,24 @@ globalThis.__coderExMergeWithInner = function (js, inner) {
   };
 };
 
-globalThis.__coderExChain = function (hooks, start, event, input, contextJson, innerFn, depth, gating) {
+// `next(e)` returns a promise: the downstream chain ends in the host's
+// configured hooks, which are asynchronous and must not block the thread that
+// owns QuickJS. A hook that does not await `next()` still works — the level
+// awaits the pending chain after the hook returns before merging.
+globalThis.__coderExInner = function (event, input, contextJson) {
+  return new Promise(function (resolve, reject) {
+    __coderExStartInner(event, input, contextJson, resolve, reject);
+  });
+};
+
+globalThis.__coderExChain = async function (hooks, start, event, input, contextJson, depth, gating) {
   const combined = __coderExEmptyResult();
   let nextCalled = false;
 
   for (let index = start; index < hooks.length; index++) {
     const hook = hooks[index];
     let downstream = null;
+    let pendingDownstream = null;
     let used = false;
     let closed = false;
 
@@ -2936,12 +3267,18 @@ globalThis.__coderExChain = function (hooks, start, event, input, contextJson, i
         }
       }
 
-      downstream = __coderExChain(hooks, index + 1, event, nextInput, nextContext, innerFn, depth + 1, gating);
-      return __coderExPublicResult(downstream);
+      pendingDownstream = __coderExChain(hooks, index + 1, event, nextInput, nextContext, depth + 1, gating);
+      return pendingDownstream.then(function (result) {
+        downstream = result;
+        return __coderExPublicResult(result);
+      });
     };
 
-    const reply = JSON.parse(__coderExCall(hook.m, hook.h, event, input, contextJson, next));
+    const reply = JSON.parse(await __coderExCall(hook.m, hook.h, event, input, contextJson, next));
     closed = true;
+    if (downstream === null && pendingDownstream !== null) {
+      downstream = await pendingDownstream;
+    }
 
     if (reply.ok) {
       const submissions = Array.isArray(reply.submissions) ? reply.submissions : [];
@@ -2973,13 +3310,16 @@ globalThis.__coderExChain = function (hooks, start, event, input, contextJson, i
   if (combined.failed && gating) combined.stop = true;
 
   let result = combined;
-  if (!nextCalled && !combined.stop && typeof innerFn === 'function') {
+  if (!nextCalled && !combined.stop) {
     // The inner executor sees the input the JavaScript hooks settled on, as it
     // did before the chain existed.
     const innerInput = (combined.updatedInput !== null && combined.updatedInput !== undefined)
       ? combined.updatedInput
       : input;
-    result = __coderExMergeWithInner(combined, JSON.parse(innerFn(event, innerInput, contextJson)));
+    result = __coderExMergeWithInner(
+      combined,
+      JSON.parse(await __coderExInner(event, innerInput, contextJson))
+    );
   }
   result.watchPaths = __coderExDedupe(result.watchPaths);
   result.pendingPrompts = __coderExDedupePrompts(result.pendingPrompts);
@@ -2998,9 +3338,9 @@ globalThis.__coderExChain = function (hooks, start, event, input, contextJson, i
   return result;
 };
 
-globalThis.__coderExRun = function (chainJson, event, input, contextJson, innerFn, gating) {
+globalThis.__coderExRun = async function (chainJson, event, input, contextJson, gating) {
   return JSON.stringify(
-    __coderExChain(JSON.parse(chainJson), 0, event, input, contextJson, innerFn, 0, gating === true)
+    await __coderExChain(JSON.parse(chainJson), 0, event, input, contextJson, 0, gating === true)
   );
 };
 
@@ -3222,8 +3562,8 @@ mod tests {
             ..HookFireResult::default()
         }));
         let runtime = load(
-            "function register(on) { on('PostToolUse', '*', function ($, e, next) { \
-             const downstream = next(); \
+            "function register(on) { on('PostToolUse', '*', async function ($, e, next) { \
+             const downstream = await next(); \
              return { updatedInput: 'js(' + downstream.updatedInput + ')' }; }); }",
         );
 
@@ -3246,8 +3586,8 @@ mod tests {
             ..HookFireResult::default()
         }));
         let runtime = load(
-            "function register(on) { on('PostToolUse', '*', function ($, e, next) { \
-             const downstream = next(); \
+            "function register(on) { on('PostToolUse', '*', async function ($, e, next) { \
+             const downstream = await next(); \
              return { updatedToolOutput: downstream.stop ? 'override' : 'saw-no-stop' }; }); }",
         );
 
@@ -3342,8 +3682,8 @@ mod tests {
             ..HookFireResult::default()
         }));
         let runtime = load(
-            "function register(on) { on('PostToolUse', '*', function ($, e, next) { \
-             const downstream = next(); \
+            "function register(on) { on('PostToolUse', '*', async function ($, e, next) { \
+             const downstream = await next(); \
              return { updatedToolOutput: 'hook saw ' + downstream.updatedToolOutput }; }); }",
         );
 
@@ -3358,8 +3698,8 @@ mod tests {
     #[test]
     fn next_without_an_inner_executor_returns_an_empty_result() {
         let runtime = load(
-            "function register(on) { on('PostToolUse', '*', function ($, e, next) { \
-             const downstream = next(); \
+            "function register(on) { on('PostToolUse', '*', async function ($, e, next) { \
+             const downstream = await next(); \
              return { updatedInput: [downstream.stop, downstream.failed, \
              downstream.watchPaths.length, String(downstream.updatedInput)].join('|') }; }); }",
         );
@@ -3455,8 +3795,8 @@ mod tests {
         // the realm survived the deadline.
         let runtime = load_with(
             "let calls = 0; \
-             function register(on) { on('PostToolUse', '*', function ($, e, next) { \
-               calls += 1; const downstream = next(); \
+             function register(on) { on('PostToolUse', '*', async function ($, e, next) { \
+               calls += 1; const downstream = await next(); \
                return { updatedInput: calls + ':' + downstream.updatedInput }; }); }",
             limits,
         );
@@ -3508,6 +3848,37 @@ mod tests {
     }
 
     #[test]
+    fn catching_the_deadline_rejection_does_not_hide_the_timeout() {
+        let limits = ModLimits {
+            hook_timeout: Duration::from_millis(100),
+            ..ModLimits::default()
+        };
+        let runtime = load_with(
+            "function register(on) { on('PostToolUse', '*', async function ($, e, next) { \
+             try { await next(); } catch (error) { return { updatedInput: 'swallowed' }; } \
+             return { updatedInput: 'finished' }; }); }",
+            limits,
+        );
+
+        let result = fire_with(
+            &runtime,
+            "PostToolUse",
+            "Bash",
+            Arc::new(BlockingInner) as _,
+        );
+
+        assert!(result.failed, "{result:?}");
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|error| error.contains("wall-clock budget")),
+            "{:?}",
+            result.errors
+        );
+    }
+
+    #[test]
     fn the_downstream_pool_abandons_a_thread_blocking_executor() {
         let pool = DownstreamPool::new();
         let inner: Arc<dyn HookExecutor> = Arc::new(BlockingInner);
@@ -3546,8 +3917,8 @@ mod tests {
     fn next_runs_the_following_hook_and_returns_its_result() {
         let runtime = load(
             "function register(on) { \
-             on('PostToolUse', '*', function ($, e, next) { \
-               const downstream = next(); \
+             on('PostToolUse', '*', async function ($, e, next) { \
+               const downstream = await next(); \
                return { updatedInput: 'A[' + downstream.updatedInput + ']' }; }); \
              on('PostToolUse', '*', function ($, e) { return { updatedInput: 'B' }; }); }",
         );
@@ -3559,11 +3930,43 @@ mod tests {
     }
 
     #[test]
+    fn a_hook_that_does_not_await_next_still_runs_the_chain_once() {
+        let inner = Arc::new(RecordingInner::answering(HookFireResult {
+            updated_input: Some("inner".to_string()),
+            ..HookFireResult::default()
+        }));
+        // The hook calls `next()` and ignores the promise. The level must
+        // still await it before merging, and the inner executor must run once.
+        let runtime = load(
+            "function register(on) { on('PostToolUse', '*', function ($, e, next) { \
+             next(); return { updatedToolOutput: 'fire-and-forget' }; }); }",
+        );
+
+        let result = fire_with(&runtime, "PostToolUse", "Bash", Arc::clone(&inner) as _);
+
+        assert_eq!(
+            inner.calls().len(),
+            1,
+            "the inner executor runs exactly once"
+        );
+        assert_eq!(
+            result.updated_tool_output.as_deref(),
+            Some("fire-and-forget")
+        );
+        assert_eq!(
+            result.updated_input.as_deref(),
+            Some("inner"),
+            "the downstream input is carried even when its result was not awaited"
+        );
+        assert!(!result.failed, "{result:?}");
+    }
+
+    #[test]
     fn a_downstream_hooks_failure_is_carried_through_next() {
         let runtime = load(
             "function register(on) { \
-             on('PostToolUse', '*', function ($, e, next) { \
-               const downstream = next(); \
+             on('PostToolUse', '*', async function ($, e, next) { \
+               const downstream = await next(); \
                return { updatedInput: downstream.failed ? 'saw-failure' : 'saw-success' }; }); \
              on('PostToolUse', '*', function () { throw new Error('downstream-broke'); }); }",
         );
@@ -3591,8 +3994,8 @@ mod tests {
         let runtime = load(
             "function register(on) { \
              on('PostToolUse', '*', function ($, e) { return { updatedToolOutput: 'first' }; }); \
-             on('PostToolUse', '*', function ($, e, next) { \
-               const downstream = next(); \
+             on('PostToolUse', '*', async function ($, e, next) { \
+               const downstream = await next(); \
                return { updatedToolOutput: 'second(' + downstream.updatedInput + ')' }; }); }",
         );
 
@@ -3619,13 +4022,13 @@ mod tests {
         let runtime = load(
             "function register(on) { \
              const order = []; \
-             on('PostToolUse', '*', function ($, e, next) { \
+             on('PostToolUse', '*', async function ($, e, next) { \
                order.push('A'); \
-               const downstream = next(); \
+               const downstream = await next(); \
                return { updatedInput: 'A(' + downstream.updatedInput + ')' }; }); \
-             on('PostToolUse', '*', function ($, e, next) { \
+             on('PostToolUse', '*', async function ($, e, next) { \
                order.push('B'); \
-               const downstream = next(); \
+               const downstream = await next(); \
                return { updatedInput: 'B(' + downstream.updatedInput + ')' }; }); \
              on('PostToolUse', '*', function ($, e) { \
                order.push('C'); \
@@ -4286,19 +4689,40 @@ mod tests {
     }
 
     #[test]
-    fn an_async_hook_is_reported_rather_than_silently_ignored() {
+    fn an_async_hook_runs_to_completion() {
+        let inner = Arc::new(RecordingInner::answering(HookFireResult {
+            updated_input: Some("inner".to_string()),
+            ..HookFireResult::default()
+        }));
         let runtime = load(
-            "function register(on) { on('PostToolUse', '*', async function () { return { stop: true }; }); }",
+            "function register(on) { on('PostToolUse', '*', async function ($, e, next) { \
+             await Promise.resolve(); \
+             const downstream = await next(); \
+             return { updatedInput: 'async(' + downstream.updatedInput + ')' }; }); }",
+        );
+
+        let result = fire_with(&runtime, "PostToolUse", "Bash", Arc::clone(&inner) as _);
+
+        assert!(!result.failed, "{result:?}");
+        assert_eq!(inner.calls().len(), 1);
+        assert_eq!(result.updated_input.as_deref(), Some("async(inner)"));
+    }
+
+    #[test]
+    fn a_hook_waiting_on_a_promise_nothing_settles_is_reported() {
+        let runtime = load(
+            "function register(on) { on('PostToolUse', '*', async function () { \
+             await new Promise(function () {}); }); }",
         );
 
         let result = runtime.fire("PostToolUse", "Bash", &HashMap::new());
 
-        assert!(result.failed);
+        assert!(result.failed, "{result:?}");
         assert!(
             result
                 .errors
                 .iter()
-                .any(|error| error.contains("async hooks are not supported")),
+                .any(|error| error.contains("nothing will settle")),
             "{:?}",
             result.errors
         );
@@ -4717,6 +5141,26 @@ mod tests {
                 },
             ],
             "the staged tree comes first, then what the handler returned"
+        );
+    }
+
+    #[test]
+    fn an_async_activation_handler_is_awaited() {
+        let runtime = load(
+            "function register(on) { \
+             $.ui.onActivate('go', async function () { \
+               await Promise.resolve(); \
+               return $.ui.text('after the await'); }); }",
+        );
+
+        let elements = runtime.activate("go").expect("the handler succeeds");
+
+        assert_eq!(
+            elements,
+            vec![UiElement::Text {
+                text: "after the await".to_string(),
+                style: UiStyle::Plain,
+            }]
         );
     }
 
