@@ -26,6 +26,9 @@ confidence-threshold = 0.93
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
+# Workspace members are referenced by path only; cargo-deny counts a path-only
+# dependency as a wildcard. They are not registry wildcards.
+allow-wildcard-paths = true
 deny = [
     # No GPL/AGPL. MPL-2.0 is allowed above for nucleo-matcher only.
 ]
