@@ -413,6 +413,17 @@ constants, so the firing side and the matching side cannot drift.
 - **Timeout.** Each hook is wrapped in `tokio::time::timeout` with
   `timeout_ms` (default 5000). A timed-out hook is killed (`kill_on_drop`);
   with `stream: true` a best-effort `{"type":"cancel"}` is written first.
+- **Process tree.** `kill_on_drop` only signals the direct child, so the hook
+  is spawned into its own process group (Unix) or Job Object (Windows) via
+  `coderex_core::process_tree::ProcessTree`. A timeout, an oversized output, an
+  unparseable answer, or a cancelled call kills the **whole** tree: a hook that
+  backgrounds a helper — `sh -c 'some-server & …'`, a wrapper that forks — does
+  not leave it running. On Windows, when the sandbox already owns a Job Object,
+  that job is the tree (a process cannot belong to two jobs without nesting).
+  A hook that exits cleanly is disarmed first, so anything it deliberately left
+  running is untouched. A descendant that inherited stderr can keep that pipe
+  open; the stderr read is bounded by the same deadline rather than waiting for
+  EOF.
 - **Sync / async.** `execute_sync` runs hooks in chain order, sequentially;
   `execute_async` spawns them as tasks. `fire_hook` uses the sequential path so
   tier/priority order is meaningful.

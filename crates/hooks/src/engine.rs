@@ -1634,6 +1634,45 @@ async fn execute_hook_with_timeout(
     result
 }
 
+/// Owns the hook's process tree, so anything the hook starts dies with it.
+///
+/// `kill_on_drop` only signals the direct child. A hook that runs a shell
+/// which backgrounds a grandchild — or a wrapper that forks — would leave that
+/// process running past a timeout, an oversized output, or the dropped future
+/// of a cancelled call. On Unix the tree is the child's process group; on
+/// Windows it is a Job Object.
+struct HookTree(Option<coderex_core::process_tree::ProcessTree>);
+
+impl HookTree {
+    /// Kill every process in the tree. Signals the group before the parent is
+    /// reaped, so the macOS descendant walk still has a chain to follow.
+    fn terminate(&self) {
+        if let Some(tree) = &self.0 {
+            tree.terminate();
+        }
+    }
+
+    /// The hook exited on its own; its remaining descendants are its own.
+    fn disarm(&self) {
+        if let Some(tree) = &self.0 {
+            tree.disarm();
+        }
+    }
+}
+
+impl Drop for HookTree {
+    fn drop(&mut self) {
+        self.terminate();
+    }
+}
+
+/// Stop a hook and everything it started, then reap it.
+async fn kill_hook_tree(child: &mut tokio::process::Child, tree: &HookTree) {
+    tree.terminate();
+    let _ = child.start_kill();
+    let _ = child.wait().await;
+}
+
 /// Execute a single hook subprocess.
 ///
 /// Every way the hook can fail to produce an answer is an `Err`: an
@@ -1703,6 +1742,38 @@ async fn execute_hook(
     #[cfg(target_os = "linux")]
     let cgroup = sandbox::prepare_cgroup_limits(hook);
 
+    // Own the whole tree before the child exists. On Windows a process can
+    // only belong to one Job Object without nesting, so when the sandbox owns
+    // one it also owns the tree (it carries `KILL_ON_JOB_CLOSE`).
+    #[cfg(target_os = "windows")]
+    let tree = if sandbox_handle.is_some() {
+        None
+    } else {
+        Some(
+            coderex_core::process_tree::ProcessTree::create(
+                coderex_core::process_tree::JobLimits::default(),
+            )
+            .map_err(|error| {
+                HookError::SpawnFailed(format!("could not create the hook's Job Object: {error}"))
+            })?,
+        )
+    };
+    #[cfg(not(target_os = "windows"))]
+    let tree = Some(
+        coderex_core::process_tree::ProcessTree::create(
+            coderex_core::process_tree::JobLimits::default(),
+        )
+        .map_err(|error| {
+            HookError::SpawnFailed(format!(
+                "could not prepare the hook's process group: {error}"
+            ))
+        })?,
+    );
+    if let Some(tree) = &tree {
+        tree.prepare(command.as_std_mut());
+    }
+    let tree = HookTree(tree);
+
     let mut child = command
         .spawn()
         .map_err(|e| HookError::SpawnFailed(e.to_string()))?;
@@ -1712,6 +1783,19 @@ async fn execute_hook(
     // `prepare` used, so there is one job, not two.
     #[cfg(target_os = "windows")]
     sandbox::finish_windows_spawn(sandbox_handle.as_ref(), &mut child).await?;
+
+    // Record the child in the tree before anything else observes it. On Unix
+    // this captures the process group; on Windows (no sandbox job) it assigns
+    // the Job Object and resumes the suspended child.
+    if let Some(tracker) = &tree.0 {
+        let pid = child.id().ok_or_else(|| {
+            HookError::SpawnFailed("the hook exited before it could be tracked".to_string())
+        })?;
+        tracker.attach_pid(pid).map_err(|error| {
+            let _ = child.start_kill();
+            HookError::SpawnFailed(format!("could not track the hook's process tree: {error}"))
+        })?;
+    }
 
     // Windows has no `RLIMIT_FSIZE`; saying nothing would make the accepted
     // field look enforced.
@@ -1735,7 +1819,7 @@ async fn execute_hook(
         .ok_or_else(|| HookError::SpawnFailed("hook stdout was not piped".to_string()))?;
     // Draining stderr concurrently is not optional: a hook that fills the
     // stderr pipe blocks forever if nobody reads it while stdout is read.
-    let stderr_task = tokio::spawn(read_stderr(child.stderr.take()));
+    let mut stderr_task = tokio::spawn(read_stderr(child.stderr.take()));
 
     // Deliver the input. See `classify_input_write`: a hook that closes stdin
     // without reading it has declined its input (benign); any other write error
@@ -1785,8 +1869,7 @@ async fn execute_hook(
             read = stream::read_line_capped(&mut reader, MAX_HOOK_LINE_BYTES) => read,
             () = tokio::time::sleep_until(deadline) => {
                 cancel_hook(&mut stdin).await;
-                let _ = child.kill().await;
-                let _ = child.wait().await;
+                kill_hook_tree(&mut child, &tree).await;
                 return Err(HookError::Timeout(hook.timeout_ms));
             }
         };
@@ -1797,8 +1880,7 @@ async fn execute_hook(
 
         total_bytes = total_bytes.saturating_add(line.len());
         if total_bytes > MAX_HOOK_OUTPUT_BYTES {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
+            kill_hook_tree(&mut child, &tree).await;
             return Err(HookError::OutputTooLarge(MAX_HOOK_OUTPUT_BYTES));
         }
 
@@ -1819,8 +1901,7 @@ async fn execute_hook(
 
         match stream::parse_message(trimmed) {
             Err(error) => {
-                let _ = child.kill().await;
-                let _ = child.wait().await;
+                kill_hook_tree(&mut child, &tree).await;
                 return Err(HookError::UnparseableOutput(error));
             }
             Ok(None) => {}
@@ -1859,12 +1940,21 @@ async fn execute_hook(
         status.map_err(|e| HookError::SpawnFailed(e.to_string()))?
     } else {
         cancel_hook(&mut stdin).await;
-        let _ = child.kill().await;
-        let _ = child.wait().await;
+        kill_hook_tree(&mut child, &tree).await;
         return Err(HookError::Timeout(hook.timeout_ms));
     };
 
-    let stderr = stderr_task.await.unwrap_or_default();
+    // A descendant that inherited stderr can hold the pipe open after the hook
+    // exits. Diagnostics are not worth waiting past the deadline for: stop the
+    // reader and report what was collected.
+    let stderr = match tokio::time::timeout_at(deadline, &mut stderr_task).await {
+        Ok(Ok(text)) => text,
+        Ok(Err(_)) => String::new(),
+        Err(_) => {
+            stderr_task.abort();
+            String::new()
+        }
+    };
     let exit_code = status.code().unwrap_or(-1);
 
     // A hook that did not exit cleanly did not answer, even if it printed a
@@ -1885,6 +1975,10 @@ async fn execute_hook(
     }
 
     let hook_result = hook_result.ok_or(HookError::NoOutput)?;
+
+    // The hook answered and exited cleanly; anything it deliberately left
+    // running is not ours to kill.
+    tree.disarm();
 
     Ok(HookExecutionResult {
         hook_result,
@@ -2874,6 +2968,129 @@ mod tests {
         };
         let result = execute_hook_with_timeout(&hook, &input, None, None).await;
         assert!(matches!(result, Err(HookError::Timeout(50))));
+    }
+
+    /// Whether `pid` still runs. A zombie has already exited and does not
+    /// count; `ps` reports it with a `Z` state.
+    #[cfg(unix)]
+    fn hook_process_alive(pid: i32) -> bool {
+        let output = std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output();
+        match output {
+            Ok(output) => {
+                let state = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                !state.is_empty() && !state.starts_with('Z')
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// A hook that backgrounds a process and then hangs. Only killing the
+    /// direct child would leave the background process running.
+    #[cfg(unix)]
+    fn backgrounding_hook(directory: &std::path::Path, timeout_ms: u64) -> HookConfig {
+        HookConfig {
+            watch: None,
+            event: "Stop".to_string(),
+            kind: HookType::Command,
+            tier: HookTier::Core,
+            command: "sh -c 'sleep 30 & echo $! > probe.pid; sleep 30'".to_string(),
+            http: None,
+            prompt: None,
+            model: None,
+            mcp: None,
+            env: HashMap::new(),
+            cwd: Some(directory.to_path_buf()),
+            internal: false,
+            timeout_ms,
+            priority: 0,
+            dry_run: false,
+            stream: false,
+            max_cpu_seconds: None,
+            max_memory_mb: None,
+            max_file_size_mb: None,
+            sandbox: None,
+        }
+    }
+
+    /// The pid the backgrounding hook wrote, once it is visible.
+    #[cfg(unix)]
+    async fn background_pid(directory: &std::path::Path) -> i32 {
+        let path = directory.join("probe.pid");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            if let Ok(text) = std::fs::read_to_string(&path)
+                && let Ok(pid) = text.trim().parse::<i32>()
+            {
+                return pid;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the hook never wrote its background pid"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Wait for a process to be gone (a zombie has already exited).
+    #[cfg(unix)]
+    async fn wait_for_process_exit(pid: i32) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while hook_process_alive(pid) && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(
+            !hook_process_alive(pid),
+            "the background process {pid} survived"
+        );
+    }
+
+    /// `kill_on_drop` only signals the direct child. A hook that backgrounds a
+    /// process must not leave it running after the timeout: the engine owns
+    /// the hook's whole process group.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn execute_hook_timeout_kills_backgrounded_descendants() {
+        let directory = tempfile::tempdir().unwrap();
+        let hook = backgrounding_hook(directory.path(), 800);
+        let input = HookInput {
+            event: "Stop".to_string(),
+            session_id: None,
+            input: None,
+            context: None,
+        };
+
+        let result = execute_hook_with_timeout(&hook, &input, None, None).await;
+        assert!(matches!(result, Err(HookError::Timeout(800))), "{result:?}");
+
+        wait_for_process_exit(background_pid(directory.path()).await).await;
+    }
+
+    /// The outer timeout drops the execution future instead of returning from
+    /// it. The guard must still kill the tree when it is dropped.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropping_the_execution_kills_backgrounded_descendants() {
+        let directory = tempfile::tempdir().unwrap();
+        // A deadline far away, so only the caller's timeout cancels it.
+        let hook = backgrounding_hook(directory.path(), 30_000);
+        let input = HookInput {
+            event: "Stop".to_string(),
+            session_id: None,
+            input: None,
+            context: None,
+        };
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_millis(800),
+            execute_hook(&hook, &input, None, deadline),
+        )
+        .await;
+        assert!(outcome.is_err(), "the caller cancelled the execution");
+
+        wait_for_process_exit(background_pid(directory.path()).await).await;
     }
 
     /// The old shell prefix could be undone by the hook itself. The limits are
