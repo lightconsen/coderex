@@ -969,6 +969,24 @@ fn configured_timeout_breaker_limit() -> usize {
 /// executor directly; it still must not hang forever.
 const DOWNSTREAM_BUDGET_FALLBACK: Duration = Duration::from_secs(5);
 
+/// Environment variable that overrides the consecutive downstream-timeout cap.
+const DOWNSTREAM_ABANDON_LIMIT_ENV: &str = "CODEREX_DOWNSTREAM_TIMEOUT_LIMIT";
+
+/// How many consecutive downstream timeouts the pool tolerates before it stops
+/// running the configured hooks for the rest of the session.
+///
+/// Each abandoned runner is a thread that cannot be reclaimed, so this is a
+/// bound on that leak. `0` disables the cap.
+const DEFAULT_DOWNSTREAM_ABANDON_LIMIT: usize = 8;
+
+/// Resolve the downstream-timeout cap from the environment.
+fn configured_abandon_limit() -> usize {
+    std::env::var(DOWNSTREAM_ABANDON_LIMIT_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(DEFAULT_DOWNSTREAM_ABANDON_LIMIT)
+}
+
 /// One downstream-executor call handed to a [`DownstreamPool`] runner.
 struct DownstreamJob {
     /// Identifies the pending promise for [`Delivery::Shared`].
@@ -1013,10 +1031,20 @@ struct DownstreamCompletion {
 /// timeout the pool forgets it, so the next call starts a fresh thread instead
 /// of queueing behind a stuck one. A forgotten thread exits on its own once
 /// its blocking call returns.
+///
+/// A thread stuck in a blocking call cannot be reclaimed, so repeated
+/// abandonments would leak one thread each. The pool therefore counts
+/// consecutive timeouts and, at the limit, stops starting runners for the rest
+/// of the session. A successful call resets the count; the settings hooks are
+/// reported as disabled rather than every later call paying the full budget.
 struct DownstreamPool {
     runner: Mutex<Option<mpsc::Sender<DownstreamJob>>>,
     completions: mpsc::Sender<DownstreamCompletion>,
     completed: Mutex<mpsc::Receiver<DownstreamCompletion>>,
+    /// Consecutive abandoned runners. Reset by any successful call.
+    abandoned: AtomicUsize,
+    /// `0` disables the cap.
+    abandon_limit: usize,
 }
 
 impl std::fmt::Debug for DownstreamPool {
@@ -1029,12 +1057,43 @@ impl std::fmt::Debug for DownstreamPool {
 
 impl DownstreamPool {
     fn new() -> Self {
+        Self::with_abandon_limit(configured_abandon_limit())
+    }
+
+    fn with_abandon_limit(abandon_limit: usize) -> Self {
         let (completions, completed) = mpsc::channel();
         Self {
             runner: Mutex::new(None),
             completions,
             completed: Mutex::new(completed),
+            abandoned: AtomicUsize::new(0),
+            abandon_limit,
         }
+    }
+
+    /// Why the pool refuses to run the downstream hooks, if it does.
+    fn disabled_reason(&self) -> Option<String> {
+        if self.abandon_limit == 0 {
+            return None;
+        }
+        let count = self.abandoned.load(Ordering::SeqCst);
+        (count >= self.abandon_limit).then(|| {
+            format!(
+                "the downstream hook executor timed out {count} times in a row; \
+                 settings hooks are disabled for the rest of this session"
+            )
+        })
+    }
+
+    /// Count one abandoned runner and stop reusing it.
+    fn abandon_runner(&self) {
+        self.abandoned.fetch_add(1, Ordering::SeqCst);
+        self.forget_runner();
+    }
+
+    /// A call the downstream executor answered resets the consecutive count.
+    fn record_success(&self) {
+        self.abandoned.store(0, Ordering::SeqCst);
     }
 
     /// Queue `inner` for the runner thread without waiting for it.
@@ -1049,6 +1108,9 @@ impl DownstreamPool {
         input: &str,
         context: &HashMap<String, String>,
     ) -> Result<tokio::sync::oneshot::Sender<()>, String> {
+        if let Some(reason) = self.disabled_reason() {
+            return Err(reason);
+        }
         let (cancel_sender, cancel) = tokio::sync::oneshot::channel();
         self.dispatch(DownstreamJob {
             id,
@@ -1084,6 +1146,13 @@ impl DownstreamPool {
         if budget.is_zero() {
             return downstream_budget_failure();
         }
+        if let Some(reason) = self.disabled_reason() {
+            return HookFireResult {
+                failed: true,
+                errors: vec![reason],
+                ..HookFireResult::default()
+            };
+        }
         let (reply_sender, reply_receiver) = mpsc::sync_channel(1);
         let (cancel_sender, cancel_receiver) = tokio::sync::oneshot::channel();
         let job = DownstreamJob {
@@ -1104,12 +1173,15 @@ impl DownstreamPool {
         }
 
         match reply_receiver.recv_timeout(budget) {
-            Ok(result) => result,
+            Ok(result) => {
+                self.record_success();
+                result
+            }
             Err(RecvTimeoutError::Timeout) => {
                 // Let a cooperative executor stop where it is. The runner is
                 // not reused either way: it may be blocked on native code.
                 let _ = cancel_sender.send(());
-                self.forget_runner();
+                self.abandon_runner();
                 downstream_budget_failure()
             }
             Err(RecvTimeoutError::Disconnected) => {
@@ -2129,6 +2201,15 @@ fn start_inner<'js>(
     let Some(inner) = call.inner.clone() else {
         return resolve.call::<_, ()>((inner_result_json(&HookFireResult::default()),));
     };
+    // A call with no time left would be abandoned before it can answer, and
+    // spawning a thread for it would only leak that thread.
+    if call
+        .deadline
+        .remaining()
+        .is_some_and(|remaining| remaining.is_zero())
+    {
+        return reject.call::<_, ()>((call.budget_message.clone(),));
+    }
     let context: HashMap<String, String> = serde_json::from_str(context_json).unwrap_or_default();
     let id = call.pending.next_id();
     match call.downstream.submit(id, &inner, event, input, &context) {
@@ -2180,13 +2261,14 @@ fn drive_promise(
             // A completion whose id is unknown belongs to a run that was
             // already abandoned at an earlier deadline.
             if let Some(entry) = pending.take(completion.id) {
+                downstream.record_success();
                 if let Ok(resolve) = entry.resolve.restore(ctx) {
                     let _ = resolve.call::<_, ()>((inner_result_json(&completion.result),));
                 }
             }
         } else {
             deadline.expire();
-            downstream.forget_runner();
+            downstream.abandon_runner();
             pending.reject_all(ctx, budget_message);
         }
     }
@@ -3875,6 +3957,109 @@ mod tests {
                 .any(|error| error.contains("wall-clock budget")),
             "{:?}",
             result.errors
+        );
+    }
+
+    #[test]
+    fn the_downstream_pool_stops_after_repeated_timeouts() {
+        let pool = DownstreamPool::with_abandon_limit(2);
+        let slow: Arc<dyn HookExecutor> = Arc::new(BlockingInner);
+        for _ in 0..2 {
+            let result = pool.run(
+                Duration::from_millis(50),
+                &slow,
+                "PostToolUse",
+                "Bash",
+                &HashMap::new(),
+            );
+            assert!(result.failed, "{result:?}");
+            assert!(
+                result
+                    .errors
+                    .iter()
+                    .any(|error| error.contains("wall-clock budget")),
+                "{:?}",
+                result.errors
+            );
+        }
+
+        // The third call is refused without waiting, so it cannot leak another
+        // thread or make the session pay the budget again.
+        let started = std::time::Instant::now();
+        let result = pool.run(
+            Duration::from_secs(5),
+            &slow,
+            "PostToolUse",
+            "Bash",
+            &HashMap::new(),
+        );
+        assert!(result.failed, "{result:?}");
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|error| error.contains("disabled for the rest of this session")),
+            "{:?}",
+            result.errors
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "a refused call must not wait; took {:?}",
+            started.elapsed()
+        );
+
+        // The promise-driven path is refused for the same reason.
+        let Err(error) = pool.submit(1, &slow, "PostToolUse", "Bash", &HashMap::new()) else {
+            panic!("the pool must refuse a new run");
+        };
+        assert!(
+            error.contains("disabled for the rest of this session"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_successful_downstream_call_resets_the_abandon_count() {
+        let pool = DownstreamPool::with_abandon_limit(2);
+        let slow: Arc<dyn HookExecutor> = Arc::new(BlockingInner);
+        let fast: Arc<dyn HookExecutor> =
+            Arc::new(RecordingInner::answering(HookFireResult::default()));
+
+        let timed = pool.run(
+            Duration::from_millis(50),
+            &slow,
+            "PostToolUse",
+            "Bash",
+            &HashMap::new(),
+        );
+        assert!(timed.failed, "{timed:?}");
+
+        let ok = pool.run(
+            Duration::from_secs(2),
+            &fast,
+            "PostToolUse",
+            "Bash",
+            &HashMap::new(),
+        );
+        assert!(!ok.failed, "{ok:?}");
+
+        // The count restarted, so one timeout is still a budget failure rather
+        // than a disabled pool.
+        let timed = pool.run(
+            Duration::from_millis(50),
+            &slow,
+            "PostToolUse",
+            "Bash",
+            &HashMap::new(),
+        );
+        assert!(timed.failed, "{timed:?}");
+        assert!(
+            !timed
+                .errors
+                .iter()
+                .any(|error| error.contains("disabled for the rest of this session")),
+            "{:?}",
+            timed.errors
         );
     }
 

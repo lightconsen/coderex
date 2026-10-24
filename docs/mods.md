@@ -499,6 +499,7 @@ runaway delays only its own runtime.
 | Queued messages per turn | 8 | The runtime drops further submissions for that turn and reports the count. |
 | Consecutive auto-turns | 3 per person-initiated turn | The CLI stops draining, drops the rest with a system notice, and resets the counter at the next person prompt. |
 | Timeouts | 3 per session | The circuit breaker disables mods for the rest of the session. See below. |
+| Consecutive downstream timeouts | 8 per session | The downstream pool stops running the settings hooks for the rest of the session. `CODEREX_DOWNSTREAM_TIMEOUT_LIMIT` overrides it; `0` disables the cap. See below. |
 
 A file that fails to read, transform, parse, evaluate or register is reported
 **once** at load (`tracing::warn!`, plus `ModRuntime::load_errors`) and
@@ -530,6 +531,16 @@ thread inside a single poll cannot be stopped and finishes on its own thread
 without holding up the session. When mods are disabled, the caller goes through
 the same pool with a five-second budget.
 
+An abandoned runner cannot be reclaimed until its blocking call returns, so
+repeated downstream timeouts would leak one thread each. The pool bounds that
+separately from the mod breaker: it counts **consecutive** downstream timeouts,
+and after 8 in a row it stops starting runners for the rest of the session.
+`next()` then rejects with a message saying the settings hooks are disabled, and
+the disabled-mods path stops delegating to them; a call the executor answers
+resets the count. `CODEREX_DOWNSTREAM_TIMEOUT_LIMIT` overrides the limit and `0`
+disables it. This trades "every later hook call pays the budget and leaks a
+thread" for "the configured hooks stop, and the person is told why".
+
 - **What counts:** only a call that exceeds the wall-clock budget — a hook
   `fire`, a nested `next`, or a UI activation handler. Ordinary hook
   exceptions, heap and stack errors, and a worker that disconnects do **not**
@@ -544,8 +555,9 @@ the same pool with a five-second budget.
   an error explaining the shutdown. On a gating event (`PreToolUse`,
   `UserPromptSubmit`) it also sets `stop`, so a disabled runtime fails closed.
   On a non-gating event `stop` is unchanged (`false`), and the downstream
-  settings hooks still run normally: disabling mods does not disable the
-  configured hooks. `activate` returns the reason as an error instead.
+  settings hooks still run normally unless the pool's own consecutive-timeout
+  cap has tripped: disabling mods does not by itself disable the configured
+  hooks. `activate` returns the reason as an error instead.
 - **Telling the person:** `ModRuntime::is_disabled()` and
   `disabled_reason()` expose the state; `JsHookExecutor` and `ModUiHandle`
   forward them. The interactive CLI shows the reason once, in the transcript.
