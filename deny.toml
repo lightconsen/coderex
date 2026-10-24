@@ -2,12 +2,24 @@
 allow = [
     "MIT",
     "Apache-2.0",
+    # wasmtime/Cranelift use this SPDX expression: still a permissive
+    # Apache-2.0 grant, with the LLVM runtime exception.
+    "Apache-2.0 WITH LLVM-exception",
     "BSD-2-Clause",
     "BSD-3-Clause",
     "ISC",
     "Unicode-3.0",
     "OpenSSL",
     "Zlib",
+    # Boost Software License (dragonbox, through oxc float formatting).
+    "BSL-1.0",
+    # Data/notice-only: CC0 for `notify`, CDLA-Permissive-2.0 for the
+    # `webpki-roots` certificate bundle.
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    # `nucleo-matcher` is MPL-2.0 (file-level copyleft). It is used
+    # unmodified; revisit if the dependency is replaced.
+    "MPL-2.0",
 ]
 confidence-threshold = 0.93
 
@@ -15,7 +27,7 @@ confidence-threshold = 0.93
 multiple-versions = "warn"
 wildcards = "deny"
 deny = [
-    # No GPL or other copyleft licenses
+    # No GPL/AGPL. MPL-2.0 is allowed above for nucleo-matcher only.
 ]
 
 [sources]

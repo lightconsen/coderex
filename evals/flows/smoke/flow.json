@@ -1,7 +1,7 @@
 {
   "name": "smoke",
   "description": "A checked-in, offline flow: the binary starts, answers through the static Anthropic fixture, and runs a local slash command.",
-  "command": "sh \"{flow}/run-case.sh\" \"{prompt}\"",
+  "command": "bash \"{flow}/run-case.sh\" \"{prompt}\"",
   "reps": 1,
   "concurrency": 1,
   "timeout_s": 600,

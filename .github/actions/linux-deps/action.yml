@@ -10,3 +10,11 @@ runs:
       run: |
         sudo apt-get update
         sudo apt-get install -y lld libdbus-1-dev pkg-config
+    - name: Free disk space
+      shell: bash
+      run: |
+        # The workspace test build (wasmtime + fixtures) fills the hosted
+        # runner's root disk. These preinstalled toolchains are unused here.
+        sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+          /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+        sudo docker image prune -af || true
