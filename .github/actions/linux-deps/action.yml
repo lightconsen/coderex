@@ -1,0 +1,12 @@
+name: Linux build dependencies
+description: >-
+  System libraries the workspace needs before cargo can build it: dbus for
+  keyring (libdbus-sys) and lld for the linker configured in
+  .cargo/config.toml.
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y lld libdbus-1-dev pkg-config
