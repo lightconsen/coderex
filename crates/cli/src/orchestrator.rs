@@ -184,7 +184,7 @@ pub struct SessionContext {
     /// Where plugin `.d.ts` declarations were exported, when any were.
     pub plugin_types_dir: Option<String>,
     /// Recent plugin channel notifications, recorded by the production
-    /// subscriber ([`StartupOrchestrator::subscribe_plugin_channels`]).
+    /// subscriber (`subscribe_plugin_channels`).
     ///
     /// Bounded, oldest first out. Kept so a session can inspect what its
     /// channels actually delivered rather than only knowing a sink exists.

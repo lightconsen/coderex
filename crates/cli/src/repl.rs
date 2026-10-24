@@ -3329,7 +3329,7 @@ impl ReplLoop {
     /// Replace the base system prompt (`--system-prompt`).
     ///
     /// Interactive sessions receive this from the orchestrator's
-    /// [`configure_repl`](crate::orchestrator::StartupOrchestrator::configure_repl);
+    /// `configure_repl`;
     /// without the setter the flag was parsed and then silently ignored.
     pub fn with_system_prompt(&mut self, prompt: Option<String>) {
         self.session_effects.override_system_prompt = prompt;
