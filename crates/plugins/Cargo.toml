@@ -47,7 +47,7 @@ process-runtime = []
 wasm-runtime = ["dep:wasmtime", "dep:wasmparser", "dep:wat"]
 
 [dependencies.wasmtime]
-version = "20"
+version = "50.0.0"
 optional = true
 
 [[bin]]
