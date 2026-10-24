@@ -1,4 +1,5 @@
-//! CodeRex Equivalence Tests — covering all 14 modules from equivalence_test_plan.md.
+//! CodeRex Equivalence Tests — API, behavioural and boundary parity across
+//! all 14 modules.
 //!
 //! These tests verify API parity, behavioral parity, and boundary parity
 //! against the Claude Code equivalence test plan.

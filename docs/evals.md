@@ -204,14 +204,10 @@ machine or workflow with credentials.
 
 In CI it is the `live-provider-eval` job (plus the
 `live-provider-eval-preflight` credential check) in
-`.github/workflows/ci.yml`, mirrored as `live_eval` in
-`azure-pipelines.yml` (queued with `runLiveEval: true`). Both are manual and
-are skipped on push and pull request. GitHub's preflight converts the presence
-of `ANTHROPIC_API_KEY` into an output so the live job does not fail merely
-because a repository has no secret; Azure's `live_eval` prints a warning and
-exits successfully when the variable is unset (an undefined Azure variable
-would otherwise arrive as a literal string). Both run
-`scripts/test-live-eval.sh`; GitHub uploads `report.html` and
+`.github/workflows/ci.yml`. The job is manual and is skipped on push and pull
+request. The preflight converts the presence of `ANTHROPIC_API_KEY` into an
+output so the live job does not fail merely because a repository has no
+secret. It runs `scripts/test-live-eval.sh` and uploads `report.html` and
 `baseline/results.jsonl` as `live-eval-report`. The script approves the
 harness only on the first run, so a later change to the flow is refused
 instead of silently re-approved.
