@@ -5,10 +5,11 @@
 //! host, never a live JavaScript object. The host can therefore render it
 //! after the mod's worker has moved on, timed out, or been unloaded.
 //!
-//! Only terminal surfaces exist today. A button is a labelled affordance with
-//! a stable `id`. The terminal can focus one and activate it, which delivers
-//! the id to the mod runtime's `$.ui.onActivate` handler; there is no mouse
-//! click routing.
+//! The tree is surface-neutral: [`crate::surface`] names the front end that
+//! presents it and states what it can do. CodeRex registers only the terminal
+//! surface; its renderer focuses a button and routes both `Enter` and mouse
+//! clicks to the mod runtime's `$.ui.onActivate` handler. Another surface
+//! renders the same tree for its own medium.
 //!
 //! [`parse_ui_elements`] is the validating boundary for the JSON that crosses
 //! from the JavaScript runtime. It enforces types, non-empty button labels and

@@ -29,6 +29,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use coderex_core::hook_executor::{HookExecutor, HookFireResult};
+use coderex_core::surface::SurfaceDescriptor;
 use coderex_core::ui_protocol::{UiElement, UiStyle, parse_ui_elements};
 use rquickjs::function::Opt;
 use rquickjs::object::Property;
@@ -146,6 +147,13 @@ pub struct ModSession {
     pub model: String,
     /// The session's permission mode.
     pub permission_mode: String,
+    /// The front-end surface the session is presented in.
+    ///
+    /// Mods see its id as `e.surface` and its capabilities as
+    /// `e.surfaceCapabilities`. The CLI registers the terminal surface, but
+    /// the host may pass any registered surface; the mod runtime never assumes
+    /// one.
+    pub surface: SurfaceDescriptor,
 }
 
 /// A cloneable handle to the user messages mods queued with
@@ -2561,11 +2569,26 @@ fn install_host_api<'js>(ctx: &Ctx<'js>, session: &ModSession, name: &str) -> Re
         ("cwd", session.cwd.as_str()),
         ("model", session.model.as_str()),
         ("permission_mode", session.permission_mode.as_str()),
+        ("surface", session.surface.id.as_str()),
     ] {
         session_object
             .prop(key, Property::from(value))
             .map_err(|error| js_error(ctx, error))?;
     }
+    let capabilities =
+        Object::new(ctx.clone()).map_err(|error| js_error(ctx, error))?;
+    for (key, value) in [
+        ("interactive", session.surface.capabilities.interactive),
+        ("mouse", session.surface.capabilities.mouse),
+        ("images", session.surface.capabilities.images),
+    ] {
+        capabilities
+            .prop(key, Property::from(value))
+            .map_err(|error| js_error(ctx, error))?;
+    }
+    session_object
+        .prop("surfaceCapabilities", Property::from(capabilities))
+        .map_err(|error| js_error(ctx, error))?;
 
     let dollar = Object::new(ctx.clone()).map_err(|error| js_error(ctx, error))?;
     dollar
@@ -3043,10 +3066,6 @@ globalThis.__coderExCall = async function (modIndex, hookIndex, event, input, co
   }
   eventObject.event = event;
   eventObject.input = input;
-  // The surface a person is looking at. CodeRex ships one — the terminal — so
-  // this is constant today; the field exists so a mod can branch on it without
-  // changing when another surface is actually built.
-  eventObject.surface = 'terminal';
 
   try {
     const parsedContext = JSON.parse(contextJson);
@@ -3068,6 +3087,11 @@ globalThis.__coderExCall = async function (modIndex, hookIndex, event, input, co
   }
 
   const host = registration.host;
+  // The surface a person is looking at, supplied by the host. A host that has
+  // not configured one is the terminal, which is what CodeRex ships.
+  eventObject.surface = (host && host.session && host.session.surface) || 'terminal';
+  eventObject.surfaceCapabilities = (host && host.session && host.session.surfaceCapabilities)
+    || { interactive: false, mouse: false, images: false };
   const ui = host && host.ui;
   if (ui && typeof ui.__resetUi === 'function') ui.__resetUi();
   if (ui && typeof ui.__beginCall === 'function') ui.__beginCall();
@@ -3145,7 +3169,9 @@ globalThis.__coderExActivate = async function (id, eventJson) {
     event.event = 'ModUiActivate';
     event.input = id;
     event.id = id;
-    event.surface = 'terminal';
+    event.surface = (host && host.session && host.session.surface) || 'terminal';
+    event.surfaceCapabilities = (host && host.session && host.session.surfaceCapabilities)
+      || { interactive: false, mouse: false, images: false };
 
     const value = await chosen.handler(host, event);
     const staged = (ui && typeof ui.__takeUi === 'function') ? ui.__takeUi() : [];
@@ -3615,6 +3641,7 @@ mod tests {
             cwd: "/work".to_string(),
             model: "test-model".to_string(),
             permission_mode: "default".to_string(),
+            surface: SurfaceDescriptor::terminal(),
         }
     }
 
@@ -4439,6 +4466,37 @@ mod tests {
         );
         let result = runtime.fire("PreToolUse", "Bash", &HashMap::new());
         assert_eq!(result.updated_input.as_deref(), Some("terminal"));
+    }
+
+    #[test]
+    fn the_hook_sees_the_host_surface_and_its_capabilities() {
+        // The surface is not a constant: the host passes a descriptor and the
+        // mod reads both its id and what it can present.
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("test.js"),
+            "function register(on) { on('PostToolUse', '*', function ($, e) { \
+             return { updatedInput: e.surface + '|' + e.surfaceCapabilities.interactive + '|' \
+             + e.surfaceCapabilities.mouse }; }); }",
+        )
+        .unwrap();
+        let session = ModSession {
+            cwd: "/work".to_string(),
+            model: "test-model".to_string(),
+            permission_mode: "default".to_string(),
+            surface: SurfaceDescriptor::new(
+                "ide",
+                coderex_core::surface::SurfaceCapabilities::TEXT_ONLY,
+            )
+            .unwrap(),
+        };
+        let runtime =
+            ModRuntime::load_dir_with_limits(directory.path(), session, ModLimits::default())
+                .unwrap();
+
+        let result = runtime.fire("PostToolUse", "Bash", &HashMap::new());
+
+        assert_eq!(result.updated_input.as_deref(), Some("ide|false|false"));
     }
 
     #[test]

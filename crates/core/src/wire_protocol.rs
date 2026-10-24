@@ -16,6 +16,7 @@
 //! ```
 
 use crate::types::{ImageBlock, ToolResult, UsageSummary};
+use crate::ui_protocol::UiElement;
 use serde::{Deserialize, Serialize};
 
 /// Events emitted by the engine over the wire.
@@ -46,6 +47,15 @@ pub enum WireEvent {
         id: String,
         /// Execution result.
         result: WireToolResult,
+    },
+    /// A mod contributed a UI block.
+    ///
+    /// The tree is the same host-owned, validated snapshot the in-process
+    /// terminal renders. A wire client picks its own presentation; the surface
+    /// abstraction does not require a particular one.
+    ModUi {
+        /// The element tree, in emission order.
+        elements: Vec<UiElement>,
     },
     /// A compact boundary marker was inserted.
     CompactBoundary,

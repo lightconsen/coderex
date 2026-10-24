@@ -47,6 +47,7 @@ pub mod shell_security;
 pub mod state;
 pub mod stop_hook;
 pub mod stream_utils;
+pub mod surface;
 pub mod syntax;
 pub mod task;
 pub mod team;

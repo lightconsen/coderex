@@ -27,9 +27,13 @@ pub fn engine_event_to_wire(event: &EngineEvent) -> Option<WireEvent> {
         },
         // The summary is a local display hint for the interactive renderer;
         // it rides in front of a `ToolCallStart` whose `summary` field already
-        // carries the same text. Mod UI is likewise rendered in-process by the
-        // terminal surfaces. The wire protocol needs no frame for either.
-        EngineEvent::ToolUseSummary { .. } | EngineEvent::ModUi(_) => return None,
+        // carries the same text, so it needs no frame.
+        EngineEvent::ToolUseSummary { .. } => return None,
+        // Mod UI is part of the surface contract: an out-of-process surface
+        // (IDE, web, chat) renders the same tree the terminal does.
+        EngineEvent::ModUi(elements) => WireEvent::ModUi {
+            elements: elements.clone(),
+        },
         EngineEvent::CompactBoundary => WireEvent::CompactBoundary,
         EngineEvent::Compaction(event) => WireEvent::Compaction(event.clone()),
         EngineEvent::PermissionRequest { id, tool, args } => WireEvent::PermissionRequest {
@@ -89,6 +93,7 @@ pub fn wire_event_to_engine(event: &WireEvent) -> Option<EngineEvent> {
             id: id.clone(),
             result: ToolResult::from(result.clone()),
         },
+        WireEvent::ModUi { elements } => EngineEvent::ModUi(elements.clone()),
         WireEvent::CompactBoundary => EngineEvent::CompactBoundary,
         WireEvent::Compaction(event) => EngineEvent::Compaction(event.clone()),
         WireEvent::PermissionRequest { id, tool, args } => EngineEvent::PermissionRequest {
@@ -213,6 +218,33 @@ mod tests {
         let wire = engine_event_to_wire(&engine).unwrap();
         let back = wire_event_to_engine(&wire).unwrap();
         assert!(matches!(back, EngineEvent::ToolCallEnd { id, .. } if id == "tc_1"));
+    }
+
+    #[test]
+    fn mod_ui_roundtrip() {
+        let elements = vec![
+            crate::ui_protocol::UiElement::Text {
+                text: "hello".into(),
+                style: crate::ui_protocol::UiStyle::Plain,
+            },
+            crate::ui_protocol::UiElement::Button {
+                label: "Retry".into(),
+                id: "retry".into(),
+            },
+        ];
+        let engine = EngineEvent::ModUi(elements.clone());
+        let wire = engine_event_to_wire(&engine).expect("mod UI crosses the wire");
+        assert!(matches!(wire, WireEvent::ModUi { .. }));
+
+        // The frame is a `mod_ui` line with the element tree; an out-of-process
+        // surface deserializes the same shape the terminal rendered.
+        let json = serde_json::to_string(&wire).unwrap();
+        assert!(json.contains("\"type\":\"mod_ui\""), "{json}");
+        let decoded: WireEvent = serde_json::from_str(&json).unwrap();
+        match wire_event_to_engine(&decoded) {
+            Some(EngineEvent::ModUi(back)) => assert_eq!(back, elements),
+            other => panic!("expected ModUi, got {other:?}"),
+        }
     }
 
     #[test]

@@ -1133,6 +1133,18 @@ fn protocol_frame(
                 serde_json::Value::String(message.clone()),
             )]),
         }),
+        // Mod UI belongs to the surface contract, not to this process: a host
+        // following the stream renders the same element tree the terminal
+        // does. It travels as a `system` frame because that is the protocol's
+        // passthrough for subtype-specific payloads.
+        EngineEvent::ModUi(elements) => {
+            let elements = serde_json::to_value(elements).ok()?;
+            ProtocolMessage::System(SystemFrame {
+                subtype: "mod_ui".to_string(),
+                session_id: session_id.to_string(),
+                data: serde_json::Map::from_iter([("elements".to_string(), elements)]),
+            })
+        }
         _ => return None,
     })
 }
@@ -3819,10 +3831,23 @@ impl ReplLoop {
                             |poisoned| poisoned.into_inner().mode(),
                             |checker| checker.mode(),
                         );
+                        // The surface the session is presented in. CodeRex
+                        // ships the terminal; registering it here is what
+                        // makes its id and capabilities reach mods through
+                        // `e.surface` / `e.surfaceCapabilities`.
+                        let mut surfaces = coderex_core::surface::SurfaceRegistry::new();
+                        if let Err(error) = surfaces.register(Arc::new(
+                            coderex_ui::surface::TerminalSurface::new(),
+                        )) {
+                            tracing::warn!(%error, "could not register the terminal surface");
+                        }
                         let mod_session = coderex_mods::ModSession {
                             cwd: session_cwd.to_string_lossy().to_string(),
                             model: session_model.0.clone(),
                             permission_mode: format!("{permission_mode:?}"),
+                            surface: surfaces
+                                .active_descriptor()
+                                .unwrap_or_else(coderex_core::surface::SurfaceDescriptor::terminal),
                         };
                         registry.set_request_handler(Arc::new(
                             crate::hook_actions::SessionHookRequestHandler::new(
@@ -11090,6 +11115,19 @@ mod tests {
             panic!("a compact boundary should be a system frame");
         };
         assert_eq!(frame.subtype, "compact_boundary");
+
+        let mod_ui = protocol_frame(
+            &EngineEvent::ModUi(vec![coderex_core::ui_protocol::UiElement::Button {
+                label: "Retry".into(),
+                id: "retry".into(),
+            }]),
+            "s1",
+        );
+        let Some(ProtocolMessage::System(frame)) = mod_ui else {
+            panic!("mod UI should be a system frame");
+        };
+        assert_eq!(frame.subtype, "mod_ui");
+        assert_eq!(frame.data["elements"][0]["id"], "retry");
     }
 
     /// A shared buffer the sink can write into while the test holds the other
