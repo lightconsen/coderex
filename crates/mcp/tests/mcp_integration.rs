@@ -397,8 +397,11 @@ impl coderex_mcp::channel::InboundRequestHandler for SlowHandler {
 }
 
 fn answer_log() -> PathBuf {
+    // As with the mock scripts, the counter is per process: include the pid so
+    // two nextest processes cannot share one answer log.
     let log = std::env::temp_dir().join(format!(
-        "coderex_mock_answers_{}.jsonl",
+        "coderex_mock_answers_{}_{}.jsonl",
+        std::process::id(),
         MOCK_ID.fetch_add(1, Ordering::SeqCst)
     ));
     let _ = std::fs::remove_file(&log);

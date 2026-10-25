@@ -214,7 +214,13 @@ mod tests {
     /// legacy table came to find one already there.
     fn temp_db() -> std::path::PathBuf {
         let n = DB_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!("coderex_session_test_{n}.db"));
+        // The counter restarts in every test process, so include the pid:
+        // nextest runs each test in its own process, and two processes that
+        // picked the same number would open the same SQLite file.
+        let path = std::env::temp_dir().join(format!(
+            "coderex_session_test_{}_{n}.db",
+            std::process::id()
+        ));
         let _ = std::fs::remove_file(&path);
         path
     }
