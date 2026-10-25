@@ -928,7 +928,10 @@ mod tests {
     fn telemetry_config_defaults() {
         let config = TelemetryConfig::default();
         assert!(!config.enabled, "telemetry must be opted into");
-        assert!(config.endpoint.is_empty(), "there is no default destination");
+        assert!(
+            config.endpoint.is_empty(),
+            "there is no default destination"
+        );
         assert_eq!(config.batch_size, 100);
         assert_eq!(config.upload_interval_secs, 300);
         assert_eq!(config.sample_rate, 1.0);
@@ -957,7 +960,11 @@ mod tests {
             "https://telemetry.example.com/v1/crashes"
         );
         // With no destination configured nothing is derived.
-        assert!(TelemetryConfig::default().resolve_crash_endpoint().is_empty());
+        assert!(
+            TelemetryConfig::default()
+                .resolve_crash_endpoint()
+                .is_empty()
+        );
     }
 
     #[test]

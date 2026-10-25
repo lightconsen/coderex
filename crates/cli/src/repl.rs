@@ -3836,9 +3836,9 @@ impl ReplLoop {
                         // makes its id and capabilities reach mods through
                         // `e.surface` / `e.surfaceCapabilities`.
                         let mut surfaces = coderex_core::surface::SurfaceRegistry::new();
-                        if let Err(error) = surfaces.register(Arc::new(
-                            coderex_ui::surface::TerminalSurface::new(),
-                        )) {
+                        if let Err(error) =
+                            surfaces.register(Arc::new(coderex_ui::surface::TerminalSurface::new()))
+                        {
                             tracing::warn!(%error, "could not register the terminal surface");
                         }
                         let mod_session = coderex_mods::ModSession {
