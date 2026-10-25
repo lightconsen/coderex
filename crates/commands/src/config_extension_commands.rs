@@ -59,6 +59,55 @@ fn list_dir_items(path: &std::path::Path) -> Vec<String> {
         .collect()
 }
 
+/// Built-in theme names.
+///
+/// Kept in sync with `coderex_ui::themes::ThemeManager::new`. The commands
+/// crate does not depend on the UI crate, so the list is repeated here rather
+/// than pulling ratatui into every command build.
+const BUILTIN_THEMES: [&str; 4] = ["dark", "light", "high-contrast", "tokyo-night"];
+
+/// Theme names installed as `~/.coderex/themes/*.json`.
+///
+/// `ThemeManager` keys a theme by the JSON `name`, not by the file name, so a
+/// file called `mine.json` may install `my-theme`. Files without a non-empty
+/// `name` are ignored, matching the loader.
+fn custom_theme_names(path: &std::path::Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|extension| extension.to_str()) == Some("json"))
+        .filter_map(|path| std::fs::read_to_string(path).ok())
+        .filter_map(|content| serde_json::from_str::<serde_json::Value>(&content).ok())
+        .filter_map(|value| {
+            value
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(str::to_string)
+        })
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// Every theme `/theme` accepts: built-ins, installed files, plugin themes.
+fn available_themes(path: &std::path::Path, plugin_themes: &[String]) -> Vec<String> {
+    let mut names: Vec<String> = BUILTIN_THEMES
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect();
+    names.extend(custom_theme_names(path));
+    names.extend(plugin_themes.iter().cloned());
+    names.sort();
+    names.dedup();
+    names
+}
+
 /// One declaration emitted under `config_home()/plugin-types`.
 struct GeneratedDeclaration {
     /// The name `/plugin types <name>` accepts.
@@ -198,8 +247,7 @@ pub fn register(registry: &mut CommandRegistry) {
                 if args.is_empty() {
                     let home = config_home();
                     let themes_path = home.join("themes");
-                    let mut available = list_dir_items(&themes_path);
-                    available.extend(ctx.plugin_themes.iter().cloned());
+                    let available = available_themes(&themes_path, &ctx.plugin_themes);
                     let mut output = format!("Current theme: {}", ctx.theme);
                     if !available.is_empty() {
                         let _ = write!(
@@ -218,15 +266,9 @@ pub fn register(registry: &mut CommandRegistry) {
                     let new_theme = &args[0];
                     let home = config_home();
                     let themes_path = home.join("themes");
-                    let theme_file = themes_path.join(format!("{new_theme}.toml"));
-                    let theme_dir = themes_path.join(new_theme);
-                    if theme_file.exists()
-                        || theme_dir.is_dir()
-                        || new_theme == "light"
-                        || new_theme == "dark"
-                        || new_theme == "high-contrast"
-                        || new_theme == "tokyo-night"
-                        || ctx.plugin_themes.iter().any(|name| name == new_theme)
+                    if available_themes(&themes_path, &ctx.plugin_themes)
+                        .iter()
+                        .any(|name| name == new_theme)
                     {
                         // `statusline.theme` is the key startup reads (and a
                         // known settings field). Writing a top-level `theme`
@@ -251,20 +293,15 @@ pub fn register(registry: &mut CommandRegistry) {
                         ))
                         .with_state_change(true)
                     } else {
-                        let mut available = list_dir_items(&themes_path);
-                        available.extend(ctx.plugin_themes.iter().cloned());
-                        let hint = if available.is_empty() {
-                            "\nNo custom themes installed in ~/.coderex/themes/".to_string()
-                        } else {
-                            format!(
-                                "\nAvailable themes:\n{}",
-                                available
-                                    .iter()
-                                    .map(|t| format!("  {t}"))
-                                    .collect::<Vec<_>>()
-                                    .join("\n")
-                            )
-                        };
+                        let available = available_themes(&themes_path, &ctx.plugin_themes);
+                        let hint = format!(
+                            "\nAvailable themes:\n{}",
+                            available
+                                .iter()
+                                .map(|t| format!("  {t}"))
+                                .collect::<Vec<_>>()
+                                .join("\n")
+                        );
                         CommandResult::error(format!("Theme not found: {new_theme}{hint}"))
                     }
                 }
@@ -669,6 +706,41 @@ mod tests {
         assert!(result.state_changed);
         // Verify settings.json was written
         assert!(tmp.path().join("settings.json").exists());
+    }
+
+    /// A theme installed as `~/.coderex/themes/*.json` is listed by its JSON
+    /// name and accepted by `/theme` — the loader keys themes by `name`, not
+    /// by the file stem.
+    #[test]
+    fn theme_accepts_an_installed_custom_theme() {
+        let tmp = tempfile::tempdir().unwrap();
+        set_test_config_home(tmp.path().to_path_buf());
+        std::fs::create_dir_all(tmp.path().join("themes")).unwrap();
+        std::fs::write(
+            tmp.path().join("themes").join("mine.json"),
+            r#"{"name":"my-theme"}"#,
+        )
+        .unwrap();
+
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
+
+        let listed = reg.execute("theme", &ctx(), &[]);
+        assert!(listed.output.contains("my-theme"), "{}", listed.output);
+        assert!(!listed.output.contains("mine.json"), "{}", listed.output);
+        for builtin in BUILTIN_THEMES {
+            assert!(listed.output.contains(builtin), "{}", listed.output);
+        }
+
+        let switched = reg.execute("theme", &ctx(), &["my-theme".into()]);
+        assert!(switched.state_changed, "{}", switched.output);
+        assert!(switched.output.contains("my-theme"), "{}", switched.output);
+
+        let settings = std::fs::read_to_string(tmp.path().join("settings.json")).unwrap();
+        assert!(settings.contains("my-theme"), "{settings}");
     }
 
     #[test]

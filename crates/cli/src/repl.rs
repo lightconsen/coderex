@@ -7297,20 +7297,41 @@ impl ReplLoop {
     }
 
     fn apply_tui_theme(&self, ui_state: &mut coderex_ui::state::UiState, theme_name: &str) -> bool {
-        let mut manager = coderex_ui::themes::ThemeManager::new();
-        // Plugin themes are part of the session's registry, so `/theme` can
-        // select them like a built-in.
-        for (name, value) in &self.plugin_themes {
-            if let Err(error) = manager.register_json(name, value) {
-                tracing::warn!(theme = %name, %error, "plugin theme was not registered");
-            }
-        }
+        let manager = self.theme_manager();
         if let Some(theme) = manager.get_theme(theme_name) {
             ui_state.theme = theme.clone();
             true
         } else {
             false
         }
+    }
+
+    /// Build a theme manager with the built-ins, the user's custom themes and
+    /// the plugins' themes.
+    ///
+    /// `~/.coderex/themes/*.json` is the directory `ThemeManager` reads; both
+    /// startup (`statusline.theme`) and `/theme` go through this builder, so a
+    /// custom theme can be selected in either place.
+    fn theme_manager(&self) -> coderex_ui::themes::ThemeManager {
+        self.theme_manager_at(coderex_config::config_home().join("themes"))
+    }
+
+    /// [`Self::theme_manager`] against an explicit theme directory.
+    fn theme_manager_at(&self, theme_dir: std::path::PathBuf) -> coderex_ui::themes::ThemeManager {
+        let mut manager = coderex_ui::themes::ThemeManager::new();
+        manager.set_theme_dir(theme_dir);
+        if let Err(error) = manager.load_custom_themes() {
+            tracing::warn!(%error, "custom themes could not be loaded");
+        }
+        // Plugin themes are part of the session's registry, so `/theme` can
+        // select them like a built-in. Registering after the files lets a
+        // plugin override a file of the same name.
+        for (name, value) in &self.plugin_themes {
+            if let Err(error) = manager.register_json(name, value) {
+                tracing::warn!(theme = %name, %error, "plugin theme was not registered");
+            }
+        }
+        manager
     }
 
     /// Apply the persisted statusline theme at startup, including plugins.
@@ -8295,6 +8316,13 @@ impl ReplLoop {
                     ui_state
                         .notifications
                         .info(format!("Theme changed to: {theme_name}"));
+                } else {
+                    // The command accepted the name (it is installed), but
+                    // the file failed to parse or register. The settings file
+                    // already holds the name; say the theme is not live.
+                    ui_state
+                        .notifications
+                        .warn(format!("Theme could not be loaded: {theme_name}"));
                 }
             }
         }
@@ -10062,6 +10090,20 @@ mod tests {
         repl.apply_cli_config();
         assert!(repl.vim_mode_enabled, "vim_mode was not applied");
         assert_eq!(repl.current_theme, "light");
+    }
+
+    /// Themes installed as files under `~/.coderex/themes` must reach the
+    /// manager both startup and `/theme` apply from.
+    #[test]
+    fn custom_theme_files_are_available_at_runtime() {
+        let tmp = tempfile::tempdir().unwrap();
+        let theme_json = r##"{"name":"my-theme","background":"#1a1a2e","foreground":"#e0e0e0","dim":"#666666","accent":"#4a9eff","accent_secondary":"#00bcd4","statusbar_bg":"#333333","statusbar_fg":"#ffffff","error":"#e74c3c","warning":"#f39c12","success":"#2ecc71","border":"#444444","selection_bg":"#2a2a4a","selection_fg":"#ffffff","input_bg":"#111111","input_fg":"#eeeeee","overlay_bg":"#111111","overlay_border":"#666666","vim_normal":"#4a9eff","vim_insert":"#2ecc71","notif_info":"#4a9eff","notif_warning":"#f39c12","notif_error":"#e74c3c"}"##;
+        std::fs::write(tmp.path().join("mine.json"), theme_json).unwrap();
+
+        let repl = ReplLoop::new("/tmp".into(), ModelId::sonnet());
+        let manager = repl.theme_manager_at(tmp.path().to_path_buf());
+        assert!(manager.get_theme("my-theme").is_some());
+        assert!(manager.get_theme("dark").is_some());
     }
 
     #[test]

@@ -127,6 +127,37 @@ project and project-local settings are stripped during resolution, so a cloned
 repository cannot inject variables. An explicit `provider` block or
 `api_key` setting wins over the corresponding environment variable.
 
+### UI Themes
+
+Built-in themes are `dark` (default), `light`, `high-contrast` and
+`tokyo-night`. Switch at runtime with `/theme <name>` (which also saves the
+choice as `statusline.theme`) or set that key directly:
+
+```json
+{ "statusline": { "theme": "light" } }
+```
+
+Custom themes are JSON files in `~/.coderex/themes/`. The theme is keyed by
+its `name` field, not the file name, and every colour field is required (the
+same keys a built-in serializes: `background`, `foreground`, `dim`, `accent`,
+`accent_secondary`, `user`, `assistant`, `tool`, `statusbar_bg`,
+`statusbar_fg`, `error`, `warning`, `success`, `border`, `selection_bg`,
+`selection_fg`, `input_bg`, `input_fg`, `overlay_bg`, `overlay_border`,
+`vim_normal`, `vim_insert`, `notif_info`, `notif_warning`, `notif_error`):
+
+```json
+{
+  "name": "my-theme",
+  "background": "#1a1a2e",
+  "foreground": "#e0e0e0",
+  "...": "the remaining colour fields"
+}
+```
+
+`/theme` lists built-ins, installed files and plugin themes. A file that fails
+to parse is ignored by the loader; `/theme` reports "Theme could not be
+loaded" if a name it accepted could not be registered.
+
 ### Source Policies (repository-controlled files cannot relax privacy)
 
 `load_settings_file` applies two policies after parsing, both keyed on the
