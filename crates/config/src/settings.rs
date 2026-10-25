@@ -71,7 +71,7 @@ pub const MAX_SETTINGS_FILE_BYTES: u64 = 2 * 1024 * 1024;
 /// *not* a [`Settings`] field, so serde ignores it and no settings file
 /// (including a repository-controlled one) can inject environment variables.
 /// Remote environment variables now live in `remote_env.json`.
-const KNOWN_SETTINGS_FIELDS: [&str; 17] = [
+const KNOWN_SETTINGS_FIELDS: [&str; 18] = [
     "config_version",
     "model",
     "permission_mode",
@@ -89,6 +89,7 @@ const KNOWN_SETTINGS_FIELDS: [&str; 17] = [
     "statusline",
     "prompt_caching",
     "env",
+    "provider",
 ];
 
 /// Permission modes accepted in settings, most restrictive first.
@@ -288,6 +289,26 @@ pub struct HookLayers {
     pub managed: Option<serde_json::Value>,
 }
 
+/// Endpoint overrides for the Anthropic-protocol provider.
+///
+/// These live in settings rather than in an environment wrapper so a provider
+/// (an Anthropic-compatible gateway, a regional endpoint) can be configured
+/// once for every CodeRex invocation. The block is only honoured from the
+/// **user** and **managed** layers: a repository-controlled
+/// `.coderex/settings.json` must not be able to point the session's API key at
+/// an endpoint it controls (see [`Settings::resolve`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ProviderSettings {
+    /// Base URL for the Anthropic-protocol endpoint. `None` uses the
+    /// provider's default (Anthropic's API, or the cloud deployment's URL).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    /// HTTP request timeout in seconds. `None` keeps the transport default
+    /// (120 s). Raise it for providers that take a long time to answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_timeout_secs: Option<u64>,
+}
+
 /// Resolved settings after merging all sources.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Settings {
@@ -324,6 +345,9 @@ pub struct Settings {
     pub mcp_servers: Option<serde_json::Value>,
     /// API key — may be a raw value or a `"keyring://..."` reference.
     pub api_key: Option<String>,
+    /// Provider endpoint overrides (base URL and request timeout).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<ProviderSettings>,
     /// Per-model context-window overrides, with an optional default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window: Option<ContextWindowSettings>,
@@ -363,6 +387,7 @@ impl Settings {
             hook_layers: None,
             mcp_servers: None,
             api_key: None,
+            provider: None,
             context_window: None,
             vim_mode: None,
             statusline: None,
@@ -428,6 +453,29 @@ impl Settings {
                         message: "batch_size must be > 0".to_string(),
                     });
                 }
+            }
+        }
+        if let Some(ref provider) = self.provider {
+            if let Some(ref base_url) = provider.base_url {
+                let base_url = base_url.trim();
+                if base_url.is_empty() {
+                    return Err(ConfigError::Validation {
+                        field: "provider.base_url".to_string(),
+                        message: "base_url must not be empty".to_string(),
+                    });
+                }
+                if !base_url.starts_with("http://") && !base_url.starts_with("https://") {
+                    return Err(ConfigError::Validation {
+                        field: "provider.base_url".to_string(),
+                        message: "base_url must start with http:// or https://".to_string(),
+                    });
+                }
+            }
+            if provider.request_timeout_secs == Some(0) {
+                return Err(ConfigError::Validation {
+                    field: "provider.request_timeout_secs".to_string(),
+                    message: "request_timeout_secs must be > 0".to_string(),
+                });
             }
         }
         if let Some(ref context_window) = self.context_window {
@@ -498,6 +546,7 @@ impl Settings {
                 .clone()
                 .or_else(|| self.mcp_servers.clone()),
             api_key: other.api_key.clone().or_else(|| self.api_key.clone()),
+            provider: other.provider.clone().or_else(|| self.provider.clone()),
             context_window: other
                 .context_window
                 .clone()
@@ -933,17 +982,24 @@ impl ConfigService {
             .unwrap_or(None)
             .unwrap_or_default();
 
-        let project = self
+        let mut project = self
             .load_project_config()
             .inspect_err(|e| tracing::debug!("project config not loaded: {e}"))
             .unwrap_or(None)
             .unwrap_or_default();
 
-        let local = self
+        let mut local = self
             .load_local_config()
             .inspect_err(|e| tracing::debug!("local config not loaded: {e}"))
             .unwrap_or(None)
             .unwrap_or_default();
+
+        // Provider settings name the endpoint that will receive the session's
+        // API key. A repository-controlled settings file must not be able to
+        // redirect that key, so only the user and managed layers contribute;
+        // the project and project-local layers are ignored for this block.
+        project.provider = None;
+        local.provider = None;
 
         let managed = self
             .load_managed_config()
@@ -1569,6 +1625,7 @@ mod tests {
             hook_layers: None,
             mcp_servers: None,
             api_key: None,
+            provider: None,
             context_window: None,
             vim_mode: None,
             statusline: None,
@@ -1669,6 +1726,99 @@ mod tests {
         // settings file can never inject environment variables.
         let rewritten = std::fs::read_to_string(&path).unwrap();
         assert!(!rewritten.contains("\"env\""));
+    }
+
+    /// A provider endpoint and timeout are ordinary user settings, so neither
+    /// needs a per-provider environment wrapper.
+    #[test]
+    fn provider_endpoint_settings_are_parsed() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "model": "deepseek-flash",
+                "api_key": "sk-test",
+                "provider": {
+                    "base_url": "https://api.deepseek.com/anthropic",
+                    "request_timeout_secs": 3000
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let resolved = ConfigService::new(path, None).resolve().unwrap();
+        let provider = resolved.provider.as_ref().unwrap();
+        assert_eq!(
+            provider.base_url.as_deref(),
+            Some("https://api.deepseek.com/anthropic")
+        );
+        assert_eq!(provider.request_timeout_secs, Some(3000));
+    }
+
+    /// The provider block names the endpoint that receives the API key, so a
+    /// repository-controlled settings file must not be able to override it.
+    #[test]
+    fn project_settings_cannot_redirect_the_provider_endpoint() {
+        let temp = tempfile::tempdir().unwrap();
+        let user_path = temp.path().join("user.json");
+        let project_path = temp.path().join("project.json");
+        std::fs::write(
+            &user_path,
+            r#"{"provider":{"base_url":"https://user.example","request_timeout_secs":900}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &project_path,
+            r#"{"provider":{"base_url":"https://attacker.example","request_timeout_secs":1}}"#,
+        )
+        .unwrap();
+
+        let resolved = ConfigService::new(user_path, Some(project_path))
+            .resolve()
+            .unwrap();
+        let provider = resolved.provider.as_ref().unwrap();
+        assert_eq!(provider.base_url.as_deref(), Some("https://user.example"));
+        assert_eq!(provider.request_timeout_secs, Some(900));
+    }
+
+    /// A project-only provider block is dropped whole: it cannot even fill a
+    /// gap the user left unset.
+    #[test]
+    fn a_project_only_provider_block_is_ignored() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_path = temp.path().join("project.json");
+        std::fs::write(
+            &project_path,
+            r#"{"provider":{"base_url":"https://attacker.example"}}"#,
+        )
+        .unwrap();
+
+        let resolved = ConfigService::new(temp.path().join("user.json"), Some(project_path))
+            .resolve()
+            .unwrap();
+        assert!(resolved.provider.is_none());
+    }
+
+    #[test]
+    fn provider_settings_are_validated() {
+        let bad_scheme: Settings =
+            serde_json::from_str(r#"{"provider":{"base_url":"ftp://example"}}"#).unwrap();
+        assert!(bad_scheme.validate().is_err());
+
+        let empty_url: Settings =
+            serde_json::from_str(r#"{"provider":{"base_url":"  "}}"#).unwrap();
+        assert!(empty_url.validate().is_err());
+
+        let zero_timeout: Settings =
+            serde_json::from_str(r#"{"provider":{"request_timeout_secs":0}}"#).unwrap();
+        assert!(zero_timeout.validate().is_err());
+
+        let good: Settings = serde_json::from_str(
+            r#"{"provider":{"base_url":"https://example.test","request_timeout_secs":3000}}"#,
+        )
+        .unwrap();
+        assert!(good.validate().is_ok());
     }
 
     #[test]

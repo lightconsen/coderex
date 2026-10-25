@@ -488,6 +488,7 @@ const PLUGIN_SETTINGS_NEVER_TAKEN: &[&str] = &[
     "mcp_servers",
     "api_key",
     "env",
+    "provider",
     "config_version",
 ];
 
@@ -515,6 +516,10 @@ fn settings_with_every_key() -> Settings {
         hooks: Some(serde_json::Value::Null),
         mcp_servers: Some(serde_json::Value::Null),
         api_key: Some(String::new()),
+        provider: Some(coderex_config::ProviderSettings {
+            base_url: Some(String::new()),
+            request_timeout_secs: Some(1),
+        }),
         context_window: Some(coderex_config::settings::ContextWindowSettings::default()),
         vim_mode: Some(false),
         statusline: Some(coderex_config::settings::StatuslineSettings::default()),
@@ -2223,11 +2228,13 @@ impl StartupOrchestrator {
     fn try_create_api_client(
         api_key_override: Option<&str>,
         prompt_caching: Option<bool>,
+        provider: Option<&coderex_config::ProviderSettings>,
     ) -> Option<Box<dyn ApiClient>> {
         Self::api_client_from_provider_config(
             ProviderConfig::from_env(),
             api_key_override,
             prompt_caching,
+            provider,
             |name| std::env::var(name).ok(),
         )
     }
@@ -2244,10 +2251,20 @@ impl StartupOrchestrator {
         mut config: ProviderConfig,
         api_key_override: Option<&str>,
         prompt_caching: Option<bool>,
+        provider: Option<&coderex_config::ProviderSettings>,
         get_env: impl Fn(&str) -> Option<String>,
     ) -> Option<Box<dyn ApiClient>> {
         if let Some(key) = api_key_override {
             config.set_anthropic_api_key(key.into());
+        }
+        // Settings-level endpoint overrides. The base URL is applied after the
+        // key so it reaches the endpoint the key created; the project layers
+        // are stripped from this block during settings resolution.
+        if let Some(provider) = provider {
+            if let Some(ref base_url) = provider.base_url {
+                config.set_anthropic_base_url(base_url.clone());
+            }
+            config.request_timeout_secs = provider.request_timeout_secs;
         }
         // The resolved setting rides into the provider config; the core
         // builder combines it with the environment override.
@@ -2341,6 +2358,14 @@ impl StartupOrchestrator {
             .settings
             .as_ref()
             .and_then(|s| s.api_key.as_deref())
+    }
+
+    /// Provider endpoint overrides from settings (user/managed layers only).
+    fn provider_settings(&self) -> Option<&coderex_config::ProviderSettings> {
+        self.ctx
+            .settings
+            .as_ref()
+            .and_then(|settings| settings.provider.as_ref())
     }
 
     /// The resolved `prompt_caching` setting, if the user set one.
@@ -2640,14 +2665,15 @@ impl StartupOrchestrator {
     ) -> crate::repl::ReplLoop {
         let api_key = self.api_key_from_settings();
         let prompt_caching = self.prompt_caching_from_settings();
-        let mut repl =
-            if let Some(api_client) = Self::try_create_api_client(api_key, prompt_caching) {
-                let api_client = Self::apply_effort(api_client, self.ctx.effort.as_deref());
-                self.install_sampling_handler(api_client.as_ref(), &model);
-                crate::repl::ReplLoop::with_engine(api_client, cwd.to_string(), model)
-            } else {
-                crate::repl::ReplLoop::new(cwd.to_string(), model)
-            };
+        let mut repl = if let Some(api_client) =
+            Self::try_create_api_client(api_key, prompt_caching, self.provider_settings())
+        {
+            let api_client = Self::apply_effort(api_client, self.ctx.effort.as_deref());
+            self.install_sampling_handler(api_client.as_ref(), &model);
+            crate::repl::ReplLoop::with_engine(api_client, cwd.to_string(), model)
+        } else {
+            crate::repl::ReplLoop::new(cwd.to_string(), model)
+        };
         if let Some(ref pm) = self.ctx.plugin_manager {
             repl.with_plugin_manager(Arc::clone(pm));
         }
@@ -2892,6 +2918,8 @@ impl StartupOrchestrator {
             permission_mode,
             self.ctx.effort.as_deref(),
             self.prompt_caching_from_settings(),
+            self.api_key_from_settings(),
+            self.provider_settings(),
         ) {
             server.set_engine_factory(factory);
         } else {
@@ -2988,6 +3016,8 @@ impl StartupOrchestrator {
         permission_mode: coderex_core::permissions::PermissionMode,
         effort: Option<&str>,
         prompt_caching: Option<bool>,
+        api_key: Option<&str>,
+        provider: Option<&coderex_config::ProviderSettings>,
     ) -> Option<coderex_server::session::EngineFactory> {
         use coderex_tools::{
             ChromeClient, CronScheduler, ExecutionConfig, ExecutionContext, RateLimiter,
@@ -2995,8 +3025,9 @@ impl StartupOrchestrator {
             register_builtin_tools,
         };
 
-        let api_key = std::env::var("ANTHROPIC_API_KEY").ok();
-        let api_client = Self::try_create_api_client(api_key.as_deref(), prompt_caching)?;
+        let env_key = std::env::var("ANTHROPIC_API_KEY").ok();
+        let api_client =
+            Self::try_create_api_client(api_key.or(env_key.as_deref()), prompt_caching, provider)?;
         let api_client = Self::apply_effort(api_client, effort);
 
         let cwd = cwd.to_string();
@@ -3191,6 +3222,7 @@ impl StartupOrchestrator {
                 Self::try_create_api_client(
                     self.api_key_from_settings(),
                     self.prompt_caching_from_settings(),
+                    self.provider_settings(),
                 )
                 .is_some(),
             ),
@@ -3669,14 +3701,15 @@ impl StartupOrchestrator {
         // Enter REPL with the resumed context
         let api_key = self.api_key_from_settings();
         let prompt_caching = self.prompt_caching_from_settings();
-        let mut repl =
-            if let Some(api_client) = Self::try_create_api_client(api_key, prompt_caching) {
-                let api_client = Self::apply_effort(api_client, self.ctx.effort.as_deref());
-                self.install_sampling_handler(api_client.as_ref(), &model);
-                crate::repl::ReplLoop::with_engine(api_client, cwd.to_string(), model)
-            } else {
-                crate::repl::ReplLoop::new(cwd.to_string(), model)
-            };
+        let mut repl = if let Some(api_client) =
+            Self::try_create_api_client(api_key, prompt_caching, self.provider_settings())
+        {
+            let api_client = Self::apply_effort(api_client, self.ctx.effort.as_deref());
+            self.install_sampling_handler(api_client.as_ref(), &model);
+            crate::repl::ReplLoop::with_engine(api_client, cwd.to_string(), model)
+        } else {
+            crate::repl::ReplLoop::new(cwd.to_string(), model)
+        };
         repl.with_resume_session(Some(resolved_session_id));
         if let Some(ref pm) = self.ctx.plugin_manager {
             repl.with_plugin_manager(Arc::clone(pm));
@@ -4479,6 +4512,7 @@ mod tests {
             bedrock_config(),
             None,
             None,
+            None,
             get_env,
         );
         assert!(
@@ -4840,6 +4874,7 @@ mod tests {
                 }),
                 ..Default::default()
             },
+            None,
             None,
             None,
             |_| None,

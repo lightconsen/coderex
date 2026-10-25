@@ -9,7 +9,8 @@ Configuration layers: defaults → user config (`~/.coderex/settings.json`) → 
 ### Key Types
 
 - **`ConfigService`** (`settings.rs`) — Loads and merges configuration from all three levels.
-- **`Settings`** (`settings.rs`) — Strongly-typed configuration struct with `config_version`, `api_key`, `context_window`, and validation.
+- **`Settings`** (`settings.rs`) — Strongly-typed configuration struct with `config_version`, `api_key`, `provider`, `context_window`, and validation.
+- **`ProviderSettings`** (`settings.rs`) — `base_url` and `request_timeout_secs` for the Anthropic-protocol endpoint, so an Anthropic-compatible provider is configured in `settings.json` instead of a per-provider environment wrapper. Only the **user** and **managed** layers contribute this block: a repository-controlled settings file must not redirect the endpoint that receives the API key. Validation requires an `http(s)://` URL and a timeout greater than zero.
 - **`ContextWindowSettings`** (`settings.rs`) — Per-model context-window overrides plus an optional default.
 - **`RuntimeOverrides`** (`settings.rs`) — Environment-variable and CLI-arg overrides.
 - **`ConfigError`** (`settings.rs`) — Error enum with `Io`, `Json`, `Validation`, `UnknownField`, and `TooLarge` variants.
@@ -71,6 +72,29 @@ cannot turn compaction off.
 Resolution precedence, environment variables, the client-data file
 (`~/.coderex/context_windows.json`), experiment syntax, and the built-in model
 table are documented in [`docs/compact.md`](compact.md).
+
+### Provider Endpoint and Timeout
+
+`provider` selects an Anthropic-compatible endpoint and sets the HTTP request
+timeout, so a provider such as a gateway or a regional endpoint needs neither
+an environment variable nor a launch wrapper:
+
+```json
+{
+  "model": "my-gateway-alias",
+  "api_key": "sk-…",
+  "provider": {
+    "base_url": "https://api.example.com/anthropic",
+    "request_timeout_secs": 3000
+  }
+}
+```
+
+`base_url` must start with `http://` or `https://`; `request_timeout_secs` must
+be greater than zero (the transport default is 120 s). The block is honoured
+only from the user and managed layers — project and project-local settings
+cannot redirect the endpoint that receives the API key. Plugins cannot supply
+it either.
 
 ### Source Policies (repository-controlled files cannot relax privacy)
 

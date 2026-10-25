@@ -327,7 +327,7 @@ The manifest is parsed with `deny_unknown_fields`: a field that is not in the ta
 | `channels` | ✅ implemented | A channel names a configured MCP server and routes that server's JSON-RPC notifications to subscribed sinks (`PluginManager::subscribe_channel` / `route_channel_notification`). `/plugin components` lists each channel with its live state — `subscribed`, `idle (no subscriber)`, or `server not configured`. See "Channels". |
 | `binaries` | ✅ implemented | SHA-256-pinned HTTPS fetch into `<plugin>/bin/` (`fetch_plugin_binaries`); `CODEREX_PLUGIN_NO_BINARIES=1` skips the fetch. |
 | `types` | ✅ implemented | Validated `.d.ts` files are exported at startup to `config_home()/plugin-types/<plugin>/` (`export_plugin_types`) so a plugin author has a stable include path, **and** read into a `PluginTypeRegistry` that `/plugin components` lists. The same export writes the host's generated surface — `coderex/`, `coderex-tools/`, `coderex-mcp/` and a `tsconfig.json` — from the registered tool schemas; `/plugin types [name]` lists or prints them. CodeRex has no TypeScript runtime, so "loaded" means read into memory and exposed — never executed. See "Types". |
-| `settings` | ✅ implemented (allowlisted) | A typed patch deep-merges into the resolved settings, by source: user/project values win over every plugin, and a plugin only fills a key the user left unset. `permission_mode`, `telemetry` and `max_budget_usd` are tighten-only; `hooks`, `mcpServers`, `api_key` and `env` are never taken. Unknown keys warn and are ignored. See "Settings". |
+| `settings` | ✅ implemented (allowlisted) | A typed patch deep-merges into the resolved settings, by source: user/project values win over every plugin, and a plugin only fills a key the user left unset. `permission_mode`, `telemetry` and `max_budget_usd` are tighten-only; `hooks`, `mcpServers`, `api_key`, `provider` and `env` are never taken. Unknown keys warn and are ignored. See "Settings". |
 | `experimental` | ✅ implemented (raw) | Exposed per plugin; expansion (themes/monitors/outputStyles/…) is the caller's job. |
 
 All declared component fields now have a runtime surface. `PluginManifest::unimplemented_fields()` is empty and remains as the guard against a future field silently doing nothing.
@@ -377,7 +377,7 @@ A plugin's `settings` is a narrow allowlist, and it is a *patch*, not a replacem
 |---|---|---|
 | Mergeable | `model`, `context_window`, `vim_mode`, `statusline` | Fill only a key the user left unset; the user's value wins, recursively for nested objects. |
 | Tighten-only | `permission_mode`, `telemetry_enabled`, `telemetry`, `max_budget_usd` | May only make the session stricter. `permission_mode` moves only toward the more restrictive end (`plan` < `dont-ask` < `default`/`auto` < `accept-edits` < `bypass-permissions`); `telemetry_enabled` may only go to `false`; `max_budget_usd` may only lower the ceiling. A `telemetry` object is refused outright. |
-| Never taken | `hooks`, `hook_layers`, `mcpServers`, `mcp_servers`, `api_key`, `env`, `config_version` | Security-sensitive; ignored with a warning, whatever the value. |
+| Never taken | `hooks`, `hook_layers`, `mcpServers`, `mcp_servers`, `api_key`, `provider`, `env`, `config_version` | Security-sensitive; ignored with a warning, whatever the value. |
 
 An unknown key is warned about and ignored. A refused or loosen-only value is warned about and ignored — never applied.
 

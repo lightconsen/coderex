@@ -33,6 +33,9 @@ pub struct ProviderConfig {
     pub custom: Vec<NamedProviderEndpoint>,
     /// Explicit fallback provider allowlist/order.
     pub fallback_providers: Vec<String>,
+    /// HTTP request timeout for the Anthropic-protocol transport, in seconds.
+    /// `None` keeps the transport default (120 s).
+    pub request_timeout_secs: Option<u64>,
     /// Whether Anthropic-protocol requests may carry prompt-cache breakpoints.
     ///
     /// `None` falls back to the `CODEREX_PROMPT_CACHING` environment override
@@ -130,6 +133,17 @@ impl ProviderConfig {
         }
     }
 
+    /// Override the Anthropic provider base URL.
+    ///
+    /// Used by settings (`provider.base_url`) to select an Anthropic-compatible
+    /// endpoint. Does nothing when no Anthropic endpoint is configured: without
+    /// a key there is nothing to send to that URL anyway.
+    pub fn set_anthropic_base_url(&mut self, base_url: String) {
+        if let Some(ref mut endpoint) = self.anthropic {
+            endpoint.base_url = Some(base_url);
+        }
+    }
+
     /// Build a [`ModelRouter`] from this configuration.
     ///
     /// Providers are added in priority order: Anthropic > OpenAI > Groq > custom.
@@ -158,6 +172,9 @@ impl ProviderConfig {
                     .ok()
                     .as_deref(),
             );
+            if let Some(secs) = self.request_timeout_secs {
+                config.request_timeout_secs = secs;
+            }
             router.add_provider(Box::new(AnthropicProvider::new(config)));
         } else if let Some(ref ep) = self.anthropic {
             let mut config = ApiConfig::new(ep.api_key.clone());
@@ -175,6 +192,9 @@ impl ProviderConfig {
             }
             for (k, v) in &ep.custom_headers {
                 config = config.with_custom_header(k.clone(), v.clone());
+            }
+            if let Some(secs) = self.request_timeout_secs {
+                config.request_timeout_secs = secs;
             }
             router.add_provider(Box::new(AnthropicProvider::new(config)));
         }
@@ -281,6 +301,29 @@ mod tests {
         let router = config.build_router();
         // Router exists even if empty
         let _ = router;
+    }
+
+    /// Settings (`provider.base_url`) select an Anthropic-compatible endpoint
+    /// without an environment wrapper.
+    #[test]
+    fn a_settings_base_url_reaches_the_anthropic_endpoint() {
+        let mut config = ProviderConfig::default();
+        config.set_anthropic_api_key("sk-test".into());
+        config.set_anthropic_base_url("https://api.deepseek.com/anthropic".into());
+
+        let endpoint = config.anthropic.as_ref().unwrap();
+        assert_eq!(endpoint.api_key, "sk-test");
+        assert_eq!(
+            endpoint.base_url.as_deref(),
+            Some("https://api.deepseek.com/anthropic")
+        );
+    }
+
+    #[test]
+    fn a_base_url_without_a_key_is_ignored() {
+        let mut config = ProviderConfig::default();
+        config.set_anthropic_base_url("https://example.test".into());
+        assert!(config.anthropic.is_none());
     }
 }
 

@@ -175,6 +175,7 @@ fn settings_json_serde_roundtrip() {
         vim_mode: None,
         statusline: None,
         api_key: Some("sk-test".into()),
+        provider: None,
         context_window: None,
         prompt_caching: Some(true),
     };
