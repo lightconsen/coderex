@@ -1,0 +1,29 @@
+# cargo-audit configuration.
+#
+# Every entry here is an explicit, reviewed decision. Prefer upgrading; these
+# are the cases where the usable version of a dependency still carries an
+# informational advisory.
+
+[advisories]
+ignore = [
+    # `yaml-rust` 0.4 is an *optional* dependency of syntect (`yaml-load`),
+    # and the build does not enable that feature: the syntax highlighter only
+    # loads the compiled default syntax/theme sets. Cargo.lock records
+    # optional dependencies regardless of feature selection, so the audit
+    # still sees it. Unmaintained; not compiled.
+    "RUSTSEC-2024-0320",
+    # syntect 5.3 stores its compiled syntax and theme dumps in bincode's
+    # format; the `parsing` feature hard-requires `dump-load`/`dump-create`,
+    # so bincode cannot be removed without replacing syntect. Unmaintained;
+    # no known vulnerability.
+    "RUSTSEC-2025-0141",
+    # zbus 5 (the maintained D-Bus stack used by keyring's Secret Service
+    # store on Linux) still depends on these crates. The advisories are
+    # "unmaintained" notices with no patched version and no known
+    # vulnerability. The alternative — the kernel keyutils store — would drop
+    # zbus but lose persistence across reboot, which is why the Secret
+    # Service backend is kept.
+    "RUSTSEC-2026-0370",
+    "RUSTSEC-2026-0371",
+    "RUSTSEC-2026-0372",
+]
