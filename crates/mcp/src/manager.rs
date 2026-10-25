@@ -1285,7 +1285,12 @@ for line in sys.stdin:
 
     fn mock_prompts_server_path() -> PathBuf {
         let id = MOCK_PROMPT_ID.fetch_add(1, Ordering::SeqCst);
-        let path = std::env::temp_dir().join(format!("coderex_mock_prompts_{id}.py"));
+        // The id counter restarts in every test process, so include the pid:
+        // two nextest processes must not write and exec the same script.
+        let path = std::env::temp_dir().join(format!(
+            "coderex_mock_prompts_{}_{id}.py",
+            std::process::id()
+        ));
         std::fs::write(&path, MOCK_PROMPTS_SERVER).expect("write mock prompt server");
         #[cfg(unix)]
         {

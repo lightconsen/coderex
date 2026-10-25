@@ -150,7 +150,13 @@ for line in sys.stdin:
 fn mock_server_path() -> PathBuf {
     let id = MOCK_ID.fetch_add(1, Ordering::SeqCst);
     let tmp = std::env::temp_dir();
-    let path = tmp.join(format!("coderex_mock_mcp_server_{id}.py"));
+    // The counter restarts in every test process, so the pid is part of the
+    // name: two concurrently running nextest processes would otherwise write
+    // and exec the same file, and exec can race the write with ETXTBSY.
+    let path = tmp.join(format!(
+        "coderex_mock_mcp_server_{}_{id}.py",
+        std::process::id()
+    ));
     std::fs::write(&path, MOCK_MCP_SERVER).unwrap();
     #[cfg(unix)]
     {
@@ -336,7 +342,9 @@ for line in sys.stdin:
 
 fn asking_server_path() -> PathBuf {
     let id = MOCK_ID.fetch_add(1, Ordering::SeqCst);
-    let path = std::env::temp_dir().join(format!("coderex_asking_mcp_{id}.py"));
+    // Same per-process counter caveat as `mock_server_path`: include the pid.
+    let path =
+        std::env::temp_dir().join(format!("coderex_asking_mcp_{}_{id}.py", std::process::id()));
     std::fs::write(&path, ASKING_SERVER).unwrap();
     #[cfg(unix)]
     {
