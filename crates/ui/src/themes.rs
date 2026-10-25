@@ -212,8 +212,8 @@ impl Theme {
     pub fn dark() -> Self {
         Self {
             name: "dark".into(),
-            background: Color::Reset,
-            foreground: Color::Reset,
+            background: Color::Rgb(24, 24, 27),
+            foreground: Color::Rgb(229, 231, 235),
             dim: Color::DarkGray,
             accent: Color::Rgb(96, 165, 250),
             accent_secondary: Color::Rgb(45, 212, 191),
@@ -245,7 +245,7 @@ impl Theme {
     pub fn light() -> Self {
         Self {
             name: "light".into(),
-            background: Color::Reset,
+            background: Color::Rgb(255, 255, 255),
             foreground: Color::Rgb(17, 24, 39),
             dim: Color::Rgb(107, 114, 128),
             accent: Color::Rgb(37, 99, 235),
@@ -682,7 +682,18 @@ mod tests {
     fn default_theme_is_dark() {
         let theme = Theme::default();
         assert_eq!(theme.name, "dark");
-        assert_eq!(theme.background, Color::Reset);
+        // The background is painted, not left to the terminal: switching
+        // themes has to be visible whatever the terminal's own palette is.
+        assert_eq!(theme.background, Color::Rgb(24, 24, 27));
+        assert_eq!(theme.foreground, Color::Rgb(229, 231, 235));
+    }
+
+    /// The two themes users switch between must differ in the field the frame
+    /// paint uses, or the switch would only re-tint accents.
+    #[test]
+    fn dark_and_light_have_distinct_backgrounds() {
+        assert_ne!(Theme::dark().background, Theme::light().background);
+        assert_ne!(Theme::dark().foreground, Theme::light().foreground);
     }
 
     #[test]
@@ -830,7 +841,10 @@ mod tests {
         let err = mgr.register_json("dark", &valid_theme_json()).unwrap_err();
         assert_eq!(err, "theme 'dark' is built in");
         // The built-in is untouched.
-        assert_eq!(mgr.get_theme("dark").unwrap().background, Color::Reset);
+        assert_eq!(
+            mgr.get_theme("dark").unwrap().background,
+            Color::Rgb(24, 24, 27)
+        );
     }
 
     #[test]

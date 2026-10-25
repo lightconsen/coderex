@@ -1627,6 +1627,31 @@ fn theme_command_switches_interactive_theme_and_stays_usable() {
     assert!(screen.contains("System Status"));
 }
 
+/// A theme switch must repaint the frame, not only re-tint the accents: the
+/// terminal stream has to carry each theme's background colour.
+#[test]
+fn theme_switch_paints_the_background() {
+    let dir = setup_project_dir();
+    let mut session = session_without_engine(dir.path());
+    session.wait_for_text("CodeRex v", SCREEN_TIMEOUT);
+
+    session.send_line("/theme light");
+    session.wait_for_text("Theme changed to: light", SCREEN_TIMEOUT);
+    let light = session.raw_text();
+    assert!(
+        light.contains("48;2;255;255;255"),
+        "the light theme did not paint its background"
+    );
+
+    session.send_line("/theme dark");
+    session.wait_for_text("Theme changed to: dark", SCREEN_TIMEOUT);
+    let dark = session.raw_text();
+    assert!(
+        dark.contains("48;2;24;24;27"),
+        "the dark theme did not paint its background"
+    );
+}
+
 #[test]
 fn compact_after_history_keeps_session_usable() {
     let dir = setup_project_dir();

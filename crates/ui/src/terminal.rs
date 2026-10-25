@@ -279,6 +279,20 @@ fn render_frame(
     mod_ui_hit_regions: &mut Vec<ModUiHitRegion>,
 ) {
     let area = frame.area();
+
+    // Paint the theme background first. Widgets only overwrite the style
+    // fields they name, so this fill survives under text without an explicit
+    // background — which is what makes switching between dark and light cover
+    // the whole screen rather than only re-tinting the accents.
+    frame.render_widget(
+        Block::default().style(
+            Style::default()
+                .bg(state.theme.background)
+                .fg(state.theme.foreground),
+        ),
+        area,
+    );
+
     let is_compact = state.force_compact || area.height < 20;
 
     // Determine chunk heights
@@ -2295,6 +2309,33 @@ mod layout_tests {
             (0..30).any(|y| row_text(&buffer, y).starts_with('╭')),
             "the welcome card is not left-aligned:\n{screen}"
         );
+    }
+
+    /// The theme background is painted across the frame, so dark and light are
+    /// visibly different instead of only re-tinting accents.
+    #[test]
+    fn the_theme_background_covers_the_frame() {
+        let mut dark = UiState::default();
+        let dark_buffer = render_to_buffer(80, 24, &mut dark);
+        let mut light = UiState::default();
+        light.theme = crate::themes::Theme::light();
+        let light_buffer = render_to_buffer(80, 24, &mut light);
+
+        let dark_bg = crate::themes::Theme::dark().background;
+        let light_bg = crate::themes::Theme::light().background;
+        assert_ne!(dark_bg, light_bg);
+        for (x, y) in [(79, 23), (40, 20), (0, 0)] {
+            assert_eq!(
+                dark_buffer.cell((x, y)).unwrap().bg,
+                dark_bg,
+                "dark {x},{y}"
+            );
+            assert_eq!(
+                light_buffer.cell((x, y)).unwrap().bg,
+                light_bg,
+                "light {x},{y}"
+            );
+        }
     }
 
     /// The wordmark carries a colour per letter, so the page is not a block of
