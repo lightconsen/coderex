@@ -56,6 +56,11 @@ jobs:
       # this pipeline. Clippy's real errors still fail the step. Restore
       # `-- -D warnings` once the backlog is cleared.
       - run: cargo clippy --workspace
+      # The jobs build default features. `keyring`, `hot-reload` and
+      # `wasm-runtime` are optional and are upgraded independently, so compile
+      # one workspace with every feature enabled as well.
+      - name: Check optional features compile
+        run: cargo check --workspace --all-features
 
   test:
     name: Test
