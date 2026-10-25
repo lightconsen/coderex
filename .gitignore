@@ -21,3 +21,4 @@ export_env.*.sh
 
 # Agent and session worktrees
 .claude/worktrees/
+screenshot/

@@ -940,22 +940,35 @@ fn normalize_plan_label(label: &str) -> String {
     }
 }
 
-fn push_activity_row(ui_state: &mut coderex_ui::state::UiState, label: &str) {
+/// Record a label in the activity log (`/activity`) and report whether it was
+/// added.
+///
+/// This deliberately does not touch the transcript: a tool call already has
+/// its own `ToolCall` row, and adding an activity row for it printed every
+/// tool call twice.
+fn record_activity(ui_state: &mut coderex_ui::state::UiState, label: &str) -> bool {
     let concise = normalize_plan_label(label);
     let duplicate = ui_state
         .activity_log
         .last()
         .is_some_and(|last| last == &concise);
     if duplicate {
-        return;
+        return false;
     }
 
-    ui_state.activity_log.push(concise.clone());
+    ui_state.activity_log.push(concise);
     if ui_state.activity_log.len() > 25 {
         let excess = ui_state.activity_log.len() - 25;
         ui_state.activity_log.drain(..excess);
     }
+    true
+}
 
+fn push_activity_row(ui_state: &mut coderex_ui::state::UiState, label: &str) {
+    let concise = normalize_plan_label(label);
+    if !record_activity(ui_state, &concise) {
+        return;
+    }
     ui_state.messages.push(coderex_ui::message_list::Message {
         role: coderex_ui::message_list::MessageRole::System,
         content: concise.into(),
@@ -1958,6 +1971,9 @@ pub struct ReplLoop {
     /// summary the engine produced under `tool_use_summaries`; when the flag
     /// is off the map stays empty and the start event's own label is used.
     tool_use_summaries: std::collections::HashMap<String, String>,
+    /// Names of in-flight tool calls, keyed by call id, so a failure can say
+    /// *which* tool failed. `ToolCallEnd` carries only the result.
+    tool_names: std::collections::HashMap<String, String>,
     /// Session usage at the end of the previous turn, for per-turn deltas.
     last_usage: coderex_core::types::UsageSummary,
     /// Model to retry with once when the primary model is unavailable
@@ -2381,6 +2397,7 @@ impl ReplLoop {
             plugin_other_components: Vec::new(),
             tool_starts: std::collections::HashMap::new(),
             tool_use_summaries: std::collections::HashMap::new(),
+            tool_names: std::collections::HashMap::new(),
             last_usage: coderex_core::types::UsageSummary::default(),
             max_tokens: QueryEngine::DEFAULT_MAX_TOKENS,
             explicit_model_override: false,
@@ -2785,6 +2802,7 @@ impl ReplLoop {
             plugin_other_components: Vec::new(),
             tool_starts: std::collections::HashMap::new(),
             tool_use_summaries: std::collections::HashMap::new(),
+            tool_names: std::collections::HashMap::new(),
             last_usage: coderex_core::types::UsageSummary::default(),
             max_tokens: QueryEngine::DEFAULT_MAX_TOKENS,
             explicit_model_override: false,
@@ -4477,6 +4495,10 @@ impl ReplLoop {
         terminal_ui.enter()?;
 
         let mut ui_state = UiState::new();
+        // Up/Down recall from the input buffer's own history; seed it with the
+        // prompts this session already knows about (resume, queued prompts),
+        // so recall works before the first new prompt is submitted.
+        ui_state.input.history.clone_from(&self.history);
         self.apply_startup_theme(&mut ui_state);
         // Plugin monitors are persistent watch scripts: arm them with the
         // session and let the supervisor stop them when the loop ends.
@@ -4874,7 +4896,11 @@ impl ReplLoop {
                                     continue;
                                 }
                                 if !ui_state.input.text.is_empty() {
+                                    // Clear the line but keep what was
+                                    // submitted: Up should still recall it.
+                                    let history = ui_state.input.history.clone();
                                     ui_state.input = InputBuffer::new();
+                                    ui_state.input.history = history;
                                 } else if ui_state.overlays.is_active() {
                                     ui_state.overlays.clear();
                                 }
@@ -4885,6 +4911,20 @@ impl ReplLoop {
                                 && key.modifiers.contains(KeyModifiers::CONTROL)
                             {
                                 break Ok(());
+                            }
+
+                            // Informational overlays do not own the keyboard.
+                            // Dismiss one on the next key and handle that key
+                            // normally, so typing `/status` after a failure
+                            // both closes the dialog and reaches the input.
+                            if matches!(
+                                ui_state.overlays.top(),
+                                Some(
+                                    coderex_ui::overlay::Overlay::Detail { .. }
+                                        | coderex_ui::overlay::Overlay::Notification { .. }
+                                )
+                            ) {
+                                ui_state.overlays.clear();
                             }
 
                             // A mod UI block owns Tab/Shift+Tab, Enter and Esc
@@ -4941,6 +4981,32 @@ impl ReplLoop {
                                         c.set_mode(ui_state.permission_bar.mode);
                                     }
                                 }
+                                continue;
+                            }
+
+                            // Ctrl+O: fold or unfold every tool call/result row.
+                            if key.code == KeyCode::Char('o')
+                                && key.modifiers.contains(KeyModifiers::CONTROL)
+                            {
+                                let fold = ui_state.messages.messages.iter().any(|message| {
+                                    matches!(
+                                        message.role,
+                                        MessageRole::ToolCall | MessageRole::ToolResult
+                                    ) && !message.folded
+                                });
+                                for message in &mut ui_state.messages.messages {
+                                    if matches!(
+                                        message.role,
+                                        MessageRole::ToolCall | MessageRole::ToolResult
+                                    ) {
+                                        message.folded = fold;
+                                    }
+                                }
+                                ui_state.notifications.info(if fold {
+                                    "Tool output folded (Ctrl+O to expand)"
+                                } else {
+                                    "Tool output expanded"
+                                });
                                 continue;
                             }
 
@@ -5642,9 +5708,13 @@ impl ReplLoop {
                         }
                         EngineEvent::ToolCallStart { id, name, summary } => {
                             let summary = self.tool_use_summaries.remove(&id).unwrap_or(summary);
+                            self.tool_names.insert(id.clone(), name.clone());
                             phase.note_tool_start(&summary);
                             set_plan_step(&mut ui_state, &summary);
-                            push_activity_row(&mut ui_state, &summary);
+                            // The log feeds `/activity`; the transcript row is
+                            // the ToolCall message below, so this must not add
+                            // a second visible row.
+                            record_activity(&mut ui_state, &summary);
                             ui_state.messages.push(Message {
                                 role: MessageRole::ToolCall,
                                 content: summary.into(),
@@ -5658,21 +5728,50 @@ impl ReplLoop {
                             // A call blocked before its start event never
                             // consumed its label; drop it here.
                             self.tool_use_summaries.remove(&id);
+                            let tool_name = self
+                                .tool_names
+                                .remove(&id)
+                                .unwrap_or_else(|| "Tool".to_string());
                             phase.note_tool_end();
                             complete_plan(&mut ui_state);
                             pending_confirmation = None;
                             clear_permission_overlay(&mut ui_state);
                             let content = if result.is_error {
-                                ui_state.notifications.err("Tool failed");
+                                // Name the tool and the first line of the
+                                // error: "Tool failed" alone cannot be acted
+                                // on, and the output lives further up the
+                                // transcript.
+                                let reason = result
+                                    .output
+                                    .lines()
+                                    .next()
+                                    .unwrap_or_default()
+                                    .trim()
+                                    .chars()
+                                    .take(80)
+                                    .collect::<String>();
+                                let reason = if reason.is_empty() {
+                                    "no output".to_string()
+                                } else {
+                                    reason
+                                };
+                                ui_state
+                                    .notifications
+                                    .err(format!("{tool_name} failed: {reason}"));
                                 format!("Error: {}", result.output)
                             } else {
-                                ui_state.notifications.success("Tool completed");
+                                ui_state
+                                    .notifications
+                                    .success(format!("{tool_name} completed"));
                                 result.output
                             };
                             ui_state.messages.push(Message {
                                 role: MessageRole::ToolResult,
                                 content: content.into(),
-                                tool_name: None,
+                                // Kept for syntax highlighting and future
+                                // per-tool rendering; the result row does not
+                                // print a second `[name]` label.
+                                tool_name: Some(tool_name.into()),
                                 streaming: false,
                                 folded: false,
                             });

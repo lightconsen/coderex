@@ -595,8 +595,13 @@ fn run_interaction_sequence(
 
 fn assert_raw_contains_any(session: &PtySession, needles: &[&str], context: &str) {
     let raw = strip_ansi(&session.raw_text());
+    // As in `wait_for_raw_text`: ratatui's diff decides whether a space reaches
+    // the byte stream, so compare with whitespace squeezed out.
+    let squeezed = squeeze_whitespace(&raw);
     assert!(
-        needles.iter().any(|needle| raw.contains(needle)),
+        needles
+            .iter()
+            .any(|needle| squeezed.contains(&squeeze_whitespace(needle))),
         "expected raw output for {context} to contain one of {needles:?}\n--- raw ---\n{raw}"
     );
 }
@@ -908,12 +913,10 @@ fn write_action_shows_permission_wait() {
     session.wait_for_text("CodeRex v", SCREEN_TIMEOUT);
     session.send_line("add a recursive fibonacci function to src/lib.rs with unit tests");
     let raw = session.wait_for_raw_text("Waitingforpermission:Writingsrc/lib.rs", SCREEN_TIMEOUT);
-    assert!(
-        raw.contains("Waitingforpermission:Writingsrc/lib.rs")
-            || raw.contains("Waiting for permission: Writing src/lib.rs")
-    );
-    assert!(raw.contains("Tool:Write"));
-    assert!(raw.contains("[a]Allowonce") || raw.contains("[a] Allow once"));
+    let squeezed = squeeze_whitespace(&raw);
+    assert!(squeezed.contains("Waitingforpermission:Writingsrc/lib.rs"));
+    assert!(squeezed.contains("Tool:Write"));
+    assert!(squeezed.contains("[a]Allowonce"));
     session.send_text("d");
     session.wait_for_text("Completed in", SCREEN_TIMEOUT);
 }

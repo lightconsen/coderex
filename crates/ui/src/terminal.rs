@@ -355,7 +355,9 @@ fn frame_constraints(
         Constraint::Length(1),                                   // rule above the input
         Constraint::Length(input_height.max(1)),                 // input lines
         Constraint::Length(1),                                   // rule below the input
-        Constraint::Length(u16::from(show_perm_bar)),            // permission bar
+        // The bar is one line plus a blank row below it, so the text does not
+        // sit against the bottom edge of the terminal.
+        Constraint::Length(if show_perm_bar { 2 } else { 0 }), // permission bar
     ]
 }
 
@@ -652,6 +654,98 @@ fn hex_to_color(hex: &str) -> Color {
 
 /// Build ratatui `Span`s from a piece of text, highlighting any Markdown
 /// fenced code blocks with `SyntaxHighlighter`.
+/// A conservative language guess for a tool result.
+///
+/// Read returns a file body without a fence, so there is no language tag to
+/// use. The guess only fires on clear signals; anything else stays plain text
+/// rather than being coloured wrongly.
+fn guess_language(text: &str) -> Option<&'static str> {
+    let sample: String = text.lines().take(80).collect::<Vec<_>>().join("\n");
+    if sample.lines().count() < 2 {
+        return None;
+    }
+    let trimmed = sample.trim_start();
+    let has = |needle: &str| sample.contains(needle);
+
+    if trimmed.starts_with("//!")
+        || trimmed.starts_with("// ")
+        || has("fn main(")
+        || has("pub fn ")
+        || has("impl ")
+        || has("use std::")
+        || has("#[derive(")
+        || (has("struct ") && has("->"))
+    {
+        return Some("rs");
+    }
+    if trimmed.starts_with("def ")
+        || trimmed.starts_with("import ")
+        || has("\ndef ")
+        || has("\nimport ")
+        || has("\nclass ")
+    {
+        return Some("py");
+    }
+    if trimmed.starts_with('{') && has("\":") {
+        return Some("json");
+    }
+    if trimmed.starts_with('[')
+        && sample.lines().take(6).any(|line| line.contains('='))
+        && !has("fn ")
+    {
+        return Some("toml");
+    }
+    if has("package ") && has("func ") {
+        return Some("go");
+    }
+    if has("function ") || has("const ") || has("=>") {
+        return Some("js");
+    }
+    None
+}
+
+/// Highlight a plain code body, preserving indentation and line breaks.
+///
+/// Unlike [`highlight_spans`], this does not collapse whitespace: a file body
+/// shown under a Read call has to keep its layout.
+fn highlighted_code_lines(
+    text: &str,
+    language: &str,
+    prefix: &str,
+    prefix_width: usize,
+    prefix_style: Style,
+    body_style: Style,
+) -> Option<Vec<Line<'static>>> {
+    let highlighted = syntax_highlighter().highlight(text, language).ok()?;
+    let mut out = Vec::with_capacity(highlighted.len());
+    for (index, tokens) in highlighted.into_iter().enumerate() {
+        let mut spans: Vec<Span<'static>> = vec![if index == 0 {
+            Span::styled(prefix.to_string(), prefix_style)
+        } else {
+            Span::styled(" ".repeat(prefix_width), body_style)
+        }];
+        let last_token = tokens.len().saturating_sub(1);
+        for (token_index, token) in tokens.into_iter().enumerate() {
+            let mut token_text = token.text;
+            if token_index == last_token {
+                while token_text.ends_with('\n') || token_text.ends_with('\r') {
+                    token_text.pop();
+                }
+            }
+            let mut style = body_style.fg(hex_to_color(&token.foreground));
+            if token.is_bold {
+                style = style.add_modifier(Modifier::BOLD);
+            }
+            if token.is_italic {
+                style = style.add_modifier(Modifier::ITALIC);
+            }
+            spans.push(Span::styled(token_text, style));
+        }
+        out.push(Line::from(spans));
+    }
+    Some(out)
+}
+
 fn highlight_spans(text: &str, base_style: Style) -> Vec<Span<'_>> {
     let mut spans = Vec::new();
     let mut rest = text;
@@ -1191,6 +1285,27 @@ fn append_message_lines(
         }
     }
 
+    // A Read result is a file body with no fence. Highlight it from a
+    // conservative guess at the language, keeping its indentation.
+    if msg.role == MessageRole::ToolResult
+        && !is_compact
+        && msg.tool_name.as_deref() == Some("Read")
+    {
+        if let Some(language) = guess_language(&msg.content) {
+            if let Some(code_lines) = highlighted_code_lines(
+                &msg.content,
+                language,
+                prefix,
+                prefix_width,
+                style,
+                body_style,
+            ) {
+                lines.extend(code_lines);
+                return None;
+            }
+        }
+    }
+
     // Use syntax highlighting for assistant messages that contain code blocks.
     let use_highlight = msg.role == MessageRole::Assistant && msg.content.contains("```");
 
@@ -1274,10 +1389,9 @@ fn append_message_lines(
         }
     }
 
-    // Show tool name for tool messages
-    if let (Some(tool), MessageRole::ToolCall | MessageRole::ToolResult) =
-        (&msg.tool_name, msg.role)
-    {
+    // The call row names the tool; the result row keeps the name only so the
+    // renderer can choose a highlighter, and does not print a second label.
+    if let (Some(tool), MessageRole::ToolCall) = (&msg.tool_name, msg.role) {
         lines.push(Line::from(Span::styled(
             format!("  [{tool}]"),
             Style::default().fg(theme.dim),
@@ -1931,14 +2045,18 @@ fn render_overlay(frame: &mut Frame, area: ratatui::layout::Rect, state: &UiStat
         .borders(Borders::ALL)
         .title(title)
         .style(Style::default().fg(state.theme.overlay_border));
-    let paragraph = Paragraph::new(content)
+    let mut paragraph = Paragraph::new(content)
         .style(Style::default().fg(state.theme.foreground))
-        .wrap(Wrap { trim: false })
         .block(block);
 
     // Center the overlay. A detail body (a provider error, for example) is
-    // long and benefits from the full width; the short dialogs stay compact.
+    // long: give it the full width and wrap it. Dialog bodies must not wrap —
+    // a long Write argument would push the `[a] Allow once` choices out of the
+    // box — so they keep their fixed layout and are clipped instead.
     let is_detail = matches!(overlay, Overlay::Detail { .. });
+    if is_detail {
+        paragraph = paragraph.wrap(Wrap { trim: false });
+    }
     let w = if is_detail {
         area.width.saturating_sub(4).min(100)
     } else {
@@ -2338,7 +2456,7 @@ mod layout_tests {
         assert_eq!(chunks[RULE_IDX].height, 1, "input rule");
         assert_eq!(chunks[INPUT_IDX].height, 1, "input");
         assert_eq!(chunks[RULE_BELOW_IDX].height, 1, "input rule below");
-        assert_eq!(chunks[PERMISSION_IDX].height, 1, "permission");
+        assert_eq!(chunks[PERMISSION_IDX].height, 2, "permission");
         assert!(chunks[0].height > 1, "message area");
         // Rects are contiguous and in order, top to bottom.
         for pair in chunks.windows(2) {
@@ -2488,6 +2606,60 @@ mod layout_tests {
             colours.len() >= 5,
             "the wordmark should use several colours, got {colours:?}"
         );
+    }
+
+    /// The permission bar has one blank row below it, so its text does not sit
+    /// against the bottom edge of the terminal.
+    #[test]
+    fn the_permission_bar_has_a_blank_row_below_it() {
+        let mut state = UiState::default();
+        let buffer = render_to_buffer(80, 24, &mut state);
+        let chunks = chunks_for(24, 0, false, true, 1, true);
+        let bar_row = chunks[PERMISSION_IDX].y;
+
+        assert_eq!(chunks[PERMISSION_IDX].height, 2);
+        assert!(row_text(&buffer, bar_row).contains("Permissions:"));
+        let below = row_text(&buffer, bar_row + 1);
+        assert!(below.trim().is_empty(), "row below permissions: {below:?}");
+    }
+
+    #[test]
+    fn tool_result_languages_are_guessed_conservatively() {
+        assert_eq!(
+            guess_language("fn main() {\n    let x = 1;\n}\n"),
+            Some("rs")
+        );
+        assert_eq!(
+            guess_language("[package]\nname = \"coderex\"\n"),
+            Some("toml")
+        );
+        assert_eq!(
+            guess_language("{\n  \"name\": \"coderex\"\n}\n"),
+            Some("json")
+        );
+        assert_eq!(guess_language("def f():\n    pass\n"), Some("py"));
+        assert_eq!(guess_language("just some prose\nover two lines\n"), None);
+    }
+
+    /// A Read result keeps its indentation when highlighted.
+    #[test]
+    fn read_results_are_highlighted_without_losing_indentation() {
+        let mut state = UiState::default();
+        state.messages.push(Message {
+            role: MessageRole::ToolResult,
+            content: "fn main() {\n    let answer = 42;\n}\n".into(),
+            tool_name: Some("Read".into()),
+            streaming: false,
+            folded: false,
+        });
+        let buffer = render_to_buffer(100, 20, &mut state);
+        let screen: String = (0..20)
+            .map(|y| row_text(&buffer, y))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(screen.contains("fn main()"), "{screen}");
+        assert!(screen.contains("    let answer = 42;"), "{screen}");
     }
 
     /// Dragging over the transcript copies exactly the characters under the
