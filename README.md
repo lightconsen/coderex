@@ -38,7 +38,8 @@ cargo build --release
 
 Or use the helper script, which checks the toolchain and the platform
 dependencies (C compiler, pkg-config, dbus, lld) before building. It builds
-the optimized profile by default; use `--debug` for a faster compile:
+the optimized profile by default and runs `cargo clean` first; use `--debug`
+for a faster compile and `--no-clean` to keep the build cache:
 
 ```bash
 scripts/build.sh

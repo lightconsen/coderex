@@ -2,16 +2,16 @@
 # Build CodeRex locally.
 #
 # Usage:
-#   scripts/build.sh                       # release build of the coderex binary
-#   scripts/build.sh --debug               # fast debug build
+#   scripts/build.sh                       # clean, then release build
+#   scripts/build.sh --debug               # clean, then fast debug build
 #   scripts/build.sh --workspace           # build every workspace crate
-#   scripts/build.sh --clean               # clean first, then build
+#   scripts/build.sh --no-clean            # skip the clean, build incrementally
 #   scripts/build.sh --run -- --version    # build, then run with arguments
 #
 # Options:
 #   -d, --debug       use the dev profile (fast to compile, slow to run)
 #   -w, --workspace   build the whole workspace instead of just the coderex bin
-#   -c, --clean       run `cargo clean` before building
+#       --no-clean    skip the `cargo clean` that runs before every build
 #   -j, --jobs N      parallel build jobs (passed to cargo)
 #       --run         run the built binary; arguments after `--` go to it
 #   -h, --help        show this help
@@ -40,7 +40,7 @@ note() {
 
 profile=release
 workspace=0
-clean=0
+clean=1
 run=0
 jobs=""
 run_args=()
@@ -50,6 +50,7 @@ while [ $# -gt 0 ]; do
     -d | --debug) profile=debug ;;
     -w | --workspace) workspace=1 ;;
     -c | --clean) clean=1 ;;
+    --no-clean) clean=0 ;;
     --run) run=1 ;;
     -j | --jobs)
       [ $# -ge 2 ] || die "--jobs needs a value"
@@ -107,7 +108,7 @@ case "$(uname -s)" in
 esac
 
 if [ "$clean" = 1 ]; then
-  note "cleaning the target directory..."
+  note "cleaning the target directory (pass --no-clean to keep the build cache)..."
   cargo clean
 fi
 

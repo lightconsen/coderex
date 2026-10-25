@@ -25,8 +25,9 @@ cargo clippy --workspace        # warnings are reported, not denied (see below)
 ```
 
 `scripts/build.sh` wraps the build and checks the toolchain and platform
-prerequisites first. It builds the release profile by default; useful options
-are `--debug`, `--workspace`, `--clean` and `--run -- <args>`.
+prerequisites first. It builds the release profile by default and starts with
+`cargo clean`; useful options are `--debug`, `--workspace`, `--no-clean` and
+`--run -- <args>`.
 
 Some suites need extra setup:
 
