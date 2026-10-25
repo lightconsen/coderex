@@ -4,6 +4,9 @@
 
 Built in Rust for performance, reliability, and cross-platform support.
 
+> CodeRex is an independent project. It is not affiliated with, endorsed by,
+> or sponsored by Anthropic; "Claude" refers to the models it can connect to.
+
 ## Features
 
 - **Interactive REPL** — ratatui-based terminal UI with Vim mode, syntax highlighting, themes, and overlays
@@ -27,16 +30,27 @@ Built in Rust for performance, reliability, and cross-platform support.
 **From source:**
 
 ```bash
-git clone https://github.com/coderex/coderex.git
+git clone https://github.com/lightconsen/coderex.git
 cd coderex
 cargo build --release
 ./target/release/coderex
 ```
 
-**Via install script:**
+**From GitHub Releases:** download the archive for your platform from
+[github.com/lightconsen/coderex/releases](https://github.com/lightconsen/coderex/releases)
+(Linux x86_64 gnu/musl, macOS x86_64/aarch64, Windows x86_64).
+
+**With the install script** (Linux/macOS; installs to `~/.local/bin` or
+`/usr/local/bin`):
 
 ```bash
-curl -fsSL https://coderex.dev/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/lightconsen/coderex/main/scripts/install.sh | sh
+```
+
+**With Cargo:**
+
+```bash
+cargo install --git https://github.com/lightconsen/coderex.git
 ```
 
 ### Usage
@@ -162,7 +176,8 @@ cargo clippy --workspace -- -D warnings
 - [Core Engine](docs/core.md)
 - [Tools](docs/tools.md)
 - [Commands](docs/commands.md)
+- [Telemetry and privacy](docs/telemetry.md)
 
 ## License
 
-[MIT](LICENSE) or [Apache-2.0](LICENSE-APACHE) at your option.
+Apache License 2.0 — see [LICENSE](LICENSE).

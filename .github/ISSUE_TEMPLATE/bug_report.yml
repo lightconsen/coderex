@@ -1,0 +1,42 @@
+name: Bug report
+description: Something behaves differently from what the documentation says
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not report security problems here. See
+        [SECURITY.md](https://github.com/lightconsen/coderex/blob/main/SECURITY.md).
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: >-
+        What you expected, what happened instead, and the smallest reproduction
+        you can give (the prompt, the configuration, the files involved).
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Version and platform
+      description: >-
+        Output of `coderex --version`, the operating system, and how it was
+        built (release archive, cargo, …).
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Relevant output with secrets removed.
+      render: text
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checklist
+      options:
+        - label: I searched existing issues.
+          required: true
+        - label: This is not a security report.
+          required: true

@@ -157,6 +157,16 @@ after these patterns run, and it is explicitly marked as pattern-scrubbed rather
   the method uses the uploader's own resolved modes and scrubber. Verbose text is already scrubbed
   in the preview, so the user sees the wire form rather than the raw local copy.
 
+### Where events go
+
+Telemetry is opt-in (`telemetry_enabled` starts undecided, and the CLI treats an
+undecided value as off). When it is enabled, events are written to a local
+SQLite database and uploaded in batches to the configured endpoint. The built-in
+endpoint is `https://telemetry.coderex.dev/v1/events`; set
+`telemetry.endpoint` in settings (or the OTLP / Datadog channels described
+below) to send them somewhere else. With `telemetry_enabled = false` nothing
+leaves the machine.
+
 ### Crash reports: safe by default
 
 A panic message is `format!("{info}")` of whatever the panicking code carried — potentially

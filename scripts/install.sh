@@ -2,12 +2,12 @@
 # CodeRex installer — cross-platform shell script.
 #
 # Usage:
-#   curl -fsSL https://coderex.dev/install.sh | sh
-#   curl -fsSL https://coderex.dev/install.sh | sh -s -- v0.1.0
+#   curl -fsSL https://raw.githubusercontent.com/lightconsen/coderex/main/scripts/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/lightconsen/coderex/main/scripts/install.sh | sh -s -- v0.1.0
 
 set -e
 
-REPO="coderex/coderex"
+REPO="lightconsen/coderex"
 BINARY="coderex"
 
 # Determine version
@@ -25,7 +25,9 @@ case "$OS" in
     linux)
         case "$ARCH" in
             x86_64) TARGET="x86_64-unknown-linux-gnu" ;;
-            aarch64|arm64) TARGET="aarch64-unknown-linux-gnu" ;;
+            aarch64|arm64)
+                echo "No prebuilt archive for aarch64 Linux yet; build from source: cargo install --git https://github.com/$REPO.git"
+                exit 1 ;;
             *) echo "Unsupported architecture: $ARCH"; exit 1 ;;
         esac
         ;;
