@@ -1568,7 +1568,12 @@ fn compile_sandbox_config(
             }
         }
     }
+    // Debug builds extend the write set with the test hooks' observation
+    // directories; release builds never mutate it.
+    #[cfg(debug_assertions)]
     let mut allowed_write_paths = vec![work_dir.to_path_buf()];
+    #[cfg(not(debug_assertions))]
+    let allowed_write_paths = vec![work_dir.to_path_buf()];
     // Debug builds add the orchestrator's child-spawn test hook (`sleep`).
     #[cfg(debug_assertions)]
     {
