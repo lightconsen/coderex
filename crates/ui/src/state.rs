@@ -133,6 +133,51 @@ pub struct PermissionDetail {
     pub risk_summary: String,
 }
 
+/// A mouse text selection over the rendered frame.
+///
+/// Coordinates are absolute terminal cells `(column, row)`. The anchor is where
+/// the drag started; the cursor follows the pointer. Selection is linear: each
+/// row between the two points is copied whole up to the first/last column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TextSelection {
+    /// Where the drag began.
+    pub anchor: (u16, u16),
+    /// Where the pointer is now.
+    pub cursor: (u16, u16),
+}
+
+impl TextSelection {
+    /// Start a selection at a cell.
+    #[must_use]
+    pub const fn new(column: u16, row: u16) -> Self {
+        Self {
+            anchor: (column, row),
+            cursor: (column, row),
+        }
+    }
+
+    /// Move the free end of the selection.
+    pub const fn drag_to(&mut self, column: u16, row: u16) {
+        self.cursor = (column, row);
+    }
+
+    /// The selection with its start point before its end point.
+    #[must_use]
+    pub fn normalized(&self) -> ((u16, u16), (u16, u16)) {
+        if (self.anchor.1, self.anchor.0) <= (self.cursor.1, self.cursor.0) {
+            (self.anchor, self.cursor)
+        } else {
+            (self.cursor, self.anchor)
+        }
+    }
+
+    /// Whether the pointer has not moved since the press.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.anchor == self.cursor
+    }
+}
+
 /// UI state, owned exclusively by the rendering thread.
 #[derive(Debug)]
 pub struct UiState {
@@ -140,6 +185,8 @@ pub struct UiState {
     pub active_view: ViewMode,
     /// Input buffer for user typing.
     pub input: InputBuffer,
+    /// In-progress mouse selection over the frame, if any.
+    pub selection: Option<TextSelection>,
     /// Message list with virtualization.
     pub messages: MessageView,
     /// Overlay stack.
@@ -181,6 +228,7 @@ impl UiState {
         Self {
             active_view: ViewMode::MainRepl,
             input: InputBuffer::new(),
+            selection: None,
             messages: MessageView::new(1000),
             overlays: OverlayStack::new(),
             search: SearchState::new(),

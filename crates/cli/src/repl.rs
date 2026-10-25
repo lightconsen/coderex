@@ -4446,7 +4446,7 @@ impl ReplLoop {
         use coderex_ui::input::{InputAction, InputBuffer};
         use coderex_ui::message_list::{Message, MessageRole};
         use coderex_ui::overlay::Overlay;
-        use coderex_ui::state::{UiState, ViewMode};
+        use coderex_ui::state::{TextSelection, UiState, ViewMode};
         use coderex_ui::terminal::TerminalUi;
         use coderex_ui::vim::{VimAction, VimMode, VimState};
         use crossterm::event::{Event, KeyCode, KeyModifiers, MouseButton, MouseEventKind};
@@ -5562,6 +5562,39 @@ impl ReplLoop {
                                             id,
                                         )
                                         .await;
+                                    } else {
+                                        // Pressing anywhere else starts a text
+                                        // selection. Releasing copies it.
+                                        ui_state.selection = Some(TextSelection::new(
+                                            mouse.column,
+                                            mouse.row,
+                                        ));
+                                    }
+                                }
+                                MouseEventKind::Drag(MouseButton::Left) => {
+                                    if let Some(selection) = ui_state.selection.as_mut() {
+                                        selection.drag_to(mouse.column, mouse.row);
+                                    }
+                                }
+                                MouseEventKind::Up(MouseButton::Left) => {
+                                    if let Some(selection) = ui_state.selection.take() {
+                                        if !selection.is_empty() {
+                                            let text = terminal_ui.selected_text(&selection);
+                                            if !text.is_empty() {
+                                                match coderex_ui::export::copy_to_clipboard(&text)
+                                                {
+                                                    Ok(()) => {
+                                                        ui_state.notifications.success(format!(
+                                                            "Copied {} characters",
+                                                            text.chars().count()
+                                                        ));
+                                                    }
+                                                    Err(error) => ui_state
+                                                        .notifications
+                                                        .err(format!("Copy failed: {error}")),
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                                 _ => {}

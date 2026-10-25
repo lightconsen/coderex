@@ -2,7 +2,7 @@
 
 use crate::message_list::{Message, MessageRole};
 use crate::mod_elements::{ButtonHit, render_mod_ui_with_focus_and_hits};
-use crate::state::UiState;
+use crate::state::{TextSelection, UiState};
 use crate::statusline::Statusline;
 use crate::terminal_profile::TerminalProfile;
 use crate::themes::Theme;
@@ -90,6 +90,11 @@ pub struct TerminalUi {
     profile: TerminalProfile,
     keyboard_pushed: bool,
     mod_ui_hit_regions: Vec<ModUiHitRegion>,
+    /// The last drawn frame as one character per cell. Used to copy a mouse
+    /// selection; a continuation cell of a wide character is `'\0'`.
+    frame_rows: Vec<Vec<char>>,
+    /// The area the last frame covered.
+    frame_area: Rect,
 }
 
 impl TerminalUi {
@@ -106,6 +111,8 @@ impl TerminalUi {
             profile: TerminalProfile::from_env(),
             keyboard_pushed: false,
             mod_ui_hit_regions: Vec::new(),
+            frame_rows: Vec::new(),
+            frame_area: Rect::default(),
         })
     }
 
@@ -164,10 +171,12 @@ impl TerminalUi {
         mod_ui_blocks: &[ModUiBlockSpec],
     ) -> std::io::Result<()> {
         let mut mod_ui_hit_regions = Vec::new();
-        self.terminal.draw(|frame| {
+        let completed = self.terminal.draw(|frame| {
             render_frame(frame, state, mod_ui_blocks, &mut mod_ui_hit_regions);
         })?;
         self.mod_ui_hit_regions = mod_ui_hit_regions;
+        self.frame_rows = capture_rows(completed.buffer);
+        self.frame_area = completed.buffer.area;
         Ok(())
     }
 
@@ -175,6 +184,100 @@ impl TerminalUi {
     #[must_use]
     pub fn mod_ui_hit_regions(&self) -> &[ModUiHitRegion] {
         &self.mod_ui_hit_regions
+    }
+
+    /// The text covered by a mouse selection, read from the last drawn frame.
+    ///
+    /// The buffer is cloned only when a copy is requested, not on every draw.
+    #[must_use]
+    pub fn selected_text(&self, selection: &TextSelection) -> String {
+        selection_text(self.frame_area, &self.frame_rows, selection)
+    }
+}
+
+/// Snapshot a rendered buffer as one character per cell.
+///
+/// A wide character owns the cell it starts in; the cell it continues into has
+/// no symbol and is recorded as `'\0'`, so column arithmetic still lines up
+/// with what the user selected on screen.
+fn capture_rows(buffer: &ratatui::buffer::Buffer) -> Vec<Vec<char>> {
+    let area = buffer.area;
+    (area.top()..area.bottom())
+        .map(|row| {
+            (area.left()..area.right())
+                .map(|column| {
+                    buffer
+                        .cell((column, row))
+                        .and_then(|cell| cell.symbol().chars().next())
+                        .unwrap_or('\0')
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// Extract the text covered by a mouse selection from a frame snapshot.
+///
+/// Rows between the endpoints are taken whole; the first and last rows are cut
+/// at the selected columns. Trailing blanks on each row and trailing blank
+/// rows are dropped, so choosing a rectangle of screen does not copy a block
+/// of spaces or the interface below the text.
+pub(crate) fn selection_text(area: Rect, rows: &[Vec<char>], selection: &TextSelection) -> String {
+    let ((start_col, start_row), (end_col, end_row)) = selection.normalized();
+    let last_col = area.right().saturating_sub(1);
+    let mut lines = Vec::new();
+    for row in start_row..=end_row {
+        if row < area.y || row >= area.bottom() {
+            continue;
+        }
+        let left = if row == start_row {
+            start_col
+        } else {
+            area.left()
+        };
+        let right = if row == end_row { end_col } else { last_col };
+        let left = left.max(area.left()).min(last_col);
+        let right = right.max(left).min(last_col);
+        let Some(cells) = rows.get((row - area.y) as usize) else {
+            continue;
+        };
+        let mut line = String::new();
+        for column in left..=right {
+            if let Some(character) = cells.get((column - area.left()) as usize) {
+                if *character != '\0' {
+                    line.push(*character);
+                }
+            }
+        }
+        lines.push(line.trim_end().to_string());
+    }
+    lines.join("\n").trim_end().to_string()
+}
+
+/// Tint the cells covered by a mouse selection.
+///
+/// Only the background changes: the text keeps the colours it was drawn with,
+/// and an empty [`Paragraph`] fills the rect without writing over the symbols.
+fn paint_selection(frame: &mut Frame, area: Rect, selection: TextSelection, theme: &Theme) {
+    let ((start_col, start_row), (end_col, end_row)) = selection.normalized();
+    let last_col = area.right().saturating_sub(1);
+    let style = Style::default().bg(theme.selection_bg);
+    for row in start_row..=end_row {
+        if row < area.y || row >= area.bottom() {
+            continue;
+        }
+        let left = if row == start_row {
+            start_col
+        } else {
+            area.left()
+        };
+        let right = if row == end_row { end_col } else { last_col };
+        let left = left.max(area.left()).min(last_col);
+        let right = right.max(left).min(last_col);
+        frame.render_widget(
+            Paragraph::new("").style(style),
+            Rect::new(left, row, right - left + 1, 1),
+        );
     }
 }
 
@@ -244,14 +347,15 @@ fn frame_constraints(
     show_perm_bar: bool,
 ) -> Vec<Constraint> {
     vec![
-        Constraint::Min(1),                             // message area
-        Constraint::Length(inline_palette_height),      // inline command hint
-        Constraint::Length(u16::from(show_notif)),      // notification bar
-        Constraint::Length(u16::from(show_statusline)), // statusline (thinking)
-        Constraint::Length(1),                          // rule above the input
-        Constraint::Length(input_height.max(1)),        // input lines
-        Constraint::Length(1),                          // rule below the input
-        Constraint::Length(u16::from(show_perm_bar)),   // permission bar
+        Constraint::Min(1),                        // message area
+        Constraint::Length(inline_palette_height), // inline command hint
+        Constraint::Length(u16::from(show_notif)), // notification bar
+        // One row of text with one blank row above and below it.
+        Constraint::Length(if show_statusline { 3 } else { 0 }), // statusline
+        Constraint::Length(1),                                   // rule above the input
+        Constraint::Length(input_height.max(1)),                 // input lines
+        Constraint::Length(1),                                   // rule below the input
+        Constraint::Length(u16::from(show_perm_bar)),            // permission bar
     ]
 }
 
@@ -401,6 +505,11 @@ fn render_frame(
     // Overlay (only non-palette overlays; palette is rendered inline)
     if state.overlays.is_active() && !is_inline_palette(state) {
         render_overlay(frame, area, state);
+    }
+
+    // A mouse selection is painted last so it is visible over the transcript.
+    if let Some(selection) = state.selection {
+        paint_selection(frame, area, selection, &state.theme);
     }
 }
 
@@ -1571,6 +1680,9 @@ fn render_statusline(
     statusline: &Statusline,
     theme: &Theme,
 ) {
+    if area.height == 0 {
+        return;
+    }
     let rendered = statusline.render(area.width as usize);
     let spans = rendered
         .split(" | ")
@@ -1580,7 +1692,14 @@ fn render_statusline(
     let paragraph = Paragraph::new(line)
         .style(Style::default().fg(theme.statusbar_fg))
         .alignment(Alignment::Left);
-    frame.render_widget(paragraph, area);
+    // The pane is three rows tall; the text owns the middle row so the blank
+    // space above and below it is the same.
+    let text_area = Rect {
+        y: area.y + area.height / 2,
+        height: 1,
+        ..area
+    };
+    frame.render_widget(paragraph, text_area);
 }
 
 fn render_permission_bar(
@@ -2110,7 +2229,8 @@ mod layout_tests {
         let rows: Vec<String> = (0..30).map(|y| row_text(&buffer, y)).collect();
 
         let chunks = chunks_for(30, 0, false, true, 1, true);
-        let statusline_y = chunks[STATUSLINE_IDX].y;
+        // The text sits on the middle row of the padded pane.
+        let statusline_y = chunks[STATUSLINE_IDX].y + 1;
         let input_y = chunks[INPUT_IDX].y;
 
         assert!(
@@ -2203,7 +2323,7 @@ mod layout_tests {
         assert_eq!(chunks.len(), PERMISSION_IDX + 1, "one rect per constraint");
         assert_eq!(chunks[PALETTE_IDX].height, 4, "palette");
         assert_eq!(chunks[NOTIFICATION_IDX].height, 1, "notification");
-        assert_eq!(chunks[STATUSLINE_IDX].height, 1, "statusline");
+        assert_eq!(chunks[STATUSLINE_IDX].height, 3, "statusline");
         assert_eq!(chunks[RULE_IDX].height, 1, "input rule");
         assert_eq!(chunks[INPUT_IDX].height, 1, "input");
         assert_eq!(chunks[RULE_BELOW_IDX].height, 1, "input rule below");
@@ -2357,6 +2477,69 @@ mod layout_tests {
             colours.len() >= 5,
             "the wordmark should use several colours, got {colours:?}"
         );
+    }
+
+    /// Dragging over the transcript copies exactly the characters under the
+    /// rectangle.
+    #[test]
+    fn a_selection_copies_the_text_under_it() {
+        let mut state = UiState::default();
+        state.messages.push(Message {
+            role: MessageRole::System,
+            content: "alpha beta\ngamma delta".into(),
+            tool_name: None,
+            streaming: false,
+            folded: false,
+        });
+        let buffer = render_to_buffer(80, 20, &mut state);
+        let rows = capture_rows(&buffer);
+
+        let alpha_row = (0..20)
+            .find(|row| row_text(&buffer, *row).contains("alpha beta"))
+            .expect("alpha row");
+        let gamma_row = (0..20)
+            .find(|row| row_text(&buffer, *row).contains("gamma delta"))
+            .expect("gamma row");
+        // Columns are display cells, not byte offsets: a marker before the
+        // text may be multi-byte.
+        let column_of = |row: u16, needle: &str| {
+            let text = row_text(&buffer, row);
+            let byte = text.find(needle).expect(needle);
+            text[..byte].chars().count() as u16
+        };
+        let alpha_col = column_of(alpha_row, "alpha");
+        let delta_col = column_of(gamma_row, "delta") + 4;
+
+        let selection = TextSelection {
+            anchor: (alpha_col, alpha_row),
+            cursor: (delta_col, gamma_row),
+        };
+        assert_eq!(
+            selection_text(buffer.area, &rows, &selection),
+            // The second line keeps the indent the transcript drew.
+            "alpha beta\n  gamma delta"
+        );
+    }
+
+    /// The selected cells get the theme's selection background and nothing
+    /// outside the rectangle changes.
+    #[test]
+    fn a_selection_is_highlighted() {
+        let mut state = UiState::default();
+        state.selection = Some(TextSelection {
+            anchor: (1, 1),
+            cursor: (5, 2),
+        });
+        let buffer = render_to_buffer(80, 20, &mut state);
+        let selected = crate::themes::Theme::dark().selection_bg;
+
+        assert_eq!(buffer.cell((2, 1)).unwrap().bg, selected);
+        assert_eq!(buffer.cell((2, 2)).unwrap().bg, selected);
+        assert_ne!(buffer.cell((0, 1)).unwrap().bg, selected);
+        // Linear selection: the rest of the first row is selected up to the
+        // second row's column.
+        assert_eq!(buffer.cell((10, 1)).unwrap().bg, selected);
+        assert_ne!(buffer.cell((10, 2)).unwrap().bg, selected);
     }
 
     /// A terminal too small for the box gets readable plain lines instead of a
