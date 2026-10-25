@@ -2,10 +2,24 @@ name: CI
 on:
   push:
     branches: [main]
+    tags: ['v*']
+    paths-ignore:
+      - 'docs/**'
+      - '**/*.md'
+      - 'LICENSE'
+      - 'NOTICE'
   pull_request:
     branches: [main]
+    paths-ignore:
+      - 'docs/**'
+      - '**/*.md'
+      - 'LICENSE'
+      - 'NOTICE'
   schedule:
+    # Nightly: tests and checks only (the release build is gated below).
     - cron: "17 3 * * *"
+    # Weekly: also runs the release build matrix.
+    - cron: "42 4 * * 1"
   workflow_dispatch:
     inputs:
       live_provider:
@@ -17,6 +31,10 @@ on:
           - none
           - kimi
           - qwen
+      release_build:
+        description: "Run the release build matrix (three OSes, expensive)"
+        type: boolean
+        default: false
 
 # One run per ref. A newer push (or PR update) cancels the run it replaced;
 # the previous result is no longer interesting and this keeps the queue short.
@@ -36,6 +54,7 @@ jobs:
   fmt:
     name: Format
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -44,6 +63,7 @@ jobs:
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
@@ -83,6 +103,7 @@ jobs:
   test-macos:
     name: Test (macOS plist carrier)
     runs-on: macos-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
@@ -96,6 +117,7 @@ jobs:
   cross-check-windows:
     name: Cross-check (Windows)
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     env:
       CARGO_BUILD_JOBS: '2'
     steps:
@@ -197,6 +219,7 @@ jobs:
   code-agent-benchmark:
     name: Code Agent Benchmark
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
@@ -207,6 +230,7 @@ jobs:
   evals:
     name: Eval Harness
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
@@ -235,6 +259,7 @@ jobs:
     name: Nightly Mock Depth
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
@@ -247,6 +272,7 @@ jobs:
     name: Live Provider Smoke
     if: github.event_name == 'workflow_dispatch' && inputs.live_provider != 'none'
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     env:
       CODEREX_SKIP_ENV_SOURCE: "1"
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
@@ -269,6 +295,7 @@ jobs:
     name: Live Provider Eval (credentials)
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     outputs:
       configured: ${{ steps.check.outputs.configured }}
     steps:
@@ -289,6 +316,7 @@ jobs:
     if: github.event_name == 'workflow_dispatch' && needs.live-provider-eval-preflight.outputs.configured == 'true'
     needs: live-provider-eval-preflight
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     env:
       CODEREX_SKIP_ENV_SOURCE: "1"
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
@@ -314,6 +342,7 @@ jobs:
   doc:
     name: Docs
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
@@ -328,6 +357,7 @@ jobs:
   audit:
     name: Security Audit
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
@@ -338,6 +368,7 @@ jobs:
   deny:
     name: License & Dependencies
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
@@ -347,11 +378,21 @@ jobs:
 
   build:
     name: Build
+    # The release build is the most expensive part of the matrix: one run cost
+    # roughly 2/3 of the day's billed minutes (Windows ~48 min at a 2x
+    # multiplier, macOS ~10 min at 10x). It runs for tagged releases, the
+    # weekly schedule, and a manual dispatch that explicitly asks for it —
+    # never on an ordinary push or pull request.
+    if: >-
+      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v'))
+      || github.event.schedule == '42 4 * * 1'
+      || (github.event_name == 'workflow_dispatch' && github.event.inputs.release_build == 'true')
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
