@@ -186,6 +186,93 @@ fn color_to_string(c: Color) -> String {
     }
 }
 
+/// Whether the terminal advertises 24-bit colour.
+///
+/// macOS Terminal.app reports 256 colours and nothing else; sending it
+/// `48;2;r;g;b` makes its background rendering unreliable. Every other
+/// terminal keeps the existing 24-bit behaviour unless it explicitly says
+/// otherwise.
+#[must_use]
+pub fn supports_truecolor() -> bool {
+    truecolor_for(
+        std::env::var("TERM_PROGRAM").ok().as_deref(),
+        std::env::var("COLORTERM").ok().as_deref(),
+        std::env::var("TERM").ok().as_deref(),
+        std::env::var_os("WT_SESSION").is_some(),
+    )
+}
+
+fn truecolor_for(
+    term_program: Option<&str>,
+    colorterm: Option<&str>,
+    term: Option<&str>,
+    wt_session: bool,
+) -> bool {
+    if colorterm.is_some_and(|value| {
+        value.eq_ignore_ascii_case("truecolor") || value.eq_ignore_ascii_case("24bit")
+    }) {
+        return true;
+    }
+    if term.is_some_and(|value| value.contains("direct")) {
+        return true;
+    }
+    if wt_session {
+        return true;
+    }
+    if term_program.is_some_and(|value| value == "Apple_Terminal") {
+        return false;
+    }
+    // Unknown terminals have received 24-bit sequences so far; keep that.
+    true
+}
+
+/// The xterm-256 cube levels, used to approximate an RGB colour.
+const XTERM_CUBE: [u8; 6] = [0, 95, 135, 175, 215, 255];
+
+fn nearest_cube_level(value: u8) -> usize {
+    XTERM_CUBE
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, level)| u32::from(**level).abs_diff(u32::from(value)))
+        .map_or(0, |(index, _)| index)
+}
+
+/// The nearest xterm-256 palette index for an RGB colour.
+fn nearest_xterm256(r: u8, g: u8, b: u8) -> u8 {
+    let ri = nearest_cube_level(r);
+    let gi = nearest_cube_level(g);
+    let bi = nearest_cube_level(b);
+    let cube = (XTERM_CUBE[ri], XTERM_CUBE[gi], XTERM_CUBE[bi]);
+    let distance = |(cr, cg, cb): (u8, u8, u8)| {
+        let d = |a: u8, b: u8| u32::from(a).abs_diff(u32::from(b)).pow(2);
+        d(cr, r) + d(cg, g) + d(cb, b)
+    };
+    let cube_index = 16 + 36 * ri as u8 + 6 * gi as u8 + bi as u8;
+
+    // The 24-step grey ramp is often closer than the cube for muted colours.
+    let average = (u32::from(r) + u32::from(g) + u32::from(b)) / 3;
+    let grey_step = average.saturating_sub(8).div_ceil(10).min(23);
+    let grey_index = 232 + grey_step as u8;
+    let grey_level = 8 + 10 * grey_step as u8;
+
+    if distance((grey_level, grey_level, grey_level)) < distance(cube) {
+        grey_index
+    } else {
+        cube_index
+    }
+}
+
+/// Map a 24-bit colour to the nearest xterm-256 entry.
+///
+/// Colours that are already palette entries pass through unchanged.
+#[must_use]
+pub fn quantize_color(color: Color) -> Color {
+    match color {
+        Color::Rgb(r, g, b) => Color::Indexed(nearest_xterm256(r, g, b)),
+        other => other,
+    }
+}
+
 fn parse_color_or(s: &str, default: Color, _field: &str) -> Result<Color, String> {
     parse_color(s)
         .ok_or_else(|| format!("invalid color: {s}"))
@@ -336,6 +423,42 @@ impl Theme {
             notif_info: Color::Rgb(122, 162, 247),
             notif_warning: Color::Rgb(224, 175, 104),
             notif_error: Color::Rgb(247, 118, 142),
+        }
+    }
+
+    /// Replace every 24-bit colour with its nearest xterm-256 entry.
+    ///
+    /// Used for terminals that do not support 24-bit SGR (macOS
+    /// Terminal.app). Names, layout and every non-colour property are kept.
+    #[must_use]
+    pub fn quantized(&self) -> Self {
+        Self {
+            name: self.name.clone(),
+            background: quantize_color(self.background),
+            foreground: quantize_color(self.foreground),
+            dim: quantize_color(self.dim),
+            accent: quantize_color(self.accent),
+            accent_secondary: quantize_color(self.accent_secondary),
+            user: quantize_color(self.user),
+            assistant: quantize_color(self.assistant),
+            tool: quantize_color(self.tool),
+            statusbar_bg: quantize_color(self.statusbar_bg),
+            statusbar_fg: quantize_color(self.statusbar_fg),
+            error: quantize_color(self.error),
+            warning: quantize_color(self.warning),
+            success: quantize_color(self.success),
+            border: quantize_color(self.border),
+            selection_bg: quantize_color(self.selection_bg),
+            selection_fg: quantize_color(self.selection_fg),
+            input_bg: quantize_color(self.input_bg),
+            input_fg: quantize_color(self.input_fg),
+            overlay_bg: quantize_color(self.overlay_bg),
+            overlay_border: quantize_color(self.overlay_border),
+            vim_normal: quantize_color(self.vim_normal),
+            vim_insert: quantize_color(self.vim_insert),
+            notif_info: quantize_color(self.notif_info),
+            notif_warning: quantize_color(self.notif_warning),
+            notif_error: quantize_color(self.notif_error),
         }
     }
 
@@ -694,6 +817,56 @@ mod tests {
     fn dark_and_light_have_distinct_backgrounds() {
         assert_ne!(Theme::dark().background, Theme::light().background);
         assert_ne!(Theme::dark().foreground, Theme::light().foreground);
+    }
+
+    /// macOS Terminal.app reports only 256 colours; 24-bit sequences must be
+    /// approximated there. Explicit capability signals win over the guess.
+    #[test]
+    fn truecolor_detection() {
+        assert!(!truecolor_for(
+            Some("Apple_Terminal"),
+            None,
+            Some("xterm-256color"),
+            false
+        ));
+        assert!(truecolor_for(
+            Some("Apple_Terminal"),
+            Some("truecolor"),
+            None,
+            false
+        ));
+        assert!(truecolor_for(
+            Some("iTerm.app"),
+            None,
+            Some("xterm-256color"),
+            false
+        ));
+        assert!(truecolor_for(None, None, Some("xterm-direct"), false));
+        assert!(truecolor_for(None, None, Some("xterm-256color"), true));
+    }
+
+    #[test]
+    fn quantize_maps_rgb_to_the_nearest_xterm_entry() {
+        assert_eq!(
+            quantize_color(Color::Rgb(255, 255, 255)),
+            Color::Indexed(231)
+        );
+        assert_eq!(quantize_color(Color::Rgb(0, 0, 0)), Color::Indexed(16));
+        // #18181b (the dark theme background) is closest to the grey ramp.
+        assert_eq!(quantize_color(Color::Rgb(24, 24, 27)), Color::Indexed(234));
+        // Palette colours pass through.
+        assert_eq!(quantize_color(Color::Blue), Color::Blue);
+    }
+
+    #[test]
+    fn a_quantized_theme_has_no_24_bit_colours() {
+        let theme = Theme::dark().quantized();
+        assert_eq!(theme.name, "dark");
+        assert!(!matches!(theme.background, Color::Rgb(..)));
+        assert!(!matches!(theme.foreground, Color::Rgb(..)));
+        assert!(!matches!(theme.accent, Color::Rgb(..)));
+        assert!(!matches!(theme.assistant, Color::Rgb(..)));
+        assert!(!matches!(theme.border, Color::Rgb(..)));
     }
 
     #[test]

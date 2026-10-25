@@ -225,6 +225,11 @@ impl PtySession {
             "ANTHROPIC_API_KEY",
             "ANTHROPIC_AUTH_TOKEN",
             "OPENAI_API_KEY",
+            // Colour-capability detection must not depend on the terminal
+            // that happens to run the test; without these the child assumes
+            // 24-bit colour and the theme assertions are stable everywhere.
+            "TERM_PROGRAM",
+            "COLORTERM",
         ] {
             cmd.env_remove(key);
         }

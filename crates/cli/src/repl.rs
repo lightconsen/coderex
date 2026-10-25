@@ -7299,7 +7299,13 @@ impl ReplLoop {
     fn apply_tui_theme(&self, ui_state: &mut coderex_ui::state::UiState, theme_name: &str) -> bool {
         let manager = self.theme_manager();
         if let Some(theme) = manager.get_theme(theme_name) {
-            ui_state.theme = theme.clone();
+            // Terminal.app only reports 256 colours; 24-bit background
+            // sequences render unreliably there, so approximate the palette.
+            ui_state.theme = if coderex_ui::themes::supports_truecolor() {
+                theme.clone()
+            } else {
+                theme.quantized()
+            };
             true
         } else {
             false

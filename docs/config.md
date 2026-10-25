@@ -158,6 +158,13 @@ same keys a built-in serializes: `background`, `foreground`, `dim`, `accent`,
 to parse is ignored by the loader; `/theme` reports "Theme could not be
 loaded" if a name it accepted could not be registered.
 
+Theme colours are 24-bit RGB. On a terminal that reports only 256 colours —
+macOS Terminal.app is the common case, identified via `TERM_PROGRAM` — every
+colour is mapped to the nearest xterm-256 entry before it is applied, because
+Terminal.app renders 24-bit background sequences unreliably. Terminals that
+advertise truecolor through `COLORTERM` or a `-direct` `TERM` keep the exact
+palette.
+
 ### Source Policies (repository-controlled files cannot relax privacy)
 
 `load_settings_file` applies two policies after parsing, both keyed on the
