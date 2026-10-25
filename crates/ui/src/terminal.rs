@@ -15,7 +15,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use std::io::Stdout;
 use std::sync::OnceLock;
 
@@ -1933,11 +1933,22 @@ fn render_overlay(frame: &mut Frame, area: ratatui::layout::Rect, state: &UiStat
         .style(Style::default().fg(state.theme.overlay_border));
     let paragraph = Paragraph::new(content)
         .style(Style::default().fg(state.theme.foreground))
+        .wrap(Wrap { trim: false })
         .block(block);
 
-    // Center the overlay
-    let w = 50.min(area.width - 4);
-    let h = 10.min(area.height - 4);
+    // Center the overlay. A detail body (a provider error, for example) is
+    // long and benefits from the full width; the short dialogs stay compact.
+    let is_detail = matches!(overlay, Overlay::Detail { .. });
+    let w = if is_detail {
+        area.width.saturating_sub(4).min(100)
+    } else {
+        50.min(area.width.saturating_sub(4))
+    };
+    let h = if is_detail {
+        area.height.saturating_sub(4).min(20)
+    } else {
+        10.min(area.height.saturating_sub(4))
+    };
     let x = (area.width - w) / 2;
     let y = (area.height - h) / 2;
     let overlay_area = ratatui::layout::Rect {
@@ -2540,6 +2551,27 @@ mod layout_tests {
         // second row's column.
         assert_eq!(buffer.cell((10, 1)).unwrap().bg, selected);
         assert_ne!(buffer.cell((10, 2)).unwrap().bg, selected);
+    }
+
+    /// A long provider error in the detail overlay must be readable, not
+    /// clipped at a fixed 50-column box.
+    #[test]
+    fn a_detail_overlay_is_wide_enough_for_its_text() {
+        use crate::overlay::Overlay;
+
+        let mut state = UiState::default();
+        state.overlays.push(Overlay::Detail {
+            title: "Failure Details".into(),
+            body: format!("{}ENDMARK", "x".repeat(70)),
+        });
+        let buffer = render_to_buffer(120, 30, &mut state);
+        let screen: String = (0..30)
+            .map(|y| row_text(&buffer, y))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(screen.contains("Failure Details"), "{screen}");
+        assert!(screen.contains("ENDMARK"), "{screen}");
     }
 
     /// A terminal too small for the box gets readable plain lines instead of a

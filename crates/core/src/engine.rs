@@ -1613,6 +1613,12 @@ impl QueryEngine {
         // assistant turn that follows it. Hold it until that turn arrives.
         let mut pending_thinking: Option<ThinkingBlock> = None;
         let mut out: Vec<(String, serde_json::Value)> = Vec::new();
+        // The engine stores one tool result per message, but a provider turn
+        // has one user message holding every `tool_result` for the preceding
+        // assistant turn. Without this, two calls in one assistant message
+        // leave the second `tool_use` unanswered in the next message and the
+        // provider rejects the request.
+        let mut last_user_is_tool_results = false;
 
         for m in messages
             .iter()
@@ -1670,16 +1676,32 @@ impl QueryEngine {
             };
 
             if role_str == "assistant" {
+                last_user_is_tool_results = false;
                 if let Some(block) = pending_thinking.take() {
                     let content = prepend_thinking_block(&block, content);
                     push_assistant_content(&mut out, content);
                 } else {
                     push_assistant_content(&mut out, content);
                 }
+            } else if matches!(m.role, crate::types::Role::Tool) {
+                if last_user_is_tool_results {
+                    if let Some((role, existing)) = out.last_mut() {
+                        if role == "user" {
+                            let mut blocks = content_blocks(std::mem::take(existing));
+                            blocks.extend(content_blocks(content));
+                            *existing = serde_json::Value::Array(blocks);
+                            continue;
+                        }
+                    }
+                }
+                pending_thinking = None;
+                out.push((role_str.to_string(), content));
+                last_user_is_tool_results = true;
             } else {
                 // Thinking can only belong to an assistant turn; a user or
                 // tool message means there is no turn to attach it to.
                 pending_thinking = None;
+                last_user_is_tool_results = false;
                 out.push((role_str.to_string(), content));
             }
         }
@@ -7927,6 +7949,52 @@ mod tests {
         assert_eq!(messages[2]["role"], "user");
         assert_eq!(messages[2]["content"][0]["type"], "tool_result");
         assert_eq!(messages[2]["content"][0]["tool_use_id"], "tc_1");
+    }
+
+    /// Two calls in one assistant turn must arrive as two `tool_use` blocks
+    /// answered by two `tool_result` blocks in *one* following message.
+    #[test]
+    fn provider_messages_merge_parallel_tool_results() {
+        let call = |id: &str| ToolCall {
+            id: id.into(),
+            name: "Read".into(),
+            input: serde_json::json!({"file_path": "src/lib.rs"}),
+        };
+        let result = |id: &str| ToolResult {
+            tool_call_id: id.into(),
+            output: "denied".into(),
+            is_error: true,
+            images: Vec::new(),
+        };
+
+        let messages = QueryEngine::provider_messages(&[
+            Message::user("read two files"),
+            Message {
+                role: crate::types::Role::Assistant,
+                content: crate::types::MessageContent::ToolCall(call("tc_a")),
+            },
+            Message {
+                role: crate::types::Role::Assistant,
+                content: crate::types::MessageContent::ToolCall(call("tc_b")),
+            },
+            Message::tool(result("tc_a")),
+            Message::tool(result("tc_b")),
+        ]);
+
+        assert_eq!(messages.len(), 3, "{messages:#?}");
+        let tool_uses = messages[1]["content"].as_array().unwrap();
+        assert_eq!(tool_uses.len(), 2);
+        let tool_results = messages[2]["content"].as_array().unwrap();
+        assert_eq!(tool_results.len(), 2);
+        assert_eq!(tool_results[0]["tool_use_id"], "tc_a");
+        assert_eq!(tool_results[1]["tool_use_id"], "tc_b");
+    }
+
+    #[test]
+    fn provider_messages_keep_consecutive_user_text_messages_separate() {
+        let messages =
+            QueryEngine::provider_messages(&[Message::user("one"), Message::user("two")]);
+        assert_eq!(messages.len(), 2);
     }
 
     #[test]

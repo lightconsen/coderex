@@ -540,6 +540,8 @@ impl PermissionChecker {
             tool_name.to_lowercase().as_str(),
             "read"
                 | "ls"
+                | "listdir"
+                | "currentdir"
                 | "grep"
                 | "glob"
                 | "web_search"
@@ -547,6 +549,8 @@ impl PermissionChecker {
                 | "grep_code"
                 | "file_search"
                 | "notebook_read"
+                | "toolsearch"
+                | "lsp"
         )
     }
 
@@ -651,6 +655,16 @@ mod tests {
         ));
         assert!(matches!(
             checker.check("grep", None),
+            PermissionResult::Allow
+        ));
+        // Directory inspection is read-only and is what a plan-mode model
+        // reaches for first.
+        assert!(matches!(
+            checker.check("CurrentDir", None),
+            PermissionResult::Allow
+        ));
+        assert!(matches!(
+            checker.check("ListDir", None),
             PermissionResult::Allow
         ));
         assert!(matches!(
