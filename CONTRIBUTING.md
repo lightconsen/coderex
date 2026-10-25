@@ -24,6 +24,10 @@ cargo fmt --all --check
 cargo clippy --workspace        # warnings are reported, not denied (see below)
 ```
 
+`scripts/build.sh` wraps the build and checks the toolchain and platform
+prerequisites first; useful options are `--release`, `--workspace`, `--clean`
+and `--run -- <args>`.
+
 Some suites need extra setup:
 
 - `cargo test -p coderex-cli --test interactive_e2e_tool` drives the TUI

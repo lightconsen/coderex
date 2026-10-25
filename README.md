@@ -36,6 +36,13 @@ cargo build --release
 ./target/release/coderex
 ```
 
+Or use the helper script, which checks the toolchain and the platform
+dependencies (C compiler, pkg-config, dbus, lld) before building:
+
+```bash
+scripts/build.sh --release
+```
+
 **From GitHub Releases:** download the archive for your platform from
 [github.com/lightconsen/coderex/releases](https://github.com/lightconsen/coderex/releases)
 (Linux x86_64 gnu/musl, macOS x86_64/aarch64, Windows x86_64).
