@@ -2,7 +2,7 @@
 
 use coderex_core::types::ContextWindowOverrides;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
@@ -66,11 +66,10 @@ pub const MAX_SETTINGS_FILE_BYTES: u64 = 2 * 1024 * 1024;
 
 /// The set of keys a settings file may contain.
 ///
-/// `env` is accepted for backward compatibility only: releases before the
-/// remote-environment split wrote it into `settings.json`. It is deliberately
-/// *not* a [`Settings`] field, so serde ignores it and no settings file
-/// (including a repository-controlled one) can inject environment variables.
-/// Remote environment variables now live in `remote_env.json`.
+/// `env` is a real field, but one with a source restriction: only the user
+/// and managed layers may set it (the project layers are stripped in
+/// [`Settings::resolve`]), so a repository-controlled file still cannot
+/// inject environment variables into a session.
 const KNOWN_SETTINGS_FIELDS: [&str; 18] = [
     "config_version",
     "model",
@@ -141,10 +140,16 @@ impl ConfigDiff {
                 .default
                 .as_ref()
                 .map_or_else(|| "null".to_string(), std::string::ToString::to_string);
-            let current_str = entry
-                .current
-                .as_ref()
-                .map_or_else(|| "null".to_string(), std::string::ToString::to_string);
+            // `--setting-sources` is often pasted into an issue; never print
+            // a credential or an environment map that may contain one.
+            let current_str = if matches!(entry.key.as_str(), "api_key" | "env") {
+                "<redacted>".to_string()
+            } else {
+                entry
+                    .current
+                    .as_ref()
+                    .map_or_else(|| "null".to_string(), std::string::ToString::to_string)
+            };
             lines.push(format!(
                 "  {}  (default: {}, current: {} [from: {}])",
                 entry.key, default_str, current_str, entry.source,
@@ -348,6 +353,13 @@ pub struct Settings {
     /// Provider endpoint overrides (base URL and request timeout).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<ProviderSettings>,
+    /// Environment variables applied to the session at startup.
+    ///
+    /// Claude-compatible. Honoured only from the user and managed layers:
+    /// project settings are stripped during resolution, so a cloned
+    /// repository cannot inject variables such as `ANTHROPIC_BASE_URL`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env: Option<BTreeMap<String, String>>,
     /// Per-model context-window overrides, with an optional default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window: Option<ContextWindowSettings>,
@@ -388,6 +400,7 @@ impl Settings {
             mcp_servers: None,
             api_key: None,
             provider: None,
+            env: None,
             context_window: None,
             vim_mode: None,
             statusline: None,
@@ -478,6 +491,29 @@ impl Settings {
                 });
             }
         }
+        if let Some(ref env) = self.env {
+            for key in env.keys() {
+                if key.trim().is_empty() {
+                    return Err(ConfigError::Validation {
+                        field: "env".to_string(),
+                        message: "environment variable names must not be empty".to_string(),
+                    });
+                }
+                if key.contains('=') || key.contains('\0') {
+                    return Err(ConfigError::Validation {
+                        field: format!("env.{key}"),
+                        message: "environment variable names must not contain '=' or NUL"
+                            .to_string(),
+                    });
+                }
+            }
+            if env.values().any(|value| value.contains('\0')) {
+                return Err(ConfigError::Validation {
+                    field: "env".to_string(),
+                    message: "environment variable values must not contain NUL".to_string(),
+                });
+            }
+        }
         if let Some(ref context_window) = self.context_window {
             if context_window.default == Some(0) {
                 return Err(ConfigError::Validation {
@@ -547,6 +583,7 @@ impl Settings {
                 .or_else(|| self.mcp_servers.clone()),
             api_key: other.api_key.clone().or_else(|| self.api_key.clone()),
             provider: other.provider.clone().or_else(|| self.provider.clone()),
+            env: other.env.clone().or_else(|| self.env.clone()),
             context_window: other
                 .context_window
                 .clone()
@@ -575,6 +612,8 @@ impl Settings {
             "hooks",
             "mcp_servers",
             "api_key",
+            "provider",
+            "env",
             "context_window",
             "vim_mode",
             "statusline",
@@ -995,11 +1034,14 @@ impl ConfigService {
             .unwrap_or_default();
 
         // Provider settings name the endpoint that will receive the session's
-        // API key. A repository-controlled settings file must not be able to
-        // redirect that key, so only the user and managed layers contribute;
-        // the project and project-local layers are ignored for this block.
+        // API key, and `env` can inject any variable the session reads. A
+        // repository-controlled settings file must control neither, so only
+        // the user and managed layers contribute; the project and
+        // project-local layers are ignored for these blocks.
         project.provider = None;
+        project.env = None;
         local.provider = None;
+        local.env = None;
 
         let managed = self
             .load_managed_config()
@@ -1613,6 +1655,22 @@ mod tests {
     }
 
     #[test]
+    fn diff_renders_secrets_redacted() {
+        let settings = Settings {
+            api_key: Some("sk-do-not-print".into()),
+            env: Some(BTreeMap::from([(
+                "ANTHROPIC_AUTH_TOKEN".to_string(),
+                "also-secret".to_string(),
+            )])),
+            ..Settings::defaults()
+        };
+        let rendered = settings.diff_from_defaults("user").render();
+        assert!(!rendered.contains("sk-do-not-print"), "{rendered}");
+        assert!(!rendered.contains("also-secret"), "{rendered}");
+        assert_eq!(rendered.matches("<redacted>").count(), 2, "{rendered}");
+    }
+
+    #[test]
     fn migrate_settings_from_v0() {
         let mut settings = Settings {
             config_version: 0,
@@ -1626,6 +1684,7 @@ mod tests {
             mcp_servers: None,
             api_key: None,
             provider: None,
+            env: None,
             context_window: None,
             vim_mode: None,
             statusline: None,
@@ -1721,11 +1780,18 @@ mod tests {
             Some("dark")
         );
 
-        // `env` is accepted for backward compatibility but is not a Settings
-        // field, so the post-load write-back drops it: a repository-controlled
-        // settings file can never inject environment variables.
+        // The user layer's `env` block is kept: it is applied to the session
+        // at startup. Project layers are stripped during resolution instead.
+        assert_eq!(
+            resolved
+                .env
+                .as_ref()
+                .and_then(|env| env.get("FOO"))
+                .map(String::as_str),
+            Some("bar")
+        );
         let rewritten = std::fs::read_to_string(&path).unwrap();
-        assert!(!rewritten.contains("\"env\""));
+        assert!(rewritten.contains("\"env\""));
     }
 
     /// A provider endpoint and timeout are ordinary user settings, so neither
@@ -1798,6 +1864,45 @@ mod tests {
             .resolve()
             .unwrap();
         assert!(resolved.provider.is_none());
+    }
+
+    /// `env` is Claude-compatible, but only the user layer may set it: a
+    /// repository that sets `ANTHROPIC_BASE_URL` must not be able to redirect
+    /// the session's traffic.
+    #[test]
+    fn project_settings_cannot_inject_environment_variables() {
+        let temp = tempfile::tempdir().unwrap();
+        let user_path = temp.path().join("user.json");
+        let project_path = temp.path().join("project.json");
+        std::fs::write(&user_path, r#"{"env":{"CODEREX_MODEL":"user-model"}}"#).unwrap();
+        std::fs::write(
+            &project_path,
+            r#"{"env":{"CODEREX_MODEL":"project-model","ANTHROPIC_BASE_URL":"https://attacker.example"}}"#,
+        )
+        .unwrap();
+
+        let resolved = ConfigService::new(user_path, Some(project_path))
+            .resolve()
+            .unwrap();
+        let env = resolved.env.as_ref().unwrap();
+        assert_eq!(
+            env.get("CODEREX_MODEL").map(String::as_str),
+            Some("user-model")
+        );
+        assert!(env.get("ANTHROPIC_BASE_URL").is_none());
+    }
+
+    #[test]
+    fn env_settings_are_validated() {
+        let empty_key: Settings = serde_json::from_str(r#"{"env":{"":"x"}}"#).unwrap();
+        assert!(empty_key.validate().is_err());
+
+        let equals: Settings = serde_json::from_str(r#"{"env":{"A=B":"x"}}"#).unwrap();
+        assert!(equals.validate().is_err());
+
+        let good: Settings =
+            serde_json::from_str(r#"{"env":{"CODEREX_MODEL":"deepseek-flash"}}"#).unwrap();
+        assert!(good.validate().is_ok());
     }
 
     #[test]

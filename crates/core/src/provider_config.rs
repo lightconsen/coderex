@@ -70,6 +70,60 @@ pub struct NamedProviderEndpoint {
     pub model_map: HashMap<String, String>,
 }
 
+/// Environment variables that supply the Anthropic-protocol API key, in
+/// priority order. The CODEREX_ spellings win over the ANTHROPIC_ ones so a
+/// session can override a globally exported Claude configuration.
+const API_KEY_ENV: &[&str] = &[
+    "CODEREX_API_KEY",
+    "CODEREX_AUTH_TOKEN",
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+];
+
+/// Environment variables that supply the Anthropic-protocol base URL.
+const BASE_URL_ENV: &[&str] = &["CODEREX_BASE_URL", "ANTHROPIC_BASE_URL"];
+
+/// Environment variable that overrides the HTTP request timeout, in seconds.
+const REQUEST_TIMEOUT_ENV: &str = "CODEREX_REQUEST_TIMEOUT_SECS";
+
+/// The first variable in `names` that is set to a non-blank value.
+fn env_first(names: &[&str]) -> Option<String> {
+    names.iter().find_map(|name| {
+        std::env::var(name)
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+    })
+}
+
+/// The request timeout from the environment, in seconds.
+///
+/// `CODEREX_REQUEST_TIMEOUT_SECS` is already in seconds; Claude's
+/// `API_TIMEOUT_MS` is in milliseconds and is rounded up. The CodeRex variable
+/// wins when both are set.
+fn request_timeout_from_env() -> Option<u64> {
+    if let Some(raw) = env_first(&[REQUEST_TIMEOUT_ENV]) {
+        return match raw.trim().parse::<u64>() {
+            Ok(secs) if secs > 0 => Some(secs),
+            _ => {
+                tracing::warn!(
+                    value = %raw,
+                    "ignoring {REQUEST_TIMEOUT_ENV}: expected a positive integer"
+                );
+                None
+            }
+        };
+    }
+
+    let raw = env_first(&["API_TIMEOUT_MS"])?;
+    match raw.trim().parse::<u64>() {
+        Ok(ms) if ms > 0 => Some(ms.div_ceil(1000)),
+        _ => {
+            tracing::warn!(value = %raw, "ignoring API_TIMEOUT_MS: expected a positive integer");
+            None
+        }
+    }
+}
+
 impl ProviderConfig {
     /// Load configuration from environment variables.
     #[must_use]
@@ -81,14 +135,16 @@ impl ProviderConfig {
             ..Self::default()
         };
 
-        if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
+        if let Some(key) = env_first(API_KEY_ENV) {
             config.anthropic = Some(ProviderEndpoint {
                 api_key: key,
-                base_url: std::env::var("ANTHROPIC_BASE_URL").ok(),
+                base_url: env_first(BASE_URL_ENV),
                 provider_profile: std::env::var("CODEREX_PROVIDER_PROFILE").ok(),
                 custom_headers: parse_custom_headers_env(),
             });
         }
+
+        config.request_timeout_secs = request_timeout_from_env();
 
         if let Ok(key) = std::env::var("OPENAI_API_KEY") {
             config.openai = Some(ProviderEndpoint {
@@ -126,7 +182,7 @@ impl ProviderConfig {
         } else {
             self.anthropic = Some(ProviderEndpoint {
                 api_key: key,
-                base_url: std::env::var("ANTHROPIC_BASE_URL").ok(),
+                base_url: env_first(BASE_URL_ENV),
                 provider_profile: std::env::var("CODEREX_PROVIDER_PROFILE").ok(),
                 custom_headers: parse_custom_headers_env(),
             });
@@ -160,7 +216,7 @@ impl ProviderConfig {
                 .anthropic
                 .as_ref()
                 .map(|ep| ep.api_key.clone())
-                .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())
+                .or_else(|| env_first(API_KEY_ENV))
                 .unwrap_or_default();
 
             let mut config = ApiConfig::new(key);
@@ -324,6 +380,91 @@ mod tests {
         let mut config = ProviderConfig::default();
         config.set_anthropic_base_url("https://example.test".into());
         assert!(config.anthropic.is_none());
+    }
+
+    /// Environment tests mutate process state, so they take a lock and put
+    /// every key back when they finish.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct EnvGuard {
+        key: &'static str,
+        previous: Option<String>,
+    }
+
+    #[allow(unsafe_code)] // Environment mutation is unsafe in edition 2024; ENV_LOCK guards it.
+    impl EnvGuard {
+        fn set(key: &'static str, value: Option<&str>) -> Self {
+            let previous = std::env::var(key).ok();
+            match value {
+                Some(value) => unsafe { std::env::set_var(key, value) },
+                None => unsafe { std::env::remove_var(key) },
+            }
+            Self { key, previous }
+        }
+    }
+
+    #[allow(unsafe_code)] // Restoring the environment, under the same lock.
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => unsafe { std::env::set_var(self.key, value) },
+                None => unsafe { std::env::remove_var(self.key) },
+            }
+        }
+    }
+
+    #[test]
+    fn coderx_variables_win_over_anthropic_variables() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _guards = [
+            EnvGuard::set("CODEREX_API_KEY", Some("coderx-key")),
+            EnvGuard::set("ANTHROPIC_API_KEY", Some("anthropic-key")),
+            EnvGuard::set("CODEREX_AUTH_TOKEN", None),
+            EnvGuard::set("ANTHROPIC_AUTH_TOKEN", None),
+            EnvGuard::set("CODEREX_BASE_URL", Some("https://coderx.example")),
+            EnvGuard::set("ANTHROPIC_BASE_URL", Some("https://anthropic.example")),
+            EnvGuard::set("CODEREX_REQUEST_TIMEOUT_SECS", Some("3000")),
+        ];
+
+        let config = ProviderConfig::from_env();
+        let endpoint = config.anthropic.as_ref().unwrap();
+        assert_eq!(endpoint.api_key, "coderx-key");
+        assert_eq!(endpoint.base_url.as_deref(), Some("https://coderx.example"));
+        assert_eq!(config.request_timeout_secs, Some(3000));
+    }
+
+    /// Claude Code exports `ANTHROPIC_AUTH_TOKEN`; it is accepted as a key in
+    /// its own right, and when only that variable is set there is no URL
+    /// override to apply.
+    #[test]
+    fn anthropic_auth_token_is_accepted_as_a_key() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _guards = [
+            EnvGuard::set("CODEREX_API_KEY", None),
+            EnvGuard::set("CODEREX_AUTH_TOKEN", None),
+            EnvGuard::set("ANTHROPIC_API_KEY", None),
+            EnvGuard::set("ANTHROPIC_AUTH_TOKEN", Some("auth-token")),
+            EnvGuard::set("CODEREX_BASE_URL", None),
+            EnvGuard::set("ANTHROPIC_BASE_URL", None),
+        ];
+
+        let config = ProviderConfig::from_env();
+        let endpoint = config.anthropic.as_ref().unwrap();
+        assert_eq!(endpoint.api_key, "auth-token");
+        assert_eq!(endpoint.base_url, None);
+    }
+
+    /// Claude's timeout variable is in milliseconds and is accepted so a
+    /// Claude `env` block can be copied over unchanged.
+    #[test]
+    fn claude_api_timeout_ms_is_converted_to_seconds() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _guards = [
+            EnvGuard::set("CODEREX_REQUEST_TIMEOUT_SECS", None),
+            EnvGuard::set("API_TIMEOUT_MS", Some("3000000")),
+        ];
+
+        assert_eq!(ProviderConfig::from_env().request_timeout_secs, Some(3000));
     }
 }
 

@@ -96,6 +96,37 @@ only from the user and managed layers — project and project-local settings
 cannot redirect the endpoint that receives the API key. Plugins cannot supply
 it either.
 
+### Environment Variables
+
+Provider variables are read from both prefixes. The `CODEREX_*` spelling wins,
+so a session can override a globally exported Claude configuration:
+
+| Setting | CodeRex | Claude-compatible |
+|---|---|---|
+| API key | `CODEREX_API_KEY`, `CODEREX_AUTH_TOKEN` | `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN` |
+| Base URL | `CODEREX_BASE_URL` | `ANTHROPIC_BASE_URL` |
+| Model | `CODEREX_MODEL` | `ANTHROPIC_MODEL`, `OPENAI_MODEL` |
+| Request timeout | `CODEREX_REQUEST_TIMEOUT_SECS` (seconds) | `API_TIMEOUT_MS` (milliseconds, rounded up) |
+
+`settings.json` may also carry a Claude-compatible `env` object; it is applied
+to the process at startup, before providers, the model resolver and feature
+flags read the environment:
+
+```json
+{
+  "env": {
+    "CODEREX_BASE_URL": "https://api.example.com/anthropic",
+    "CODEREX_API_KEY": "sk-…",
+    "CODEREX_MODEL": "my-gateway-alias"
+  }
+}
+```
+
+Like `provider`, `env` is honoured only from the user and managed layers —
+project and project-local settings are stripped during resolution, so a cloned
+repository cannot inject variables. An explicit `provider` block or
+`api_key` setting wins over the corresponding environment variable.
+
 ### Source Policies (repository-controlled files cannot relax privacy)
 
 `load_settings_file` applies two policies after parsing, both keyed on the

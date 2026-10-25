@@ -520,6 +520,10 @@ fn settings_with_every_key() -> Settings {
             base_url: Some(String::new()),
             request_timeout_secs: Some(1),
         }),
+        env: Some(std::collections::BTreeMap::from([(
+            "CODEREX_MODEL".to_string(),
+            "m".to_string(),
+        )])),
         context_window: Some(coderex_config::settings::ContextWindowSettings::default()),
         vim_mode: Some(false),
         statusline: Some(coderex_config::settings::StatuslineSettings::default()),
@@ -837,12 +841,13 @@ impl StartupOrchestrator {
 
         tracing::info!("CodeRex ready");
 
-        // Determine model: ANTHROPIC_MODEL / OPENAI_MODEL env → --model/settings → default.
-        // `fast_mode` only changes the default: an explicitly configured model
-        // (`--model`, `ANTHROPIC_MODEL`/`OPENAI_MODEL`, or a settings `model`
-        // value) always wins, so the flag is what you get when nothing else
-        // chose one.
-        let explicit_model = std::env::var("ANTHROPIC_MODEL")
+        // Determine model: CODEREX_MODEL / ANTHROPIC_MODEL / OPENAI_MODEL env
+        // → --model/settings → default. `fast_mode` only changes the default:
+        // an explicitly configured model (`--model`, the model variables, or a
+        // settings `model` value) always wins, so the flag is what you get
+        // when nothing else chose one.
+        let explicit_model = std::env::var("CODEREX_MODEL")
+            .or_else(|_| std::env::var("ANTHROPIC_MODEL"))
             .or_else(|_| std::env::var("OPENAI_MODEL"))
             .ok()
             .filter(|m| !m.is_empty())
@@ -1065,6 +1070,11 @@ impl StartupOrchestrator {
         let session = overrides.session_overrides();
         settings = overrides.apply(settings);
 
+        // Apply the Claude-compatible `env` block before anything below reads
+        // the environment: model selection, providers, feature flags and the
+        // telemetry channels all consult it later in startup.
+        Self::apply_settings_env(&settings);
+
         if let Some(system_prompt) = session.system_prompt {
             self.ctx.system_prompt = Some(system_prompt);
         }
@@ -1083,7 +1093,8 @@ impl StartupOrchestrator {
         tracing::info!(
             "settings loaded: model={}, effective_model={}",
             settings.model.as_deref().unwrap_or("default"),
-            std::env::var("ANTHROPIC_MODEL")
+            std::env::var("CODEREX_MODEL")
+                .or_else(|_| std::env::var("ANTHROPIC_MODEL"))
                 .or_else(|_| std::env::var("OPENAI_MODEL"))
                 .ok()
                 .filter(|model| !model.is_empty())
@@ -2340,7 +2351,10 @@ impl StartupOrchestrator {
         get_env: &impl Fn(&str) -> Option<String>,
     ) -> bool {
         let present = |name: &str| get_env(name).is_some_and(|value| !value.trim().is_empty());
-        let api_key = present("ANTHROPIC_API_KEY");
+        let api_key = present("CODEREX_API_KEY")
+            || present("CODEREX_AUTH_TOKEN")
+            || present("ANTHROPIC_API_KEY")
+            || present("ANTHROPIC_AUTH_TOKEN");
         match cloud.kind {
             ProviderKind::Bedrock | ProviderKind::AnthropicAws | ProviderKind::Mantle => {
                 api_key || (present("AWS_ACCESS_KEY_ID") && present("AWS_SECRET_ACCESS_KEY"))
@@ -2376,6 +2390,29 @@ impl StartupOrchestrator {
             .settings
             .as_ref()
             .and_then(|settings| settings.prompt_caching)
+    }
+
+    /// Apply the user `env` block to this process.
+    ///
+    /// Settings resolution strips `env` from the project and project-local
+    /// layers, so only the user and a checksum-verified managed file can reach
+    /// this method. The block is applied once at startup, before the model
+    /// resolver, provider construction, feature flags and telemetry channels
+    /// read the environment.
+    #[allow(unsafe_code)] // `set_var` is unsafe in edition 2024; applied once at startup.
+    fn apply_settings_env(settings: &coderex_config::Settings) {
+        let Some(env) = settings.env.as_ref() else {
+            return;
+        };
+        for (key, value) in env {
+            // SAFETY: edition 2024 makes `set_var` unsafe because a concurrent
+            // reader could observe the mutation. Startup applies the block in
+            // one place, before the readers listed above run; the threads that
+            // already exist (the runtime's I/O drivers and the plugin monitor
+            // supervisor) do not consult these keys. This is the same trade-off
+            // a Claude-compatible `env` block makes.
+            unsafe { std::env::set_var(key, value) };
+        }
     }
 
     /// Configure a ReplLoop with all CLI-derived settings.
@@ -2955,7 +2992,8 @@ impl StartupOrchestrator {
     /// `fast_mode`.
     ///
     /// Precedence: an explicit model always wins — `--model`,
-    /// `ANTHROPIC_MODEL`/`OPENAI_MODEL`, or a settings `model` value. `fast_mode`
+    /// `CODEREX_MODEL`/`ANTHROPIC_MODEL`/`OPENAI_MODEL`, or a settings `model`
+    /// value. `fast_mode`
     /// only changes the default used when nothing else chose one: on, the
     /// session resolves through [`ModelProfile::Lightweight`] (haiku,
     /// overridable via `CODEREX_LIGHTWEIGHT_MODEL`); off, it is
