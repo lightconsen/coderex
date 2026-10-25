@@ -161,11 +161,11 @@ after these patterns run, and it is explicitly marked as pattern-scrubbed rather
 
 Telemetry is opt-in (`telemetry_enabled` starts undecided, and the CLI treats an
 undecided value as off). When it is enabled, events are written to a local
-SQLite database and uploaded in batches to the configured endpoint. The built-in
-endpoint is `https://telemetry.coderex.dev/v1/events`; set
-`telemetry.endpoint` in settings (or the OTLP / Datadog channels described
-below) to send them somewhere else. With `telemetry_enabled = false` nothing
-leaves the machine.
+SQLite database. **There is no built-in upload destination**: set
+`telemetry.endpoint` in settings (or the OTLP / Datadog export channels
+described below) to have them uploaded; without one, an opted-in session keeps
+everything local and logs that no destination is configured. With
+`telemetry_enabled = false` nothing is recorded or sent.
 
 ### Crash reports: safe by default
 

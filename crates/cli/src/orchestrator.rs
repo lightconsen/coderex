@@ -1231,9 +1231,11 @@ impl StartupOrchestrator {
             let defaults = coderex_telemetry::TelemetryConfig::default();
             let t = settings.telemetry.as_ref();
             Some(coderex_telemetry::TelemetryConfig {
+                // No destination ships with the project: an opted-in session
+                // with no endpoint configured records locally only.
                 endpoint: t
                     .and_then(|t| t.endpoint.clone())
-                    .unwrap_or(defaults.endpoint),
+                    .unwrap_or_default(),
                 crash_endpoint: t.and_then(|t| t.crash_endpoint.clone()),
                 api_key,
                 batch_size: t.and_then(|t| t.batch_size).unwrap_or(defaults.batch_size),
@@ -1252,12 +1254,28 @@ impl StartupOrchestrator {
             })
         };
 
-        let (handle, uploader) = coderex_telemetry::TelemetryHandle::new(&store, telemetry_config);
         // `TelemetryUploader::new` derives channels from the environment; the
         // settings file is the host's own configuration and must be able to
         // supply (or override) OTLP/Datadog values too.
-        let uploader =
-            uploader.map(|uploader| uploader.with_channels(Self::telemetry_channels(settings)));
+        let channels = Self::telemetry_channels(settings);
+        let has_endpoint = settings
+            .telemetry
+            .as_ref()
+            .and_then(|telemetry| telemetry.endpoint.as_deref())
+            .is_some_and(|endpoint| !endpoint.trim().is_empty());
+        let has_destination = has_endpoint || channels.has_destination();
+        let (handle, uploader) = coderex_telemetry::TelemetryHandle::new(&store, telemetry_config);
+        let uploader = uploader.map(|uploader| uploader.with_channels(channels));
+        // Opting in without a destination keeps the data local instead of
+        // posting to an endpoint the project does not operate.
+        let uploader = if has_destination {
+            uploader
+        } else {
+            tracing::info!(
+                "telemetry is enabled but no endpoint is configured; recording locally only"
+            );
+            None
+        };
         Some((handle, uploader))
     }
 
@@ -1272,7 +1290,7 @@ impl StartupOrchestrator {
         eprintln!();
         eprintln!("Help improve CodeRex by sending anonymous usage data?");
         eprintln!("  - No PII is collected");
-        eprintln!("  - Events are stored locally and batch-uploaded");
+        eprintln!("  - Events are stored locally; they are uploaded only if you configure an endpoint");
         eprintln!("  - You can change this anytime in ~/.coderex/settings.json");
         eprint!("Enable telemetry? [Y/n]: ");
 

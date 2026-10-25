@@ -40,12 +40,14 @@ pub struct TelemetryConfig {
 impl Default for TelemetryConfig {
     fn default() -> Self {
         Self {
-            endpoint: "https://telemetry.coderex.dev/v1/events".into(),
+            // No built-in destination: an enabled configuration must name an
+            // endpoint, otherwise telemetry stays in the local database.
+            endpoint: String::new(),
             crash_endpoint: None,
             api_key: None,
             batch_size: 100,
             upload_interval_secs: 300,
-            enabled: true,
+            enabled: false,
             sample_rate: 1.0,
             pinned_cert_pem: None,
             strict: false,
@@ -59,6 +61,9 @@ impl TelemetryConfig {
     pub fn resolve_crash_endpoint(&self) -> String {
         if let Some(ref explicit) = self.crash_endpoint {
             return explicit.clone();
+        }
+        if self.endpoint.trim().is_empty() {
+            return String::new();
         }
         format!("{}/crashes", self.endpoint.trim_end_matches("/events"))
     }
@@ -856,6 +861,7 @@ mod tests {
             TelemetryConfig {
                 endpoint: format!("{}/events", server.uri()),
                 crash_endpoint: Some(format!("{}/crashes", server.uri())),
+                enabled: true,
                 ..Default::default()
             },
         );
@@ -893,6 +899,7 @@ mod tests {
             file.path().to_path_buf(),
             TelemetryConfig {
                 endpoint: format!("{}/events", server.uri()),
+                enabled: true,
                 ..Default::default()
             },
         )
@@ -920,7 +927,8 @@ mod tests {
     #[test]
     fn telemetry_config_defaults() {
         let config = TelemetryConfig::default();
-        assert!(config.enabled);
+        assert!(!config.enabled, "telemetry must be opted into");
+        assert!(config.endpoint.is_empty(), "there is no default destination");
         assert_eq!(config.batch_size, 100);
         assert_eq!(config.upload_interval_secs, 300);
         assert_eq!(config.sample_rate, 1.0);
@@ -940,11 +948,16 @@ mod tests {
 
     #[test]
     fn crash_endpoint_derived() {
-        let config = TelemetryConfig::default();
+        let config = TelemetryConfig {
+            endpoint: "https://telemetry.example.com/v1/events".into(),
+            ..TelemetryConfig::default()
+        };
         assert_eq!(
             config.resolve_crash_endpoint(),
-            "https://telemetry.coderex.dev/v1/crashes"
+            "https://telemetry.example.com/v1/crashes"
         );
+        // With no destination configured nothing is derived.
+        assert!(TelemetryConfig::default().resolve_crash_endpoint().is_empty());
     }
 
     #[test]
