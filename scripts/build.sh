@@ -2,14 +2,14 @@
 # Build CodeRex locally.
 #
 # Usage:
-#   scripts/build.sh                       # debug build of the coderex binary
-#   scripts/build.sh --release             # optimized build (fat LTO; much slower)
+#   scripts/build.sh                       # release build of the coderex binary
+#   scripts/build.sh --debug               # fast debug build
 #   scripts/build.sh --workspace           # build every workspace crate
-#   scripts/build.sh --clean --release     # clean first, then build
+#   scripts/build.sh --clean               # clean first, then build
 #   scripts/build.sh --run -- --version    # build, then run with arguments
 #
 # Options:
-#   -r, --release     use the release profile (LTO + one codegen unit: slow)
+#   -d, --debug       use the dev profile (fast to compile, slow to run)
 #   -w, --workspace   build the whole workspace instead of just the coderex bin
 #   -c, --clean       run `cargo clean` before building
 #   -j, --jobs N      parallel build jobs (passed to cargo)
@@ -38,7 +38,7 @@ note() {
   printf '%s\n' "$*"
 }
 
-profile=debug
+profile=release
 workspace=0
 clean=0
 run=0
@@ -47,7 +47,7 @@ run_args=()
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    -r | --release) profile=release ;;
+    -d | --debug) profile=debug ;;
     -w | --workspace) workspace=1 ;;
     -c | --clean) clean=1 ;;
     --run) run=1 ;;

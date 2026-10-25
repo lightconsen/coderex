@@ -37,10 +37,11 @@ cargo build --release
 ```
 
 Or use the helper script, which checks the toolchain and the platform
-dependencies (C compiler, pkg-config, dbus, lld) before building:
+dependencies (C compiler, pkg-config, dbus, lld) before building. It builds
+the optimized profile by default; use `--debug` for a faster compile:
 
 ```bash
-scripts/build.sh --release
+scripts/build.sh
 ```
 
 **From GitHub Releases:** download the archive for your platform from
