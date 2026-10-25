@@ -308,19 +308,14 @@ mod tests {
     }
 
     fn test_surface(id: &str) -> Arc<dyn UiSurface> {
-        Arc::new(TestSurface(SurfaceDescriptor::new(
-            id,
-            SurfaceCapabilities::TEXT_ONLY,
-        )
-        .unwrap()))
+        Arc::new(TestSurface(
+            SurfaceDescriptor::new(id, SurfaceCapabilities::TEXT_ONLY).unwrap(),
+        ))
     }
 
     #[test]
     fn surface_ids_are_validated() {
-        assert_eq!(
-            SurfaceId::new("").unwrap_err(),
-            SurfaceError::Empty
-        );
+        assert_eq!(SurfaceId::new("").unwrap_err(), SurfaceError::Empty);
         assert_eq!(
             SurfaceId::new("x".repeat(MAX_SURFACE_ID_LEN + 1)).unwrap_err(),
             SurfaceError::TooLong
@@ -329,7 +324,10 @@ mod tests {
             SurfaceId::new("Terminal").unwrap_err(),
             SurfaceError::InvalidCharacter
         );
-        assert_eq!(SurfaceId::new("ide-panel_2").unwrap().as_str(), "ide-panel_2");
+        assert_eq!(
+            SurfaceId::new("ide-panel_2").unwrap().as_str(),
+            "ide-panel_2"
+        );
         assert_eq!(SurfaceId::terminal().as_str(), SurfaceId::TERMINAL);
     }
 
@@ -348,7 +346,10 @@ mod tests {
         assert!(registry.active().is_none());
         registry.register(test_surface("terminal")).unwrap();
         registry.register(test_surface("ide")).unwrap();
-        assert_eq!(registry.active().unwrap().descriptor().id.as_str(), "terminal");
+        assert_eq!(
+            registry.active().unwrap().descriptor().id.as_str(),
+            "terminal"
+        );
     }
 
     #[test]

@@ -2575,8 +2575,7 @@ fn install_host_api<'js>(ctx: &Ctx<'js>, session: &ModSession, name: &str) -> Re
             .prop(key, Property::from(value))
             .map_err(|error| js_error(ctx, error))?;
     }
-    let capabilities =
-        Object::new(ctx.clone()).map_err(|error| js_error(ctx, error))?;
+    let capabilities = Object::new(ctx.clone()).map_err(|error| js_error(ctx, error))?;
     for (key, value) in [
         ("interactive", session.surface.capabilities.interactive),
         ("mouse", session.surface.capabilities.mouse),

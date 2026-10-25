@@ -9,8 +9,12 @@ allow = [
     "BSD-3-Clause",
     "ISC",
     "Unicode-3.0",
+    # Unicode data license, used by text-shaping crates.
+    "Unicode-DFS-2016",
     "OpenSSL",
     "Zlib",
+    # terminfo 0.9 is WTFPL: a permissive, condition-free license.
+    "WTFPL",
     # Boost Software License (dragonbox, through oxc float formatting).
     "BSL-1.0",
     # Data/notice-only: CC0 for `notify`, CDLA-Permissive-2.0 for the

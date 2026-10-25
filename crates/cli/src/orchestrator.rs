@@ -1233,9 +1233,7 @@ impl StartupOrchestrator {
             Some(coderex_telemetry::TelemetryConfig {
                 // No destination ships with the project: an opted-in session
                 // with no endpoint configured records locally only.
-                endpoint: t
-                    .and_then(|t| t.endpoint.clone())
-                    .unwrap_or_default(),
+                endpoint: t.and_then(|t| t.endpoint.clone()).unwrap_or_default(),
                 crash_endpoint: t.and_then(|t| t.crash_endpoint.clone()),
                 api_key,
                 batch_size: t.and_then(|t| t.batch_size).unwrap_or(defaults.batch_size),
@@ -1290,7 +1288,9 @@ impl StartupOrchestrator {
         eprintln!();
         eprintln!("Help improve CodeRex by sending anonymous usage data?");
         eprintln!("  - No PII is collected");
-        eprintln!("  - Events are stored locally; they are uploaded only if you configure an endpoint");
+        eprintln!(
+            "  - Events are stored locally; they are uploaded only if you configure an endpoint"
+        );
         eprintln!("  - You can change this anytime in ~/.coderex/settings.json");
         eprint!("Enable telemetry? [Y/n]: ");
 
