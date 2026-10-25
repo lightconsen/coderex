@@ -72,8 +72,9 @@ const WELCOME_T_REX: &str = r"
        /__.-'|_|--|_|
 ";
 
-/// The welcome page is drawn inside a box no wider than this.
-const WELCOME_CARD_MAX_WIDTH: usize = 62;
+/// The welcome page is drawn inside a box no wider than this. Two columns
+/// beyond the longest hint keep the text off the right border.
+const WELCOME_CARD_MAX_WIDTH: usize = 64;
 /// Below this width the box's padding and hints no longer fit; the page falls
 /// back to plain centered lines.
 const WELCOME_CARD_MIN_WIDTH: usize = 34;
@@ -227,7 +228,8 @@ const NOTIFICATION_IDX: usize = 2;
 const STATUSLINE_IDX: usize = 3;
 const RULE_IDX: usize = 4;
 const INPUT_IDX: usize = 5;
-const PERMISSION_IDX: usize = 6;
+const RULE_BELOW_IDX: usize = 6;
+const PERMISSION_IDX: usize = 7;
 
 /// The vertical pane stack, top to bottom.
 ///
@@ -248,6 +250,7 @@ fn frame_constraints(
         Constraint::Length(u16::from(show_statusline)), // statusline (thinking)
         Constraint::Length(1),                          // rule above the input
         Constraint::Length(input_height.max(1)),        // input lines
+        Constraint::Length(1),                          // rule below the input
         Constraint::Length(u16::from(show_perm_bar)),   // permission bar
     ]
 }
@@ -363,11 +366,13 @@ fn render_frame(
         );
     }
 
-    // Rule between the transcript and the input box
+    // Rules that frame the input box
     render_input_rule(frame, chunks[RULE_IDX], &state.theme);
 
     // Input line
     render_input(frame, chunks[INPUT_IDX], &state.input, &state.theme);
+
+    render_input_rule(frame, chunks[RULE_BELOW_IDX], &state.theme);
 
     // Permission bar (below input)
     if show_perm_bar {
@@ -1195,7 +1200,7 @@ fn render_welcome_art(
 ) -> Vec<Line<'static>> {
     let meta = welcome_meta(model, branch);
     if width >= WELCOME_CARD_MIN_WIDTH && viewport_height >= WELCOME_CARD_HEIGHT {
-        welcome_card(theme, width, &meta)
+        welcome_card(theme, width, model, branch)
     } else {
         welcome_plain(theme, &meta)
     }
@@ -1214,69 +1219,160 @@ fn welcome_meta(model: &str, branch: &str) -> String {
 }
 
 /// The boxed welcome page.
-fn welcome_card(theme: &Theme, width: usize, meta: &str) -> Vec<Line<'static>> {
+///
+/// The card hugs the left edge: the transcript is a log, and a centred card
+/// floats away from the text it introduces. Colour carries the hierarchy
+/// instead of position: the wordmark cycles through the theme's accents, the
+/// mascot is green, the version/model/branch and the key hints each have their
+/// own colour.
+fn welcome_card(theme: &Theme, width: usize, model: &str, branch: &str) -> Vec<Line<'static>> {
     let card_width = width.min(WELCOME_CARD_MAX_WIDTH);
     let inner = card_width.saturating_sub(2);
-    let indent = " ".repeat((width - card_width) / 2);
+    let indent = "";
     let border = Style::default().fg(theme.border);
-    let wordmark = Style::default()
-        .fg(theme.assistant)
-        .add_modifier(Modifier::BOLD);
     let art = Style::default().fg(theme.assistant);
     let muted = Style::default().fg(theme.dim);
 
     let mut lines = Vec::with_capacity(WELCOME_CARD_HEIGHT);
-    lines.push(card_border(&indent, '╭', '╮', inner, border));
-    lines.push(card_row(&indent, "", muted, inner, border));
-    lines.push(card_row(&indent, "C O D E R E X", wordmark, inner, border));
-    lines.push(card_row(&indent, "", muted, inner, border));
-    // Centre the mascot as one block: centring each row on its own would shift
-    // the drawing by a column wherever its rows differ in width.
+    lines.push(card_border(indent, '╭', '╮', inner, border));
+    lines.push(card_row(indent, "", muted, inner, border));
+    lines.push(card_row_spans(indent, wordmark_spans(theme), inner, border));
+    lines.push(card_row(indent, "", muted, inner, border));
+
+    // Left-align the mascot as one block. Stripping each line's own leading
+    // spaces would distort the drawing, so remove only the indent common to
+    // every row and keep the rest.
     let art_lines: Vec<&str> = WELCOME_T_REX
         .lines()
         .filter(|line| !line.trim().is_empty())
         .map(str::trim_end)
         .collect();
-    let art_width = art_lines
+    let common_indent = art_lines
         .iter()
-        .map(|line| unicode_width::UnicodeWidthStr::width(*line))
-        .max()
+        .map(|line| line.len() - line.trim_start().len())
+        .min()
         .unwrap_or(0);
-    let art_indent = " ".repeat(inner.saturating_sub(art_width) / 2);
     for art_line in art_lines {
+        let art_line = &art_line[common_indent..];
         lines.push(card_row_left(
-            &indent,
-            &format!("{art_indent}{art_line}"),
+            indent,
+            &format!("  {art_line}"),
             art,
             inner,
             border,
         ));
     }
-    lines.push(card_row(&indent, "", muted, inner, border));
-    lines.push(card_row(&indent, meta, muted, inner, border));
-    lines.push(card_row(&indent, "", muted, inner, border));
-    let hint = if inner >= 58 {
-        "Type /help for commands · Ctrl+C to clear · Ctrl+D to exit"
-    } else if inner >= 42 {
-        "Type /help for commands · Ctrl+D to exit"
-    } else {
-        "Type /help · Ctrl+D to exit"
-    };
-    lines.push(card_row(&indent, hint, muted, inner, border));
-    lines.push(card_row(&indent, "", muted, inner, border));
-    lines.push(card_border(&indent, '╰', '╯', inner, border));
+
+    lines.push(card_row(indent, "", muted, inner, border));
+    lines.push(card_row_spans(
+        indent,
+        welcome_meta_spans(theme, model, branch),
+        inner,
+        border,
+    ));
+    lines.push(card_row(indent, "", muted, inner, border));
+    lines.push(card_row_spans(
+        indent,
+        welcome_hint_spans(theme, inner),
+        inner,
+        border,
+    ));
+    lines.push(card_row(indent, "", muted, inner, border));
+    lines.push(card_border(indent, '╰', '╯', inner, border));
     lines
+}
+
+/// `C O D E R E X`, one colour per letter, hugging the left edge.
+fn wordmark_spans(theme: &Theme) -> Vec<Span<'static>> {
+    const LETTERS: [char; 7] = ['C', 'O', 'D', 'E', 'R', 'E', 'X'];
+    let colors = [
+        theme.accent,
+        theme.assistant,
+        theme.accent_secondary,
+        theme.warning,
+        theme.error,
+        theme.accent,
+        theme.assistant,
+    ];
+
+    let mut spans = vec![Span::raw("  ")];
+    for (index, letter) in LETTERS.iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::raw(" "));
+        }
+        spans.push(Span::styled(
+            letter.to_string(),
+            Style::default()
+                .fg(colors[index])
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    spans
+}
+
+/// Version, model and branch as separate coloured spans.
+fn welcome_meta_spans(theme: &Theme, model: &str, branch: &str) -> Vec<Span<'static>> {
+    let separator = Style::default().fg(theme.dim);
+    let mut spans = vec![
+        Span::raw("  "),
+        Span::styled(
+            format!("CodeRex v{}", env!("CARGO_PKG_VERSION")),
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ];
+    if !model.is_empty() {
+        spans.push(Span::styled(" · ", separator));
+        spans.push(Span::styled(
+            model.to_string(),
+            Style::default().fg(theme.assistant),
+        ));
+    }
+    if !branch.is_empty() {
+        spans.push(Span::styled(" · ", separator));
+        spans.push(Span::styled(
+            branch.to_string(),
+            Style::default().fg(theme.accent_secondary),
+        ));
+    }
+    spans
+}
+
+/// `/help` and the exit keys, each in its own colour.
+fn welcome_hint_spans(theme: &Theme, inner: usize) -> Vec<Span<'static>> {
+    let dim = Style::default().fg(theme.dim);
+    let key = |color| Style::default().fg(color).add_modifier(Modifier::BOLD);
+
+    let mut spans = vec![
+        Span::raw("  "),
+        Span::styled("Type ", dim),
+        Span::styled("/help", key(theme.accent)),
+    ];
+    if inner >= 60 {
+        spans.push(Span::styled(" for commands · ", dim));
+        spans.push(Span::styled("Ctrl+C", key(theme.warning)));
+        spans.push(Span::styled(" to clear · ", dim));
+        spans.push(Span::styled("Ctrl+D", key(theme.assistant)));
+        spans.push(Span::styled(" to exit", dim));
+    } else if inner >= 42 {
+        spans.push(Span::styled(" for commands · ", dim));
+        spans.push(Span::styled("Ctrl+D", key(theme.assistant)));
+        spans.push(Span::styled(" to exit", dim));
+    } else {
+        spans.push(Span::styled(" · ", dim));
+        spans.push(Span::styled("Ctrl+D", key(theme.assistant)));
+        spans.push(Span::styled(" to exit", dim));
+    }
+    spans
 }
 
 /// Plain welcome lines, used when the box would not fit.
 fn welcome_plain(theme: &Theme, meta: &str) -> Vec<Line<'static>> {
-    let name = Style::default()
-        .fg(theme.assistant)
-        .add_modifier(Modifier::BOLD);
     let muted = Style::default().fg(theme.dim);
     vec![
         Line::from(""),
-        Line::from(Span::styled("  C O D E R E X", name)),
+        Line::from(wordmark_spans(theme)),
         Line::from(Span::styled(format!("  {meta}"), muted)),
         Line::from(""),
         Line::from(Span::styled(
@@ -1300,6 +1396,45 @@ fn card_row(indent: &str, text: &str, style: Style, inner: usize, border: Style)
         Span::styled(center_padded(text, inner), style),
         Span::styled("│", border),
     ])
+}
+
+/// A card row built from styled spans, left-aligned and padded to `inner`.
+///
+/// Content longer than the card is truncated span by span; the row still ends
+/// at the border, so a long model name cannot break the box.
+fn card_row_spans(
+    indent: &str,
+    spans: Vec<Span<'static>>,
+    inner: usize,
+    border: Style,
+) -> Line<'static> {
+    let mut remaining = inner;
+    let mut rendered: Vec<Span<'static>> = Vec::new();
+    for span in spans {
+        if remaining == 0 {
+            break;
+        }
+        let content = span.content.to_string();
+        let width = unicode_width::UnicodeWidthStr::width(content.as_str());
+        if width <= remaining {
+            remaining -= width;
+            rendered.push(span);
+        } else {
+            let truncated = truncate_to_width(&content, remaining);
+            let truncated_width = unicode_width::UnicodeWidthStr::width(truncated.as_str());
+            remaining = remaining.saturating_sub(truncated_width);
+            rendered.push(Span::styled(truncated, span.style));
+            break;
+        }
+    }
+    if remaining > 0 {
+        rendered.push(Span::raw(" ".repeat(remaining)));
+    }
+
+    let mut line = vec![Span::styled(format!("{indent}│"), border)];
+    line.extend(rendered);
+    line.push(Span::styled("│", border));
+    Line::from(line)
 }
 
 /// Like [`card_row`], but the content is already laid out and is only padded
@@ -2057,6 +2192,7 @@ mod layout_tests {
         assert_eq!(chunks[STATUSLINE_IDX].height, 1, "statusline");
         assert_eq!(chunks[RULE_IDX].height, 1, "input rule");
         assert_eq!(chunks[INPUT_IDX].height, 1, "input");
+        assert_eq!(chunks[RULE_BELOW_IDX].height, 1, "input rule below");
         assert_eq!(chunks[PERMISSION_IDX].height, 1, "permission");
         assert!(chunks[0].height > 1, "message area");
         // Rects are contiguous and in order, top to bottom.
@@ -2087,8 +2223,35 @@ mod layout_tests {
         assert!(row_text(&buffer, chunks[INPUT_IDX].y).contains('❯'));
     }
 
-    /// Compact mode hides the statusline and permission bar; the rule is part
-    /// of the input box and stays.
+    /// The input box is closed by a second rule below it, identical to the one
+    /// above.
+    #[test]
+    fn the_input_has_a_rule_below_it() {
+        let mut state = UiState::default();
+        let buffer = render_to_buffer(80, 24, &mut state);
+        let chunks = chunks_for(24, 0, false, true, 1, true);
+        let input_y = chunks[INPUT_IDX].y;
+
+        assert_eq!(chunks[RULE_BELOW_IDX].height, 1);
+        assert_eq!(
+            chunks[RULE_BELOW_IDX].y,
+            input_y + 1,
+            "the lower rule is not directly below the input"
+        );
+        let rule = row_text(&buffer, chunks[RULE_BELOW_IDX].y);
+        assert!(
+            rule.chars().all(|character| character == '─'),
+            "lower rule row has other content: {rule:?}"
+        );
+        assert_eq!(
+            row_text(&buffer, chunks[RULE_IDX].y),
+            rule,
+            "the two rules around the input differ"
+        );
+    }
+
+    /// Compact mode hides the statusline and permission bar; the rules are
+    /// part of the input box and stay.
     #[test]
     fn the_input_rule_is_drawn_in_compact_mode() {
         let mut state = UiState {
@@ -2097,11 +2260,13 @@ mod layout_tests {
         };
         let buffer = render_to_buffer(80, 12, &mut state);
         let chunks = chunks_for(12, 0, false, false, 1, false);
-        let rule = row_text(&buffer, chunks[RULE_IDX].y);
-        assert!(
-            rule.chars().all(|character| character == '─'),
-            "rule row has other content: {rule:?}"
-        );
+        for index in [RULE_IDX, RULE_BELOW_IDX] {
+            let rule = row_text(&buffer, chunks[index].y);
+            assert!(
+                rule.chars().all(|character| character == '─'),
+                "rule row has other content: {rule:?}"
+            );
+        }
         assert!(row_text(&buffer, chunks[INPUT_IDX].y).contains('❯'));
     }
 
@@ -2126,6 +2291,31 @@ mod layout_tests {
             "the mascot is missing:\n{screen}"
         );
         assert!(screen.contains('╭') && screen.contains('╯'), "{screen}");
+        assert!(
+            (0..30).any(|y| row_text(&buffer, y).starts_with('╭')),
+            "the welcome card is not left-aligned:\n{screen}"
+        );
+    }
+
+    /// The wordmark carries a colour per letter, so the page is not a block of
+    /// dim text.
+    #[test]
+    fn the_welcome_wordmark_is_colourful() {
+        let mut state = UiState::default();
+        let buffer = render_to_buffer(80, 30, &mut state);
+        let y = (0..30)
+            .find(|y| row_text(&buffer, *y).contains("C O D E R E X"))
+            .expect("wordmark row");
+
+        let colours: std::collections::HashSet<Color> = (0..80)
+            .filter_map(|x| buffer.cell((x, y)))
+            .filter(|cell| matches!(cell.symbol(), "C" | "O" | "D" | "E" | "R" | "X"))
+            .map(|cell| cell.fg)
+            .collect();
+        assert!(
+            colours.len() >= 5,
+            "the wordmark should use several colours, got {colours:?}"
+        );
     }
 
     /// A terminal too small for the box gets readable plain lines instead of a
