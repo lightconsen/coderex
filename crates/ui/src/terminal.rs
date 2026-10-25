@@ -58,32 +58,27 @@ fn syntax_highlighter() -> &'static coderex_core::syntax::SyntaxHighlighter {
     HIGHLIGHTER.get_or_init(coderex_core::syntax::SyntaxHighlighter::new)
 }
 
-/// ASCII T-Rex welcome art (larger variant).
-const T_REX: &str = r"
-                              .-.
-                    ,        ( {o\
-                    {\    /   ~o   }
-                     \`  '-'/    ~ |
-                    {.'   ~   ~  /}
-                     `.    ~  ~ /
-                    .'  ~  ~   `}.
-                   /    ~     ~  `}
-                  {      ~     ~  /)
-                  |`-._  ~    ~  /
-                  |    `-._     ~(
-                  |        `--.__/)
-                  {         `--._/
-                   |  |  |  |   |
-                   |  |  |  |   |
-                   |  |  |  |   |
-                   |  |  |  |   |
-                   |  |  |  |   |
-                   |__|__|__|___|
-                   |__|__|__|___|
-                   \____________/
-                    \__________/
-                     \________/
+/// ASCII T-Rex on the welcome page.
+///
+/// Deliberately the compact variant: the page has to fit above the input box
+/// on a standard 24-row terminal, and the taller CLI banner does not leave
+/// room for the wordmark and hints.
+const WELCOME_T_REX: &str = r"
+                      __
+                     / _)
+            _.----._/ /
+           /         /
+        __/ (  | (  |
+       /__.-'|_|--|_|
 ";
+
+/// The welcome page is drawn inside a box no wider than this.
+const WELCOME_CARD_MAX_WIDTH: usize = 62;
+/// Below this width the box's padding and hints no longer fit; the page falls
+/// back to plain centered lines.
+const WELCOME_CARD_MIN_WIDTH: usize = 34;
+/// Rows the full welcome card occupies, including its border.
+const WELCOME_CARD_HEIGHT: usize = 16;
 
 /// The main terminal UI.
 #[allow(missing_debug_implementations)]
@@ -230,8 +225,9 @@ fn exit_commands(keyboard_pushed: bool, out: &mut impl std::io::Write) -> std::i
 const PALETTE_IDX: usize = 1;
 const NOTIFICATION_IDX: usize = 2;
 const STATUSLINE_IDX: usize = 3;
-const INPUT_IDX: usize = 4;
-const PERMISSION_IDX: usize = 5;
+const RULE_IDX: usize = 4;
+const INPUT_IDX: usize = 5;
+const PERMISSION_IDX: usize = 6;
 
 /// The vertical pane stack, top to bottom.
 ///
@@ -250,6 +246,7 @@ fn frame_constraints(
         Constraint::Length(inline_palette_height),      // inline command hint
         Constraint::Length(u16::from(show_notif)),      // notification bar
         Constraint::Length(u16::from(show_statusline)), // statusline (thinking)
+        Constraint::Length(1),                          // rule above the input
         Constraint::Length(input_height.max(1)),        // input lines
         Constraint::Length(u16::from(show_perm_bar)),   // permission bar
     ]
@@ -365,6 +362,9 @@ fn render_frame(
             &state.theme,
         );
     }
+
+    // Rule between the transcript and the input box
+    render_input_rule(frame, chunks[RULE_IDX], &state.theme);
 
     // Input line
     render_input(frame, chunks[INPUT_IDX], &state.input, &state.theme);
@@ -622,7 +622,13 @@ fn render_messages(
                 mod_ui_blocks,
             );
             if lines.is_empty() {
-                lines.extend(render_welcome_art(&state.theme));
+                lines.extend(render_welcome_art(
+                    &state.theme,
+                    width,
+                    viewport_height,
+                    &state.statusline.model,
+                    &state.statusline.git_branch,
+                ));
             }
             state.messages.render_cache.width = width;
             state.messages.render_cache.is_compact = is_compact;
@@ -711,9 +717,15 @@ fn render_messages(
         }
     }
 
-    // If no messages, show dynamic welcome art
+    // If no messages, show the welcome page
     if lines.is_empty() {
-        lines.extend(render_welcome_art(&state.theme));
+        lines.extend(render_welcome_art(
+            &state.theme,
+            width,
+            viewport_height,
+            &state.statusline.model,
+            &state.statusline.git_branch,
+        ));
     }
 
     state.messages.total_height = lines.len();
@@ -1167,42 +1179,180 @@ fn scroll_slice_bounds(len: usize, viewport_height: usize, scroll_offset: usize)
     (start, end)
 }
 
-/// Dynamic welcome art — cycles between T-Rex ASCII, tips, and hints.
-fn render_welcome_art(theme: &Theme) -> Vec<Line<'static>> {
-    const TIPS: &[&str] = &[
-        "  Tip: Press / for commands, Ctrl+C to interrupt.",
-        "  Tip: Type /vim to enable Vim keybindings.",
-        "  Tip: Use Ctrl+F to search messages.",
-        "  Tip: Press Ctrl+P for the command palette.",
-        "  Tip: Type /help to see all available commands.",
-    ];
-
-    let mut lines: Vec<Line> = Vec::new();
-
-    // Show T-Rex on a rotating basis (using a simple hash of tips count)
-    // For simplicity, always show T-Rex with a random tip below it
-    // In a real implementation, you'd track frame count for rotation
-    for line in T_REX.lines() {
-        lines.push(Line::from(Span::styled(
-            line.to_string(),
-            Style::default().fg(theme.assistant),
-        )));
+/// The welcome page shown while the transcript is empty.
+///
+/// It replaces the old one-line startup banner: the same facts (name, version,
+/// model, branch) plus the mascot and the keys a new user needs. The transcript
+/// is not a widget, so the page is built from [`Line`]s rather than a boxed
+/// widget; a terminal too small for the box gets plain centred lines instead of
+/// a clipped one.
+fn render_welcome_art(
+    theme: &Theme,
+    width: usize,
+    viewport_height: usize,
+    model: &str,
+    branch: &str,
+) -> Vec<Line<'static>> {
+    let meta = welcome_meta(model, branch);
+    if width >= WELCOME_CARD_MIN_WIDTH && viewport_height >= WELCOME_CARD_HEIGHT {
+        welcome_card(theme, width, &meta)
+    } else {
+        welcome_plain(theme, &meta)
     }
-    lines.push(Line::from(Span::raw("")));
+}
 
-    // Show a tip
-    let tip = TIPS[0]; // In production, rotate based on frame count
-    lines.push(Line::from(Span::styled(
-        tip.to_string(),
-        Style::default().fg(theme.dim),
-    )));
+/// `CodeRex v0.1.0 · model · branch`, omitting what the session does not know.
+fn welcome_meta(model: &str, branch: &str) -> String {
+    let mut parts = vec![format!("CodeRex v{}", env!("CARGO_PKG_VERSION"))];
+    if !model.is_empty() {
+        parts.push(model.to_string());
+    }
+    if !branch.is_empty() {
+        parts.push(branch.to_string());
+    }
+    parts.join("  ·  ")
+}
 
-    lines.push(Line::from(Span::styled(
-        "  Welcome to CodeRex. Type a message and press Enter.".to_string(),
-        Style::default().fg(theme.dim),
-    )));
+/// The boxed welcome page.
+fn welcome_card(theme: &Theme, width: usize, meta: &str) -> Vec<Line<'static>> {
+    let card_width = width.min(WELCOME_CARD_MAX_WIDTH);
+    let inner = card_width.saturating_sub(2);
+    let indent = " ".repeat((width - card_width) / 2);
+    let border = Style::default().fg(theme.border);
+    let wordmark = Style::default()
+        .fg(theme.assistant)
+        .add_modifier(Modifier::BOLD);
+    let art = Style::default().fg(theme.assistant);
+    let muted = Style::default().fg(theme.dim);
 
+    let mut lines = Vec::with_capacity(WELCOME_CARD_HEIGHT);
+    lines.push(card_border(&indent, '╭', '╮', inner, border));
+    lines.push(card_row(&indent, "", muted, inner, border));
+    lines.push(card_row(&indent, "C O D E R E X", wordmark, inner, border));
+    lines.push(card_row(&indent, "", muted, inner, border));
+    // Centre the mascot as one block: centring each row on its own would shift
+    // the drawing by a column wherever its rows differ in width.
+    let art_lines: Vec<&str> = WELCOME_T_REX
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(str::trim_end)
+        .collect();
+    let art_width = art_lines
+        .iter()
+        .map(|line| unicode_width::UnicodeWidthStr::width(*line))
+        .max()
+        .unwrap_or(0);
+    let art_indent = " ".repeat(inner.saturating_sub(art_width) / 2);
+    for art_line in art_lines {
+        lines.push(card_row_left(
+            &indent,
+            &format!("{art_indent}{art_line}"),
+            art,
+            inner,
+            border,
+        ));
+    }
+    lines.push(card_row(&indent, "", muted, inner, border));
+    lines.push(card_row(&indent, meta, muted, inner, border));
+    lines.push(card_row(&indent, "", muted, inner, border));
+    let hint = if inner >= 58 {
+        "Type /help for commands · Ctrl+C to clear · Ctrl+D to exit"
+    } else if inner >= 42 {
+        "Type /help for commands · Ctrl+D to exit"
+    } else {
+        "Type /help · Ctrl+D to exit"
+    };
+    lines.push(card_row(&indent, hint, muted, inner, border));
+    lines.push(card_row(&indent, "", muted, inner, border));
+    lines.push(card_border(&indent, '╰', '╯', inner, border));
     lines
+}
+
+/// Plain welcome lines, used when the box would not fit.
+fn welcome_plain(theme: &Theme, meta: &str) -> Vec<Line<'static>> {
+    let name = Style::default()
+        .fg(theme.assistant)
+        .add_modifier(Modifier::BOLD);
+    let muted = Style::default().fg(theme.dim);
+    vec![
+        Line::from(""),
+        Line::from(Span::styled("  C O D E R E X", name)),
+        Line::from(Span::styled(format!("  {meta}"), muted)),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  Type /help for commands · Ctrl+D to exit",
+            muted,
+        )),
+        Line::from(""),
+    ]
+}
+
+fn card_border(indent: &str, left: char, right: char, inner: usize, style: Style) -> Line<'static> {
+    Line::from(Span::styled(
+        format!("{indent}{left}{}{right}", "─".repeat(inner)),
+        style,
+    ))
+}
+
+fn card_row(indent: &str, text: &str, style: Style, inner: usize, border: Style) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!("{indent}│"), border),
+        Span::styled(center_padded(text, inner), style),
+        Span::styled("│", border),
+    ])
+}
+
+/// Like [`card_row`], but the content is already laid out and is only padded
+/// on the right. Used for multi-line art, where centring each line separately
+/// would distort the drawing.
+fn card_row_left(
+    indent: &str,
+    text: &str,
+    style: Style,
+    inner: usize,
+    border: Style,
+) -> Line<'static> {
+    let text = truncate_to_width(text, inner);
+    let text_width = unicode_width::UnicodeWidthStr::width(text.as_str());
+    Line::from(vec![
+        Span::styled(format!("{indent}│"), border),
+        Span::styled(
+            format!("{text}{}", " ".repeat(inner.saturating_sub(text_width))),
+            style,
+        ),
+        Span::styled("│", border),
+    ])
+}
+
+/// Pad `text` with spaces so it is centred in `width` display columns.
+///
+/// A string longer than the space is truncated first; the caller passes text
+/// that renders as a single line (the mascot rows have no styling).
+fn center_padded(text: &str, width: usize) -> String {
+    let text = truncate_to_width(text, width);
+    let text_width = unicode_width::UnicodeWidthStr::width(text.as_str());
+    let total_pad = width.saturating_sub(text_width);
+    let left = total_pad / 2;
+    format!(
+        "{}{}{}",
+        " ".repeat(left),
+        text,
+        " ".repeat(total_pad - left)
+    )
+}
+
+fn truncate_to_width(text: &str, width: usize) -> String {
+    let mut out = String::new();
+    let mut used = 0;
+    for character in text.chars() {
+        let character_width = unicode_width::UnicodeWidthChar::width(character).unwrap_or(1);
+        if used + character_width > width {
+            break;
+        }
+        out.push(character);
+        used += character_width;
+    }
+    out
 }
 
 /// Render a compact notification bar above the statusline.
@@ -1300,6 +1450,18 @@ fn render_permission_bar(
     let line = Line::from(Span::styled(rendered, Style::default().fg(color)));
     let paragraph = Paragraph::new(line).alignment(Alignment::Left);
     frame.render_widget(paragraph, area);
+}
+
+/// A horizontal rule separating the transcript from the input box.
+fn render_input_rule(frame: &mut Frame, area: ratatui::layout::Rect, theme: &Theme) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let rule = Line::from(Span::styled(
+        "─".repeat(area.width as usize),
+        Style::default().fg(theme.border),
+    ));
+    frame.render_widget(Paragraph::new(rule), area);
 }
 
 fn render_input(
@@ -1893,6 +2055,7 @@ mod layout_tests {
         assert_eq!(chunks[PALETTE_IDX].height, 4, "palette");
         assert_eq!(chunks[NOTIFICATION_IDX].height, 1, "notification");
         assert_eq!(chunks[STATUSLINE_IDX].height, 1, "statusline");
+        assert_eq!(chunks[RULE_IDX].height, 1, "input rule");
         assert_eq!(chunks[INPUT_IDX].height, 1, "input");
         assert_eq!(chunks[PERMISSION_IDX].height, 1, "permission");
         assert!(chunks[0].height > 1, "message area");
@@ -1900,6 +2063,111 @@ mod layout_tests {
         for pair in chunks.windows(2) {
             assert_eq!(pair[0].y + pair[0].height, pair[1].y);
         }
+    }
+
+    /// The input box is separated from the transcript by a full-width rule.
+    #[test]
+    fn the_input_has_a_rule_above_it() {
+        let mut state = UiState::default();
+        let buffer = render_to_buffer(80, 24, &mut state);
+        let chunks = chunks_for(24, 0, false, true, 1, true);
+        let rule_y = chunks[RULE_IDX].y;
+
+        assert_eq!(chunks[RULE_IDX].height, 1);
+        assert_eq!(
+            rule_y + 1,
+            chunks[INPUT_IDX].y,
+            "the rule is not directly above the input"
+        );
+        let rule = row_text(&buffer, rule_y);
+        assert!(
+            rule.chars().all(|character| character == '─'),
+            "rule row has other content: {rule:?}"
+        );
+        assert!(row_text(&buffer, chunks[INPUT_IDX].y).contains('❯'));
+    }
+
+    /// Compact mode hides the statusline and permission bar; the rule is part
+    /// of the input box and stays.
+    #[test]
+    fn the_input_rule_is_drawn_in_compact_mode() {
+        let mut state = UiState {
+            force_compact: true,
+            ..UiState::default()
+        };
+        let buffer = render_to_buffer(80, 12, &mut state);
+        let chunks = chunks_for(12, 0, false, false, 1, false);
+        let rule = row_text(&buffer, chunks[RULE_IDX].y);
+        assert!(
+            rule.chars().all(|character| character == '─'),
+            "rule row has other content: {rule:?}"
+        );
+        assert!(row_text(&buffer, chunks[INPUT_IDX].y).contains('❯'));
+    }
+
+    /// An empty transcript paints the welcome page: name, version, model and
+    /// the T-Rex mascot, not just a one-line banner.
+    #[test]
+    fn the_welcome_page_shows_the_name_version_and_model() {
+        let mut state = UiState::default();
+        state.statusline.model = "claude-sonnet-4-6".into();
+        let buffer = render_to_buffer(80, 30, &mut state);
+        let screen: String = (0..30)
+            .map(|y| row_text(&buffer, y))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(screen.contains("C O D E R E X"), "{screen}");
+        assert!(screen.contains("CodeRex v"), "{screen}");
+        assert!(screen.contains("claude-sonnet-4-6"), "{screen}");
+        assert!(screen.contains("Type /help for commands"), "{screen}");
+        assert!(
+            screen.contains("__.-'|_|--|_|"),
+            "the mascot is missing:\n{screen}"
+        );
+        assert!(screen.contains('╭') && screen.contains('╯'), "{screen}");
+    }
+
+    /// A terminal too small for the box gets readable plain lines instead of a
+    /// clipped card.
+    #[test]
+    fn a_narrow_terminal_gets_the_plain_welcome_page() {
+        let mut state = UiState::default();
+        let buffer = render_to_buffer(30, 12, &mut state);
+        let screen: String = (0..12)
+            .map(|y| row_text(&buffer, y))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(screen.contains("C O D E R E X"), "{screen}");
+        assert!(screen.contains("CodeRex v"), "{screen}");
+        assert!(screen.contains("Type /help for commands"), "{screen}");
+        assert!(
+            !screen.contains('╭'),
+            "the card should not be drawn:\n{screen}"
+        );
+    }
+
+    /// The page is a placeholder for an empty transcript; once a message
+    /// exists, the transcript wins.
+    #[test]
+    fn a_message_replaces_the_welcome_page() {
+        let mut state = UiState::default();
+        state.messages.push(Message {
+            role: MessageRole::System,
+            content: "hello from the transcript".into(),
+            tool_name: None,
+            streaming: false,
+            folded: false,
+        });
+        let buffer = render_to_buffer(80, 30, &mut state);
+        let screen: String = (0..30)
+            .map(|y| row_text(&buffer, y))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(screen.contains("hello from the transcript"), "{screen}");
+        assert!(!screen.contains("C O D E R E X"), "{screen}");
     }
 
     /// A multi-line buffer renders one row per line, with the continuation

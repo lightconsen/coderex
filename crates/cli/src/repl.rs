@@ -4512,22 +4512,11 @@ impl ReplLoop {
             None
         };
 
+        // A fresh session leaves the transcript empty; the TUI then paints its
+        // welcome page (name, version, model, mascot) instead of a banner
+        // message that would scroll away with the first turn.
         if let Some(ref engine) = self.engine {
-            if engine.session().messages.is_empty() {
-                ui_state.messages.push(Message {
-                    role: MessageRole::System,
-                    content: format!(
-                        "CodeRex v{} | model: {} | cwd: {} | Type /help for commands, Ctrl+C to clear, Ctrl+D to exit",
-                        env!("CARGO_PKG_VERSION"),
-                        self.model.0,
-                        self.cwd
-                    )
-                    .into(),
-                    tool_name: None,
-                    streaming: false,
-                    folded: false,
-                });
-            } else {
+            if !engine.session().messages.is_empty() {
                 let snapshot = session_resume::load_snapshot(
                     &self.cwd,
                     &engine.session().session_id.to_string(),
@@ -4556,20 +4545,6 @@ impl ReplLoop {
                     });
                 }
             }
-        } else {
-            ui_state.messages.push(Message {
-                role: MessageRole::System,
-                content: format!(
-                    "CodeRex v{} | model: {} | cwd: {} | Type /help for commands, Ctrl+C to clear, Ctrl+D to exit",
-                    env!("CARGO_PKG_VERSION"),
-                    self.model.0,
-                    self.cwd
-                )
-                .into(),
-                tool_name: None,
-                streaming: false,
-                folded: false,
-            });
         }
 
         // Adopt what the last session left behind.
