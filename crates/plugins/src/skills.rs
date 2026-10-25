@@ -2,6 +2,8 @@
 
 use std::path::{Path, PathBuf};
 
+use yaml_rust2::{Yaml, YamlLoader};
+
 /// Parsed skill frontmatter metadata.
 #[derive(Debug, Clone)]
 pub struct SkillMetadata {
@@ -83,62 +85,63 @@ pub struct SkillFile {
     pub script: String,
 }
 
-/// Deserialize a field that may be a single string or a list of strings.
-fn deserialize_string_or_list<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    struct StringOrList;
-
-    impl<'de> serde::de::Visitor<'de> for StringOrList {
-        type Value = Vec<String>;
-
-        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-            formatter.write_str("a string or a list of strings")
-        }
-
-        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
-        where
-            E: serde::de::Error,
-        {
-            Ok(vec![value.to_string()])
-        }
-
-        fn visit_seq<S>(self, visitor: S) -> Result<Self::Value, S::Error>
-        where
-            S: serde::de::SeqAccess<'de>,
-        {
-            serde::Deserialize::deserialize(serde::de::value::SeqAccessDeserializer::new(visitor))
-        }
+/// Parse a field that may be a single string or a list of strings.
+///
+/// `None` means the value has the wrong shape, which makes the whole
+/// frontmatter unparseable.
+fn string_or_list(value: Option<&Yaml>) -> Option<Vec<String>> {
+    match value {
+        None => Some(Vec::new()),
+        Some(Yaml::String(text)) => Some(vec![text.clone()]),
+        Some(Yaml::Array(items)) => items
+            .iter()
+            .map(|item| item.as_str().map(str::to_string))
+            .collect(),
+        Some(_) => None,
     }
-
-    deserializer.deserialize_any(StringOrList)
 }
 
 /// Intermediate representation for YAML frontmatter parsing.
-#[derive(Debug, serde::Deserialize)]
 struct SkillFrontmatter {
     name: String,
-    #[serde(default, deserialize_with = "deserialize_string_or_list")]
     hooks: Vec<String>,
     agent: Option<String>,
-    #[serde(
-        default,
-        alias = "allowed_tools",
-        deserialize_with = "deserialize_string_or_list"
-    )]
     allowed_tools: Vec<String>,
-    #[serde(default)]
     description: String,
-    #[serde(default = "default_true")]
     enabled: bool,
 }
 
-const fn default_true() -> bool {
-    true
+/// Parse the YAML frontmatter block.
+///
+/// The shape mirrors the previous serde model: `name` is required; `hooks` and
+/// `allowed_tools` accept a string or a list of strings; `agent` is optional;
+/// `description` defaults to empty; `enabled` defaults to true. Unknown keys
+/// are ignored, and a field of the wrong type makes the whole block invalid.
+fn parse_frontmatter(frontmatter: &str) -> Option<SkillFrontmatter> {
+    let documents = YamlLoader::load_from_str(frontmatter).ok()?;
+    let mapping = documents.first()?.as_hash()?;
+    let field = |name: &str| mapping.get(&Yaml::String(name.to_string()));
+    Some(SkillFrontmatter {
+        name: field("name")?.as_str()?.to_string(),
+        hooks: string_or_list(field("hooks"))?,
+        agent: match field("agent") {
+            None | Some(Yaml::Null) => None,
+            Some(value) => Some(value.as_str()?.to_string()),
+        },
+        allowed_tools: string_or_list(field("allowed_tools"))?,
+        description: match field("description") {
+            None => String::new(),
+            Some(value) => value.as_str()?.to_string(),
+        },
+        enabled: match field("enabled") {
+            None => true,
+            Some(Yaml::Boolean(value)) => *value,
+            Some(_) => return None,
+        },
+    })
 }
 
-/// Parse skill frontmatter from markdown file content using serde_yaml.
+/// Parse skill frontmatter from markdown file content.
 /// Expected format:
 /// ```markdown
 /// ---
@@ -162,7 +165,7 @@ pub fn parse_skill_file(content: &str) -> Option<SkillFile> {
     let frontmatter_end = 3 + closing + 5; // "---\n" is 4 chars + newline
     let frontmatter = &content[3..3 + closing];
 
-    let parsed: SkillFrontmatter = serde_yaml::from_str(frontmatter).ok()?;
+    let parsed = parse_frontmatter(frontmatter)?;
 
     if parsed.name.is_empty() {
         return None;

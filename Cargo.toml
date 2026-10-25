@@ -39,7 +39,7 @@ async-stream = "0.3"
 
 # JavaScript engines — `boa_engine` for in-process workflow scripts and
 # `rquickjs` for extension hooks (it exposes heap, stack and interrupt limits).
-boa_engine = "0.20"
+boa_engine = "0.22"
 rquickjs = "0.14"
 
 # Serialization
@@ -59,8 +59,8 @@ http = "1"
 bytes = "1"
 
 # Terminal UI
-ratatui = "0.29"
-crossterm = "0.28"
+ratatui = "0.30"
+crossterm = "0.29"
 unicode-segmentation = "1"
 unicode-width = "0.2"
 
@@ -90,7 +90,6 @@ tar = "0.4"
 flate2 = "1"
 
 # YAML parsing
-serde_yaml = "0.9"
 
 # Semantic versioning
 semver = "1"
@@ -101,7 +100,14 @@ ed25519-dalek = "2"
 # Text processing
 nucleo-matcher = "0.3"
 comrak = "0.37"
-syntect = "5"
+# `yaml-load`/`plist-load` are intentionally off: they pull the unmaintained
+# `yaml-rust`, and the code only uses the compiled default syntax/theme sets.
+syntect = { version = "5", default-features = false, features = [
+    "parsing",
+    "default-syntaxes",
+    "default-themes",
+    "regex-onig",
+] }
 compact_str = "0.9"
 smallvec = "1"
 regex = "1"

@@ -329,7 +329,9 @@ fn drive(
     // is a loop.
     let mut rounds = 0usize;
     loop {
-        context.run_jobs();
+        context
+            .run_jobs()
+            .map_err(|error| WorkflowError::Failed(readable(&error)))?;
         state.pending = pending_requests(&mut context);
         if state.pending.is_empty() {
             break;
@@ -354,7 +356,9 @@ fn drive(
         // spent.
         set_budget_globals(&mut context, state)?;
     }
-    context.run_jobs();
+    context
+        .run_jobs()
+        .map_err(|error| WorkflowError::Failed(readable(&error)))?;
 
     if let Some(failure) = read_string(&mut context, "__workflow_failure") {
         if !failure.is_empty() && failure != "null" {

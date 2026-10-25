@@ -131,7 +131,13 @@ impl TerminalUi {
         enter_commands(&self.profile, &mut stdout)?;
         self.keyboard_pushed = self.profile.keyboard_flags().is_some();
         self.alternate = true;
-        self.terminal.clear()?;
+        // Clear the screen and reset ratatui's back buffer so the next draw
+        // repaints everything. `Terminal::clear` is not used: ratatui 0.30
+        // made it query the cursor position (a DSR request), which a PTY
+        // without a terminal emulator never answers; `resize` performs the
+        // same clear and buffer reset without that round trip.
+        let area: ratatui::layout::Rect = self.terminal.size()?.into();
+        self.terminal.resize(area)?;
         Ok(())
     }
 

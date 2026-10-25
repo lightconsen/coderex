@@ -47,7 +47,7 @@ coderex-bridge = { path = "../bridge" }
 coderex-server = { path = "../server" }
 coderex-ui = { path = "../ui" }
 coderex-config = { path = "../config" }
-notify = { version = "7", optional = true }
+notify = { version = "8", optional = true }
 coderex-telemetry = { path = "../telemetry" }
 
 clap.workspace = true
@@ -68,7 +68,7 @@ async-trait.workspace = true
 crossterm.workspace = true
 compact_str.workspace = true
 uuid.workspace = true
-portable-pty = "0.8"
+portable-pty = "0.9"
 vt100 = "0.15"
 
 [dev-dependencies]
