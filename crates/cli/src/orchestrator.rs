@@ -1432,9 +1432,17 @@ impl StartupOrchestrator {
     // task, and removing it cascades into unnecessary_wraps/unused_self.
     #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
     async fn phase_build_capabilities(&mut self) -> Result<()> {
-        // Resolve model from settings
+        // Resolve model from settings. A settings file that never mentions
+        // `model` resolves to the built-in default; copying that into
+        // `ctx.model` would make it look explicitly chosen and would stop
+        // `--betas +fast_mode` from selecting the lightweight profile.
         if let Some(ref settings) = self.ctx.settings {
-            if let Some(ref model_name) = settings.model {
+            let model_is_explicit = settings
+                .diff_from_defaults("resolved")
+                .changes
+                .iter()
+                .any(|change| change.key == "model");
+            if model_is_explicit && let Some(ref model_name) = settings.model {
                 self.ctx.model = Some(ModelId(model_name.clone()));
             }
         }
@@ -1767,7 +1775,14 @@ impl StartupOrchestrator {
         apply_tighten_only_settings(&mut settings, object);
 
         if self.ctx.model.is_none() && !self.ctx.model_explicit {
-            self.ctx.model = settings.model.clone().map(coderex_core::types::ModelId);
+            let model_is_explicit = settings
+                .diff_from_defaults("resolved")
+                .changes
+                .iter()
+                .any(|change| change.key == "model");
+            if model_is_explicit {
+                self.ctx.model = settings.model.clone().map(coderex_core::types::ModelId);
+            }
         }
         self.ctx.settings = Some(settings);
     }
