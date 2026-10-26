@@ -20,11 +20,18 @@ use coderex_config::{
 // ═══════════════════════════════════════════════════════════════════════════
 
 fn unique_name(prefix: &str) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    // The clock can hand two parallel tests the same nanosecond on macOS, and
+    // then one test's settings file overwrites the other's. A counter in the
+    // name removes the collision without serialising the tests.
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    format!("{prefix}_{ts}")
+    let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+    format!("{prefix}_{}_{ts}_{n}", std::process::id())
 }
 
 fn temp_settings_file(settings: &Settings) -> PathBuf {
