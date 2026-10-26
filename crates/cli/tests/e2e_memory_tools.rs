@@ -35,9 +35,7 @@ fn start_static_provider() -> (Child, String) {
     std::thread::spawn(move || {
         let mut announced = false;
         for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-            if !announced
-                && let Some(address) = line.split("listening on ").nth(1)
-            {
+            if !announced && let Some(address) = line.split("listening on ").nth(1) {
                 let _ = tx.send(address.trim().to_string());
                 announced = true;
             }
@@ -51,7 +49,12 @@ fn start_static_provider() -> (Child, String) {
 
 fn run(cwd: &Path, home: &Path, base_url: &str, prompt: &str) -> String {
     let mut child = Command::new(env!("CARGO_BIN_EXE_coderex"))
-        .args(["-p", "--dangerously-skip-permissions", "--output-format", "stream-json"])
+        .args([
+            "-p",
+            "--dangerously-skip-permissions",
+            "--output-format",
+            "stream-json",
+        ])
         .current_dir(cwd)
         .env("ANTHROPIC_API_KEY", "mock")
         .env("ANTHROPIC_BASE_URL", base_url)

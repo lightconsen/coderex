@@ -6489,7 +6489,9 @@ impl ReplLoop {
     fn drain_events_inner(
         &mut self,
         output: &mut String,
-        mut protocol: Option<&mut coderex_events::MessageSink<Box<dyn std::io::Write + Send + Sync>>>,
+        mut protocol: Option<
+            &mut coderex_events::MessageSink<Box<dyn std::io::Write + Send + Sync>>,
+        >,
         session_id: &str,
     ) {
         // Collect first: recording needs `&mut self`, while the receiver

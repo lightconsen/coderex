@@ -4,7 +4,7 @@ mod common;
 use assert_cmd::cargo::cargo_bin;
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use std::io::{BufRead, BufReader, Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child as ProcessChild, Command, Stdio};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
@@ -152,7 +152,9 @@ struct PtySession {
     /// first-run consent gate *writes* them — so a test would inherit whatever
     /// permission mode the person running it happens to have configured, and a
     /// test run could change it.
-    _config_home: tempfile::TempDir,
+    _config_home: Option<tempfile::TempDir>,
+    /// The config home path, whether owned or shared with another launch.
+    config_home_path: PathBuf,
     /// Held for the session's lifetime so only one PTY test runs at a time.
     _serial: std::sync::MutexGuard<'static, ()>,
 }
@@ -195,6 +197,38 @@ impl PtySession {
         args: &[&str],
         seed_config: bool,
     ) -> Self {
+        Self::launch_with_config_home(
+            cwd,
+            extra_envs,
+            model,
+            persist_session,
+            args,
+            seed_config,
+            None,
+        )
+    }
+
+    /// Launch with a config home shared with an earlier launch, so the second
+    /// session can `/resume` what the first persisted.
+    fn launch_with_home(
+        cwd: &Path,
+        extra_envs: &[(String, String)],
+        model: &str,
+        home: &Path,
+    ) -> Self {
+        Self::launch_with_config_home(cwd, extra_envs, model, true, &[], false, Some(home))
+    }
+
+    #[allow(clippy::option_if_let_else)]
+    fn launch_with_config_home(
+        cwd: &Path,
+        extra_envs: &[(String, String)],
+        model: &str,
+        persist_session: bool,
+        args: &[&str],
+        seed_config: bool,
+        shared_home: Option<&Path>,
+    ) -> Self {
         let serial = PTY_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -227,15 +261,22 @@ impl PtySession {
         // It is seeded with a decision already recorded, because an untouched
         // config home makes the CLI ask for telemetry consent on stdin before
         // it draws anything, and a test has no one to answer.
-        let config_home = tempfile::tempdir().expect("config home");
+        let (config_home, config_home_path) = if let Some(home) = shared_home {
+            std::fs::create_dir_all(home).expect("shared config home");
+            (None, home.to_path_buf())
+        } else {
+            let home = tempfile::tempdir().expect("config home");
+            let path = home.path().to_path_buf();
+            (Some(home), path)
+        };
         if seed_config {
             std::fs::write(
-                config_home.path().join("settings.json"),
+                config_home_path.join("settings.json"),
                 r#"{"config_version": 3, "telemetry_enabled": false}"#,
             )
             .expect("seed config home");
         }
-        cmd.env("CLAUDE_CONFIG_DIR", config_home.path());
+        cmd.env("CLAUDE_CONFIG_DIR", &config_home_path);
         // A developer's exported provider variables must not reach the child:
         // `ANTHROPIC_MODEL`/`OPENAI_MODEL` take precedence over `--model`, so a
         // shell that exports one would make the rendered model name depend on
@@ -296,12 +337,13 @@ impl PtySession {
             raw,
             reader_thread: Some(reader_thread),
             _config_home: config_home,
+            config_home_path,
             _serial: serial,
         }
     }
 
     fn config_home(&self) -> &Path {
-        self._config_home.path()
+        &self.config_home_path
     }
 
     fn screen_text(&self) -> String {
@@ -523,6 +565,12 @@ fn session_with_static_server_envs(
 fn session_with_static_server_args(cwd: &Path, args: &[&str]) -> (StaticServer, PtySession) {
     let server = StaticServer::start();
     let session = PtySession::launch_with_args(cwd, &server.envs(), "K2.6", false, args);
+    (server, session)
+}
+
+fn session_with_static_server_home(cwd: &Path, home: &Path) -> (StaticServer, PtySession) {
+    let server = StaticServer::start();
+    let session = PtySession::launch_with_home(cwd, &server.envs(), "K2.6", home);
     (server, session)
 }
 
@@ -2324,4 +2372,32 @@ fn first_run_consent_declining_persists_off() {
 #[test]
 fn first_run_consent_accepting_persists_on() {
     assert!(first_run_consent("y"), "accepting must record true");
+}
+
+/// `/resume <fragment>` finds the persisted session by a word from its title.
+#[test]
+fn resume_finds_a_session_by_a_fragment() {
+    let dir = setup_project_dir();
+    let home = tempfile::tempdir().expect("shared home");
+    std::fs::write(
+        home.path().join("settings.json"),
+        r#"{"config_version": 4, "telemetry_enabled": false}"#,
+    )
+    .expect("settings");
+
+    {
+        let (_server, mut session) = session_with_static_server_home(dir.path(), home.path());
+        session.wait_for_text("CodeRex v", SCREEN_TIMEOUT);
+        session.send_line("hello");
+        session.wait_for_text("Completed in", SCREEN_TIMEOUT);
+        session.ctrl_d();
+        session.wait_for_exit(SCREEN_TIMEOUT);
+    }
+
+    let (_server, mut session) = session_with_static_server_home(dir.path(), home.path());
+    session.wait_for_text("CodeRex v", SCREEN_TIMEOUT);
+    session.send_line("/resume hello");
+    let screen = session.wait_for_text("Resumed session:", SCREEN_TIMEOUT);
+    drop(session);
+    assert!(screen.contains("Resumed session:"), "{screen}");
 }

@@ -2514,18 +2514,17 @@ impl PluginManager {
             if let Some(plugins) = settings.get("plugins").and_then(Value::as_object) {
                 plugins
                     .iter()
-                    .filter_map(|(name, entry)| {
-                        Some((name.clone(), entry.get("options")?))
-                    })
+                    .filter_map(|(name, entry)| Some((name.clone(), entry.get("options")?)))
                     .collect()
             } else if let Some(options) = settings.get("pluginOptions").and_then(Value::as_object) {
-                options.iter().map(|(name, options)| (name.clone(), options)).collect()
+                options
+                    .iter()
+                    .map(|(name, options)| (name.clone(), options))
+                    .collect()
             } else if let Some(plugins) = settings.as_object() {
                 plugins
                     .iter()
-                    .filter_map(|(name, entry)| {
-                        Some((name.clone(), entry.get("options")?))
-                    })
+                    .filter_map(|(name, entry)| Some((name.clone(), entry.get("options")?)))
                     .collect()
             } else {
                 Vec::new()

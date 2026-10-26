@@ -36,9 +36,7 @@ fn start_static_provider() -> (Child, String) {
     std::thread::spawn(move || {
         let mut announced = false;
         for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-            if !announced
-                && let Some(address) = line.split("listening on ").nth(1)
-            {
+            if !announced && let Some(address) = line.split("listening on ").nth(1) {
                 let _ = tx.send(address.trim().to_string());
                 announced = true;
             }
