@@ -1279,6 +1279,77 @@ fn a_background_subagent_cannot_run_shell_tools() {
     );
 }
 
+/// Compaction with a real summary: five turns exceed a small window, the
+/// session is summarized, the pre-compaction transcript is backed up, and the
+/// next request carries the `<context_summary>` handoff.
+#[test]
+fn a_compacted_session_backs_up_and_summarizes() {
+    let dir = setup_project_dir();
+    let record = dir.path().join("requests.jsonl");
+    let server = StaticServer::start_recording(Some(&record));
+    let mut envs = server.envs();
+    envs.push(("CODEREX_CONTEXT_WINDOW".into(), "12000".into()));
+    let mut session = PtySession::launch_with_args(
+        dir.path(),
+        &envs,
+        "K2.6",
+        true,
+        &["--allowed-tools", "Read", "--dangerously-skip-permissions"],
+    );
+    session.wait_for_text("CodeRex v", SCREEN_TIMEOUT);
+
+    for (prompt, answer) in [
+        ("compact-turn fibonacci", "remove the `use` line"),
+        ("compact-turn stack", "`Default` trait implementation"),
+        (
+            "compact-turn palindrome",
+            "it still collects chars for indexing",
+        ),
+        ("compact-turn auth protected", "this.verificationCode ="),
+        ("compact-turn api endpoint", "curl -X POST"),
+        ("compact-turn secrets", "writeln!(file, \"# Comment line\")"),
+        ("compact-turn review", "return Err(MyError::"),
+        ("compact-turn triple", "existing `add` function"),
+    ] {
+        session.send_line(prompt);
+        session.wait_for_text(answer, SCREEN_TIMEOUT);
+    }
+
+    let transcripts = dir.path().join(".coderex").join("transcripts");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let backups: Vec<PathBuf> = loop {
+        let found = std::fs::read_dir(&transcripts)
+            .ok()
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.to_string_lossy().contains(".backup."))
+            .collect::<Vec<_>>();
+        if !found.is_empty() {
+            break found;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "compaction left no transcript backup in {}",
+            transcripts.display()
+        );
+        thread::sleep(Duration::from_millis(100));
+    };
+    drop(session);
+
+    let backup = std::fs::read_to_string(&backups[0]).unwrap();
+    assert!(
+        backup.contains("fibonacci"),
+        "the backup does not hold the pre-compaction history: {backup}"
+    );
+    let requests = std::fs::read_to_string(&record).unwrap_or_default();
+    assert!(
+        requests.contains("<context_summary>"),
+        "the next request did not carry the summary; recorded requests:\n{requests}"
+    );
+}
+
 #[test]
 fn two_turn_transcript_is_preserved() {
     let dir = setup_project_dir();

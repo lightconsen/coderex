@@ -445,6 +445,9 @@ fn should_stream_text_response(prompt: &str) -> bool {
         || p.contains("show your tools")
         || p.contains("cargo test")
         || p.contains("test results")
+        // A marker for E2E prompts that need a text answer with a keyword of
+        // their own choosing (compaction turns, for example).
+        || p.contains("compact-turn")
 }
 
 fn build_text_response(prompt: &str, responses: &StaticResponses) -> String {
@@ -768,6 +771,10 @@ fn select_tools(prompt: &str) -> Vec<Tool> {
     } else if p.contains("try a network request") {
         vec![Tool::Bash {
             command: "curl -s --max-time 5 https://example.com".into(),
+        }]
+    } else if p.contains("run a command with sudo") {
+        vec![Tool::Bash {
+            command: "sudo -n true".into(),
         }]
     } else if p.contains("run a safe echo") {
         vec![Tool::Bash {

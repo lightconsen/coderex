@@ -213,3 +213,42 @@ fn a_denial_response_keeps_the_tool_from_running() {
         "the denial produced no tool result"
     );
 }
+
+/// A command that runs as another user is an elevation question, not an
+/// ordinary approval. The same control channel answers it, and the decision
+/// decides whether the command is retried with privilege.
+#[test]
+fn an_elevation_request_can_be_approved_or_denied() {
+    let approved = {
+        let dir = tempfile::tempdir().expect("workspace");
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        let (mut provider, base_url) = start_static_provider();
+        let outcome = run_with_control(dir.path(), &base_url, "run a command with sudo", "allow");
+        let _ = provider.kill();
+        let _ = provider.wait();
+        outcome
+    };
+    assert!(approved.saw_request, "no control_request for the elevation");
+    assert_eq!(approved.tool, "Bash");
+    assert!(
+        !approved.tool_result.contains("elevation denied"),
+        "an approved elevation was denied: {:?}",
+        approved.tool_result
+    );
+
+    let denied = {
+        let dir = tempfile::tempdir().expect("workspace");
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        let (mut provider, base_url) = start_static_provider();
+        let outcome = run_with_control(dir.path(), &base_url, "run a command with sudo", "deny");
+        let _ = provider.kill();
+        let _ = provider.wait();
+        outcome
+    };
+    assert!(denied.saw_request, "no control_request for the elevation");
+    assert!(
+        denied.tool_result.contains("elevation denied"),
+        "a denied elevation reported something else: {:?}",
+        denied.tool_result
+    );
+}
