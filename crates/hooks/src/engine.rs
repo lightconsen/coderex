@@ -3067,6 +3067,34 @@ mod tests {
         wait_for_process_exit(background_pid(directory.path()).await).await;
     }
 
+    /// The tree kill also covers a hook running under the OS sandbox: the
+    /// confinement wrapper must not hide the backgrounded process from the
+    /// group kill.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn execute_hook_timeout_kills_a_sandboxed_tree() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut hook = backgrounding_hook(directory.path(), 1500);
+        hook.sandbox = Some(HookSandboxConfig {
+            enabled: true,
+            ..HookSandboxConfig::default()
+        });
+        let input = HookInput {
+            event: "Stop".to_string(),
+            session_id: None,
+            input: None,
+            context: None,
+        };
+
+        let result = execute_hook_with_timeout(&hook, &input, None, None).await;
+        assert!(
+            matches!(result, Err(HookError::Timeout(1500))),
+            "{result:?}"
+        );
+
+        wait_for_process_exit(background_pid(directory.path()).await).await;
+    }
+
     /// The outer timeout drops the execution future instead of returning from
     /// it. The guard must still kill the tree when it is dropped.
     #[cfg(unix)]

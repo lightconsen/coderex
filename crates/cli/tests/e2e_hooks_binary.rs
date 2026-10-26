@@ -753,3 +753,128 @@ fn an_agent_hook_is_opt_in_and_can_block_the_tool() {
         "an enabled agent hook that answered stop let the write through:\n{content}"
     );
 }
+
+/// Every lifecycle event a headless session can reach really reaches a hook,
+/// with the event name in the hook's stdin JSON. A wildcard hook records the
+/// name and answers `continue` so the session proceeds.
+#[test]
+fn the_session_lifecycle_events_reach_their_hooks() {
+    fn marker_script(dir: &Path, marker: &Path) -> PathBuf {
+        let body = concat!(
+            "input=$(cat)\n",
+            "printf '%s\\n' \"$input\" | sed -n 's/.*\"event\":\"\\([^\"]*\\)\".*/\\1/p' >> ",
+            "MARKER",
+            "\n",
+            "echo '{\"action\":\"continue\"}'\n",
+        )
+        .replace("MARKER", &marker.display().to_string());
+        script(dir, "record-event.sh", &body)
+    }
+
+    fn recorded(marker: &Path) -> Vec<String> {
+        std::fs::read_to_string(marker)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    let prompt = "add a recursive fibonacci function to src/lib.rs with unit tests";
+
+    // Without a grant, Write asks; the request and its failure are both hooks.
+    let asking = tempfile::tempdir().expect("asking workspace");
+    std::fs::create_dir_all(asking.path().join("src")).unwrap();
+    std::fs::write(
+        asking.path().join("src/lib.rs"),
+        "pub fn add(a: i32, b: i32) -> i32 { a + b }\n",
+    )
+    .unwrap();
+    let marker = asking.path().join("events");
+    let recorder = marker_script(asking.path(), &marker);
+    let home = seed_config(&serde_json::json!({
+        "hooks": [{
+            "event": "*",
+            "command": recorder.display().to_string(),
+            "timeout_ms": 5000,
+            "sandbox": {"enabled": false}
+        }]
+    }));
+    let api = start_static_provider();
+    let denied = run(asking.path(), home.path(), &api.1, prompt, &[]);
+    let _ = api.0;
+    assert!(denied.status.success(), "{denied:?}");
+    let events = recorded(&marker);
+    for expected in [
+        "SessionStart",
+        "UserPromptSubmit",
+        "PreToolUse",
+        "PermissionRequest",
+        "PostToolUseFailure",
+        "TurnEnd",
+        "Stop",
+    ] {
+        assert!(
+            events.iter().any(|event| event == expected),
+            "the {expected} hook did not fire; saw {events:?}"
+        );
+    }
+    assert!(
+        !events.iter().any(|event| event == "PostToolUse"),
+        "a denied Write reported PostToolUse: {events:?}"
+    );
+    assert!(
+        !std::fs::read_to_string(asking.path().join("src/lib.rs"))
+            .unwrap()
+            .contains("fibonacci"),
+        "the denied write landed"
+    );
+
+    // With the grant, the same session runs the tool and reports PostToolUse.
+    let granted = tempfile::tempdir().expect("granted workspace");
+    std::fs::create_dir_all(granted.path().join("src")).unwrap();
+    std::fs::write(
+        granted.path().join("src/lib.rs"),
+        "pub fn add(a: i32, b: i32) -> i32 { a + b }\n",
+    )
+    .unwrap();
+    let marker = granted.path().join("events");
+    let recorder = marker_script(granted.path(), &marker);
+    let home = seed_config(&serde_json::json!({
+        "hooks": [{
+            "event": "*",
+            "command": recorder.display().to_string(),
+            "timeout_ms": 5000,
+            "sandbox": {"enabled": false}
+        }]
+    }));
+    let api = start_static_provider();
+    let allowed = run(
+        granted.path(),
+        home.path(),
+        &api.1,
+        prompt,
+        &["--dangerously-skip-permissions"],
+    );
+    let _ = api.0;
+    assert!(allowed.status.success(), "{allowed:?}");
+    let events = recorded(&marker);
+    for expected in [
+        "SessionStart",
+        "UserPromptSubmit",
+        "PreToolUse",
+        "PostToolUse",
+        "TurnEnd",
+        "Stop",
+    ] {
+        assert!(
+            events.iter().any(|event| event == expected),
+            "the {expected} hook did not fire; saw {events:?}"
+        );
+    }
+    assert!(
+        std::fs::read_to_string(granted.path().join("src/lib.rs"))
+            .unwrap()
+            .contains("fibonacci"),
+        "the granted write did not land"
+    );
+}
