@@ -2125,3 +2125,157 @@ fn interactive_live_directory_listing_smoke() {
     drop(session);
     assert!(screen.contains("Cargo.toml") || screen.contains("src") || screen.contains(".coderex"));
 }
+
+/// A provider that streams a text delta every 150 ms, so a turn can be
+/// interrupted while it is visibly running.
+struct SlowProvider {
+    url: String,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl SlowProvider {
+    fn start() -> Self {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind slow provider");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let url = format!("http://{}", listener.local_addr().expect("addr"));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_thread = Arc::clone(&stop);
+        let handle = thread::spawn(move || {
+            while !stop_thread.load(std::sync::atomic::Ordering::SeqCst) {
+                let mut socket = match listener.accept() {
+                    Ok((socket, _)) => socket,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(20));
+                        continue;
+                    }
+                    Err(_) => break,
+                };
+                let _ = socket.set_read_timeout(Some(Duration::from_secs(5)));
+                let mut buffer = Vec::new();
+                let mut chunk = [0_u8; 4096];
+                let header_end = loop {
+                    match socket.read(&mut chunk) {
+                        Ok(0) | Err(_) => break None,
+                        Ok(read) => {
+                            buffer.extend_from_slice(&chunk[..read]);
+                            if let Some(position) =
+                                buffer.windows(4).position(|window| window == b"\r\n\r\n")
+                            {
+                                break Some(position + 4);
+                            }
+                        }
+                    }
+                };
+                let Some(header_end) = header_end else {
+                    continue;
+                };
+                let headers = String::from_utf8_lossy(&buffer[..header_end]).to_string();
+                let length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                    .unwrap_or(0);
+                while buffer.len() < header_end + length {
+                    match socket.read(&mut chunk) {
+                        Ok(0) | Err(_) => break,
+                        Ok(read) => buffer.extend_from_slice(&chunk[..read]),
+                    }
+                }
+                if socket
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n",
+                    )
+                    .is_err()
+                {
+                    continue;
+                }
+                let _ = socket.write_all(
+                    b"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+                );
+                for _ in 0..80 {
+                    if stop_thread.load(std::sync::atomic::Ordering::SeqCst) {
+                        break;
+                    }
+                    let delta = b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"tick \"}}\n\n";
+                    if socket.write_all(delta).is_err() {
+                        break;
+                    }
+                    let _ = socket.flush();
+                    thread::sleep(Duration::from_millis(150));
+                }
+                let _ = socket.write_all(
+                    b"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+                );
+            }
+        });
+        Self {
+            url,
+            stop,
+            handle: Some(handle),
+        }
+    }
+}
+
+impl Drop for SlowProvider {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn session_with_slow_provider(dir: &Path) -> (SlowProvider, PtySession) {
+    let provider = SlowProvider::start();
+    let envs = vec![
+        ("ANTHROPIC_BASE_URL".to_string(), provider.url.clone()),
+        ("ANTHROPIC_API_KEY".to_string(), "mock".to_string()),
+        (
+            "ANTHROPIC_MODEL".to_string(),
+            "claude-sonnet-4-6".to_string(),
+        ),
+    ];
+    let session = PtySession::launch(dir, &envs, "claude-sonnet-4-6");
+    (provider, session)
+}
+
+#[test]
+fn ctrl_c_interrupts_a_running_turn_and_the_prompt_stays_usable() {
+    let dir = setup_project_dir();
+    let (provider, mut session) = session_with_slow_provider(dir.path());
+    session.wait_for_text("CodeRex v", SCREEN_TIMEOUT);
+    session.send_line("write a very long response");
+    session.wait_for_text("tick", SCREEN_TIMEOUT);
+
+    session.ctrl_c();
+    session.wait_for_text("(interrupted)", SCREEN_TIMEOUT);
+
+    session.send_line("/status");
+    let screen = session.wait_for_text("System Status", SCREEN_TIMEOUT);
+    drop(session);
+    drop(provider);
+    assert!(screen.contains("System Status"), "{screen}");
+}
+
+#[test]
+fn escape_interrupts_a_running_turn_in_the_default_mode() {
+    let dir = setup_project_dir();
+    let (provider, mut session) = session_with_slow_provider(dir.path());
+    session.wait_for_text("CodeRex v", SCREEN_TIMEOUT);
+    session.send_line("write a very long response");
+    session.wait_for_text("tick", SCREEN_TIMEOUT);
+
+    session.esc();
+    let screen = session.wait_for_text("(interrupted)", SCREEN_TIMEOUT);
+    drop(session);
+    drop(provider);
+    assert!(screen.contains("(interrupted)"), "{screen}");
+}

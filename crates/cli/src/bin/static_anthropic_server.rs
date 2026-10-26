@@ -640,6 +640,10 @@ fn select_tools(prompt: &str) -> Vec<Tool> {
             file: "src/lib.rs".into(),
             content: "pub fn safe_noop() -> bool {\n    true\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n\n    #[test]\n    fn safe_noop_returns_true() {\n        assert!(safe_noop());\n    }\n}\n".into(),
         }]
+    } else if p.contains("print the provider key") {
+        vec![Tool::Bash {
+            command: "printf '%s' \"$ANTHROPIC_API_KEY\"".into(),
+        }]
     } else if p.contains("call the mock mcp tool") {
         vec![Tool::Raw {
             name: "mcp__mock__echo".into(),
