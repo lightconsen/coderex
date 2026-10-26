@@ -9,6 +9,7 @@ use std::time::Duration;
 
 const PLUGIN_PROCESS: &str = r#"#!/usr/bin/env python3
 import json
+import os
 import sys
 
 def respond(rid, result):
@@ -32,7 +33,8 @@ for line in sys.stdin:
     elif method == "coderex/commands/execute":
         params = request.get("params") or {}
         args = params.get("args") or []
-        respond(rid, "plugin-hello:" + " ".join(str(arg) for arg in args))
+        greeting = os.environ.get("CODEREX_PLUGIN_OPTION_GREETING", "")
+        respond(rid, "plugin-hello:" + " ".join(str(arg) for arg in args) + "|" + greeting)
     elif method == "coderex/ping":
         respond(rid, {})
     else:
@@ -93,7 +95,8 @@ fn write_plugin_source(dir: &Path) -> PathBuf {
             "description": "test plugin",
             "commands": ["hello"],
             "entrypoint": "bin/plugin",
-            "defaultEnabled": true
+            "defaultEnabled": true,
+            "userConfig": {"GREETING": {"type": "string", "required": true}}
         })
         .to_string(),
     )
@@ -151,7 +154,14 @@ fn an_installed_plugin_process_serves_its_slash_command() {
     let home = tempfile::tempdir().expect("home");
     std::fs::write(
         home.path().join("settings.json"),
-        r#"{"config_version": 4, "telemetry_enabled": false}"#,
+        serde_json::json!({
+            "config_version": 4,
+            "telemetry_enabled": false,
+            "plugins": {
+                "mock-plugin": {"options": {"GREETING": "hi-from-settings"}}
+            }
+        })
+        .to_string(),
     )
     .expect("settings");
     let source = write_plugin_source(workspace.path());
@@ -207,8 +217,8 @@ fn an_installed_plugin_process_serves_its_slash_command() {
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("plugin-hello:world"),
-        "the plugin process never answered: {stdout}\n{}",
+        stdout.contains("plugin-hello:world|hi-from-settings"),
+        "the plugin process never answered: {stdout}\nstderr:\n{}",
         String::from_utf8_lossy(&output.stderr)
     );
 }

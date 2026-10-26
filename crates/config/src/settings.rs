@@ -1247,6 +1247,12 @@ fn load_settings_file(path: &Path, source: &str) -> Result<Option<Settings>, Con
         check_unknown_fields(&value, source)?;
     }
 
+    let original: serde_json::Value = serde_json::from_str(&content).unwrap_or_default();
+    let original_version = original
+        .get("config_version")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+
     let settings: Settings =
         serde_json::from_str(&content).map_err(|source| ConfigError::Json {
             path: path.to_path_buf(),
@@ -1254,9 +1260,22 @@ fn load_settings_file(path: &Path, source: &str) -> Result<Option<Settings>, Con
         })?;
     let settings = finalize_settings(settings, source)?;
 
-    // Write back migrated config
-    if let Ok(migrated) = serde_json::to_string_pretty(&settings) {
-        let _ = std::fs::write(path, migrated);
+    // Write back only an actual migration. A rewrite on every load used to
+    // serialize the modelled `Settings` back over the file, silently deleting
+    // keys the struct does not carry (`plugins`, `marketplaces`) — which is
+    // exactly where plugin `userConfig` lives. Merge the migrated fields onto
+    // the original document so unmodelled but allowed keys survive too.
+    if u32::try_from(original_version).unwrap_or(u32::MAX) != settings.config_version
+        && let Ok(migrated) = serde_json::to_value(&settings)
+        && let Some(mut document) = original.as_object().cloned()
+        && let Some(fields) = migrated.as_object()
+    {
+        for (key, value) in fields {
+            document.insert(key.clone(), value.clone());
+        }
+        if let Ok(text) = serde_json::to_string_pretty(&document) {
+            let _ = std::fs::write(path, text);
+        }
     }
 
     Ok(Some(settings))

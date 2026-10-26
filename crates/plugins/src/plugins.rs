@@ -2504,31 +2504,32 @@ impl PluginManager {
     ///
     /// Returns how many values were applied.
     pub fn apply_options_from_settings(&self, settings: &Value) -> Result<usize, String> {
-        let per_plugin = settings
-            .get("plugins")
-            .and_then(|plugins| plugins.as_object())
-            .map_or_else(
-                || {
-                    settings
-                        .get("pluginOptions")
-                        .and_then(Value::as_object)
-                        .map(|map| {
-                            map.iter()
-                                .map(|(name, options)| (name.clone(), options))
-                                .collect()
-                        })
-                        .unwrap_or_default()
-                },
-                |plugins| {
-                    plugins
-                        .iter()
-                        .filter_map(|(name, entry)| {
-                            let options = entry.get("options")?;
-                            Some((name.clone(), options))
-                        })
-                        .collect::<Vec<_>>()
-                },
-            );
+        // Three shapes reach this method: the full settings document
+        // (`{"plugins": {name: {"options": ...}}}`), the legacy
+        // `{"pluginOptions": {name: {...}}}`, and the `plugins` map itself
+        // (what `PluginHostSettings::plugins` carries). The last shape was
+        // silently ignored, so host-configured `userConfig` never reached a
+        // plugin process.
+        let per_plugin: Vec<(String, &Value)> =
+            if let Some(plugins) = settings.get("plugins").and_then(Value::as_object) {
+                plugins
+                    .iter()
+                    .filter_map(|(name, entry)| {
+                        Some((name.clone(), entry.get("options")?))
+                    })
+                    .collect()
+            } else if let Some(options) = settings.get("pluginOptions").and_then(Value::as_object) {
+                options.iter().map(|(name, options)| (name.clone(), options)).collect()
+            } else if let Some(plugins) = settings.as_object() {
+                plugins
+                    .iter()
+                    .filter_map(|(name, entry)| {
+                        Some((name.clone(), entry.get("options")?))
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
 
         let mut applied = 0;
         for (plugin, options) in per_plugin {
