@@ -159,7 +159,29 @@ async fn serve_authenticates_and_answers_a_query() {
         "the served query did not answer: {answer}"
     );
 
+    // A second client gets its own session; reusing the id would let one
+    // connection read or continue another person's conversation.
     drop(ws);
+    let mut second = connect(port).await;
+    second
+        .send(Message::Text(
+            serde_json::json!({"token": "test-key"}).to_string().into(),
+        ))
+        .await
+        .expect("second auth send");
+    let second_auth: serde_json::Value =
+        serde_json::from_str(&recv_text(&mut second).await).expect("second auth json");
+    let second_session = second_auth["session_id"]
+        .as_str()
+        .expect("second session id");
+    assert_ne!(
+        second_session, session_id,
+        "two connections shared one session id"
+    );
+    let second_ready: serde_json::Value =
+        serde_json::from_str(&recv_text(&mut second).await).expect("second ready json");
+    assert_eq!(second_ready["event"], "session_ready");
+    drop(second);
     let _ = server.kill();
     let _ = server.wait();
     let _ = provider.kill();

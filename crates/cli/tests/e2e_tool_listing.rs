@@ -104,7 +104,7 @@ fn run(cwd: &Path, base_url: &str, args: &[&str]) -> std::process::Output {
         .expect("run coderex")
 }
 
-async fn tool_names(args: &[&str]) -> Vec<String> {
+async fn tool_definitions(args: &[&str]) -> Vec<serde_json::Value> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind");
@@ -134,12 +134,43 @@ async fn tool_names(args: &[&str]) -> Vec<String> {
                 .is_some_and(|tools| !tools.is_empty())
         })
         .expect("the turn request advertises tools");
-    turn["tools"]
-        .as_array()
-        .unwrap()
+    turn["tools"].as_array().unwrap().clone()
+}
+
+async fn tool_names(args: &[&str]) -> Vec<String> {
+    tool_definitions(args)
+        .await
         .iter()
         .map(|tool| tool["name"].as_str().unwrap_or_default().to_string())
         .collect()
+}
+
+/// A tool that executes `run_in_background` advertises it; one that would
+/// ignore it must not. The request body is where the model learns the
+/// difference.
+#[tokio::test]
+async fn backgrounding_tools_advertise_run_in_background() {
+    let tools = tool_definitions(&["--dangerously-skip-permissions"]).await;
+    let property = |name: &str| {
+        tools
+            .iter()
+            .find(|tool| tool["name"] == name)
+            .map(|tool| tool["input_schema"]["properties"]["run_in_background"].clone())
+            .unwrap_or_else(|| panic!("{name} is not advertised: {tools:?}"))
+    };
+
+    for name in ["Bash", "Agent"] {
+        let advertised = property(name);
+        assert_eq!(
+            advertised["type"], "boolean",
+            "{name} does not advertise run_in_background: {advertised}"
+        );
+    }
+    let write = property("Write");
+    assert!(
+        write.is_null(),
+        "Write ignores run_in_background but advertises it: {write}"
+    );
 }
 
 #[tokio::test]

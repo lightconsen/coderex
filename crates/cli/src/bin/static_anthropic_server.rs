@@ -756,6 +756,10 @@ fn select_tools(prompt: &str) -> Vec<Tool> {
             name: "memory_write".into(),
             input_json: r#"{"store":"project","key":"e2e-memory","content":"memo-value"}"#.into(),
         }]
+    } else if p.contains("read the large file") {
+        vec![Tool::Read {
+            file: "large.txt".into(),
+        }]
     } else if p.contains("read a memory") {
         vec![Tool::Raw {
             name: "memory_read".into(),
@@ -772,6 +776,11 @@ fn select_tools(prompt: &str) -> Vec<Tool> {
     } else if p.contains("print the provider key") {
         vec![Tool::Bash {
             command: "printf '%s' \"$ANTHROPIC_API_KEY\"".into(),
+        }]
+    } else if p.contains("call the mock image tool") {
+        vec![Tool::Raw {
+            name: "mcp__mock__image".into(),
+            input_json: "{}".into(),
         }]
     } else if p.contains("call the mock mcp tool") {
         vec![Tool::Raw {
