@@ -670,6 +670,131 @@ async fn tool_call_loop_executes_and_continues() {
 
 /// A provider that returned thinking in one turn requires the block back in
 /// the next request, before the text and tool_use of that same assistant turn.
+/// The same conversation through both submission paths must end in the same
+/// state: the streaming path's deferred finish and the non-streaming path's
+/// immediate one converge on identical messages, usage and reason.
+struct BothPathsMock {
+    calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl BothPathsMock {
+    fn new() -> Self {
+        Self {
+            calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }
+    }
+}
+
+fn parity_tool_call() -> ToolCall {
+    ToolCall {
+        id: "tc_parity".into(),
+        name: "echo".into(),
+        input: serde_json::json!({"text": "hi"}),
+    }
+}
+
+#[async_trait]
+impl ApiClient for BothPathsMock {
+    fn clone_box(&self) -> Box<dyn ApiClient> {
+        Box::new(BothPathsMock {
+            calls: std::sync::Arc::clone(&self.calls),
+        })
+    }
+
+    async fn create_message(
+        &self,
+        _system: &str,
+        _messages: &[serde_json::Value],
+        _model: &ModelId,
+        _max_tokens: u32,
+        _tools: &[ToolInfo],
+    ) -> Result<ApiResponse, ApiError> {
+        let first = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
+        Ok(if first {
+            ApiResponse {
+                content: "working".into(),
+                tool_calls: vec![parity_tool_call()],
+                usage: usage(10),
+                stop_reason: "tool_use".into(),
+                thinking: None,
+            }
+        } else {
+            ApiResponse {
+                content: "done".into(),
+                tool_calls: Vec::new(),
+                usage: usage(10),
+                stop_reason: "end_turn".into(),
+                thinking: None,
+            }
+        })
+    }
+
+    async fn create_message_streaming(
+        &self,
+        _system: &str,
+        _messages: &[serde_json::Value],
+        _model: &ModelId,
+        _max_tokens: u32,
+        _tools: &[ToolInfo],
+    ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send + 'static>> {
+        let first = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
+        let stream = async_stream::stream! {
+            if first {
+                yield StreamEvent::TextDelta("working".into());
+                yield StreamEvent::ToolCallBlockStart {
+                    id: "tc_parity".into(),
+                    name: "echo".into(),
+                };
+                yield StreamEvent::ToolCallInputDelta {
+                    id: "tc_parity".into(),
+                    delta: r#"{"text":"hi"}"#.into(),
+                };
+                yield StreamEvent::ToolCallBlockEnd {
+                    id: "tc_parity".into(),
+                    input: serde_json::Value::Null,
+                };
+            } else {
+                yield StreamEvent::TextDelta("done".into());
+            }
+            yield StreamEvent::UsageSummary(usage(10));
+            yield StreamEvent::StreamEnd;
+        };
+        Box::pin(stream)
+    }
+}
+
+fn messages_json(engine: &QueryEngine) -> String {
+    serde_json::to_string(&engine.session().messages).expect("messages serialize")
+}
+
+#[tokio::test]
+async fn both_submission_paths_finish_a_tool_turn_in_the_same_state() {
+    let mut options = SubmitOptions::default();
+    options.handle_elicitation = false;
+
+    let (mut immediate, _rx) =
+        make_engine(Box::new(BothPathsMock::new()), Box::new(EchoToolExecutor));
+    let immediate_reason = immediate
+        .submit("use a tool".into(), options.clone())
+        .await
+        .unwrap();
+
+    let (mut streamed, _rx) =
+        make_engine(Box::new(BothPathsMock::new()), Box::new(EchoToolExecutor));
+    let streamed_reason = streamed
+        .submit_streaming("use a tool".into(), options)
+        .await
+        .unwrap();
+
+    assert_eq!(immediate_reason, streamed_reason);
+    assert_eq!(
+        messages_json(&immediate),
+        messages_json(&streamed),
+        "the two finish paths produced different histories"
+    );
+    assert_eq!(immediate.total_usage(), streamed.total_usage());
+}
+
 #[tokio::test]
 async fn thinking_block_is_round_tripped_in_the_follow_up_request() {
     let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
