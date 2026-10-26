@@ -163,6 +163,7 @@ pub async fn run_tool_calls<S: std::hash::BuildHasher + Sync>(
                 });
                 let mut ctx = HashMap::new();
                 ctx.insert("tool_call_id".to_string(), call.id.clone());
+                ctx.insert("tool_input".to_string(), call.input.to_string());
                 ctx.insert("reason".to_string(), reason.clone());
                 let ask_result = hooks
                     .fire_hook(hook_events::PERMISSION_REQUEST, &call.name, &ctx)
@@ -188,6 +189,7 @@ pub async fn run_tool_calls<S: std::hash::BuildHasher + Sync>(
                 };
                 let mut ctx = HashMap::new();
                 ctx.insert("tool_call_id".to_string(), call.id.clone());
+                ctx.insert("tool_input".to_string(), call.input.to_string());
                 ctx.insert("reason".to_string(), reason.clone());
                 let fail_result = hooks
                     .fire_hook(hook_events::POST_TOOL_USE_FAILURE, &call.name, &ctx)
@@ -220,6 +222,7 @@ pub async fn run_tool_calls<S: std::hash::BuildHasher + Sync>(
                 };
                 let mut ctx = HashMap::new();
                 ctx.insert("tool_call_id".to_string(), call.id.clone());
+                ctx.insert("tool_input".to_string(), call.input.to_string());
                 ctx.insert("reason".to_string(), reason.clone());
                 let denied_result = hooks
                     .fire_hook(hook_events::PERMISSION_DENIED, &call.name, &ctx)
@@ -288,6 +291,7 @@ pub async fn run_tool_calls<S: std::hash::BuildHasher + Sync>(
 
         let mut ctx = HashMap::new();
         ctx.insert("tool_call_id".to_string(), call.id.clone());
+        ctx.insert("tool_input".to_string(), call.input.to_string());
         ctx.insert(
             "tool_output_len".to_string(),
             result.output.len().to_string(),

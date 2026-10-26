@@ -4873,6 +4873,7 @@ impl QueryEngine {
 
                 let mut ctx = std::collections::HashMap::new();
                 ctx.insert("tool_call_id".to_string(), call.id.clone());
+                ctx.insert("tool_input".to_string(), call.input.to_string());
                 ctx.insert(
                     "tool_output_len".to_string(),
                     result.output.len().to_string(),
@@ -4919,6 +4920,7 @@ impl QueryEngine {
                 };
                 let mut ctx = std::collections::HashMap::new();
                 ctx.insert("tool_call_id".to_string(), call.id.clone());
+                ctx.insert("tool_input".to_string(), call.input.to_string());
                 ctx.insert("reason".to_string(), reason.clone());
                 let fail_result = self
                     .fire_hook(hook_events::POST_TOOL_USE_FAILURE, &call.name, &ctx)
@@ -4951,6 +4953,7 @@ impl QueryEngine {
                 };
                 let mut ctx = std::collections::HashMap::new();
                 ctx.insert("tool_call_id".to_string(), call.id.clone());
+                ctx.insert("tool_input".to_string(), call.input.to_string());
                 ctx.insert("reason".to_string(), reason.clone());
                 let fail_result = self
                     .fire_hook(hook_events::POST_TOOL_USE_FAILURE, &call.name, &ctx)
