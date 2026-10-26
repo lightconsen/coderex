@@ -178,6 +178,23 @@ impl PtySession {
         persist_session: bool,
         args: &[&str],
     ) -> Self {
+        Self::launch_with_config(cwd, extra_envs, model, persist_session, args, true)
+    }
+
+    /// Launch without seeding a telemetry decision, so the first-run consent
+    /// gate is reachable.
+    fn launch_unseeded(cwd: &Path, extra_envs: &[(String, String)], model: &str) -> Self {
+        Self::launch_with_config(cwd, extra_envs, model, false, &[], false)
+    }
+
+    fn launch_with_config(
+        cwd: &Path,
+        extra_envs: &[(String, String)],
+        model: &str,
+        persist_session: bool,
+        args: &[&str],
+        seed_config: bool,
+    ) -> Self {
         let serial = PTY_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -211,11 +228,13 @@ impl PtySession {
         // config home makes the CLI ask for telemetry consent on stdin before
         // it draws anything, and a test has no one to answer.
         let config_home = tempfile::tempdir().expect("config home");
-        std::fs::write(
-            config_home.path().join("settings.json"),
-            r#"{"config_version": 3, "telemetry_enabled": false}"#,
-        )
-        .expect("seed config home");
+        if seed_config {
+            std::fs::write(
+                config_home.path().join("settings.json"),
+                r#"{"config_version": 3, "telemetry_enabled": false}"#,
+            )
+            .expect("seed config home");
+        }
         cmd.env("CLAUDE_CONFIG_DIR", config_home.path());
         // A developer's exported provider variables must not reach the child:
         // `ANTHROPIC_MODEL`/`OPENAI_MODEL` take precedence over `--model`, so a
@@ -279,6 +298,10 @@ impl PtySession {
             _config_home: config_home,
             _serial: serial,
         }
+    }
+
+    fn config_home(&self) -> &Path {
+        self._config_home.path()
     }
 
     fn screen_text(&self) -> String {
@@ -2278,4 +2301,27 @@ fn escape_interrupts_a_running_turn_in_the_default_mode() {
     drop(session);
     drop(provider);
     assert!(screen.contains("(interrupted)"), "{screen}");
+}
+
+fn first_run_consent(answer: &str) -> bool {
+    let dir = setup_project_dir();
+    let mut session = PtySession::launch_unseeded(dir.path(), &[], "claude-sonnet-4-6");
+    session.wait_for_raw_text("Enable telemetry?", SCREEN_TIMEOUT);
+    session.send_line(answer);
+    session.wait_for_text("CodeRex v", SCREEN_TIMEOUT);
+    let settings = std::fs::read_to_string(session.config_home().join("settings.json"))
+        .expect("the consent decision is written");
+    drop(session);
+    let value: serde_json::Value = serde_json::from_str(&settings).expect("settings json");
+    value["telemetry_enabled"].as_bool().expect("a decision")
+}
+
+#[test]
+fn first_run_consent_declining_persists_off() {
+    assert!(!first_run_consent("n"), "declining must record false");
+}
+
+#[test]
+fn first_run_consent_accepting_persists_on() {
+    assert!(first_run_consent("y"), "accepting must record true");
 }

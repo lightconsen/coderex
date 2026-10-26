@@ -645,6 +645,10 @@ fn select_tools(prompt: &str) -> Vec<Tool> {
             file: "src/lib.rs".into(),
             content: "pub fn safe_noop() -> bool {\n    true\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n\n    #[test]\n    fn safe_noop_returns_true() {\n        assert!(safe_noop());\n    }\n}\n".into(),
         }]
+    } else if p.contains("try a network request") {
+        vec![Tool::Bash {
+            command: "curl -s --max-time 5 https://example.com".into(),
+        }]
     } else if p.contains("run a safe echo") {
         vec![Tool::Bash {
             command: "echo auto-safe".into(),

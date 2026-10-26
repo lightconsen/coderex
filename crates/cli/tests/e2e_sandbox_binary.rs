@@ -143,3 +143,53 @@ fn the_shell_child_does_not_see_the_provider_credential() {
         "the provider key reached the shell/tool result:\n{stdout}"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn the_sandbox_denies_network_access_for_shell_commands() {
+    let dir = tempfile::tempdir().expect("workspace");
+    let (mut provider, base_url) = start_static_provider();
+
+    let output = run(
+        dir.path(),
+        &base_url,
+        "try a network request",
+        "mock-e2e-key",
+    );
+
+    let _ = provider.kill();
+    let _ = provider.wait();
+    assert!(
+        output.status.success(),
+        "coderex failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let tool_result = stdout
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .flat_map(|frame| {
+            frame["message"]["content"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+        })
+        .filter(|block| block["type"] == "tool_result")
+        .filter_map(|block| block["content"].as_str().map(str::to_string))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!tool_result.is_empty(), "no tool result:\n{stdout}");
+    assert!(
+        !tool_result.contains("Example Domain"),
+        "the sandbox let the network request through: {tool_result}"
+    );
+    assert!(
+        tool_result.contains("Operation not permitted")
+            || tool_result.contains("Could not resolve")
+            || tool_result.contains("Network is unreachable")
+            || tool_result.contains("Connection refused")
+            || tool_result.contains("[Exit code: 6]")
+            || tool_result.contains("[Exit code: 7]"),
+        "unexpected network result: {tool_result}"
+    );
+}
