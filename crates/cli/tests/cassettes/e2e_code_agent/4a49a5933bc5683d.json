@@ -4,7 +4,7 @@
     {
       "status": 200,
       "content_type": "application/json",
-      "body": "{\"id\":\"04141815-f71a-49d9-b9bd-d7cb17fa4c69\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"The user wants a title for the conversation. The conversation is about adding a triple function to src/lib.rs after the add function. Need 3-7 word sentence-case title.\\n\\n\\\"Add triple function to lib.rs\\\" - that's 5 words. Sentence case. Good.\",\"signature\":\"04141815-f71a-49d9-b9bd-d7cb17fa4c69\"},{\"type\":\"text\",\"text\":\"{\\\"title\\\": \\\"Add triple function to lib.rs\\\"}\"}],\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":130,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":68,\"service_tier\":\"standard\"}}"
+      "body": "{\"id\":\"fa3336de-3627-4786-aec9-11887e703578\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"We need answer only JSON object title. Need title 3-7 words sentence case. Conversation: add triple function to src/lib.rs after add. Title identify session. Need concise. \\\"Add triple function to lib.rs\\\" is 5 words? Add(1) triple2 function3 to4 lib.rs5. Sentence case: \\\"Add triple function to lib.rs\\\" (lib.rs lowercase proper). JSON.\",\"signature\":\"fa3336de-3627-4786-aec9-11887e703578\"},{\"type\":\"text\",\"text\":\"{\\\"title\\\": \\\"Add triple function to lib.rs\\\"}\"}],\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":130,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":95,\"service_tier\":\"standard\"}}"
     }
   ],
   "request": {

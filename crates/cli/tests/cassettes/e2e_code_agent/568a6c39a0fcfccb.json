@@ -1,0 +1,26 @@
+{
+  "key": "568a6c39a0fcfccb",
+  "responses": [
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"55fbbf94-56e7-405a-9ac4-a60a49f449ea\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"We need answer. Need assess Glob pattern. Tool Glob likely searches files. Pattern **/{middleware,routes,models}.rs. Risks? It's read-only file listing. Could traverse large directory, performance, reveal file paths? Since no path specified, relative to cwd. Pattern matches .rs files named middleware.rs, routes.rs, models.rs recursively. Potential risks: broad recursive glob can be expensive in huge repos/node_modules? But pattern specific filenames. Still recursive traversal could hit many directories, symlink? Glob may follow symlinks? Could expose paths outside intended root if symlinks or if cwd broad. But no content read. In security advisor context, explain concrete risks. 1-2 sentences. Likely safe. Need mention if executed in sensitive filesystem, path disclosure and resource use. \\\"This is a read-only filename search; main concrete risks are unintended path disclosure (returning locations of matching Rust files) and potentially slow traversal in very large or symlink-heavy trees. It does not read file contents or modify anything.\\\" That's 2 sentences. Desired. Ensure \\\"If tool call appears safe, say so briefly.\\\" We can say largely safe. final.\",\"signature\":\"55fbbf94-56e7-405a-9ac4-a60a49f449ea\"},{\"type\":\"text\",\"text\":\"This is a read-only filename search and is largely safe:\"}],\"stop_reason\":\"max_tokens\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":114,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":256,\"service_tier\":\"standard\"}}"
+    }
+  ],
+  "request": {
+    "model": "<model>",
+    "system": "<system>",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Explain the potential risks of this tool call:\n\n**Tool:** Glob\n**Input:**\n```\n{\"pattern\":\"**/{middleware,routes,models}.rs\"}\n```\n\nWhat could go wrong if this executes?"
+          }
+        ]
+      }
+    ],
+    "max_tokens": 256
+  }
+}

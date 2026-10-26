@@ -1,0 +1,26 @@
+{
+  "key": "8faf87444d625125",
+  "responses": [
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"56f17e76-8f9f-4810-93d1-273bdf3f3dac\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"The tool call writes a Rust source file to a temp directory. Let me think about concrete risks.\\n\\nThe file path is /private/var/folders/.../T/.tmp23ZUfd/src/models.rs — a temp dir on macOS. Content is benign Rust model definitions. Risks: overwriting an existing file at that path (write tools typically truncate), no backup; the temp dir is user-writable but if the process runs with elevated privileges, symlink attack potential (temp dirs are predictable-ish and world-writable parent? Actually /private/var/folders/.../T is per-user). Content itself contains no secrets, no exec.\\n\\nAlso note: the AuthRequest struct with a token field is just a type definition — the token isn't being logged, but deriving Clone and Debug... actually Debug is not derived on AuthRequest, only Debug+Clone+Serialize+Deserialize. Wait: `#[derive(Debug, Clone, Serialize, Deserialize)]` — it does include Debug. So a token field with Debug derived means tokens could be printed in logs/panic messages. That's a mild design concern but not a risk of the tool call itself.\\n\\nMain risks: overwriting existing file silently, writing into a temp dir that\",\"signature\":\"56f17e76-8f9f-4810-93d1-273bdf3f3dac\"}],\"stop_reason\":\"max_tokens\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":243,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":256,\"service_tier\":\"standard\"}}"
+    }
+  ],
+  "request": {
+    "model": "<model>",
+    "system": "<system>",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Explain the potential risks of this tool call:\n\n**Tool:** Write\n**Input:**\n```\n{\"file_path\":\"<tmp>\",\"content\":\"use serde::{Deserialize, Serialize};\\n\\n#[derive(Debug)]\\npub struct User {\\n    pub id: u64,\\n    pub name: String,\\n}\\n\\n/// Body of a request that carries an auth token (e.g. `POST /protected`).\\n#[derive(Debug, Clone, Serialize, Deserialize)]\\npub struct AuthRequest {\\n    pub token: String,\\n}\\n\"}\n```\n\nWhat could go wrong if this executes?"
+          }
+        ]
+      }
+    ],
+    "max_tokens": 256
+  }
+}

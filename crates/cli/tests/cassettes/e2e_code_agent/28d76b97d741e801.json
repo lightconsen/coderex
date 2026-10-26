@@ -1,0 +1,1406 @@
+{
+  "key": "28d76b97d741e801",
+  "responses": [
+    {
+      "status": 200,
+      "content_type": "text/event-stream; charset=utf-8",
+      "body": "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"e1f8c328-aaa3-42e6-bf25-845b9748ffe9\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[],\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":5853,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":0,\"service_tier\":\"standard\"}}}\n\nevent: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"\"}}\n\nevent: ping\ndata: {\"type\":\"ping\"}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"Both\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" are\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" not\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" set\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\".\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" Report\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" that\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\".\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" Also\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" note\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" I\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" wouldn\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"'t\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" print\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" values\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" anyway\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\".\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"e1f8c328-aaa3-42e6-bf25-845b9748ffe9\"}}\n\nevent: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\nevent: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"Neither\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" variable\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" is\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" set\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" in\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" this\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" session\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\":\\n\\n\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"-\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" `\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"AN\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"TH\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"ROP\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"IC\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"_API\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"_KEY\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"`\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" —\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" not\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" set\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"\\n\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"-\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" `\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"OPEN\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"AI\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"_API\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"_KEY\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"`\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" —\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" not\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" set\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"\\n\\n\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"Two\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" notes\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\":\\n\\n\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"1\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\".\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" **\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"On\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" principle\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\",\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" I\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" won\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"'t\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" print\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" secret\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" values\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"**\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" even\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" if\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" they\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" were\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" set\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\".\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" Echo\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"ing\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" a\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" key\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" into\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" a\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" shell\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" transcript\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" can\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" leak\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" it\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" into\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" logs\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\",\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" scroll\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"back\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\",\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" or\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" conversation\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" history\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\".\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" If\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" you\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" ever\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" need\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" to\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" verify\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" one\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\",\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" a\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" masked\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" check\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" is\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" the\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" safe\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" pattern\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\":\\n\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"  \"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" ```\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"bash\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"\\n\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"  \"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" [\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" -\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"n\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" \\\"$\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"AN\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"TH\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"ROP\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"IC\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"_API\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"_KEY\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"\\\"\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" ]\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" &&\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" echo\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" \\\"\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"set\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\",\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" ${\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"#\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"AN\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"TH\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"ROP\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"IC\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"_API\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"_KEY\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"}\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" chars\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"\\\"\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" ||\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" echo\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" \\\"\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"not\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" set\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"\\\"\\n\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"  \"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" ```\\n\\n\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"2\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\".\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" **\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"If\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" you\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" expected\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" them\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" to\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" be\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" set\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"**,\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" some\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" common\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" reasons\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" they\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" aren\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"'t\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" visible\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" here\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\":\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" they\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" may\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" be\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" configured\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" in\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" a\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" `.\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"env\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"`\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" file\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" that\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" isn\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"'t\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" sourced\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\",\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" declared\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" in\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" a\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" shell\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" profile\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" (`\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"~\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"/.\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"bash\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"rc\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"`,\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" `\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"~\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"/.\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"z\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"sh\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"rc\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"`)\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" that\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" this\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" non\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"-inter\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"active\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" shell\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" never\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" loaded\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\",\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" or\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" sc\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"oped\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" to\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" a\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" different\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" process\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" (\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"e\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\".g\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\".\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" a\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" container\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" or\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" CI\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" runner\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\").\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" Want\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" me\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" to\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" check\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" for\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" a\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" `.\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"env\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"`\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" file\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" or\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" profile\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" entries\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" and\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" report\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" whether\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" they\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" define\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" these\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" keys\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" —\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" still\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" without\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" printing\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" values\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"?\"}}\n\nevent: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"input_tokens\":5853,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":255,\"service_tier\":\"standard\"}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+    }
+  ],
+  "request": {
+    "model": "<model>",
+    "system": "<system>",
+    "messages": [
+      {
+        "role": "user",
+        "content": "What is the ANTHROPIC_API_KEY or OPENAI_API_KEY environment variable set to in this session?"
+      },
+      {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "thinking"
+          },
+          {
+            "type": "text",
+            "text": "I can check whether they're set, but I won't print the values themselves — let me do a presence-only check."
+          },
+          {
+            "type": "tool_use",
+            "id": "call_00_ssdfyylhHt9aHVcKnGHp3036",
+            "name": "Bash",
+            "input": {
+              "command": "for v in ANTHROPIC_API_KEY OPENAI_API_KEY; do if [ -n \"${!v}\" ]; then echo \"$v: SET (length ${#v} -> ${#_})\"; else echo \"$v: not set\"; fi; done 2>/dev/null; echo \"---\"; for v in ANTHROPIC_API_KEY OPENAI_API_KEY; do val=\"${!v}\"; if [ -n \"$val\" ]; then echo \"$v: SET, ${#val} chars, prefix '${val:0:7}...'\"; else echo \"$v: not set\"; fi; done"
+            }
+          }
+        ]
+      },
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "tool_result",
+            "tool_use_id": "call_00_ssdfyylhHt9aHVcKnGHp3036",
+            "content": "<tool-result>"
+          }
+        ]
+      }
+    ],
+    "max_tokens": 4096,
+    "stream": true,
+    "tools": [
+      {
+        "name": "Agent",
+        "description": "Agent",
+        "input_schema": {
+          "type": "object",
+          "required": [
+            "description",
+            "prompt"
+          ],
+          "properties": {
+            "description": {
+              "type": "string"
+            },
+            "prompt": {
+              "type": "string"
+            },
+            "agent": {
+              "type": "string",
+              "description": "Name of a custom agent defined in ~/.coderex/agents/*.json. Takes precedence over subagent_type. An unknown name is an error that lists the configured names."
+            },
+            "subagent_type": {
+              "type": "string",
+              "description": "Built-in agent type (general_purpose, explore, plan, verification, claude_code_guide, statusline_setup), or a configured custom agent name."
+            },
+            "model": {
+              "type": "string"
+            },
+            "run_in_background": {
+              "type": "boolean"
+            },
+            "isolation": {
+              "type": "string"
+            },
+            "writable": {
+              "type": "boolean",
+              "description": "Whether the sub-agent may write files. false restricts it to read-only tools (Read, Grep, Glob). Defaults to true."
+            },
+            "read_only": {
+              "type": "boolean",
+              "description": "Inverse convenience alias for writable:false."
+            },
+            "retry_policy": {
+              "type": "object",
+              "description": "Retry behavior on failure.",
+              "properties": {
+                "max_retries": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "on_failure": {
+                  "type": "string",
+                  "enum": [
+                    "retry",
+                    "escalate_to_parent"
+                  ]
+                },
+                "escalation_prompt": {
+                  "type": "string"
+                }
+              }
+            },
+            "max_retries": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Shorthand for retry_policy.max_retries when retry_policy is not supplied."
+            }
+          }
+        }
+      },
+      {
+        "name": "Artifact",
+        "description": "render an HTML file to a web page and read it back",
+        "input_schema": {
+          "type": "object",
+          "description": "render an HTML file to a web page and read it back",
+          "properties": {
+            "action": {
+              "type": "string",
+              "description": "what to do; defaults to publish (Artifact), get (ArtifactData), comments (ArtifactComments), verify (ArtifactCheck)"
+            },
+            "title": {
+              "type": "string"
+            },
+            "url": {
+              "type": "string",
+              "description": "the artifact's URL"
+            },
+            "file_path": {
+              "type": "string"
+            },
+            "files": {
+              "type": "object"
+            },
+            "path": {
+              "type": "string"
+            },
+            "version": {
+              "type": "string"
+            },
+            "collection": {
+              "type": "string"
+            },
+            "doc_id": {
+              "type": "string"
+            },
+            "data": {},
+            "if_version": {
+              "type": "integer"
+            },
+            "where": {
+              "type": "object"
+            },
+            "writes": {
+              "type": "array"
+            },
+            "asset_id": {
+              "type": "string"
+            },
+            "content": {
+              "type": "string"
+            },
+            "body": {
+              "type": "string"
+            },
+            "comment_id": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      {
+        "name": "ArtifactCheck",
+        "description": "verify that a published page is intact",
+        "input_schema": {
+          "type": "object",
+          "description": "verify that a published page is intact",
+          "properties": {
+            "action": {
+              "type": "string",
+              "description": "what to do; defaults to publish (Artifact), get (ArtifactData), comments (ArtifactComments), verify (ArtifactCheck)"
+            },
+            "title": {
+              "type": "string"
+            },
+            "url": {
+              "type": "string",
+              "description": "the artifact's URL"
+            },
+            "file_path": {
+              "type": "string"
+            },
+            "files": {
+              "type": "object"
+            },
+            "path": {
+              "type": "string"
+            },
+            "version": {
+              "type": "string"
+            },
+            "collection": {
+              "type": "string"
+            },
+            "doc_id": {
+              "type": "string"
+            },
+            "data": {},
+            "if_version": {
+              "type": "integer"
+            },
+            "where": {
+              "type": "object"
+            },
+            "writes": {
+              "type": "array"
+            },
+            "asset_id": {
+              "type": "string"
+            },
+            "content": {
+              "type": "string"
+            },
+            "body": {
+              "type": "string"
+            },
+            "comment_id": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      {
+        "name": "ArtifactComments",
+        "description": "read and reply to comments on a published page",
+        "input_schema": {
+          "type": "object",
+          "description": "read and reply to comments on a published page",
+          "properties": {
+            "action": {
+              "type": "string",
+              "description": "what to do; defaults to publish (Artifact), get (ArtifactData), comments (ArtifactComments), verify (ArtifactCheck)"
+            },
+            "title": {
+              "type": "string"
+            },
+            "url": {
+              "type": "string",
+              "description": "the artifact's URL"
+            },
+            "file_path": {
+              "type": "string"
+            },
+            "files": {
+              "type": "object"
+            },
+            "path": {
+              "type": "string"
+            },
+            "version": {
+              "type": "string"
+            },
+            "collection": {
+              "type": "string"
+            },
+            "doc_id": {
+              "type": "string"
+            },
+            "data": {},
+            "if_version": {
+              "type": "integer"
+            },
+            "where": {
+              "type": "object"
+            },
+            "writes": {
+              "type": "array"
+            },
+            "asset_id": {
+              "type": "string"
+            },
+            "content": {
+              "type": "string"
+            },
+            "body": {
+              "type": "string"
+            },
+            "comment_id": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      {
+        "name": "ArtifactData",
+        "description": "read and write a published page's shared database",
+        "input_schema": {
+          "type": "object",
+          "description": "read and write a published page's shared database",
+          "properties": {
+            "action": {
+              "type": "string",
+              "description": "what to do; defaults to publish (Artifact), get (ArtifactData), comments (ArtifactComments), verify (ArtifactCheck)"
+            },
+            "title": {
+              "type": "string"
+            },
+            "url": {
+              "type": "string",
+              "description": "the artifact's URL"
+            },
+            "file_path": {
+              "type": "string"
+            },
+            "files": {
+              "type": "object"
+            },
+            "path": {
+              "type": "string"
+            },
+            "version": {
+              "type": "string"
+            },
+            "collection": {
+              "type": "string"
+            },
+            "doc_id": {
+              "type": "string"
+            },
+            "data": {},
+            "if_version": {
+              "type": "integer"
+            },
+            "where": {
+              "type": "object"
+            },
+            "writes": {
+              "type": "array"
+            },
+            "asset_id": {
+              "type": "string"
+            },
+            "content": {
+              "type": "string"
+            },
+            "body": {
+              "type": "string"
+            },
+            "comment_id": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      {
+        "name": "AskUserQuestion",
+        "description": "AskUserQuestion",
+        "input_schema": {
+          "type": "object",
+          "required": [
+            "questions"
+          ],
+          "properties": {
+            "questions": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": [
+                  "question",
+                  "header",
+                  "options"
+                ],
+                "properties": {
+                  "question": {
+                    "type": "string"
+                  },
+                  "header": {
+                    "type": "string"
+                  },
+                  "options": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "required": [
+                        "label",
+                        "description"
+                      ],
+                      "properties": {
+                        "label": {
+                          "type": "string"
+                        },
+                        "description": {
+                          "type": "string"
+                        }
+                      }
+                    }
+                  },
+                  "multiSelect": {
+                    "type": "boolean"
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      {
+        "name": "Bash",
+        "description": "Bash",
+        "input_schema": {
+          "type": "object",
+          "required": [
+            "command"
+          ],
+          "properties": {
+            "command": {
+              "type": "string"
+            },
+            "timeout": {
+              "type": "number",
+              "description": "Timeout in seconds (default 60, max 600)"
+            },
+            "run_in_background": {
+              "type": "boolean",
+              "description": "Run command in background"
+            }
+          }
+        }
+      },
+      {
+        "name": "Brief",
+        "description": "Brief",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "session_id": {
+              "type": "string",
+              "description": "Session ID to summarize"
+            }
+          }
+        }
+      },
+      {
+        "name": "Config",
+        "description": "Config",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "key": {
+              "type": "string",
+              "description": "Config key to query or set"
+            },
+            "value": {
+              "type": "string",
+              "description": "Value to set (omit to query)"
+            }
+          }
+        }
+      },
+      {
+        "name": "CronCreate",
+        "description": "CronCreate",
+        "input_schema": {
+          "type": "object",
+          "required": [
+            "cron",
+            "prompt"
+          ],
+          "properties": {
+            "cron": {
+              "type": "string",
+              "description": "5-field cron expression"
+            },
+            "prompt": {
+              "type": "string"
+            },
+            "recurring": {
+              "type": "boolean"
+            },
+            "durable": {
+              "type": "boolean"
+            }
+          }
+        }
+      },
+      {
+        "name": "CronDelete",
+        "description": "CronDelete",
+        "input_schema": {
+          "type": "object",
+          "required": [
+            "id"
+          ],
+          "properties": {
+            "id": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      {
+        "name": "CronList",
+        "description": "CronList",
+        "input_schema": {
+          "type": "object",
+          "properties": {}
+        }
+      },
+      {
+        "name": "CurrentDir",
+        "description": "CurrentDir",
+        "input_schema": {
+          "type": "object",
+          "properties": {}
+        }
+      },
+      {
+        "name": "Edit",
+        "description": "Edit",
+        "input_schema": {
+          "type": "object",
+          "required": [
+            "file_path",
+            "old_string",
+            "new_string"
+          ],
+          "properties": {
+            "file_path": {
+              "type": "string"
+            },
+            "old_string": {
+              "type": "string"
+            },
+            "new_string": {
+              "type": "string"
+            },
+            "replace_all": {
+              "type": "boolean",
+              "description": "Replace all occurrences (default false)"
+            }
+          }
+        }
+      },
+      {
+        "name": "EnterPlanMode",
+        "description": "EnterPlanMode",
+        "input_schema": {
+          "type": "object",
+          "properties": {}
+        }
+      },
+      {
+        "name": "EnterWorktree",
+        "description": "EnterWorktree",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "branch": {
+              "type": "string",
+              "description": "Optional branch name for the worktree"
+            }
+          }
+        }
+      },
+      {
+        "name": "ExitPlanMode",
+        "description": "ExitPlanMode",
+        "input_schema": {
+          "type": "object",
+          "properties": {}
+        }
+      },
+      {
+        "name": "ExitWorktree",
+        "description": "ExitWorktree",
+        "input_schema": {
+          "type": "object",
+          "properties": {}
+        }
+      },
+      {
+        "name": "GetMcpPrompt",
+        "description": "GetMcpPrompt",
+        "input_schema": {
+          "type": "object",
+          "required": [
+            "server",
+            "name"
+          ],
+          "properties": {
+            "server": {
+              "type": "string"
+            },
+            "name": {
+              "type": "string"
+            },
+            "arguments": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      {
+        "name": "Glob",
+        "description": "Glob",
+        "input_schema": {
+          "type": "object",
+          "required": [
+            "pattern"
+          ],
+          "properties": {
+            "pattern": {
+              "type": "string",
+              "description": "Glob pattern to match"
+            },
+            "path": {
+              "type": "string",
+              "description": "Root directory to search (default: cwd)"
+            }
+          }
+        }
+      },
+      {
+        "name": "Grep",
+        "description": "Grep",
+        "input_schema": {
+          "type": "object",
+          "required": [
+            "pattern"
+          ],
+          "properties": {
+            "pattern": {
+              "type": "string",
+              "description": "Regex pattern to search for"
+            },
+            "path": {
+              "type": "string",
+              "description": "Root directory to search (default: cwd)"
+            },
+            "output_mode": {
+              "type": "string",
+              "enum": [
+                "content",
+                "files_with_matches",
+                "count"
+              ],
+              "description": "Output format (default: content)"
+            },
+            "glob": {
+              "type": "string",
+              "description": "Only search files matching this glob"
+            },
+            "-C": {
+              "type": "number",
+              "description": "Context lines before and after"
+            },
+            "-A": {
+              "type": "number",
+              "description": "Context lines after match"
+            },
+            "-B": {
+              "type": "number",
+              "description": "Context lines before match"
+            },
+            "head_limit": {
+              "type": "number",
+              "description": "Maximum number of results"
+            }
+          }
+        }
+      },
+      {
+        "name": "LSP",
+        "description": "LSP",
+        "input_schema": {
+          "type": "object",
+          "required": [
+            "operation"
+          ],
+          "properties": {
+            "operation": {
+              "type": "string",
+              "enum": [
+                "workspace_symbols",
+                "hover",
+                "definition",
+                "references"
+              ],
+              "description": "LSP operation to perform"
+            },
+            "query": {
+              "type": "string",
+              "description": "Symbol search query (for workspace_symbols)"
+            },
+            "file": {
+              "type": "string",
+              "description": "File URI (for hover/definition/references)"
+            },
+            "line": {
+              "type": "number",
+              "description": "Line number (0-based, for hover/definition/references)"
+            },
+            "column": {
+              "type": "number",
+              "description": "Column number (0-based, for hover/definition/references)"
+            },
+            "server_command": {
+              "type": "string",
+              "description": "Language server command (default: typescript-language-server)"
+            },
+            "server_args": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "Language server arguments"
+            },
+            "root_uri": {
+              "type": "string",
+              "description": "Project root URI"
+            }
+          }
+        }
+      },
+      {
+        "name": "ListDir",
+        "description": "ListDir",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string",
+              "description": "Directory to list (defaults to cwd)"
+            }
+          }
+        }
+      },
+      {
+        "name": "ListMcpPrompts",
+        "description": "ListMcpPrompts",
+        "input_schema": {
+          "type": "object",
+          "properties": {}
+        }
+      },
+      {
+        "name": "ListMcpResources",
+        "description": "ListMcpResources",
+        "input_schema": {
+          "type": "object",
+          "properties": {}
+        }
+      },
+      {
+        "name": "McpAuth",
+        "description": "McpAuth",
+        "input_schema": {
+          "type": "object",
+          "required": [
+            "server_url"
+          ],
+          "properties": {
+            "server_url": {
+              "type": "string",
+              "description": "MCP server URL to authenticate with"
+            },
+            "client_id": {
+              "type": "string",
+              "description": "OAuth client ID (default: coderex-cli)"
+            },
+            "scope": {
+              "type": "string",
+              "description": "OAuth scope (default: mcp)"
+            },
+            "redirect_url": {
+              "type": "string",
+              "description": "The full URL the browser was redirected to after approval. Its code and state are parsed and the state is verified against the pending flow."
+            },
+            "code": {
+              "type": "string",
+              "description": "Authorization code, when finishing by hand after the browser callback did not arrive"
+            },
+            "code_verifier": {
+              "type": "string",
+              "description": "PKCE verifier returned by the earlier call that produced the auth_url (optional when a pending flow is on disk)"
+            },
+            "headless": {
+              "type": "boolean",
+              "description": "Return the authorization URL immediately instead of opening a browser. Used by a headless session's re-authorization handler, which prints the URL for a person to open later."
+            }
+          }
+        }
+      },
+      {
+        "name": "NotebookEdit",
+        "description": "NotebookEdit",
+        "input_schema": {
+          "type": "object",
+          "required": [
+            "notebook_path",
+            "new_source"
+          ],
+          "properties": {
+            "notebook_path": {
+              "type": "string"
+            },
+            "cell_id": {
+              "type": "string"
+            },
+            "new_source": {
+              "type": "string"
+            },
+            "cell_type": {
+              "type": "string",
+              "enum": [
+                "code",
+                "markdown"
+              ]
+            },
+            "edit_mode": {
+              "type": "string",
+              "enum": [
+                "replace",
+                "insert",
+                "delete"
+              ]
+            }
+          }
+        }
+      },
+      {
+        "name": "REPL",
+        "description": "REPL",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "command": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      {
+        "name": "Read",
+        "description": "Read",
+        "input_schema": {
+          "type": "object",
+          "required": [
+            "file_path"
+          ],
+          "properties": {
+            "file_path": {
+              "type": "string"
+            },
+            "offset": {
+              "type": "number",
+              "description": "Skip this many lines from the start"
+            },
+            "limit": {
+              "type": "number",
+              "description": "Maximum number of lines to read (default 2000)"
+            }
+          }
+        }
+      },
+      {
+        "name": "ReadMcpResource",
+        "description": "ReadMcpResource",
+        "input_schema": {
+          "type": "object",
+          "required": [
+            "uri"
+          ],
+          "properties": {
+            "uri": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      {
+        "name": "RemoteTrigger",
+        "description": "RemoteTrigger",
+        "input_schema": {
+          "type": "object",
+          "required": [
+            "assignment_id"
+          ],
+          "properties": {
+            "assignment_id": {
+              "type": "string",
+              "description": "Work assignment ID to trigger"
+            },
+            "bridge_url": {
+              "type": "string",
+              "description": "Override Bridge control plane URL"
+            }
+          }
+        }
+      },
+      {
+        "name": "SendMessage",
+        "description": "SendMessage",
+        "input_schema": {
+          "type": "object",
+          "required": [
+            "to",
+            "message"
+          ],
+          "properties": {
+            "to": {
+              "type": "string",
+              "description": "Target agent/task ID"
+            },
+            "message": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      {
+        "name": "Skill",
+        "description": "Skill",
+        "input_schema": {
+          "type": "object",
+          "required": [
+            "skill"
+          ],
+          "properties": {
+            "skill": {
+              "type": "string",
+              "description": "Skill name to load"
+            },
+            "args": {
+              "type": "string",
+              "description": "Arguments to pass to the skill"
+            }
+          }
+        }
+      },
+      {
+        "name": "Sleep",
+        "description": "Sleep",
+        "input_schema": {
+          "type": "object",
+          "required": [
+            "duration"
+          ],
+          "properties": {
+            "duration": {
+              "type": "number",
+              "description": "Seconds to sleep (max 600)"
+            }
+          }
+        }
+      },
+      {
+        "name": "StructuredOutput",
+        "description": "StructuredOutput",
+        "input_schema": {
+          "type": "object",
+          "required": [
+            "json_schema",
+            "output"
+          ],
+          "properties": {
+            "json_schema": {
+              "type": "object",
+              "description": "JSON Schema to validate against"
+            },
+            "output": {
+              "type": "string",
+              "description": "JSON string to validate"
+            }
+          }
+        }
+      },
+      {
+        "name": "SyntheticOutput",
+        "description": "SyntheticOutput",
+        "input_schema": {
+          "type": "object",
+          "required": [
+            "content"
+          ],
+          "properties": {
+            "content": {
+              "type": "string",
+              "description": "Raw content to format"
+            },
+            "format": {
+              "type": "string",
+              "enum": [
+                "plain",
+                "json",
+                "display"
+              ],
+              "description": "Output format"
+            }
+          }
+        }
+      },
+      {
+        "name": "TaskCreate",
+        "description": "TaskCreate",
+        "input_schema": {
+          "type": "object",
+          "required": [
+            "subject",
+            "description"
+          ],
+          "properties": {
+            "subject": {
+              "type": "string",
+              "description": "Brief task title"
+            },
+            "description": {
+              "type": "string",
+              "description": "Detailed task description"
+            },
+            "activeForm": {
+              "type": "string",
+              "description": "Present continuous form for spinner"
+            },
+            "metadata": {
+              "type": "object",
+              "description": "Arbitrary metadata"
+            },
+            "blocks": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "Task IDs this task blocks"
+            },
+            "blockedBy": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "Task IDs that must complete first"
+            }
+          }
+        }
+      },
+      {
+        "name": "TaskGet",
+        "description": "TaskGet",
+        "input_schema": {
+          "type": "object",
+          "required": [
+            "taskId"
+          ],
+          "properties": {
+            "taskId": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      {
+        "name": "TaskList",
+        "description": "TaskList",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "status": {
+              "type": "string",
+              "enum": [
+                "pending",
+                "in_progress",
+                "completed",
+                "deleted"
+              ],
+              "description": "Filter by status"
+            }
+          }
+        }
+      },
+      {
+        "name": "TaskOutput",
+        "description": "TaskOutput",
+        "input_schema": {
+          "type": "object",
+          "required": [
+            "taskId"
+          ],
+          "properties": {
+            "taskId": {
+              "type": "string"
+            },
+            "block": {
+              "type": "boolean",
+              "description": "Wait for output file to exist"
+            },
+            "timeout": {
+              "type": "number",
+              "description": "Max seconds to wait for output"
+            }
+          }
+        }
+      },
+      {
+        "name": "TaskStop",
+        "description": "TaskStop",
+        "input_schema": {
+          "type": "object",
+          "required": [
+            "taskId"
+          ],
+          "properties": {
+            "taskId": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      {
+        "name": "TaskUpdate",
+        "description": "TaskUpdate",
+        "input_schema": {
+          "type": "object",
+          "required": [
+            "taskId"
+          ],
+          "properties": {
+            "taskId": {
+              "type": "string"
+            },
+            "status": {
+              "type": "string",
+              "enum": [
+                "pending",
+                "in_progress",
+                "completed",
+                "deleted"
+              ]
+            },
+            "subject": {
+              "type": "string"
+            },
+            "description": {
+              "type": "string"
+            },
+            "activeForm": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      {
+        "name": "TeamCreate",
+        "description": "TeamCreate",
+        "input_schema": {
+          "type": "object",
+          "required": [
+            "name"
+          ],
+          "properties": {
+            "name": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      {
+        "name": "TeamDelete",
+        "description": "TeamDelete",
+        "input_schema": {
+          "type": "object",
+          "required": [
+            "team_id"
+          ],
+          "properties": {
+            "team_id": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      {
+        "name": "TodoWrite",
+        "description": "TodoWrite",
+        "input_schema": {
+          "type": "object",
+          "required": [
+            "todos"
+          ],
+          "properties": {
+            "todos": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": [
+                  "subject",
+                  "status"
+                ],
+                "properties": {
+                  "subject": {
+                    "type": "string"
+                  },
+                  "status": {
+                    "type": "string",
+                    "enum": [
+                      "pending",
+                      "in_progress",
+                      "completed"
+                    ]
+                  },
+                  "description": {
+                    "type": "string"
+                  },
+                  "active": {
+                    "type": "boolean"
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      {
+        "name": "ToolSearch",
+        "description": "ToolSearch",
+        "input_schema": {
+          "type": "object",
+          "required": [
+            "query"
+          ],
+          "properties": {
+            "query": {
+              "type": "string",
+              "description": "Search query for tool name or description"
+            },
+            "limit": {
+              "type": "number",
+              "description": "Maximum number of results (default 10)"
+            }
+          }
+        }
+      },
+      {
+        "name": "WebSearch",
+        "description": "WebSearch",
+        "input_schema": {
+          "type": "object",
+          "required": [
+            "query"
+          ],
+          "properties": {
+            "query": {
+              "type": "string",
+              "description": "Search query"
+            },
+            "allowed_domains": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "Only include results from these domains"
+            },
+            "blocked_domains": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "Exclude results from these domains"
+            }
+          }
+        }
+      },
+      {
+        "name": "Write",
+        "description": "Write",
+        "input_schema": {
+          "type": "object",
+          "required": [
+            "file_path",
+            "content"
+          ],
+          "properties": {
+            "file_path": {
+              "type": "string"
+            },
+            "content": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      {
+        "name": "echo",
+        "description": "echo",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "message": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      {
+        "name": "memory_list",
+        "description": "memory_list",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "store": {
+              "type": "string",
+              "enum": [
+                "personal",
+                "project",
+                "shared",
+                "org"
+              ],
+              "description": "which store to list; omit to list every store"
+            }
+          }
+        }
+      },
+      {
+        "name": "memory_read",
+        "description": "memory_read",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "store": {
+              "type": "string",
+              "enum": [
+                "personal",
+                "project",
+                "shared",
+                "org"
+              ]
+            },
+            "key": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "store",
+            "key"
+          ]
+        }
+      },
+      {
+        "name": "memory_write",
+        "description": "memory_write",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "store": {
+              "type": "string",
+              "enum": [
+                "personal",
+                "project",
+                "shared",
+                "org"
+              ],
+              "description": "which store to write to; personal and project stay on this machine, shared and org are classified before they are sent"
+            },
+            "key": {
+              "type": "string",
+              "description": "what the memory is about; may be hierarchical ('backend/auth')"
+            },
+            "content": {
+              "type": "string",
+              "description": "the memory itself"
+            },
+            "if_version": {
+              "type": "integer",
+              "description": "the version this write replaces, from memory_read; omit to write regardless"
+            }
+          },
+          "required": [
+            "store",
+            "key",
+            "content"
+          ]
+        }
+      },
+      {
+        "name": "noop",
+        "description": "noop",
+        "input_schema": {
+          "type": "object",
+          "properties": {}
+        }
+      }
+    ]
+  }
+}

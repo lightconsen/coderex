@@ -1,0 +1,26 @@
+{
+  "key": "6a85cc32c9f20b73",
+  "responses": [
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"fa8937b0-8c5c-40d0-9328-0790ea40d8c9\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"The user asks about risks of a bash command: `ls -la src/ && for f in src/*.rs; do echo \\\"=== $f ===\\\"; cat \\\"$f\\\"; done`\\n\\nThis is a read-only command. Risks: it dumps file contents to output/transcript, potentially exposing secrets in source files. The `$f` is quoted properly and glob expansion is safe. Minor risk: if src/ contains many files or huge files, output could be large, flooding the context window. Also `cat` of a file named `-` wouldn't happen since glob from src/. Also glob `src/*.rs` — files beginning with `-` would be prefixed with `src/`, so cat won't interpret as flag... actually `cat \\\"src/-foo.rs\\\"` is fine since it's a path. No command injection. No writes. So overall safe, with the caveat of information disclosure and large output.\\n\\nKeep it 1-2 sentences.\",\"signature\":\"fa8937b0-8c5c-40d0-9328-0790ea40d8c9\"},{\"type\":\"text\",\"text\":\"Broadly safe: it's a read-only command with properly quoted glob expansion, so there's no injection, deletion, or write risk. The main concerns are disclosure and volume—dumping every `.rs` file into the transcript can expose hardcoded secrets\"}],\"stop_reason\":\"max_tokens\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":134,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":256,\"service_tier\":\"standard\"}}"
+    }
+  ],
+  "request": {
+    "model": "<model>",
+    "system": "<system>",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Explain the potential risks of this tool call:\n\n**Tool:** Bash\n**Input:**\n```\n{\"command\":\"ls -la src/ && for f in src/*.rs; do echo \\\"=== $f ===\\\"; cat \\\"$f\\\"; done\"}\n```\n\nWhat could go wrong if this executes?"
+          }
+        ]
+      }
+    ],
+    "max_tokens": 256
+  }
+}

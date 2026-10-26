@@ -4,7 +4,7 @@
     {
       "status": 200,
       "content_type": "application/json",
-      "body": "{\"id\":\"d0346f78-cafa-454d-85be-e25c0896f557\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"We need answer only JSON object title. Need capture main topic: adding POST /users endpoint route. 3-7 words sentence case. Something like \\\"Add POST users endpoint route\\\" = 5 words. Sentence case. Need concise. Return only JSON.\",\"signature\":\"d0346f78-cafa-454d-85be-e25c0896f557\"},{\"type\":\"text\",\"text\":\"{\\\"title\\\": \\\"Add POST users endpoint route\\\"}\"}],\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":113,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":63,\"service_tier\":\"standard\"}}"
+      "body": "{\"id\":\"8c78f529-16d1-4e75-b641-5ff8f7b101ad\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"We need answer only JSON title. Need infer title from request: Add POST /users endpoint JSON returns 201 add route. Sentence case 3-7 words. E.g. \\\"Add POST users endpoint route\\\" 5 words? Add(1) POST(2) users(3) endpoint(4) route(5). Sentence case: \\\"Add POST users endpoint route\\\". Need concise. Return JSON only.\",\"signature\":\"8c78f529-16d1-4e75-b641-5ff8f7b101ad\"},{\"type\":\"text\",\"text\":\"{\\\"title\\\": \\\"Add POST users endpoint route\\\"}\"}],\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":113,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":95,\"service_tier\":\"standard\"}}"
     }
   ],
   "request": {

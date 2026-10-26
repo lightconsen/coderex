@@ -4,7 +4,7 @@
     {
       "status": 200,
       "content_type": "application/json",
-      "body": "{\"id\":\"a7f4f099-6dcd-481a-bbdf-20743dab07d3\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"The user wants a title. Conversation: add function fn_last to src/large.rs. Title sentence-case, 3-7 words.\",\"signature\":\"a7f4f099-6dcd-481a-bbdf-20743dab07d3\"},{\"type\":\"text\",\"text\":\"{\\\"title\\\": \\\"Add fn_last function to large.rs\\\"}\"}],\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":117,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":41,\"service_tier\":\"standard\"}}"
+      "body": "{\"id\":\"6e752d64-7185-4b55-859b-95b98a5cf7bb\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"The user wants a title for the conversation. The conversation is about adding a function fn_last to src/large.rs. Need concise 3-7 word sentence-case title. Return JSON only.\\n\\nTitle: \\\"Adding fn_last function to large.rs\\\" - 6 words? \\\"Adding\\\", \\\"fn_last\\\", \\\"function\\\", \\\"to\\\", \\\"large.rs\\\" = 5 words. Good. Sentence case.\",\"signature\":\"6e752d64-7185-4b55-859b-95b98a5cf7bb\"},{\"type\":\"text\",\"text\":\"{\\\"title\\\": \\\"Adding fn_last function to large.rs\\\"}\"}],\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":117,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":95,\"service_tier\":\"standard\"}}"
     }
   ],
   "request": {

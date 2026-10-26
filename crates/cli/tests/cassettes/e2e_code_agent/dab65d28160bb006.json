@@ -1,0 +1,31 @@
+{
+  "key": "dab65d28160bb006",
+  "responses": [
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"0ff03c0e-3361-48f4-9fd0-8141d51eaa26\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"We need answer. Need assess Bash pwd && ls -la. Risks? Lists current directory including hidden files. Safe generally. But could leak sensitive filenames if output exposed, especially in shared logs/screenshots. pwd reveals path. ls -la no modification. 1-2 sentences. Mention safe except info disclosure.\",\"signature\":\"0ff03c0e-3361-48f4-9fd0-8141d51eaa26\"},{\"type\":\"text\",\"text\":\"This call is largely safe because `pwd` and `ls -la` are read-only and only print the current path and directory contents. The main risk is information disclosure: the output may reveal sensitive file or directory names (including hidden files) or internal paths if captured in logs or shared.\"}],\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":110,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":129,\"service_tier\":\"standard\"}}"
+    },
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"3a442347-7831-4eda-a527-3228829f376f\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"We need answer security advisor. Need explain risks of Bash pwd && ls -la. Very benign. Need 1-2 clear sentences. Focus concrete risks not generic. If safe say briefly. Need mention read-only listing current directory. Potential minor info disclosure if output shared/logged, reveals path and filenames/permissions including hidden files. No mutation. Need concise.\",\"signature\":\"3a442347-7831-4eda-a527-3228829f376f\"},{\"type\":\"text\",\"text\":\"This call is essentially safe: `pwd && ls -la` only prints the current directory and lists files, including hidden ones, without modifying anything. The only concrete risk is information disclosure if the output is exposed, since it reveals the working path and filenames/permissions.\"}],\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":110,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":134,\"service_tier\":\"standard\"}}"
+    }
+  ],
+  "request": {
+    "model": "<model>",
+    "system": "<system>",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Explain the potential risks of this tool call:\n\n**Tool:** Bash\n**Input:**\n```\n{\"command\":\"pwd && ls -la\"}\n```\n\nWhat could go wrong if this executes?"
+          }
+        ]
+      }
+    ],
+    "max_tokens": 256
+  }
+}

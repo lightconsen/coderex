@@ -1,0 +1,26 @@
+{
+  "key": "bb9a54184f072377",
+  "responses": [
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"6238a6b9-aa54-45af-9fa6-f5a2a5085afe\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"We need answer security advisor 1-2 sentences. Need explain potential risks of Write tool call. File path temp dir, writes Rust middleware.rs with hardcoded secret token \\\"secret-token\\\" and auth check. Risks: hardcoded credential in source can be leaked if committed/logged; simplistic auth maybe demo but if used in real service token predictable/static and no rotation. Also writes to temp path could overwrite? Path is unique temp dir .tmp... likely safe. Need focus concrete. 1-2 sentences. Mention if tool executes, it writes file containing hardcoded auth token, which could be exposed via source control, logs, backups, or repo sharing; also this code compares against static token, so anyone who learns it gets auth and rotation requires code change. Is that 2 sentences. Also path in temp folder low risk. Need maybe \\\"The write itself targets a temp directory and is low-risk; the main issue is content.\\\" Keep concise.\",\"signature\":\"6238a6b9-aa54-45af-9fa6-f5a2a5085afe\"},{\"type\":\"text\",\"text\":\"The write targets a temp directory, so the action itself is low-risk, but it creates source code containing a hardcoded auth token (`\\\"secret-token\\\"`) that could leak through source control, logs, backups, or sharing and cannot be rotated without changing code. The auth\"}],\"stop_reason\":\"max_tokens\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":243,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":256,\"service_tier\":\"standard\"}}"
+    }
+  ],
+  "request": {
+    "model": "<model>",
+    "system": "<system>",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Explain the potential risks of this tool call:\n\n**Tool:** Write\n**Input:**\n```\n{\"file_path\":\"<tmp>\",\"content\":\"/// Token the demo service accepts.\\npub const VALID_TOKEN: &str = \\\"secret-token\\\";\\n\\npub fn log_request(path: &str) {\\n    println!(\\\"request: {}\\\", path);\\n}\\n\\n/// Returns `true` if `token` is an accepted auth token.\\npub fn check_auth(token: &str) -> bool {\\n    token == VALID_TOKEN\\n}\\n\"}\n```\n\nWhat could go wrong if this executes?"
+          }
+        ]
+      }
+    ],
+    "max_tokens": 256
+  }
+}

@@ -1,0 +1,26 @@
+{
+  "key": "876481c275b58c5e",
+  "responses": [
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"5542ec2f-5ac7-4898-95e3-1313cc3f4000\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"The tool call just runs `rustc --version` and echoes exit code. No file modification, no network, no sudo, no destructive commands. Safe.\",\"signature\":\"5542ec2f-5ac7-4898-95e3-1313cc3f4000\"},{\"type\":\"text\",\"text\":\"This call is essentially safe: `rustc --version` only prints the compiler version to stdout and exits, with output redirected so nothing is written to disk, no network access, and no elevated privileges involved. The worst case is a benign failure—if `rustc` isn't installed or isn't on `PATH`, the shell reports \\\"command not found\\\" and `exit=127`, which the `2>&1` capture will simply surface rather than hide.\"}],\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":119,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":127,\"service_tier\":\"standard\"}}"
+    }
+  ],
+  "request": {
+    "model": "<model>",
+    "system": "<system>",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Explain the potential risks of this tool call:\n\n**Tool:** Bash\n**Input:**\n```\n{\"command\":\"rustc --version 2>&1; echo \\\"exit=$?\\\"\"}\n```\n\nWhat could go wrong if this executes?"
+          }
+        ]
+      }
+    ],
+    "max_tokens": 256
+  }
+}

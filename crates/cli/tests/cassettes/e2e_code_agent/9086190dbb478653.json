@@ -1,0 +1,26 @@
+{
+  "key": "9086190dbb478653",
+  "responses": [
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"42c3eeeb-3ec3-4c26-ae8f-18d8801f86bf\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"The user asks about risks of a Glob tool call with pattern \\\"**/*\\\" and path \\\".\\\". I should be accurate: Glob just enumerates file paths, doesn't read contents. Risks: performance/resource exhaustion on large trees, exposing filenames (which can leak sensitive info like .env, credentials filenames), traversing into sensitive directories or mounted/untrusted filesystems, symlink following could escape intended directory, output flooding context window. Also hidden files may or may not be matched depending on implementation. Overall it's a read-only metadata operation, low risk but not zero.\\n\\nProvide 1-2 clear sentences per instruction, but can add a bit. The instruction says explain in 1-2 clear sentences. Keep concise.\",\"signature\":\"42c3eeeb-3ec3-4c26-ae8f-18d8801f86bf\"},{\"type\":\"text\",\"text\":\"**Glob only enumerates path names — it doesn't read file contents — so the direct risk is low.** The concrete concerns are: (1) output flooding / resource exhaustion, since `**/*` from `.` recursively walks the entire tree and can return tens of thousands of paths, blowing up the context window or hanging on large or networked/mounted filesystems; (2) information disclosure via filenames, which often reveal sensitive material (`.env`, `id_rsa`, `prod-credentials\"}],\"stop_reason\":\"max_tokens\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":110,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":256,\"service_tier\":\"standard\"}}"
+    }
+  ],
+  "request": {
+    "model": "<model>",
+    "system": "<system>",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Explain the potential risks of this tool call:\n\n**Tool:** Glob\n**Input:**\n```\n{\"pattern\":\"**/*\",\"path\":\".\"}\n```\n\nWhat could go wrong if this executes?"
+          }
+        ]
+      }
+    ],
+    "max_tokens": 256
+  }
+}

@@ -1,0 +1,26 @@
+{
+  "key": "b50ef999d61c4858",
+  "responses": [
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"e7071d63-974e-49b1-9519-f17f5d7cedca\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"We need answer security advisor explain potential risks this Bash tool call. Need inspect command: `git diff --stat src/large.rs 2>&1; git diff src/large.rs 2>&1 | head -20`. Need identify concrete risks. It's read-only git diff, no modifications. Potential risks: if repository has malicious git config/attributes/textconv? Git diff can invoke external diff drivers via .gitattributes or config diff.external, textconv filters for binary files. Also pager? Git diff may use pager unless disabled? In non-interactive maybe pager? `git diff` may invoke pager if configured? Usually git diff uses pager when stdout tty; here pipe/redirect likely no tty. But external diff/textconv can execute arbitrary commands if repo-controlled config/.gitattributes. Also path `src/large.rs` could be huge/symlink? git diff reads file from working tree/index; large file could cause memory/time or output huge, but head limits second output; first `--stat` could process large file maybe expensive; `2>&1` merges stderr. Semicolon ensures second runs regardless. `head -20` may cause SIGPIPE to git diff but okay. Potential command\",\"signature\":\"e7071d63-974e-49b1-9519-f17f5d7cedca\"}],\"stop_reason\":\"max_tokens\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":131,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":256,\"service_tier\":\"standard\"}}"
+    }
+  ],
+  "request": {
+    "model": "<model>",
+    "system": "<system>",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Explain the potential risks of this tool call:\n\n**Tool:** Bash\n**Input:**\n```\n{\"command\":\"git diff --stat src/large.rs 2>&1; git diff src/large.rs 2>&1 | head -20\"}\n```\n\nWhat could go wrong if this executes?"
+          }
+        ]
+      }
+    ],
+    "max_tokens": 256
+  }
+}

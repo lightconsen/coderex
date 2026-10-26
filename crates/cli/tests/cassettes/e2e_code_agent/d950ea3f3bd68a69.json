@@ -1,0 +1,26 @@
+{
+  "key": "d950ea3f3bd68a69",
+  "responses": [
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"6faf4add-1a24-4034-ab9e-f65a2f839de2\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"We need answer security advisor. Need analyze tool call. Bash command cd temp dir and cat source files. Need explain potential risks 1-2 sentences concrete risks, if safe say briefly. Need consider: cd to /private/var/folders/.../T/.tmp23ZUfd (macOS temp dir). Then loop cat -n src/lib.rs etc. Risks? Command injection? Filenames fixed, no user input. cat reads files. Could expose sensitive content? It prints source files to output; if those files contain secrets, they'd be disclosed in tool output/logs. Also executing in temp dir path could be attacker-controlled? The directory is in /private/var/folders temp, maybe predictable? .tmp23ZUfd random. If an attacker can create/replace that path or symlink, cat could read unintended files? The cd target is specific; if directory is world-writable? On macOS /private/var/folders/.../T is per-user temp, not world-writable generally. But temp dirs can be symlink attacks? The random name .tmp23ZUfd. If directory exists and controlled by another process/user, files could be malicious content but cat only reads, no execution. Could output terminal\",\"signature\":\"6faf4add-1a24-4034-ab9e-f65a2f839de2\"}],\"stop_reason\":\"max_tokens\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":180,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":256,\"service_tier\":\"standard\"}}"
+    }
+  ],
+  "request": {
+    "model": "<model>",
+    "system": "<system>",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Explain the potential risks of this tool call:\n\n**Tool:** Bash\n**Input:**\n```\n{\"command\":\"cd <tmp> && for f in src/lib.rs src/models.rs src/middleware.rs src/routes.rs; do echo \\\"=== $f ===\\\"; cat -n \\\"$f\\\"; done\"}\n```\n\nWhat could go wrong if this executes?"
+          }
+        ]
+      }
+    ],
+    "max_tokens": 256
+  }
+}

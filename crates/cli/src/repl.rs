@@ -7890,11 +7890,9 @@ impl ReplLoop {
                             engine.set_session(session);
                         }
                     }
-                    if output.is_empty() {
-                        output = format!("[Session title: {title}]");
-                    } else {
-                        output.insert_str(0, &format!("[Session title: {title}]\n"));
-                    }
+                    // The title belongs to the session (resume, `/status`),
+                    // not to the answer: `-p` output is piped and parsed, so
+                    // prefixing it with a bracketed notice would corrupt it.
                 }
             }
         }

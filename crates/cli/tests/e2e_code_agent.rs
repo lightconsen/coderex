@@ -522,7 +522,7 @@ fn refactor_extract_helper() {
     let out = run_with_args(
         dir.path(),
         "Refactor src/lib.rs: extract the duplicated age-prefix logic into a shared helper function called `format_user_label`. Keep both public functions working.",
-        &["--dangerously-skip-permissions", "--max-turns", "3"],
+        &["--dangerously-skip-permissions", "--max-turns", "6"],
         120,
     );
     eprintln!("stdout:\n{}", out.stdout);

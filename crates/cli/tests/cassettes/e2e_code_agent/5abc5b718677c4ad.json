@@ -1,0 +1,26 @@
+{
+  "key": "5abc5b718677c4ad",
+  "responses": [
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"de1a50f2-03fe-4ad7-a83b-4bd2eff12007\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"We need answer risk of Write tool creating Cargo.toml. Need 1-2 sentences concrete. The content is benign package manifest for Rust lib. Potential risk: overwrites existing Cargo.toml at path, losing project config/dependencies; package name target_lib and rust-version could affect build. But if file exists, overwrite. Need say appears mostly safe. Focus concrete. Maybe no malicious code. 1-2 sentences.\",\"signature\":\"de1a50f2-03fe-4ad7-a83b-4bd2eff12007\"},{\"type\":\"text\",\"text\":\"This appears mostly safe: it writes a simple Rust package manifest with no scripts or dependencies. The concrete risk is that it overwrites an existing `Cargo.toml`, potentially destroying project metadata, dependencies, or build settings.\"}],\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":172,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":140,\"service_tier\":\"standard\"}}"
+    }
+  ],
+  "request": {
+    "model": "<model>",
+    "system": "<system>",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Explain the potential risks of this tool call:\n\n**Tool:** Write\n**Input:**\n```\n{\"content\":\"[package]\\nname = \\\"target_lib\\\"\\nversion = \\\"0.1.0\\\"\\nedition = \\\"2021\\\"\\nrust-version = \\\"1.58\\\"\\ndescription = \\\"Small integer arithmetic helpers, with checked and unchecked addition.\\\"\\n\",\"file_path\":\"Cargo.toml\"}\n```\n\nWhat could go wrong if this executes?"
+          }
+        ]
+      }
+    ],
+    "max_tokens": 256
+  }
+}

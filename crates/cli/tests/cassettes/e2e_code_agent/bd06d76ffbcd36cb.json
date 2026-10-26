@@ -1,0 +1,26 @@
+{
+  "key": "bd06d76ffbcd36cb",
+  "responses": [
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"abba74a8-e04d-4919-aabf-0679a97c4835\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"We need answer security advisor explain risks tool call in 1-2 sentences. Need assess command. It's read-only environment probing: command -v cargo rustc rustup; ls /usr/local/bin | grep -i rust; echo ---; echo $PATH. Risks? Executes shell, but no destructive. Leaks PATH and installed Rust tooling, maybe info disclosure. Could be used reconnaissance. No write/network. If untrusted input? No. Need concise 1-2 sentences. Mention safe/read-only. Need focus concrete. Final.\",\"signature\":\"abba74a8-e04d-4919-aabf-0679a97c4835\"},{\"type\":\"text\",\"text\":\"This is a read-only reconnaissance command that reveals installed Rust tooling and the system `PATH`, which could expose environment layout or toolchain locations to an attacker if the output is shared. It does not modify files, execute downloaded code, or access the network, so the direct risk is low.\"}],\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":132,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":174,\"service_tier\":\"standard\"}}"
+    }
+  ],
+  "request": {
+    "model": "<model>",
+    "system": "<system>",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Explain the potential risks of this tool call:\n\n**Tool:** Bash\n**Input:**\n```\n{\"command\":\"command -v cargo rustc rustup; ls /usr/local/bin | grep -i rust; echo \\\"---\\\"; echo $PATH\"}\n```\n\nWhat could go wrong if this executes?"
+          }
+        ]
+      }
+    ],
+    "max_tokens": 256
+  }
+}

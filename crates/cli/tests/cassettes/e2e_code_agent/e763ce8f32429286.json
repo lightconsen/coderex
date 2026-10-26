@@ -1,0 +1,26 @@
+{
+  "key": "e763ce8f32429286",
+  "responses": [
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"34dd4aee-2954-4606-8c58-c8e5f5c6c438\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"We need answer security advisor. Need explain potential risks of tool call. Command: ls -la *.rs 2>/dev/null; echo \\\"---\\\"; find . -maxdepth 3 -name '*.rs' -type f 2>/dev/null | head -100. Need assess risks. It's read-only listing files. Potential issues: glob expansion of *.rs in current directory could expand to many files causing argument list too long? ls -la *.rs if no match? In bash default nullglob off, literal *.rs passed, ls errors suppressed. If many .rs files, ARG_MAX risk low; ls could read metadata. find traverses current directory maxdepth 3 and outputs up to 100 .rs files. Risks: information disclosure (file names/paths) to tool output/logs; find follows? No -L so doesn't follow symlinks, but will traverse symlinked dirs? find default does not follow symlinks, but symlink to dir not traversed; files named *.rs symlinks printed as type f? -type f excludes symlinks unless follow? Actually find -type f on symlink to file returns false (default). So limited. It may traverse into sensitive directories under current dir? maxdepth \",\"signature\":\"34dd4aee-2954-4606-8c58-c8e5f5c6c438\"}],\"stop_reason\":\"max_tokens\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":145,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":256,\"service_tier\":\"standard\"}}"
+    }
+  ],
+  "request": {
+    "model": "<model>",
+    "system": "<system>",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Explain the potential risks of this tool call:\n\n**Tool:** Bash\n**Input:**\n```\n{\"command\":\"ls -la *.rs 2>/dev/null; echo \\\"---\\\"; find . -maxdepth 3 -name '*.rs' -type f 2>/dev/null | head -100\"}\n```\n\nWhat could go wrong if this executes?"
+          }
+        ]
+      }
+    ],
+    "max_tokens": 256
+  }
+}

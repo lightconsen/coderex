@@ -1,0 +1,26 @@
+{
+  "key": "eb80b47e91b8eabf",
+  "responses": [
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"16ac4831-a574-4789-ad8f-75127541976c\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"We need answer risk of bash command. Need explain 1-2 sentences, concrete. Command lists /Users/lando/.cargo/bin and grep homebrew for cargo/rustc. Read-only listing. Risks minimal. Maybe reveals local paths/tooling in output, but no destructive. Could be safe. Need mention if output shared may leak username and installed binaries. 1-2 sentences. Ensure no generic.\",\"signature\":\"16ac4831-a574-4789-ad8f-75127541976c\"},{\"type\":\"text\",\"text\":\"This is essentially read-only: it lists Rust-related binaries in the user’s Cargo directory and Homebrew bin, with no writes, network access, or privileged operations. The only concrete risk is minor information disclosure—the output may reveal the username (`lando`) and installed tooling if shared—so it is safe to run in most contexts.\"}],\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":147,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":156,\"service_tier\":\"standard\"}}"
+    }
+  ],
+  "request": {
+    "model": "<model>",
+    "system": "<system>",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Explain the potential risks of this tool call:\n\n**Tool:** Bash\n**Input:**\n```\n{\"command\":\"ls -la /Users/lando/.cargo/bin/ 2>&1 | head; ls /opt/homebrew/bin 2>/dev/null | grep -i -E 'cargo|rustc'\"}\n```\n\nWhat could go wrong if this executes?"
+          }
+        ]
+      }
+    ],
+    "max_tokens": 256
+  }
+}
