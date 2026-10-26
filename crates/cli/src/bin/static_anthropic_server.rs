@@ -21,6 +21,19 @@ use std::thread;
 
 static PROVIDER_RETRY_COUNT: AtomicUsize = AtomicUsize::new(0);
 
+/// Optional request log for tests that need to inspect what the binary sent.
+static RECORD: std::sync::OnceLock<Option<std::sync::Mutex<std::fs::File>>> =
+    std::sync::OnceLock::new();
+
+fn record_request(body: &str) {
+    let Some(Some(file)) = RECORD.get() else {
+        return;
+    };
+    if let Ok(mut file) = file.lock() {
+        let _ = writeln!(file, "{body}");
+    }
+}
+
 /// Pre-recorded text responses keyed by prompt keyword.
 struct StaticResponses {
     texts: HashMap<String, String>,
@@ -54,6 +67,20 @@ fn main() {
         .windows(2)
         .find(|w| w[0] == "--responses")
         .map_or_else(|| "responses.json".into(), |w| w[1].clone());
+
+    let record_path = args
+        .windows(2)
+        .find(|w| w[0] == "--record")
+        .map(|w| w[1].clone());
+    let record_file = record_path.and_then(|path| {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .ok()
+            .map(std::sync::Mutex::new)
+    });
+    let _ = RECORD.set(record_file);
 
     let responses = StaticResponses::load(&responses_path);
     let responses = std::sync::Arc::new(responses);
@@ -114,6 +141,8 @@ fn handle_connection(mut stream: TcpStream, responses: &std::sync::Arc<StaticRes
         buf_reader.read_exact(&mut body).expect("read body");
     }
     let body_str = String::from_utf8_lossy(&body);
+
+    record_request(&body_str);
 
     let prompt = extract_last_user_prompt(&body_str);
     let has_tool_result = latest_user_message_has_tool_result(&body_str);
@@ -443,6 +472,32 @@ fn build_json_sse_response(json: &str) -> String {
 }
 
 fn build_json_response(prompt: &str, has_tool_result: bool, responses: &StaticResponses) -> String {
+    // Sub-agents call the provider without streaming, so a deterministic tool
+    // call has to be expressible as one JSON message too.
+    if !has_tool_result
+        && prompt
+            .to_lowercase()
+            .contains("write a file inside the worktree")
+    {
+        return serde_json::json!({
+            "id": "msg_static_tool",
+            "type": "message",
+            "role": "assistant",
+            "content": [{
+                "type": "tool_use",
+                "id": "tool_worktree_write",
+                "name": "Write",
+                "input": {
+                    "file_path": "src/agent_only.rs",
+                    "content": "pub const AGENT_WROTE: bool = true;\n"
+                }
+            }],
+            "stop_reason": "tool_use",
+            "stop_sequence": null,
+            "usage": {"input_tokens": 10, "output_tokens": 20}
+        })
+        .to_string();
+    }
     let text = if has_tool_result {
         resolve_text_response(prompt, responses)
     } else if prompt.to_lowercase().contains("title") {
@@ -649,6 +704,21 @@ fn select_tools(prompt: &str) -> Vec<Tool> {
         vec![Tool::Write {
             file: "src/lib.rs".into(),
             content: "pub fn safe_noop() -> bool {\n    true\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n\n    #[test]\n    fn safe_noop_returns_true() {\n        assert!(safe_noop());\n    }\n}\n".into(),
+        }]
+    } else if p.contains("spawn a subagent in a worktree") {
+        vec![Tool::Raw {
+            name: "Agent".into(),
+            input_json: r#"{"description":"edit in an isolated worktree","prompt":"write a file inside the worktree","isolation":"worktree"}"#.into(),
+        }]
+    } else if p.contains("write a file inside the worktree") {
+        vec![Tool::Write {
+            file: "src/agent_only.rs".into(),
+            content: "pub const AGENT_WROTE: bool = true;\n".into(),
+        }]
+    } else if p.contains("spawn a subagent to inspect") {
+        vec![Tool::Raw {
+            name: "Agent".into(),
+            input_json: r#"{"description":"inspect the code","prompt":"inspect the code"}"#.into(),
         }]
     } else if p.contains("call the mock sampling tool") {
         vec![Tool::Raw {

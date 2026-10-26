@@ -74,6 +74,12 @@ impl StaticServer {
     /// nothing and report "provider returned no visible response". `--port 0`
     /// lets the server bind first.
     fn start() -> Self {
+        Self::start_recording(None)
+    }
+
+    /// Start with `--record`: every provider request body is appended to the
+    /// file, so a test can inspect what the binary actually sent.
+    fn start_recording(record_path: Option<&Path>) -> Self {
         let responses_path =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/responses.json");
         assert!(
@@ -82,13 +88,22 @@ impl StaticServer {
             responses_path.display()
         );
 
+        let mut args = vec![
+            "--port".to_string(),
+            "0".to_string(),
+            "--responses".to_string(),
+            responses_path
+                .to_str()
+                .expect("utf8 responses path")
+                .to_string(),
+        ];
+        if let Some(record_path) = record_path {
+            args.push("--record".to_string());
+            args.push(record_path.to_str().expect("utf8 record path").to_string());
+        }
+
         let mut child = Command::new(cargo_bin("static-anthropic-server"))
-            .args([
-                "--port",
-                "0",
-                "--responses",
-                responses_path.to_str().expect("utf8 responses path"),
-            ])
+            .args(&args)
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()
@@ -1136,6 +1151,84 @@ fn message_area_scrolls_while_footer_stays_fixed() {
     let screen = session.wait_for_text("VERY_LONG_TAIL", SCREEN_TIMEOUT);
     assert!(screen.contains("❯"));
     assert!(screen.contains("Permissions:"));
+}
+
+/// The text of a provider message, whether the content is a string or blocks.
+fn message_text(message: &serde_json::Value) -> String {
+    match &message["content"] {
+        serde_json::Value::String(text) => text.clone(),
+        serde_json::Value::Array(blocks) => blocks
+            .iter()
+            .filter_map(|block| block["text"].as_str())
+            .collect::<Vec<_>>()
+            .join(""),
+        _ => String::new(),
+    }
+}
+
+/// A sub-agent's provider request carries the parent conversation verbatim as
+/// its prefix, then its own task: the fork is what makes the provider's
+/// prompt-prefix cache reusable.
+#[test]
+fn a_subagent_forks_the_parent_conversation() {
+    let dir = setup_project_dir();
+    let record = dir.path().join("requests.jsonl");
+    let server = StaticServer::start_recording(Some(&record));
+    let mut session = PtySession::launch_with_persistence(dir.path(), &server.envs(), "K2.6", true);
+    session.wait_for_text("CodeRex v", SCREEN_TIMEOUT);
+
+    session.send_line("hello");
+    session.wait_for_text("Hello!", SCREEN_TIMEOUT);
+    session.wait_for_text("Completed in", SCREEN_TIMEOUT);
+
+    session.send_line("spawn a subagent to inspect the code");
+    let deadline = Instant::now() + SCREEN_TIMEOUT;
+    let (bodies, fork_messages) = loop {
+        let text = std::fs::read_to_string(&record).unwrap_or_default();
+        let bodies: Vec<serde_json::Value> = text
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect();
+        let fork = bodies.iter().find_map(|body| {
+            let messages = body["messages"].as_array()?;
+            (message_text(messages.last()?).trim() == "inspect the code").then(|| messages.clone())
+        });
+        if let Some(messages) = fork {
+            break (bodies, messages);
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the sub-agent never made a request; recorded:\n{text}"
+        );
+        thread::sleep(Duration::from_millis(100));
+    };
+    session.send_line("/exit");
+    session.wait_for_exit(Duration::from_secs(10));
+    drop(session);
+
+    let parent_messages = bodies
+        .iter()
+        .find_map(|body| {
+            let messages = body["messages"].as_array()?;
+            (message_text(messages.last()?).contains("spawn a subagent to inspect the code"))
+                .then(|| messages.clone())
+        })
+        .expect("the delegating turn's request");
+    assert!(
+        fork_messages.len() > 1,
+        "the fork carried no parent prefix: {fork_messages:?}"
+    );
+    assert_eq!(
+        &fork_messages[..fork_messages.len() - 1],
+        &parent_messages[..parent_messages.len() - 1],
+        "the fork's prefix is not the parent's bytes"
+    );
+    assert!(
+        serde_json::Value::Array(fork_messages[..fork_messages.len() - 1].to_vec())
+            .to_string()
+            .contains("hello"),
+        "the reused prefix does not contain the first turn: {fork_messages:?}"
+    );
 }
 
 #[test]
