@@ -630,3 +630,126 @@ fn an_http_pretooluse_hook_can_block_the_tool() {
         "an HTTP hook that answered stop let the write through:\n{content}"
     );
 }
+
+/// Model-backed hooks run through the real session's action runner: the
+/// prompt reaches the provider and the JSON answer stops the tool.
+#[test]
+fn a_model_backed_pretooluse_hook_can_block_the_tool() {
+    let dir = tempfile::tempdir().expect("workspace");
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(
+        dir.path().join("src/lib.rs"),
+        "pub fn add(a: i32, b: i32) -> i32 { a + b }\n",
+    )
+    .unwrap();
+    let home = seed_config(&serde_json::json!({
+        "hooks": [{
+            "event": "PreToolUse",
+            "type": "prompt",
+            "if": "Write(*)",
+            "prompt": "Give a hook verdict for this tool call",
+            "timeout_ms": 10000
+        }]
+    }));
+    let api = start_static_provider();
+
+    let output = run(
+        dir.path(),
+        home.path(),
+        &api.1,
+        "add a recursive fibonacci function to src/lib.rs with unit tests",
+        &["--dangerously-skip-permissions"],
+    );
+
+    let _ = api.0;
+    assert!(
+        output.status.success(),
+        "coderex failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let content = std::fs::read_to_string(dir.path().join("src/lib.rs")).unwrap();
+    assert!(
+        !content.contains("fibonacci"),
+        "a prompt hook that answered stop let the write through:\n{content}"
+    );
+}
+
+/// `agent` hooks are a beta: without the flag the session skips them (and says
+/// so), and with it the verifier's answer gates the tool.
+#[test]
+fn an_agent_hook_is_opt_in_and_can_block_the_tool() {
+    let agent_home = || {
+        seed_config(&serde_json::json!({
+            "hooks": [{
+                "event": "PreToolUse",
+                "type": "agent",
+                "if": "Write(*)",
+                "prompt": "Give a hook verdict for this tool call",
+                "timeout_ms": 10000
+            }]
+        }))
+    };
+    let prompt = "add a recursive fibonacci function to src/lib.rs with unit tests";
+
+    let without = tempfile::tempdir().expect("workspace without the flag");
+    std::fs::create_dir_all(without.path().join("src")).unwrap();
+    std::fs::write(
+        without.path().join("src/lib.rs"),
+        "pub fn add(a: i32, b: i32) -> i32 { a + b }\n",
+    )
+    .unwrap();
+    let home = agent_home();
+    let api = start_static_provider();
+    let skipped = run(
+        without.path(),
+        home.path(),
+        &api.1,
+        prompt,
+        &["--dangerously-skip-permissions"],
+    );
+    let _ = api.0;
+    assert!(skipped.status.success(), "{skipped:?}");
+    assert!(
+        String::from_utf8_lossy(&skipped.stderr).contains("agent_triggers"),
+        "the skipped agent hook did not name its flag: {}",
+        String::from_utf8_lossy(&skipped.stderr)
+    );
+    assert!(
+        std::fs::read_to_string(without.path().join("src/lib.rs"))
+            .unwrap()
+            .contains("fibonacci"),
+        "an un-enabled agent hook still gated the write"
+    );
+
+    let with = tempfile::tempdir().expect("workspace with the flag");
+    std::fs::create_dir_all(with.path().join("src")).unwrap();
+    std::fs::write(
+        with.path().join("src/lib.rs"),
+        "pub fn add(a: i32, b: i32) -> i32 { a + b }\n",
+    )
+    .unwrap();
+    let home = agent_home();
+    let api = start_static_provider();
+    let gated = run(
+        with.path(),
+        home.path(),
+        &api.1,
+        prompt,
+        &[
+            "--dangerously-skip-permissions",
+            "--betas",
+            "agent_triggers",
+        ],
+    );
+    let _ = api.0;
+    assert!(
+        gated.status.success(),
+        "coderex failed: {}",
+        String::from_utf8_lossy(&gated.stderr)
+    );
+    let content = std::fs::read_to_string(with.path().join("src/lib.rs")).unwrap();
+    assert!(
+        !content.contains("fibonacci"),
+        "an enabled agent hook that answered stop let the write through:\n{content}"
+    );
+}

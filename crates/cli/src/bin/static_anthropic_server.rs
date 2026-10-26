@@ -262,7 +262,12 @@ fn count_tool_results(body: &str) -> usize {
 fn resolve_text_response(prompt: &str, responses: &StaticResponses) -> String {
     let p = prompt.to_lowercase();
 
-    if p.contains("classify the risk level") {
+    if p.contains("hook verdict") {
+        // A `prompt`/`agent` hook's question. The hook engine expects the
+        // model's answer to be a JSON hook result, so the static answer is
+        // one and the E2E can observe the hook stopping the tool.
+        r#"{"action":"stop"}"#.into()
+    } else if p.contains("classify the risk level") {
         // The auto-mode classifier's own query. It is advisory: the static
         // shell analysis still vetoes a dangerous command that this says is
         // safe, which the auto-mode E2E relies on.
