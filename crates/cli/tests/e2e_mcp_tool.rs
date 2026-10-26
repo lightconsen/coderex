@@ -5,7 +5,7 @@
 //! `mcp__mock__echo` call actually runs in the server process.
 
 use std::io::{BufRead, BufReader, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::time::Duration;
@@ -109,28 +109,13 @@ fn write_mock_server() -> PathBuf {
     path
 }
 
-#[test]
-fn a_model_tool_call_runs_in_the_configured_mcp_server() {
-    let dir = tempfile::tempdir().expect("workspace");
-    let script = write_mock_server();
-    std::fs::write(
-        dir.path().join(".mcp.json"),
-        serde_json::json!({
-            "mcpServers": {
-                "mock": {"command": script.to_str().unwrap(), "args": []}
-            }
-        })
-        .to_string(),
-    )
-    .unwrap();
-    let (mut provider, base_url) = start_static_provider();
+fn run_coderex(dir: &Path, base_url: &str, extra_args: &[&str]) -> std::process::Output {
     let config_home = tempfile::tempdir().expect("config home");
     std::fs::write(
         config_home.path().join("settings.json"),
         r#"{"config_version": 4, "telemetry_enabled": false}"#,
     )
     .unwrap();
-
     let mut child = Command::new(env!("CARGO_BIN_EXE_coderex"))
         .args([
             "-p",
@@ -138,9 +123,10 @@ fn a_model_tool_call_runs_in_the_configured_mcp_server() {
             "--output-format",
             "stream-json",
         ])
-        .current_dir(dir.path())
+        .args(extra_args)
+        .current_dir(dir)
         .env("ANTHROPIC_API_KEY", "mock")
-        .env("ANTHROPIC_BASE_URL", &base_url)
+        .env("ANTHROPIC_BASE_URL", base_url)
         .env("ANTHROPIC_MODEL", "claude-sonnet-4-6")
         .env("CLAUDE_CONFIG_DIR", config_home.path())
         .env("CODEREX_LOG", "off")
@@ -155,10 +141,26 @@ fn a_model_tool_call_runs_in_the_configured_mcp_server() {
         .expect("stdin")
         .write_all(b"call the mock mcp tool\n")
         .expect("write prompt");
-    let output = child.wait_with_output().expect("wait");
+    child.wait_with_output().expect("wait")
+}
 
-    let _ = provider.kill();
-    let _ = provider.wait();
+fn configured_workspace() -> (tempfile::TempDir, PathBuf) {
+    let dir = tempfile::tempdir().expect("workspace");
+    let script = write_mock_server();
+    std::fs::write(
+        dir.path().join(".mcp.json"),
+        serde_json::json!({
+            "mcpServers": {
+                "mock": {"command": script.to_str().unwrap(), "args": []}
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    (dir, script)
+}
+
+fn assert_echoed(output: &std::process::Output) {
     assert!(
         output.status.success(),
         "coderex failed: {}",
@@ -173,5 +175,26 @@ fn a_model_tool_call_runs_in_the_configured_mcp_server() {
         stdout.contains("mcp__mock__echo"),
         "the model-visible name is missing:\n{stdout}"
     );
+}
+
+#[test]
+fn a_model_tool_call_runs_in_the_configured_mcp_server() {
+    let (dir, script) = configured_workspace();
+    let (mut provider, base_url) = start_static_provider();
+    let output = run_coderex(dir.path(), &base_url, &[]);
+    let _ = provider.kill();
+    let _ = provider.wait();
+    assert_echoed(&output);
+    let _ = std::fs::remove_file(&script);
+}
+
+#[test]
+fn the_ide_flag_connects_to_the_named_mcp_server() {
+    let (dir, script) = configured_workspace();
+    let (mut provider, base_url) = start_static_provider();
+    let output = run_coderex(dir.path(), &base_url, &["--ide", "mock"]);
+    let _ = provider.kill();
+    let _ = provider.wait();
+    assert_echoed(&output);
     let _ = std::fs::remove_file(&script);
 }
