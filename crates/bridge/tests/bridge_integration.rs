@@ -1016,3 +1016,109 @@ fn state_machine_fail_from_any_state() {
     assert!(sm.is_terminal());
     assert!(matches!(sm.current, BridgeSessionState::Failed(_)));
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Process cleanup — the registry a spawn site fills, and what cleanup does
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[cfg(unix)]
+fn alive(pid: u32) -> bool {
+    std::process::Command::new("ps")
+        .args(["-p", &pid.to_string()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+#[cfg(unix)]
+#[test]
+fn cleanup_terminates_a_registered_child() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut manager = coderex_bridge::archive::BridgeCleanupManager::new(
+        dir.path().join("worktrees"),
+        dir.path().join("sessions"),
+    );
+    let mut child = std::process::Command::new("sleep")
+        .arg("60")
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn sleep");
+    let pid = child.id();
+    manager.track_process("session-1", pid);
+    assert!(manager.has_tracked_process("session-1"));
+
+    let report = manager.cleanup("session-1").expect("cleanup");
+
+    assert!(report.process_terminated);
+    let _ = child.wait();
+    assert!(!alive(pid), "the registered child is gone");
+    assert_eq!(manager.tracked_process_count(), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn cleanup_of_a_tracked_tree_kills_the_grandchild() {
+    use std::io::{BufRead, BufReader};
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut manager = coderex_bridge::archive::BridgeCleanupManager::new(
+        dir.path().join("worktrees"),
+        dir.path().join("sessions"),
+    );
+
+    let tree = coderex_core::process_tree::ProcessTree::create(Default::default()).unwrap();
+    let mut command = std::process::Command::new("sh");
+    command
+        .arg("-c")
+        .arg("sleep 60 & echo $!; wait")
+        .stdout(std::process::Stdio::piped());
+    tree.prepare(&mut command);
+    let mut child = command.spawn().expect("spawn shell");
+    tree.attach(&child).expect("attach");
+    let mut line = String::new();
+    BufReader::new(child.stdout.take().expect("stdout"))
+        .read_line(&mut line)
+        .expect("grandchild pid");
+    let grandchild: u32 = line.trim().parse().expect("pid");
+
+    manager.track_tree("session-tree", Arc::new(tree));
+    let report = manager.cleanup("session-tree").expect("cleanup");
+    let _ = child.wait();
+
+    assert!(report.process_terminated);
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(!alive(grandchild), "the grandchild is gone too");
+}
+
+#[test]
+fn cleanup_of_an_untracked_session_reports_no_process() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut manager = coderex_bridge::archive::BridgeCleanupManager::new(
+        dir.path().join("worktrees"),
+        dir.path().join("sessions"),
+    );
+
+    let report = manager.cleanup("unknown").expect("cleanup");
+
+    assert!(!report.process_terminated);
+    assert!(!report.worktree_removed);
+    assert!(!report.session_dir_removed);
+}
+
+#[test]
+fn the_shared_registry_sees_registrations_from_the_spawn_site() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut manager = coderex_bridge::archive::BridgeCleanupManager::new(
+        dir.path().join("worktrees"),
+        dir.path().join("sessions"),
+    );
+    let registry = manager.process_registry();
+    registry.track_process("shared", u32::MAX);
+
+    assert!(manager.has_tracked_process("shared"));
+    assert_eq!(manager.tracked_process_count(), 1);
+    manager.untrack_process("shared");
+    assert!(!manager.has_tracked_process("shared"));
+}

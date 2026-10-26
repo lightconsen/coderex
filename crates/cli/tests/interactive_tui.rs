@@ -1298,6 +1298,147 @@ fn provider_failure_recovers_to_usable_prompt() {
 /// right-hand side was true no matter what the TUI did after the resize. The
 /// assertion is now about what is *on the screen* afterwards, which is the
 /// thing a resize can break.
+fn assert_screen_order(screen: &str, needles: &[&str]) {
+    let mut position = 0;
+    for needle in needles {
+        let found = screen[position..]
+            .find(needle)
+            .unwrap_or_else(|| panic!("{needle:?} not found after position {position}:\n{screen}"));
+        position += found + needle.len();
+    }
+}
+
+/// `o` and `O` create lines on either side of the cursor; the buffer renders
+/// them in order and Enter submits the whole multi-line prompt.
+#[test]
+fn vim_o_and_upper_o_insert_lines_around_the_cursor() {
+    let dir = setup_project_dir();
+    let mut session = session_without_engine(dir.path());
+    session.wait_for_text("CodeRex v", SCREEN_TIMEOUT);
+    session.send_line("/vim");
+    session.wait_for_text("Vim mode: enabled", SCREEN_TIMEOUT);
+
+    session.send_text("middle");
+    session.esc();
+    thread::sleep(Duration::from_millis(150));
+    session.send_text("o");
+    session.send_text("below");
+    session.esc();
+    thread::sleep(Duration::from_millis(150));
+    session.send_text("O");
+    session.send_text("above");
+    session.esc();
+    thread::sleep(Duration::from_millis(150));
+
+    let screen = session.wait_for_text("above", SCREEN_TIMEOUT);
+    drop(session);
+    assert_screen_order(&screen, &["middle", "above", "below"]);
+}
+
+/// `dd` deletes a linewise buffer line and `p` puts it back below the cursor,
+/// so the rendered order changes to two / one / three.
+#[test]
+fn vim_dd_and_p_move_a_line() {
+    let dir = setup_project_dir();
+    let mut session = session_without_engine(dir.path());
+    session.wait_for_text("CodeRex v", SCREEN_TIMEOUT);
+    session.send_line("/vim");
+    session.wait_for_text("Vim mode: enabled", SCREEN_TIMEOUT);
+
+    session.send_text("one");
+    session.esc();
+    thread::sleep(Duration::from_millis(150));
+    session.send_text("o");
+    session.send_text("two");
+    session.esc();
+    thread::sleep(Duration::from_millis(150));
+    session.send_text("o");
+    session.send_text("three");
+    session.esc();
+    thread::sleep(Duration::from_millis(150));
+
+    // Back to the first line, delete it, and paste it below the (new) first
+    // line: two, one, three.
+    session.send_text("g");
+    session.send_text("dd");
+    thread::sleep(Duration::from_millis(150));
+    session.send_text("p");
+
+    // "one" disappears with `dd` and only comes back with `p`; waiting for it
+    // (rather than for "three", which is already on screen) proves the paste
+    // was rendered.
+    let screen = session.wait_for_text("one", SCREEN_TIMEOUT);
+    drop(session);
+    assert_screen_order(&screen, &["two", "one", "three"]);
+}
+
+/// `cc` replaces the current line and leaves the buffer in insert mode.
+#[test]
+fn vim_cc_replaces_the_current_line() {
+    let dir = setup_project_dir();
+    let mut session = session_without_engine(dir.path());
+    session.wait_for_text("CodeRex v", SCREEN_TIMEOUT);
+    session.send_line("/vim");
+    session.wait_for_text("Vim mode: enabled", SCREEN_TIMEOUT);
+
+    session.send_text("keep");
+    session.esc();
+    thread::sleep(Duration::from_millis(150));
+    session.send_text("o");
+    session.send_text("middle-code");
+    session.esc();
+    thread::sleep(Duration::from_millis(150));
+    session.send_text("o");
+    session.send_text("tail");
+    session.esc();
+    thread::sleep(Duration::from_millis(150));
+
+    // Top, then one line down to the middle, change the whole line.
+    session.send_text("g");
+    session.send_text("j");
+    session.send_text("cc");
+    session.send_text("replacement");
+
+    let screen = session.wait_for_text("replacement", SCREEN_TIMEOUT);
+    drop(session);
+    assert_screen_order(&screen, &["keep", "replacement", "tail"]);
+    assert!(
+        !screen.contains("middle-code"),
+        "the changed line is still rendered:\n{screen}"
+    );
+}
+
+/// A count applies to the linewise delete: `3dd` removes three lines.
+#[test]
+fn vim_counted_3dd_deletes_three_lines() {
+    let dir = setup_project_dir();
+    let mut session = session_without_engine(dir.path());
+    session.wait_for_text("CodeRex v", SCREEN_TIMEOUT);
+    session.send_line("/vim");
+    session.wait_for_text("Vim mode: enabled", SCREEN_TIMEOUT);
+
+    session.send_text("alpha");
+    session.esc();
+    thread::sleep(Duration::from_millis(150));
+    for line in ["bravo", "charlie", "delta"] {
+        session.send_text("o");
+        session.send_text(line);
+        session.esc();
+        thread::sleep(Duration::from_millis(120));
+    }
+    session.send_text("g");
+    session.send_text("3dd");
+    session.send_text("i");
+    session.send_text("survivor");
+
+    let screen = session.wait_for_text("survivor", SCREEN_TIMEOUT);
+    drop(session);
+    assert!(screen.contains("survivor"), "{screen}");
+    for gone in ["alpha", "bravo", "charlie"] {
+        assert!(!screen.contains(gone), "{gone:?} survived 3dd:\n{screen}");
+    }
+}
+
 #[test]
 fn resize_keeps_tui_alive() {
     let dir = setup_project_dir();

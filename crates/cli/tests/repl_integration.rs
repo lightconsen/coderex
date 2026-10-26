@@ -7,8 +7,8 @@
 
 use coderex_cli::repl::{ReplLoop, ReplSession, parse_input};
 use coderex_core::permissions::PermissionMode;
-use coderex_core::types::ModelId;
-use coderex_test_utils::{MockApiClient, mock_response};
+use coderex_core::types::{ModelId, ToolCall};
+use coderex_test_utils::{MockApiClient, mock_response, mock_response_with_tool_calls};
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  14.1 ReplLoop Construction
@@ -67,6 +67,47 @@ async fn headless_turn_persists_a_resumable_transcript() {
         content.contains("persisted answer"),
         "the transcript should carry the turn: {content}"
     );
+}
+
+/// Each headless submit persists its turn. The first transcript is complete
+/// before the second prompt runs, so a long session is resumable even if the
+/// process is stopped between turns.
+#[tokio::test]
+async fn a_headless_session_persists_after_every_turn() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path().to_str().unwrap().to_string();
+    // The first turn also asks the model for a session title, so the second
+    // answer is the third response.
+    let mock = MockApiClient::new(vec![
+        mock_response("the first answer"),
+        mock_response("a session title"),
+        mock_response("the second answer"),
+    ]);
+    let mut repl = ReplLoop::with_engine(Box::new(mock), cwd.clone(), ModelId::sonnet());
+
+    repl.run_headless("first prompt").await.unwrap();
+
+    let dir = coderex_cli::session_resume::transcript_dir(&cwd);
+    let transcript = |dir: &std::path::Path| {
+        let entry = std::fs::read_dir(dir)
+            .expect("transcript directory")
+            .filter_map(Result::ok)
+            .find(|entry| entry.path().extension().is_some_and(|ext| ext == "jsonl"))
+            .expect("a transcript");
+        std::fs::read_to_string(entry.path()).unwrap()
+    };
+    let after_first = transcript(&dir);
+    assert!(after_first.contains("the first answer"), "{after_first}");
+    assert!(
+        !after_first.contains("the second answer"),
+        "the second turn has not run yet: {after_first}"
+    );
+
+    repl.run_headless("second prompt").await.unwrap();
+
+    let after_second = transcript(&dir);
+    assert!(after_second.contains("the first answer"), "{after_second}");
+    assert!(after_second.contains("the second answer"), "{after_second}");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
