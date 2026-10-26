@@ -1,0 +1,14 @@
+{"type":"text_delta","delta":"Hello"}
+{"type":"tool_call_start","id":"tc_1","name":"Read","summary":"Reading src/lib.rs..."}
+{"type":"tool_call_end","id":"tc_1","result":{"tool_call_id":"tc_1","output":"pub fn add","is_error":false}}
+{"type":"mod_ui","elements":[{"type":"text","text":"hi","style":"plain"},{"type":"button","label":"OK","id":"ok"}]}
+{"type":"compact_boundary"}
+{"type":"permission_request","id":"p_1","tool":"Bash","args":{"command":"ls"}}
+{"type":"usage_summary","input_tokens":10,"output_tokens":20,"cache_read_tokens":0,"cache_creation_tokens":0}
+{"type":"turn_start","turn_number":1}
+{"type":"turn_end","turn_number":1,"stop_reason":"end_turn"}
+{"type":"session_end"}
+{"type":"error","message":"boom"}
+{"type":"notification","message":"hi"}
+{"type":"permission_explanation","tool":"Bash","explanation":"runs ls"}
+{"type":"stream_interrupted","reason":"error","partial_len":5,"will_retry":true}

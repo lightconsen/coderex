@@ -8,7 +8,7 @@ use crate::provider::{
     Provider, ProviderApiStyle, ProviderCapabilities, ProviderError, ReasoningEffortSupport,
     ResolvedProviderProfile, classify_api_error,
 };
-use crate::types::{ModelId, ToolCall, UsageSummary};
+use crate::types::{ModelId, ThinkingBlock, ToolCall, UsageSummary};
 use async_trait::async_trait;
 use futures::{Stream, StreamExt};
 use reqwest::Client;
@@ -566,12 +566,27 @@ impl OpenAiCompatibleProvider {
 
         let usage = Self::parse_usage(&json["usage"]);
 
+        // Reasoning models on this wire format return their chain of thought
+        // in `reasoning_content` (some endpoints spell it `reasoning`). It is
+        // provider state, not visible answer text.
+        let thinking = message
+            .and_then(|m| {
+                m.get("reasoning_content")
+                    .or_else(|| m.get("reasoning"))
+                    .and_then(|value| value.as_str())
+            })
+            .filter(|text| !text.is_empty())
+            .map(|text| ThinkingBlock {
+                thinking: text.to_string(),
+                signature: String::new(),
+            });
+
         ApiResponse {
             content,
             tool_calls,
             usage,
             stop_reason,
-            thinking: None,
+            thinking,
         }
     }
 
@@ -1013,10 +1028,39 @@ fn parse_openai_chat_sse_message(message: &str, state: &mut OpenAiSseState) -> V
     let mut events = Vec::new();
     if let Some(choices) = value.get("choices").and_then(serde_json::Value::as_array) {
         for choice in choices {
+            let finish_reason = choice
+                .get("finish_reason")
+                .or_else(|| {
+                    choice
+                        .get("delta")
+                        .and_then(|delta| delta.get("finish_reason"))
+                })
+                .and_then(serde_json::Value::as_str)
+                .filter(|reason| !reason.is_empty());
+            let error_finish = finish_reason == Some("error_finish");
+
             if let Some(delta) = choice.get("delta") {
+                // Reasoning precedes the visible answer when a model emits
+                // both; keep that order within a single chunk.
+                if let Some(reasoning) = delta
+                    .get("reasoning_content")
+                    .or_else(|| delta.get("reasoning"))
+                    .and_then(serde_json::Value::as_str)
+                {
+                    if !reasoning.is_empty() {
+                        events.push(StreamEvent::ThinkingDelta(reasoning.to_string()));
+                    }
+                }
                 if let Some(content) = delta.get("content").and_then(serde_json::Value::as_str) {
                     if !content.is_empty() {
-                        events.push(StreamEvent::TextDelta(content.to_string()));
+                        if error_finish {
+                            // An in-band failure carries the error text in
+                            // `content` with `finish_reason: "error_finish"`.
+                            // Surface it as an error, not as answer text.
+                            events.push(StreamEvent::Error(ApiError::Http(content.to_string())));
+                        } else {
+                            events.push(StreamEvent::TextDelta(content.to_string()));
+                        }
                     }
                 }
                 if let Some(tool_calls) = delta
@@ -1029,18 +1073,21 @@ fn parse_openai_chat_sse_message(message: &str, state: &mut OpenAiSseState) -> V
                 }
             }
 
-            if let Some(finish_reason) = choice
-                .get("finish_reason")
-                .or_else(|| {
-                    choice
-                        .get("delta")
-                        .and_then(|delta| delta.get("finish_reason"))
-                })
-                .and_then(serde_json::Value::as_str)
-            {
-                events.extend(finish_openai_chat_tool_calls(state));
-                if !finish_reason.is_empty() {
-                    events.push(StreamEvent::StopReason(finish_reason.to_string()));
+            if let Some(reason) = finish_reason {
+                if error_finish {
+                    // If the error text arrived in an earlier chunk, still
+                    // report a failure so the turn does not end silently.
+                    if !events
+                        .iter()
+                        .any(|event| matches!(event, StreamEvent::Error(_)))
+                    {
+                        events.push(StreamEvent::Error(ApiError::Http(
+                            "the provider ended the stream with an error".into(),
+                        )));
+                    }
+                } else {
+                    events.extend(finish_openai_chat_tool_calls(state));
+                    events.push(StreamEvent::StopReason(reason.to_string()));
                 }
             }
         }
