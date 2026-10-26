@@ -241,3 +241,52 @@ fn a_posttooluse_rewrite_reaches_the_tool_result() {
         "the PostToolUse rewrite never reached the transcript:\n{stdout}"
     );
 }
+
+#[test]
+fn the_setup_hook_runs_after_init() {
+    let dir = tempfile::tempdir().expect("workspace");
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(
+        dir.path().join("Cargo.toml"),
+        "[package]\nname = \"setup_fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("src/lib.rs"),
+        "pub fn add(a: i32, b: i32) -> i32 { a + b }\n",
+    )
+    .unwrap();
+    let marker = dir.path().join("setup-hit");
+    let setup = script(
+        dir.path(),
+        "setup.sh",
+        &format!("printf hit >> {}", marker.display()),
+    );
+    let home = seed_config(&hook_settings("Setup", None, setup.to_str().unwrap()));
+    let (mut provider, base_url) = start_static_provider();
+
+    let output = run(
+        dir.path(),
+        home.path(),
+        &base_url,
+        "/init",
+        &["--dangerously-skip-permissions"],
+    );
+
+    let _ = provider.kill();
+    let _ = provider.wait();
+    assert!(
+        output.status.success(),
+        "coderex failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("Project initialized"),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&marker).expect("the Setup hook ran"),
+        "hit"
+    );
+}

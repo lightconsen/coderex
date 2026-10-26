@@ -645,6 +645,16 @@ fn select_tools(prompt: &str) -> Vec<Tool> {
             file: "src/lib.rs".into(),
             content: "pub fn safe_noop() -> bool {\n    true\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n\n    #[test]\n    fn safe_noop_returns_true() {\n        assert!(safe_noop());\n    }\n}\n".into(),
         }]
+    } else if p.contains("write a memory") {
+        vec![Tool::Raw {
+            name: "memory_write".into(),
+            input_json: r#"{"store":"project","key":"e2e-memory","content":"memo-value"}"#.into(),
+        }]
+    } else if p.contains("read a memory") {
+        vec![Tool::Raw {
+            name: "memory_read".into(),
+            input_json: r#"{"store":"project","key":"e2e-memory"}"#.into(),
+        }]
     } else if p.contains("try a network request") {
         vec![Tool::Bash {
             command: "curl -s --max-time 5 https://example.com".into(),
