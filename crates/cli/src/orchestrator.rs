@@ -2728,6 +2728,10 @@ impl StartupOrchestrator {
             repl.with_protocol_sink(Some(coderex_events::MessageSink::new(
                 Box::new(std::io::stdout()) as Box<dyn std::io::Write + Send + Sync>,
             )));
+            // The host asked for the protocol, so it can answer tool approvals:
+            // an `Ask` becomes a `control_request` frame and the answer is read
+            // from stdin as a `control_response`.
+            repl.with_headless_permission_control(true);
         }
         repl
     }

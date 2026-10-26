@@ -1215,6 +1215,7 @@ fn spawn_headless_control_reader(
             // apply the mapping.
             let Ok(frame) = coderex_events::protocol::ControlResponseFrame::parse_line(&line)
             else {
+                tracing::debug!(line = %line, "ignoring a non-control line on stdin");
                 continue;
             };
             let request_id = &frame.response.request_id;
