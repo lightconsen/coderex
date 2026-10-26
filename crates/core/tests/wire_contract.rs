@@ -17,7 +17,21 @@ fn expected_keys() -> HashMap<&'static str, &'static [&'static str]> {
         ("tool_call_end", &["type", "id", "result"][..]),
         ("mod_ui", &["type", "elements"][..]),
         ("compact_boundary", &["type"][..]),
+        (
+            "compaction",
+            &[
+                "type",
+                "kind",
+                "strategy",
+                "trigger",
+                "tokens_removed",
+                "messages_remaining",
+            ][..],
+        ),
         ("permission_request", &["type", "id", "tool", "args"][..]),
+        ("elicitation_request", &["type", "id", "message"][..]),
+        ("elevation_request", &["type", "id", "tool", "reason"][..]),
+        ("agent_event", &["type", "agent_id", "event"][..]),
         (
             "usage_summary",
             &[
@@ -99,4 +113,34 @@ fn raw_renderer_fields_are_dropped_by_the_projection() {
 fn an_unknown_event_type_is_rejected() {
     let result = serde_json::from_str::<WireEvent>(r#"{"type":"not_an_event"}"#);
     assert!(result.is_err());
+}
+
+#[test]
+fn every_wire_request_round_trips() {
+    use coderex_core::wire_protocol::WireRequest;
+
+    for line in [
+        r#"{"type":"submit","prompt":"hello"}"#,
+        r#"{"type":"submit","prompt":"hello","system_prompt":"be terse","max_turns":2}"#,
+        r#"{"type":"permission_response","id":"p_1","granted":true}"#,
+        r#"{"type":"elicitation_response","id":"e_1","response":"Ada"}"#,
+        r#"{"type":"elevation_response","id":"el_1","granted":false}"#,
+        r#"{"type":"interrupt"}"#,
+    ] {
+        let value: serde_json::Value = serde_json::from_str(line).expect("json");
+        let request: WireRequest =
+            serde_json::from_value(value.clone()).unwrap_or_else(|error| panic!("{error}\n{line}"));
+        assert_eq!(
+            serde_json::to_value(&request).expect("serialize"),
+            value,
+            "round trip changed {line}"
+        );
+    }
+}
+
+#[test]
+fn an_unknown_request_type_is_rejected() {
+    use coderex_core::wire_protocol::WireRequest;
+
+    assert!(serde_json::from_str::<WireRequest>(r#"{"type":"reboot"}"#).is_err());
 }

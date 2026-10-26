@@ -1608,6 +1608,19 @@ impl QueryEngine {
         }
     }
 
+    /// Replace the most recent user text message in `messages`.
+    fn replace_last_user_text(messages: &mut [Message], updated: &str) -> bool {
+        for message in messages.iter_mut().rev() {
+            if message.role == crate::types::Role::User
+                && let crate::types::MessageContent::Text(text) = &mut message.content
+            {
+                *text = updated.to_string();
+                return true;
+            }
+        }
+        false
+    }
+
     fn provider_messages(messages: &[Message]) -> Vec<serde_json::Value> {
         // Thinking is not a message of its own: it is the first block of the
         // assistant turn that follows it. Hold it until that turn arrives.
@@ -2787,6 +2800,13 @@ impl QueryEngine {
                 .await);
         }
 
+        // `updatedInput` replaces the submitted prompt before it reaches the
+        // provider. The hook's input was the original, so a hook can normalise
+        // or redact what the model sees without changing the visible history.
+        if let Some(updated) = hook_result.updated_input.as_deref() {
+            self.apply_updated_prompt(turn, updated);
+        }
+
         // The prompt cache may have gone cold while this session sat idle:
         // the cheapest moment to compact is just before a request that is
         // going to miss the cache anyway.
@@ -3099,6 +3119,13 @@ impl QueryEngine {
                     TerminalReason::Completed,
                 )
                 .await);
+        }
+
+        // `updatedInput` replaces the submitted prompt before it reaches the
+        // provider. The hook's input was the original, so a hook can normalise
+        // or redact what the model sees without changing the visible history.
+        if let Some(updated) = hook_result.updated_input.as_deref() {
+            self.apply_updated_prompt(turn, updated);
         }
 
         // The prompt cache may have gone cold while this session sat idle:
@@ -3560,6 +3587,18 @@ impl QueryEngine {
                 _ => None,
             })
             .unwrap_or_default()
+    }
+
+    /// Replace the prompt the user just submitted with a hook's
+    /// `updatedInput`.
+    ///
+    /// The prompt is already in the session and, because `build_context` runs
+    /// before the pre-submit hook, in this turn's request snapshot. Both are
+    /// updated so the model sees the replacement and later turns keep it.
+    fn apply_updated_prompt(&mut self, turn: &mut TurnRuntime, updated: &str) {
+        if Self::replace_last_user_text(&mut self.session.messages, updated) {
+            Self::replace_last_user_text(&mut turn.messages, updated);
+        }
     }
 
     fn build_context(&mut self, turn: &mut TurnRuntime, options: &SubmitOptions) {

@@ -12,3 +12,8 @@
 {"type":"notification","message":"hi"}
 {"type":"permission_explanation","tool":"Bash","explanation":"runs ls"}
 {"type":"stream_interrupted","reason":"error","partial_len":5,"will_retry":true}
+{"type":"compaction","kind":"compacted","strategy":"auto","trigger":"threshold","tokens_removed":1000,"messages_remaining":4}
+{"type":"elicitation_request","id":"e_1","message":"Pick a name"}
+{"type":"elevation_request","id":"el_1","tool":"Bash","reason":"needs sudo"}
+{"type":"agent_event","agent_id":"a_1","event":"Started"}
+{"type":"agent_event","agent_id":"a_1","event":{"Completed":{"summary":"done"}}}
