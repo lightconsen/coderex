@@ -34,11 +34,20 @@ for line in sys.stdin:
             "name": "echo",
             "description": "Echo the text",
             "inputSchema": {"type": "object", "properties": {"text": {"type": "string"}}}
+        }, {
+            "name": "verdict",
+            "description": "Refuse the action under review",
+            "inputSchema": {"type": "object", "properties": {}}
         }]}}), flush=True)
     elif method == "tools/call":
         arguments = (request.get("params") or {}).get("arguments") or {}
+        name = (request.get("params") or {}).get("name")
+        if name == "verdict":
+            text = json.dumps({"action": "stop"})
+        else:
+            text = "mock-echo:" + str(arguments.get("text", ""))
         print(json.dumps({"jsonrpc": "2.0", "id": rid, "result": {
-            "content": [{"type": "text", "text": "mock-echo:" + str(arguments.get("text", ""))}],
+            "content": [{"type": "text", "text": text}],
             "isError": False
         }}), flush=True)
     else:
@@ -197,4 +206,83 @@ fn the_ide_flag_connects_to_the_named_mcp_server() {
     let _ = provider.wait();
     assert_echoed(&output);
     let _ = std::fs::remove_file(&script);
+}
+
+/// An `mcp_tool` PreToolUse hook asks the configured MCP server and applies
+/// its JSON answer: the verdict refuses the Write.
+#[test]
+fn an_mcp_tool_hook_can_block_the_tool() {
+    let dir = tempfile::tempdir().expect("workspace");
+    let script = write_mock_server();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(
+        dir.path().join("src/lib.rs"),
+        "pub fn add(a: i32, b: i32) -> i32 { a + b }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join(".mcp.json"),
+        serde_json::json!({
+            "mcpServers": {
+                "mock": {"command": script.to_str().unwrap(), "args": []}
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let config_home = tempfile::tempdir().expect("config home");
+    std::fs::write(
+        config_home.path().join("settings.json"),
+        serde_json::json!({
+            "config_version": 4,
+            "telemetry_enabled": false,
+            "hooks": [{
+                "event": "PreToolUse",
+                "type": "mcp_tool",
+                "if": "Write(*)",
+                "server": "mock",
+                "tool": "verdict",
+                "input": {},
+                "timeout_ms": 10000
+            }]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let (mut provider, base_url) = start_static_provider();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_coderex"))
+        .args(["-p", "--dangerously-skip-permissions"])
+        .current_dir(dir.path())
+        .env("ANTHROPIC_API_KEY", "mock")
+        .env("ANTHROPIC_BASE_URL", &base_url)
+        .env("ANTHROPIC_MODEL", "claude-sonnet-4-6")
+        .env("CLAUDE_CONFIG_DIR", config_home.path())
+        .env("CODEREX_LOG", "off")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn coderex");
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(b"add a recursive fibonacci function to src/lib.rs with unit tests\n")
+        .expect("write prompt");
+    let output = child.wait_with_output().expect("wait");
+
+    let _ = provider.kill();
+    let _ = provider.wait();
+    let _ = std::fs::remove_file(&script);
+    assert!(
+        output.status.success(),
+        "coderex failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let content = std::fs::read_to_string(dir.path().join("src/lib.rs")).unwrap();
+    assert!(
+        !content.contains("fibonacci"),
+        "an mcp_tool hook that answered stop let the write through:\n{content}"
+    );
 }
