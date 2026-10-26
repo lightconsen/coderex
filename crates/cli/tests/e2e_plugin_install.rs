@@ -222,3 +222,112 @@ fn an_installed_plugin_process_serves_its_slash_command() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+fn run_with_key(
+    cwd: &Path,
+    home: &Path,
+    args: &[&str],
+    key: &str,
+    base_url: &str,
+) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_coderex"))
+        .args(args)
+        .current_dir(cwd)
+        .env("ANTHROPIC_API_KEY", "mock")
+        .env("ANTHROPIC_BASE_URL", base_url)
+        .env("ANTHROPIC_MODEL", "claude-sonnet-4-6")
+        .env("CLAUDE_CONFIG_DIR", home)
+        .env("HOME", home)
+        .env("CODEREX_LOG", "off")
+        .env("CODEREX_PLUGIN_PUBLIC_KEY", key)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("run coderex")
+}
+
+/// A directory has no archive signature, so a configured signing key accepts
+/// it only when trust-on-first-use already pinned those exact contents.
+#[test]
+fn a_signing_key_enforces_the_trust_on_first_use_pin() {
+    const KEY: &str = "0707070707070707070707070707070707070707070707070707070707070707";
+
+    let workspace = tempfile::tempdir().expect("workspace");
+    let home = tempfile::tempdir().expect("home");
+    std::fs::write(
+        home.path().join("settings.json"),
+        r#"{"config_version": 4, "telemetry_enabled": false}"#,
+    )
+    .expect("settings");
+    let source = write_plugin_source(workspace.path());
+    let (mut provider, base_url) = start_static_provider();
+    let plugin_dir = workspace.path().join(".coderex/plugins/mock-plugin");
+    let pins = workspace.path().join(".coderex/plugins/.coderex-pins.json");
+
+    // No key: the install is unverified, and it records what it got.
+    let first = run(
+        workspace.path(),
+        home.path(),
+        &["plugin", "install", source.to_str().unwrap()],
+        None,
+        &base_url,
+    );
+    assert!(
+        String::from_utf8_lossy(&first.stdout).contains("Plugin installed to:"),
+        "the unkeyed install failed: {}\n{}",
+        String::from_utf8_lossy(&first.stdout),
+        String::from_utf8_lossy(&first.stderr)
+    );
+    assert!(pins.exists(), "no trust-on-first-use pin was recorded");
+    std::fs::remove_dir_all(&plugin_dir).expect("remove the installed copy");
+
+    // The same contents are accepted with a key configured.
+    let matching = run_with_key(
+        workspace.path(),
+        home.path(),
+        &["plugin", "install", source.to_str().unwrap()],
+        KEY,
+        &base_url,
+    );
+    assert!(
+        String::from_utf8_lossy(&matching.stdout).contains("Plugin installed to:"),
+        "the keyed install of the pinned contents failed: {}\n{}",
+        String::from_utf8_lossy(&matching.stdout),
+        String::from_utf8_lossy(&matching.stderr)
+    );
+    std::fs::remove_dir_all(&plugin_dir).expect("remove the installed copy");
+
+    // Changed contents no longer match the pin: refuse rather than replace.
+    let mut script = std::fs::read_to_string(source.join("bin/plugin")).unwrap();
+    script.push_str("\n# changed after the pin\n");
+    std::fs::write(source.join("bin/plugin"), script).unwrap();
+    let changed = run_with_key(
+        workspace.path(),
+        home.path(),
+        &["plugin", "install", source.to_str().unwrap()],
+        KEY,
+        &base_url,
+    );
+
+    let _ = provider.kill();
+    let _ = provider.wait();
+    assert!(
+        !changed.status.success(),
+        "changed contents were installed over the pin: {}",
+        String::from_utf8_lossy(&changed.stdout)
+    );
+    let message = format!(
+        "{}{}",
+        String::from_utf8_lossy(&changed.stdout),
+        String::from_utf8_lossy(&changed.stderr)
+    );
+    assert!(
+        message.contains("does not match") || message.contains("pinned"),
+        "the refusal does not explain the pin: {message}"
+    );
+    assert!(
+        !plugin_dir.exists(),
+        "a refused install left a plugin directory behind"
+    );
+}

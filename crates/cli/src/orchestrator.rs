@@ -3563,7 +3563,13 @@ impl StartupOrchestrator {
                 };
                 match result {
                     Ok(path) => println!("Plugin installed to: {}", path.display()),
-                    Err(e) => println!("Installation failed: {e}"),
+                    // A failed install must not exit 0: scripts and CI read
+                    // the status, and a refusal that reports success is a
+                    // refusal nobody acts on.
+                    Err(e) => {
+                        println!("Installation failed: {e}");
+                        return Err(anyhow::anyhow!("plugin install failed: {e}"));
+                    }
                 }
             }
             Some(crate::cli::PluginAction::Uninstall { name }) => {
