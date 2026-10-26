@@ -399,3 +399,60 @@ fn prescan_rejects_pathological_module_before_compiling() {
         "the compiler must not be invoked for a module the pre-scan rejected"
     );
 }
+
+/// The compiler child gets a minimal environment: the host's variables — an
+/// API key, say — do not leak into it. The wrapper dumps what it actually
+/// received, then runs the real helper so the compile still succeeds.
+#[test]
+fn the_compiler_child_does_not_inherit_host_secrets() {
+    let _guard = env_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let input = write_module(dir.path(), "plugin.wat", NORMAL_MODULE);
+    let dump = dir.path().join("child.env");
+    let wrapper = dir.path().join("dump-env.sh");
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\nenv > {}\nexec {} \"$@\"\n",
+            dump.display(),
+            helper_binary()
+        ),
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(&wrapper).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&wrapper, permissions).unwrap();
+    }
+
+    set_env("CODEREX_TEST_HOST_SECRET", "hunter2-should-not-leak");
+    set_env(NO_SANDBOX_ENV, "1");
+    let result = load_with(
+        &input,
+        Some(
+            WasmCompilerCommand::new("/bin/sh")
+                .arg("-c")
+                .arg(format!(
+                    "env > {}; exec {} \"$@\"",
+                    dump.display(),
+                    helper_binary()
+                ))
+                .arg("sh"),
+        ),
+        dir.path(),
+    );
+    remove_env("CODEREX_TEST_HOST_SECRET");
+    remove_env(NO_SANDBOX_ENV);
+
+    result.expect("the wrapper compiles through the real helper");
+    let observed = std::fs::read_to_string(&dump).expect("the wrapper dumped its environment");
+    assert!(
+        !observed.contains("hunter2-should-not-leak"),
+        "a host variable reached the compiler child:\n{observed}"
+    );
+    assert!(
+        observed.lines().any(|line| line.starts_with("PATH=")),
+        "PATH is the one variable the compiler needs:\n{observed}"
+    );
+}

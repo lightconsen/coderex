@@ -67,7 +67,24 @@ const fn style_marker(style: &str) -> &'static str {
     }
 }
 
+/// Clip one line to the panel width, marking the cut with an ellipsis.
+///
+/// Padding alone would let a long line poke through the right border, so the
+/// panel would no longer be a panel. The marker keeps the loss visible.
+fn clip_line(line: &str) -> String {
+    if line.chars().count() <= MAX_PANEL_WIDTH {
+        return line.to_string();
+    }
+    let mut clipped: String = line
+        .chars()
+        .take(MAX_PANEL_WIDTH.saturating_sub(1))
+        .collect();
+    clipped.push('…');
+    clipped
+}
+
 fn render_panel(style: &str, title: &str, lines: &[String]) -> String {
+    let lines: Vec<String> = lines.iter().map(|line| clip_line(line)).collect();
     let heading = format!("{}{title}", style_marker(style));
     let widest = lines
         .iter()
@@ -80,7 +97,7 @@ fn render_panel(style: &str, title: &str, lines: &[String]) -> String {
     let top = if heading.is_empty() {
         format!("╭{}╮", "─".repeat(width + 2))
     } else {
-        let rule = (width + 2).saturating_sub(heading.chars().count() + 2);
+        let rule = (width + 1).saturating_sub(heading.chars().count() + 2);
         format!("╭─ {heading} {}╮", "─".repeat(rule))
     };
 
@@ -90,7 +107,7 @@ fn render_panel(style: &str, title: &str, lines: &[String]) -> String {
         let padding = width.saturating_sub(line.chars().count());
         out.push('\n');
         out.push_str("│ ");
-        out.push_str(line);
+        out.push_str(&line);
         out.push_str(&" ".repeat(padding));
         out.push_str(" │");
     }
