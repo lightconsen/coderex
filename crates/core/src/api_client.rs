@@ -269,9 +269,17 @@ pub struct TransportFacts {
 /// a body that failed after a response arrived is a stream failure rather
 /// than a connect failure.
 #[must_use]
-pub const fn classify_transport_facts(facts: TransportFacts) -> ErrorClass {
+pub fn classify_transport_facts(facts: TransportFacts) -> ErrorClass {
     if facts.timeout {
         return ErrorClass::Timeout;
+    }
+    // A response body cut before its declared end is a stream failure, not a
+    // decode failure: the bytes were valid, there were just fewer of them.
+    // The HTTP client reports it as `decode` with an `UnexpectedEof` at the
+    // bottom; classifying that as `Decode` made every cut stream
+    // non-retryable and left the mid-stream recovery path unreachable.
+    if (facts.body || facts.decode) && facts.io_kind == Some(std::io::ErrorKind::UnexpectedEof) {
+        return ErrorClass::Stream;
     }
     if facts.decode {
         return ErrorClass::Decode;
@@ -372,14 +380,20 @@ pub fn retry_backoff_for(attempt: u32, base: Duration, triage: &ErrorTriage) -> 
 impl From<reqwest::Error> for ApiError {
     fn from(e: reqwest::Error) -> Self {
         // Asked of the error itself rather than read out of its message.
-        let class = classify_transport_facts(TransportFacts {
+        let facts = TransportFacts {
             timeout: e.is_timeout(),
             body: e.is_body(),
             decode: e.is_decode(),
             connect: e.is_connect(),
             request: e.is_request(),
             io_kind: io_error_kind(&e),
-        });
+        };
+        tracing::debug!(
+            ?facts,
+            message = %e,
+            "classified a transport failure"
+        );
+        let class = classify_transport_facts(facts);
         Self::Transport {
             kind: class.transport_kind(),
             class,
@@ -2767,6 +2781,18 @@ mod tests {
             classify_transport_facts(TransportFacts::default()),
             ErrorClass::Unknown
         );
+    }
+
+    /// A body cut short reports `decode` + `UnexpectedEof`; that is a stream
+    /// failure, and retryable, not a decode failure.
+    #[test]
+    fn a_cut_stream_is_retryable_even_though_the_client_calls_it_decode() {
+        let facts = TransportFacts {
+            decode: true,
+            io_kind: Some(std::io::ErrorKind::UnexpectedEof),
+            ..TransportFacts::default()
+        };
+        assert_eq!(classify_transport_facts(facts), ErrorClass::Stream);
     }
 
     /// A permanent failure must not be retried, and the class must not be

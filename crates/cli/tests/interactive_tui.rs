@@ -1282,6 +1282,71 @@ fn a_background_subagent_cannot_run_shell_tools() {
 /// Compaction with a real summary: five turns exceed a small window, the
 /// session is summarized, the pre-compaction transcript is backed up, and the
 /// next request carries the `<context_summary>` handoff.
+/// The idle statusline shows the model, token count, cost and git branch.
+#[test]
+fn the_statusline_shows_model_tokens_cost_and_branch() {
+    let dir = setup_git_project_dir();
+    let branch = String::from_utf8(
+        Command::new("git")
+            .args(["branch", "--show-current"])
+            .current_dir(dir.path())
+            .output()
+            .expect("git branch")
+            .stdout,
+    )
+    .expect("branch utf8");
+    let branch = branch.trim().to_string();
+    assert!(!branch.is_empty(), "the fixture has no branch");
+
+    let (_server, mut session) = session_with_static_server(dir.path());
+    session.wait_for_text("CodeRex v", SCREEN_TIMEOUT);
+    let screen = session.wait_for_text("tok:0,", SCREEN_TIMEOUT);
+    assert!(screen.contains("K2.6"), "model segment missing:\n{screen}");
+    assert!(screen.contains("$0.00"), "cost segment missing:\n{screen}");
+    assert!(
+        screen.contains(&branch),
+        "branch {branch} missing from the statusline:\n{screen}"
+    );
+}
+
+/// A terminal that speaks the kitty keyboard protocol is asked to disambiguate
+/// keys on entry and restored on exit.
+#[test]
+fn a_supported_terminal_gets_the_keyboard_protocol_push_and_pop() {
+    let dir = setup_project_dir();
+    let (_server, mut session) =
+        session_with_static_server_envs(dir.path(), &[("TERM_PROGRAM", "ghostty")]);
+    let _ = session.wait_for_text("CodeRex v", SCREEN_TIMEOUT);
+    assert!(
+        session.raw_text().contains("\u{1b}[>1u"),
+        "the keyboard protocol was not pushed"
+    );
+    session.send_line("/exit");
+    session.wait_for_exit(Duration::from_secs(10));
+    assert!(
+        session.raw_text().contains("\u{1b}[<1u"),
+        "the keyboard protocol was not popped on exit"
+    );
+}
+
+/// The explicit opt-out leaves the terminal's legacy encoding alone.
+#[test]
+fn the_keyboard_protocol_opt_out_pushes_nothing() {
+    let dir = setup_project_dir();
+    let (_server, mut session) = session_with_static_server_envs(
+        dir.path(),
+        &[
+            ("TERM_PROGRAM", "ghostty"),
+            ("CODEREX_KEYBOARD_PROTOCOL", "legacy"),
+        ],
+    );
+    let _ = session.wait_for_text("CodeRex v", SCREEN_TIMEOUT);
+    assert!(
+        !session.raw_text().contains("\u{1b}[>1u"),
+        "legacy mode pushed the keyboard protocol anyway"
+    );
+}
+
 #[test]
 fn a_compacted_session_backs_up_and_summarizes() {
     let dir = setup_project_dir();
