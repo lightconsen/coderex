@@ -393,9 +393,19 @@ impl JsonRpcChannel {
     }
 
     /// Hand a notification to the installed sink.
-    async fn dispatch_notification(&self, method: &str, params: Option<&Value>) {
+    ///
+    /// The handler runs on its own task: a notification such as
+    /// `prompts/list_changed` makes the manager re-discover over this same
+    /// channel, which means taking the channel again. Awaiting the handler here
+    /// would deadlock on the lock this read loop already holds.
+    fn dispatch_notification(&self, method: &str, params: Option<&Value>) {
         if let Some(handler) = &self.notification_handler {
-            handler.handle_notification(method, params).await;
+            let handler = std::sync::Arc::clone(handler);
+            let method = method.to_string();
+            let params = params.cloned();
+            tokio::spawn(async move {
+                handler.handle_notification(&method, params.as_ref()).await;
+            });
         } else {
             tracing::debug!(
                 server = %self.command,
@@ -822,8 +832,7 @@ impl JsonRpcChannel {
                 // manager to re-discover tools or invalidate a cached resource.
                 (true, false) => {
                     let method = value.get("method").and_then(Value::as_str).unwrap_or("");
-                    self.dispatch_notification(method, value.get("params"))
-                        .await;
+                    self.dispatch_notification(method, value.get("params"));
                     continue;
                 }
                 (false, true) => {}
