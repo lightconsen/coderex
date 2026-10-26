@@ -275,20 +275,56 @@ pub type EngineFactory = Arc<
         + Sync,
 >;
 
+/// One session's engine and its event receiver.
+///
+/// Kept for the life of the session so a second query sees the first
+/// exchange; a fresh engine per query would silently drop the conversation.
+struct SessionEngine {
+    engine: QueryEngine,
+    events: tokio::sync::mpsc::UnboundedReceiver<EngineEvent>,
+}
+
+/// A session's engine, shared with the task running its query.
+#[derive(Clone)]
+struct SessionEngineSlot {
+    engine: Arc<tokio::sync::Mutex<SessionEngine>>,
+    interrupt: coderex_core::engine::InterruptHandle,
+}
+
+impl std::fmt::Debug for SessionEngineSlot {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("SessionEngineSlot")
+    }
+}
+
 /// The state every connection shares.
 ///
 /// Behind a synchronous lock on purpose: it is only ever held for the short
 /// bookkeeping a message needs, never across an `await`, and a guard that is
 /// not `Send` makes the compiler enforce that in the tasks that serve
 /// connections.
-#[derive(Debug, Default)]
+#[derive(Default)]
 struct Shared {
     /// Active sessions.
     sessions: HashMap<String, Session>,
+    /// Engines kept alive for the life of a session, keyed by session id.
+    engines: HashMap<String, SessionEngineSlot>,
     /// Optional SQLite session store for persistence.
     store: Option<crate::persistence::SessionStore>,
     /// Monotonic source of session ids.
     next_session_id: u64,
+}
+
+impl std::fmt::Debug for Shared {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Shared")
+            .field("sessions", &self.sessions.len())
+            .field("engines", &self.engines.len())
+            .field("has_store", &self.store.is_some())
+            .field("next_session_id", &self.next_session_id)
+            .finish()
+    }
 }
 
 /// The numeric part of a `sess_N` id, if it has one.
@@ -379,11 +415,15 @@ impl Shared {
                 true
             }
         });
+        for id in &removed {
+            self.engines.remove(id);
+        }
         removed
     }
 
     /// End a session, in memory and in the store.
     fn disconnect(&mut self, session_id: &str) -> bool {
+        self.engines.remove(session_id);
         let removed = self.sessions.remove(session_id).is_some();
         if removed {
             if let Some(ref mut store) = self.store {
@@ -725,42 +765,77 @@ impl Connection {
                     ));
                 };
 
-                let (mut engine, mut events) = factory();
-                let handle = engine.interrupt_handle();
-                running_queries.insert(session_id.to_string(), handle);
+                // One engine per session: a fresh engine for every query
+                // would drop the conversation between messages. The engine is
+                // kept behind an async lock, which also serialises queries on
+                // one session (a turn needs `&mut`).
+                let slot = {
+                    let mut shared = self.shared.lock();
+                    if let Some(slot) = shared.engines.get(session_id) {
+                        slot.clone()
+                    } else {
+                        let (engine, events) = factory();
+                        let slot = SessionEngineSlot {
+                            interrupt: engine.interrupt_handle(),
+                            engine: Arc::new(tokio::sync::Mutex::new(SessionEngine {
+                                engine,
+                                events,
+                            })),
+                        };
+                        shared.engines.insert(session_id.to_string(), slot.clone());
+                        slot
+                    }
+                };
+                running_queries.insert(session_id.to_string(), slot.interrupt.clone());
 
                 let id = req.id.clone();
                 let out = out.clone();
-                let session = session_id.to_string();
                 tokio::spawn(async move {
-                    // The answer streams while the query runs, so the events
-                    // are pumped on their own task.
-                    let pump_id = id.clone();
-                    let pump_out = out.clone();
-                    let pump = tokio::spawn(async move {
-                        while let Some(event) = events.recv().await {
-                            if let EngineEvent::TextDelta(chunk) = event {
-                                let frame = WsResponse {
-                                    id: pump_id.clone(),
-                                    kind: WsResponseKind::StreamChunk { chunk },
-                                };
-                                if let Ok(json) = serde_json::to_string(&frame) {
-                                    if pump_out.send(json).is_err() {
-                                        break;
+                    let mut guard = slot.engine.lock().await;
+                    let SessionEngine { engine, events } = &mut *guard;
+
+                    // Pump the answer while the turn runs, in this task, so
+                    // the receiver stays with the engine for the next query.
+                    let result = {
+                        let submit = engine.submit_streaming(content, SubmitOptions::default());
+                        tokio::pin!(submit);
+                        loop {
+                            tokio::select! {
+                                Some(event) = events.recv() => {
+                                    if let EngineEvent::TextDelta(chunk) = event {
+                                        let frame = WsResponse {
+                                            id: id.clone(),
+                                            kind: WsResponseKind::StreamChunk { chunk },
+                                        };
+                                        if let Ok(json) = serde_json::to_string(&frame) {
+                                            if out.send(json).is_err() {
+                                                // The client is gone; the
+                                                // connection loop will interrupt
+                                                // the turn on disconnect.
+                                                break Err("client disconnected".to_string());
+                                            }
+                                        }
                                     }
                                 }
+                                result = &mut submit => break result,
                             }
                         }
-                    });
+                    };
 
-                    let result = engine
-                        .submit_streaming(content, SubmitOptions::default())
-                        .await;
-
-                    // Dropping the engine closes the event channel, which ends
-                    // the pump.
-                    drop(engine);
-                    let _ = pump.await;
+                    // Forward chunks that were queued after the turn future
+                    // completed, then release the engine for the next query.
+                    while let Ok(event) = events.try_recv() {
+                        if let EngineEvent::TextDelta(chunk) = event {
+                            let frame = WsResponse {
+                                id: id.clone(),
+                                kind: WsResponseKind::StreamChunk { chunk },
+                            };
+                            if let Ok(json) = serde_json::to_string(&frame) {
+                                let _ = out.send(json);
+                            }
+                        }
+                    }
+                    drop(guard);
 
                     let frame = match result {
                         Ok(reason) => WsResponse {
@@ -776,7 +851,6 @@ impl Connection {
                     }
                     // The handle stays until the session ends: `Interrupt`
                     // needs to find it while the query is in flight.
-                    let _ = session;
                 });
 
                 None

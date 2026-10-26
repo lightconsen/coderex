@@ -447,6 +447,138 @@ async fn structured_io_query_request_response() {
     assert_eq!(answer, "the scripted answer", "the streamed answer");
 }
 
+/// Ported from qwen-code's channel-plugin contract: messages on one session
+/// share that session's history, while a second session starts clean. The
+/// scripted model reports how many provider messages it received, so the
+/// assertion is about what the server actually sent, not about echoed text.
+#[tokio::test]
+async fn a_session_reuses_its_history_and_a_new_session_starts_clean() {
+    struct HistoryEcho;
+
+    #[async_trait::async_trait]
+    impl coderex_core::api_client::ApiClient for HistoryEcho {
+        fn clone_box(&self) -> Box<dyn coderex_core::api_client::ApiClient> {
+            Box::new(HistoryEcho)
+        }
+
+        async fn create_message(
+            &self,
+            _system: &str,
+            messages: &[serde_json::Value],
+            _model: &coderex_core::types::ModelId,
+            _max_tokens: u32,
+            _tools: &[coderex_core::tool_executor::ToolInfo],
+        ) -> Result<coderex_core::api_client::ApiResponse, coderex_core::api_client::ApiError>
+        {
+            Ok(coderex_core::api_client::ApiResponse {
+                content: format!("history={}", messages.len()),
+                tool_calls: Vec::new(),
+                thinking: None,
+                usage: coderex_core::types::UsageSummary::default(),
+                stop_reason: "end_turn".into(),
+            })
+        }
+
+        async fn create_message_streaming(
+            &self,
+            system: &str,
+            messages: &[serde_json::Value],
+            model: &coderex_core::types::ModelId,
+            max_tokens: u32,
+            tools: &[coderex_core::tool_executor::ToolInfo],
+        ) -> std::pin::Pin<
+            Box<dyn futures::Stream<Item = coderex_core::api_client::StreamEvent> + Send + 'static>,
+        > {
+            let response = self
+                .create_message(system, messages, model, max_tokens, tools)
+                .await
+                .expect("history echo answers");
+            Box::pin(futures::stream::iter(vec![
+                coderex_core::api_client::StreamEvent::TextDelta(response.content),
+                coderex_core::api_client::StreamEvent::StopReason(response.stop_reason),
+                coderex_core::api_client::StreamEvent::StreamEnd,
+            ]))
+        }
+    }
+
+    let config = ServerConfig {
+        valid_keys: vec!["key".into()],
+        idle_timeout: Duration::from_secs(3600),
+        max_sessions: 10,
+        rate_limit_per_minute: 100,
+        health_port: None,
+        persist_path: None,
+        allow_anonymous: false,
+    };
+    let factory: coderex_server::session::EngineFactory = std::sync::Arc::new(|| {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut engine = coderex_core::engine::QueryEngine::new(
+            Box::new(HistoryEcho),
+            coderex_core::types::ModelId::sonnet(),
+            coderex_core::state::SessionState::new(std::path::PathBuf::from("/tmp")),
+            coderex_core::permission_engine::PermissionEngine::new(
+                coderex_core::permissions::PermissionChecker::new(
+                    coderex_core::permissions::PermissionMode::BypassPermissions,
+                ),
+            ),
+            tx,
+        );
+        engine.set_tool_executor(Box::new(coderex_core::tool_executor::NoOpToolExecutor));
+        (engine, rx)
+    });
+    let addr = start_server_with_factory(config, factory).await;
+
+    async fn ask(
+        ws: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+        id: &str,
+        content: &str,
+    ) -> String {
+        ws_send_json(
+            ws,
+            &serde_json::json!({"id": id, "type": "query", "content": content}),
+        )
+        .await;
+        let mut answer = String::new();
+        loop {
+            let text = ws_recv_text(ws).await;
+            let frame: serde_json::Value = serde_json::from_str(&text).unwrap();
+            match frame.get("type").and_then(|value| value.as_str()) {
+                Some("stream_chunk") => {
+                    answer.push_str(frame.get("chunk").and_then(|v| v.as_str()).unwrap_or(""));
+                }
+                Some("query_done") => break,
+                other => panic!("unexpected frame: {other:?} ({text})"),
+            }
+        }
+        answer
+    }
+
+    let mut first = ws_connect(addr).await;
+    let _sid = ws_auth(&mut first, "key").await;
+    assert_eq!(
+        ask(&mut first, "q1", "remember pineapple").await,
+        "history=1"
+    );
+    assert_eq!(
+        ask(&mut first, "q2", "what fruit?").await,
+        "history=3",
+        "the second query must carry the first exchange"
+    );
+
+    // The server accepts one connection at a time; release the first before
+    // opening the second session.
+    drop(first);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let mut second = ws_connect(addr).await;
+    let _sid = ws_auth(&mut second, "key").await;
+    assert_eq!(
+        ask(&mut second, "q3", "what fruit?").await,
+        "history=1",
+        "a new session must not inherit another session's history"
+    );
+}
+
 /// A query still running when the connection goes away is stopped: nothing is
 /// listening for its answer, and it would keep using the account otherwise.
 #[tokio::test]
