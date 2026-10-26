@@ -2912,6 +2912,7 @@ const HOST_UI_API: &str = r#"
   Object.freeze(ui);
   $.ui = ui;
 })();
+Object.freeze($.session.surfaceCapabilities);
 Object.freeze($.session);
 Object.freeze($);
 "#;

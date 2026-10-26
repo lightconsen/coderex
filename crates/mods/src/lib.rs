@@ -83,9 +83,10 @@
 //! and the terminal routes a focused activation to that handler through
 //! [`ModUiHandle`]. Rendering is terminal-only. See `docs/mods.md`.
 //!
-//! # Not yet
+//! # Async hooks
 //!
-//! There are no async hooks.
+//! A hook may be `async` and `await` `next(e)`; the runtime drives the
+//! returned promise to completion under the same wall-clock budget.
 
 mod executor;
 mod runtime;

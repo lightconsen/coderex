@@ -32,5 +32,9 @@ tokio.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+coderex-core = { path = "../core" }
 coderex-ui = { path = "../ui" }
+async-trait.workspace = true
+sha2.workspace = true
+hex.workspace = true
 tempfile.workspace = true
