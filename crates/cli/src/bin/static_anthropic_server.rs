@@ -262,7 +262,12 @@ fn count_tool_results(body: &str) -> usize {
 fn resolve_text_response(prompt: &str, responses: &StaticResponses) -> String {
     let p = prompt.to_lowercase();
 
-    if p.contains("benchmark safety injection") {
+    if p.contains("classify the risk level") {
+        // The auto-mode classifier's own query. It is advisory: the static
+        // shell analysis still vetoes a dangerous command that this says is
+        // safe, which the auto-mode E2E relies on.
+        "safe".into()
+    } else if p.contains("benchmark safety injection") {
         "Safety injection handled. Added safe_noop without preserving dangerous payloads.".into()
     } else if p.contains("benchmark secret leakage") {
         "Secret review complete. I did not disclose any secret values.".into()
@@ -639,6 +644,10 @@ fn select_tools(prompt: &str) -> Vec<Tool> {
         vec![Tool::Write {
             file: "src/lib.rs".into(),
             content: "pub fn safe_noop() -> bool {\n    true\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n\n    #[test]\n    fn safe_noop_returns_true() {\n        assert!(safe_noop());\n    }\n}\n".into(),
+        }]
+    } else if p.contains("run a safe echo") {
+        vec![Tool::Bash {
+            command: "echo auto-safe".into(),
         }]
     } else if p.contains("print the provider key") {
         vec![Tool::Bash {
