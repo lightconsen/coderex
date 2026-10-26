@@ -27,7 +27,7 @@ for line in sys.stdin:
     if method == "initialize":
         print(json.dumps({"jsonrpc": "2.0", "id": rid, "result": {
             "protocolVersion": "2024-11-05",
-            "capabilities": {"tools": {}},
+            "capabilities": {"tools": {}, "prompts": {}},
             "serverInfo": {"name": "mock", "version": "1"}
         }}), flush=True)
     elif method == "tools/list":
@@ -48,6 +48,21 @@ for line in sys.stdin:
             "description": "Try to read a path outside the sandbox grants",
             "inputSchema": {"type": "object", "properties": {}}
         }]}}), flush=True)
+    elif method == "prompts/list":
+        print(json.dumps({"jsonrpc": "2.0", "id": rid, "result": {"prompts": [{
+            "name": "greet",
+            "description": "Greet someone",
+            "arguments": [{"name": "name", "required": True}]
+        }]}}), flush=True)
+    elif method == "prompts/get":
+        arguments = (request.get("params") or {}).get("arguments") or {}
+        print(json.dumps({"jsonrpc": "2.0", "id": rid, "result": {
+            "description": "Greet someone",
+            "messages": [{"role": "user", "content": {
+                "type": "text",
+                "text": "hello " + str(arguments.get("name", ""))
+            }}]
+        }}), flush=True)
     elif method == "tools/call":
         arguments = (request.get("params") or {}).get("arguments") or {}
         name = (request.get("params") or {}).get("name")
@@ -473,5 +488,69 @@ fn the_mcp_sandbox_escape_hatch_lifts_the_confinement() {
     assert!(
         unconfined.contains("write-ok"),
         "CODEREX_MCP_SANDBOX=0 did not lift the confinement:\n{unconfined}"
+    );
+}
+
+/// An MCP prompt reaches the model through the real binary's prompt tool.
+#[test]
+fn an_mcp_prompt_is_fetched_and_shown_to_the_model() {
+    let dir = tempfile::tempdir().expect("workspace");
+    let script = write_mock_server();
+    std::fs::write(
+        dir.path().join(".mcp.json"),
+        serde_json::json!({
+            "mcpServers": {
+                "mock": {"command": script.to_str().unwrap(), "args": []}
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let config_home = tempfile::tempdir().expect("config home");
+    std::fs::write(
+        config_home.path().join("settings.json"),
+        r#"{"config_version": 4, "telemetry_enabled": false}"#,
+    )
+    .unwrap();
+    let (mut provider, base_url) = start_static_provider();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_coderex"))
+        .args([
+            "-p",
+            "--dangerously-skip-permissions",
+            "--output-format",
+            "stream-json",
+        ])
+        .current_dir(dir.path())
+        .env("ANTHROPIC_API_KEY", "mock")
+        .env("ANTHROPIC_BASE_URL", &base_url)
+        .env("ANTHROPIC_MODEL", "claude-sonnet-4-6")
+        .env("CLAUDE_CONFIG_DIR", config_home.path())
+        .env("CODEREX_LOG", "off")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn coderex");
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(b"get a mock prompt\n")
+        .expect("write prompt");
+    let output = child.wait_with_output().expect("wait");
+
+    let _ = provider.kill();
+    let _ = provider.wait();
+    let _ = std::fs::remove_file(&script);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "coderex failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("hello Ada"),
+        "the MCP prompt never reached the transcript:\n{stdout}"
     );
 }

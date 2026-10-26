@@ -784,6 +784,11 @@ fn select_tools(prompt: &str) -> Vec<Tool> {
         vec![Tool::Bash {
             command: "printf '%s' \"$ANTHROPIC_API_KEY\"".into(),
         }]
+    } else if p.contains("get a mock prompt") {
+        vec![Tool::Raw {
+            name: "GetMcpPrompt".into(),
+            input_json: r#"{"server":"mock","name":"greet","arguments":{"name":"Ada"}}"#.into(),
+        }]
     } else if p.contains("call the mock probe tool") {
         vec![Tool::Raw {
             name: "mcp__mock__probe".into(),
