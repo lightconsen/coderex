@@ -1,0 +1,26 @@
+{
+  "key": "48473dc8f4d90172",
+  "responses": [
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"71f16fa6-5a4f-4ecb-a355-fc69b8bdf544\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"We need answer concise 1-2 sentences. Tool call Bash command loop echo date sleep. Risks? It's benign. Maybe minor: uses date and sleep, 2.5 sec delay. No destructive. Need say safe briefly. Ensure 1-2 sentences.\",\"signature\":\"71f16fa6-5a4f-4ecb-a355-fc69b8bdf544\"},{\"type\":\"text\",\"text\":\"This command is safe: it only prints five timestamped iteration messages and pauses briefly between them, with no file, network, or system modification. The only minor impact is a roughly 2.5-second execution delay.\"}],\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":143,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":100,\"service_tier\":\"standard\"}}"
+    }
+  ],
+  "request": {
+    "model": "<model>",
+    "system": "<system>",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Explain the potential risks of this tool call:\n\n**Tool:** Bash\n**Input:**\n```\n{\"command\":\"for i in 1 2 3 4 5; do echo \\\"iteration $i: $(date +%H:%M:%S)\\\"; sleep 0.5; done\"}\n```\n\nWhat could go wrong if this executes?"
+          }
+        ]
+      }
+    ],
+    "max_tokens": 256
+  }
+}

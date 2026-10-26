@@ -1,0 +1,26 @@
+{
+  "key": "3712cf2f56d9bc5d",
+  "responses": [
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"d2bea663-5c05-4476-afdd-ec74c8e0c961\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"We need answer. Tool echo message \\\"iteration 3\\\". Need assess risks. Echo just returns input. Potential risks minimal. Could be used in loop causing log spam? Input static benign. Need 1-2 sentences. Say safe, no command execution, no file/network. Only risk trivial log noise if invoked repeatedly. Ensure concise.\",\"signature\":\"d2bea663-5c05-4476-afdd-ec74c8e0c961\"},{\"type\":\"text\",\"text\":\"This tool call appears safe: it only echoes the static string `\\\"iteration 3\\\"` and does not execute commands, access files, or make network requests. The only minor risk is unnecessary log/output noise if called repeatedly in a loop.\"}],\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":107,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":119,\"service_tier\":\"standard\"}}"
+    }
+  ],
+  "request": {
+    "model": "<model>",
+    "system": "<system>",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Explain the potential risks of this tool call:\n\n**Tool:** echo\n**Input:**\n```\n{\"message\":\"iteration 3\"}\n```\n\nWhat could go wrong if this executes?"
+          }
+        ]
+      }
+    ],
+    "max_tokens": 256
+  }
+}

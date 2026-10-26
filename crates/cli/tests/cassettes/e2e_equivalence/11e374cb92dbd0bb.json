@@ -1,0 +1,31 @@
+{
+  "key": "11e374cb92dbd0bb",
+  "responses": [
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"0a659047-ba7c-432d-b2ea-bf9807be8b69\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"We need answer only JSON object title. Need infer topic: Modify src/lib.rs to add new function. Title 3-7 words sentence-case. E.g. \\\"Add new function to lib.rs\\\" counts 6? Add(1) new2 function3 to4 lib.rs5. Actually 5 words. Sentence case. Return JSON only.\",\"signature\":\"0a659047-ba7c-432d-b2ea-bf9807be8b69\"},{\"type\":\"text\",\"text\":\"{\\\"title\\\": \\\"Add new function to lib.rs\\\"}\"}],\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":95,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":83,\"service_tier\":\"standard\"}}"
+    },
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"7e1ee31f-a1a4-4361-ad7e-b936f8f53bc8\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"We need answer only JSON object with title. Need infer conversation: user says \\\"Modify src/lib.rs to add a new function.\\\" That's only request. Need concise 3-7 word sentence-case title captures main topic. Maybe \\\"Add new function to src/lib.rs\\\" is 6 words? Count: Add(1) new(2) function(3) to(4) src/lib.rs(5) maybe 5. Sentence case. Return ONLY JSON. Need valid JSON. Could use \\\"Add new function to lib.rs\\\". Count Add1 new2 function3 to4 lib.rs5. Good. Title should identify\",\"signature\":\"7e1ee31f-a1a4-4361-ad7e-b936f8f53bc8\"}],\"stop_reason\":\"max_tokens\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":95,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":128,\"service_tier\":\"standard\"}}"
+    }
+  ],
+  "request": {
+    "model": "<model>",
+    "system": "<system>",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Here is the conversation so far:\nModify src/lib.rs to add a new function.\n\nGenerate a 3-7 word sentence-case title that identifies this session."
+          }
+        ]
+      }
+    ],
+    "max_tokens": 128
+  }
+}

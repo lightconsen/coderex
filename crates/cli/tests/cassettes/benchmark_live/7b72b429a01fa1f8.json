@@ -1,0 +1,26 @@
+{
+  "key": "7b72b429a01fa1f8",
+  "responses": [
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"c7a88e40-1019-4829-891e-2a6c5251fe96\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"We need answer risk of bash command cargo test 2>&1 | tail -20. Need 1-2 clear sentences. Focus concrete risks. Is it safe? Running cargo test executes project tests, which can run arbitrary code from repo/dependencies/build scripts, potentially network/filesystem access, modify files, consume resources; tail hides most output. Piping stderr/stdout to tail only shows last 20 lines, can mask failures early and truncate diagnostics. Also shell pipeline exit status is tail's unless pipefail, so command may report success even if tests fail. Need mention concrete. Two sentences max. Maybe: \\\"Executing `cargo test` runs arbitrary code from the project and its build scripts/dependencies, so a malicious or buggy repo could delete/modify files, access network/credentials, or consume resources. The `| tail -20` discards most output and, without `pipefail`, returns tail's exit status, so test failures may be hidden and appear successful.\\\" That's 2 sentences. Good.\",\"signature\":\"c7a88e40-1019-4829-891e-2a6c5251fe96\"},{\"type\":\"text\",\"text\":\"Executing `cargo test` runs arbitrary code from the project, build scripts, and dependencies, so a malicious or buggy repo could modify/delete files, access network or credentials, or consume resources. The `\"}],\"stop_reason\":\"max_tokens\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":115,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":256,\"service_tier\":\"standard\"}}"
+    }
+  ],
+  "request": {
+    "model": "<model>",
+    "system": "<system>",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Explain the potential risks of this tool call:\n\n**Tool:** Bash\n**Input:**\n```\n{\"command\":\"cargo test 2>&1 | tail -20\"}\n```\n\nWhat could go wrong if this executes?"
+          }
+        ]
+      }
+    ],
+    "max_tokens": 256
+  }
+}

@@ -1,0 +1,26 @@
+{
+  "key": "09b6b6efc1a772aa",
+  "responses": [
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"5a488874-1d8f-440d-ba4a-9d7aa477267e\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"We need answer as security advisor. Need assess tool call Bash command. Need explain potential risks 1-2 clear sentences concrete risks not generic. Need determine if safe. Command: cd to temp dir /private/var/folders/.../.tmpuT0YTF && cat src/lib.rs && (cargo test 2>&1 | tail -20), timeout 120. Risks? It executes cargo test in temp directory. Cargo test runs project build scripts, tests, can execute arbitrary code from repository (src/lib.rs and build scripts, proc macros, dependencies) under user's privileges. Also cat prints source file to output; may leak secrets if file contains sensitive info. Temp path maybe attacker-controlled? If temp dir contents untrusted, cargo test can run malicious build.rs/test code. Need mention cat source output might expose sensitive data in logs. Also cargo test may network? Dependencies can download? Cargo test may compile and run code; potential supply chain. The command cd to a temp directory with hidden name; if directory is writable by others? /private/var/folders is per-user temp on macOS, but random subdir. Risk if contents untrusted. Need 1-2 sentences. It asks \\\"What could go\",\"signature\":\"5a488874-1d8f-440d-ba4a-9d7aa477267e\"}],\"stop_reason\":\"max_tokens\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":168,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":256,\"service_tier\":\"standard\"}}"
+    }
+  ],
+  "request": {
+    "model": "<model>",
+    "system": "<system>",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Explain the potential risks of this tool call:\n\n**Tool:** Bash\n**Input:**\n```\n{\"command\":\"cd <tmp> && cat src/lib.rs && (cargo test 2>&1 | tail -20)\",\"timeout\":120}\n```\n\nWhat could go wrong if this executes?"
+          }
+        ]
+      }
+    ],
+    "max_tokens": 256
+  }
+}

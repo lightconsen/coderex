@@ -1,0 +1,26 @@
+{
+  "key": "d59d24485275839d",
+  "responses": [
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"89765653-0333-4669-8217-25d9afc0d250\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"We need answer. Need assess command. Tool Bash input: cd \\\"$(pwd)\\\" && rustc --edition 2021 --emit=metadata -o /tmp/large.meta src/large.rs 2>&1 | head -20; echo \\\"exit: $?\\\"\\n\\nNeed explain risks 1-2 sentences. Need concrete. Command compiles Rust file to metadata output /tmp/large.meta, pipes stderr/stdout to head. Potential risks: executes rustc on local source; rustc may run build scripts? rustc directly no cargo, no build scripts. It compiles code. Could consume resources (CPU/memory/disk) if large.rs malicious/complex, proc macros? Wait rustc --emit=metadata only compiles crate to metadata. Does it execute procedural macros? Yes procedural macros require compiling and running macro crate if dependency? But direct rustc on src/large.rs, extern crates? If source has `extern crate` with proc macro? Without --extern dependencies, likely no. But rustc can load dynamic libraries? Hmm. Compilation could trigger compiler bugs? More importantly output path /tmp/large.meta predictable and in world-writable /tmp. Rustc may overwrite existing file/sym\",\"signature\":\"89765653-0333-4669-8217-25d9afc0d250\"}],\"stop_reason\":\"max_tokens\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":152,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":256,\"service_tier\":\"standard\"}}"
+    }
+  ],
+  "request": {
+    "model": "<model>",
+    "system": "<system>",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Explain the potential risks of this tool call:\n\n**Tool:** Bash\n**Input:**\n```\n{\"command\":\"cd \\\"$(pwd)\\\" && rustc --edition 2021 --emit=metadata -o <tmp> src/large.rs 2>&1 | head -20; echo \\\"exit: $?\\\"\"}\n```\n\nWhat could go wrong if this executes?"
+          }
+        ]
+      }
+    ],
+    "max_tokens": 256
+  }
+}

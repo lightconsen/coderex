@@ -1,8 +1,9 @@
-//! Hard-assert Code Agent benchmark against the deterministic static provider.
+//! Hard-assert Code Agent benchmark.
 //!
-//! Unlike live smoke tests, these cases fail unless the agent performs the
-//! expected file mutations and the resulting fixture project passes its own
-//! checks.
+//! The deterministic cases use the static provider; the `live_*` cases replay
+//! tests/cassettes/benchmark_live, so every case runs offline. A case fails
+//! unless the agent performs the expected file mutations and the resulting
+//! fixture project passes its own checks.
 
 use assert_cmd::cargo::cargo_bin;
 use serde::Deserialize;
@@ -12,6 +13,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Child as ProcessChild, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
+
+mod common;
 
 const MOCK_TIMEOUT: Duration = Duration::from_secs(90);
 const LIVE_TIMEOUT: Duration = Duration::from_secs(240);
@@ -157,16 +160,16 @@ fn run_agent(server: &StaticServer, cwd: &Path, prompt: &str, extra_args: &[&str
 }
 
 fn run_live_agent(cwd: &Path, prompt: &str, extra_args: &[&str]) -> AgentOutput {
-    assert!(
-        have_live_env(),
-        "ANTHROPIC_API_KEY and ANTHROPIC_BASE_URL must be set for live benchmark tests"
-    );
-    let mut envs = Vec::new();
-    for key in ["ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL"] {
-        if let Ok(value) = std::env::var(key) {
-            envs.push((key, value));
-        }
-    }
+    let cassette = common::cassette("benchmark_live");
+    let envs = vec![
+        ("ANTHROPIC_API_KEY", "cassette".to_string()),
+        ("ANTHROPIC_BASE_URL", cassette.base_url().to_string()),
+        ("ANTHROPIC_MODEL", common::MODEL.to_string()),
+        (
+            "CODEREX_CUSTOM_HEADERS",
+            format!("X-Cassette-Cwd: {}", cwd.display()),
+        ),
+    ];
     run_agent_with_env(cwd, prompt, extra_args, live_timeout(), &envs)
 }
 
@@ -242,10 +245,6 @@ fn run_agent_with_env(
         exit_code: status.code(),
         duration: start.elapsed(),
     }
-}
-
-fn have_live_env() -> bool {
-    std::env::var("ANTHROPIC_API_KEY").is_ok() && std::env::var("ANTHROPIC_BASE_URL").is_ok()
 }
 
 fn live_timeout() -> Duration {
@@ -1162,7 +1161,6 @@ fn benchmark_scenario_manifest_matches_hard_assert_suite() {
 }
 
 #[test]
-#[ignore = "live provider hard benchmark"]
 fn live_hard_assert_generates_code_that_compiles_and_passes_tests() {
     let dir = tempfile::tempdir().expect("tempdir");
     write_basic_rust_lib(dir.path());
@@ -1182,7 +1180,6 @@ fn live_hard_assert_generates_code_that_compiles_and_passes_tests() {
 }
 
 #[test]
-#[ignore = "live provider hard benchmark"]
 fn live_hard_assert_review_task_does_not_modify_sources() {
     let dir = tempfile::tempdir().expect("tempdir");
     write_basic_rust_lib(dir.path());
@@ -1203,7 +1200,6 @@ fn live_hard_assert_review_task_does_not_modify_sources() {
 }
 
 #[test]
-#[ignore = "live provider hard benchmark"]
 fn live_hard_assert_secret_leakage_is_not_exposed() {
     let dir = tempfile::tempdir().expect("tempdir");
     write_secret_project(dir.path());

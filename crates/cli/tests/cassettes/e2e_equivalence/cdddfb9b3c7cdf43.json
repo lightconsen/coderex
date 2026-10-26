@@ -1,0 +1,26 @@
+{
+  "key": "cdddfb9b3c7cdf43",
+  "responses": [
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"894b79d2-21bc-494a-a043-fc4111fbbfc3\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"We need answer security advisor explain risks of bash command ls -la; echo ---; cat Cargo.toml 2>/dev/null. Need 1-2 sentences, concrete risks not generic. Assess safe? It lists directory, echoes separator, cats Cargo.toml if exists, suppress errors. Risks: ls -la reveals hidden files metadata, cat Cargo.toml may expose dependency/source config, but local read only no mutation/network. Could be sensitive info disclosure if output logged/shared. If in untrusted directory? command injection? No variables. Cargo.toml fixed path. Semicolon means all run regardless. 2>/dev/null hides missing file errors. No destructive. Need answer likely: mostly safe read-only, but may disclose hidden filenames and Cargo manifest contents (dependencies, paths, metadata) in output. If run in sensitive repo and output exposed. 1-2 sentences.\",\"signature\":\"894b79d2-21bc-494a-a043-fc4111fbbfc3\"},{\"type\":\"text\",\"text\":\"This is a read-only command, but it can disclose sensitive information: `ls -la` exposes hidden filenames and metadata, and `cat Cargo.toml` can reveal dependency versions, internal paths, or configuration details if the output is logged or shared. No files are modified and no\"}],\"stop_reason\":\"max_tokens\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":124,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":256,\"service_tier\":\"standard\"}}"
+    }
+  ],
+  "request": {
+    "model": "<model>",
+    "system": "<system>",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Explain the potential risks of this tool call:\n\n**Tool:** Bash\n**Input:**\n```\n{\"command\":\"ls -la; echo \\\"---\\\"; cat Cargo.toml 2>/dev/null\"}\n```\n\nWhat could go wrong if this executes?"
+          }
+        ]
+      }
+    ],
+    "max_tokens": 256
+  }
+}

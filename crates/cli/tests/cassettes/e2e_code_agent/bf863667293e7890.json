@@ -1,0 +1,26 @@
+{
+  "key": "bf863667293e7890",
+  "responses": [
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"faec6f6a-8813-41f8-8294-8b6c09082981\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"We need answer only JSON object title. Need infer conversation: \\\"tests in src/lib.rs failing. Fix max function so all tests pass. Do not change tests.\\\" Need 3-7 word sentence-case title captures main topic. Maybe \\\"Fix failing max function tests\\\" (5 words? Fix1 failing2 max3 function4 tests5). Sentence case. Return JSON. Ensure only JSON.\",\"signature\":\"faec6f6a-8813-41f8-8294-8b6c09082981\"},{\"type\":\"text\",\"text\":\"{\\\"title\\\": \\\"Fix failing max function tests\\\"}\"}],\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":108,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":90,\"service_tier\":\"standard\"}}"
+    }
+  ],
+  "request": {
+    "model": "<model>",
+    "system": "<system>",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Here is the conversation so far:\nThe tests in src/lib.rs are failing. Fix the max function so all tests pass. Do not change the tests.\n\nGenerate a 3-7 word sentence-case title that identifies this session."
+          }
+        ]
+      }
+    ],
+    "max_tokens": 128
+  }
+}

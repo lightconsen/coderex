@@ -1,0 +1,41 @@
+{
+  "key": "766e659ec662f53d",
+  "responses": [
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"15ebc9bf-f863-43b9-96be-f6b6f37f44da\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"We need answer. Need assess Glob pattern **/*.rs. Tool call glob. Risks? Glob searching all Rust files recursively. Potential risks: performance/resource exhaustion in huge directory trees or symlink loops? Glob may follow symlinks? Usually glob might traverse. Could expose file paths? But just pattern, no reading contents. Sensitive info? It lists paths of .rs files, could reveal project structure if output exposed, but benign. Need 1-2 clear sentences. Focus concrete risks not generic. If safe say briefly. We can say generally safe: read-only path enumeration. Concrete risk: in very large or deeply nested filesystem or with symlink cycles, recursive glob could be slow/consume resources; output may reveal Rust source file paths but not contents. Need maybe mention no file modification/execution. Final concise. \\nNeed answer desired 5 but 1-2 sentences. Ensure not overdo.\",\"signature\":\"15ebc9bf-f863-43b9-96be-f6b6f37f44da\"},{\"type\":\"text\",\"text\":\"This is a read-only recursive filename search that cannot modify or execute files. The main concrete risks are performance/resource strain in very large or deeply nested/cyclic directory trees, and exposure of Rust source file paths (but not their contents) if the results are surfaced.\"}],\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":108,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":243,\"service_tier\":\"standard\"}}"
+    },
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"163df953-d630-4007-9c34-5ac9e33a7e18\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"We need answer. Need assess Glob pattern **/*.rs. Tool Glob likely file search. Risks? Recursive glob across working directory, enumerates all Rust files. Potential performance if huge tree, symlink loops? Glob libraries may follow symlinks? Could expose filenames/paths, but pattern only .rs. No content read. If directory huge or network FS, can be slow/hang, resource exhaustion. If runs in sensitive dir, discloses file paths maybe. Need 1-2 sentences. Concrete. Safe mostly. Mention may traverse entire directory tree, causing expensive I/O and potentially following symlinks depending implementation, but only returns matching paths. Final concise.\",\"signature\":\"163df953-d630-4007-9c34-5ac9e33a7e18\"},{\"type\":\"text\",\"text\":\"This is mostly safe: it only lists paths ending in `.rs` and does not read file contents or modify anything. The main risk is resource exhaustion or delay if run over a very large tree, network filesystem, or symlink-heavy directory, and it may reveal Rust file paths present in the search root.\"}],\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":108,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":200,\"service_tier\":\"standard\"}}"
+    },
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"e07298ae-efc8-4aac-b85f-baa419d25e65\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"We need answer. Need assess Glob tool call pattern **/*.rs. Security advisor explain potential risks 1-2 sentences concrete. Tool glob search Rust files. Input pattern broad recursive. Risks: may enumerate many files, disclose file paths in output, performance if huge tree, symlink traversal? Glob typically may follow symlinks? Need concrete. It searches all .rs files recursively from cwd. Potential risk: information disclosure of directory structure/source file names to caller, resource exhaustion in large repos, possibly crossing into unintended directories if run from broad root. If sandbox/scoped safe. Need 1-2 clear sentences. Mention if safe briefly. Could say generally low risk, read-only metadata; main concrete concern is leaking file paths and expensive traversal in massive trees or unintended directories. Ensure not generic. Final.\",\"signature\":\"e07298ae-efc8-4aac-b85f-baa419d25e65\"},{\"type\":\"text\",\"text\":\"This is generally low-risk because it only enumerates paths rather than reading or modifying files. The concrete concerns are information disclosure of source-file names/directory structure and potential performance issues if run from a very large or unintended root directory.\"}],\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":108,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":213,\"service_tier\":\"standard\"}}"
+    },
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"eeca0d70-8457-421f-992e-5e8c83fbe028\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"We need answer. Need analyze Glob with pattern **/*.rs. Security advisor explain risks 1-2 clear sentences. Focus concrete risks. If safe say briefly. Need understand tool Glob likely lists files matching pattern recursively. Input pattern **/*.rs means find all Rust source files recursively from current dir. Risks? It only reads directory listings, no file contents, no writes. Potential risks: information disclosure of file paths? But output to model? Could reveal directory structure / existence of Rust files, including sensitive paths if cwd broad. Recursive glob over huge tree could be expensive/hang or resource exhaustion if many files/symlink cycles? Glob typically doesn't follow symlinks? Need concrete. Pattern **/*.rs could traverse entire filesystem if run at root or large workspace, causing performance issues, but not destructive. It may expose filenames/paths in output, potentially sensitive naming. It doesn't read contents. Is it safe? Mostly safe read-only. Need 1-2 sentences. Mention if current directory is sensitive/large, it can enumerate paths and be slow; no modification. Let's craft: \\\"This is a read-only recursive file listing, so it won’t modify or delete anything. The concrete risks are information disclosure of\",\"signature\":\"eeca0d70-8457-421f-992e-5e8c83fbe028\"}],\"stop_reason\":\"max_tokens\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":108,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":256,\"service_tier\":\"standard\"}}"
+    }
+  ],
+  "request": {
+    "model": "<model>",
+    "system": "<system>",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Explain the potential risks of this tool call:\n\n**Tool:** Glob\n**Input:**\n```\n{\"pattern\":\"**/*.rs\"}\n```\n\nWhat could go wrong if this executes?"
+          }
+        ]
+      }
+    ],
+    "max_tokens": 256
+  }
+}

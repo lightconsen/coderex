@@ -1,0 +1,26 @@
+{
+  "key": "c2f7534576f747b1",
+  "responses": [
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"27de52d4-cc73-4c46-ac8a-ec04928891b7\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"The user wants a title. The conversation: \\\"Add a comment at the top of src/lib.rs.\\\" So the topic is adding a comment to lib.rs. Need 3-7 word sentence-case title. Return only JSON.\\n\\nSomething like \\\"Add comment to src/lib.rs\\\" — that's 5 words? \\\"Add\\\" (1) \\\"comment\\\" (2) \\\"to\\\" (3) \\\"src/lib.rs\\\" (4) — 4 words. Sentence case. Good.\\n\\nCould be \\\"Add top comment to lib.rs\\\" (5 words). I'll pick \\\"Add comment to src/lib.rs\\\".\",\"signature\":\"27de52d4-cc73-4c46-ac8a-ec04928891b7\"},{\"type\":\"text\",\"text\":\"{\\\"title\\\":\"}],\"stop_reason\":\"max_tokens\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":95,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":128,\"service_tier\":\"standard\"}}"
+    }
+  ],
+  "request": {
+    "model": "<model>",
+    "system": "<system>",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Here is the conversation so far:\nAdd a comment at the top of src/lib.rs.\n\nGenerate a 3-7 word sentence-case title that identifies this session."
+          }
+        ]
+      }
+    ],
+    "max_tokens": 128
+  }
+}

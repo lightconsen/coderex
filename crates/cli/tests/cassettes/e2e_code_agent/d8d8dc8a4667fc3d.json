@@ -1,0 +1,26 @@
+{
+  "key": "d8d8dc8a4667fc3d",
+  "responses": [
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"5dac318d-db2e-441f-aa62-7d808b6e6411\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"We need to respond only JSON title. Need infer conversation: user said list files using bash, don't modify image.bin. Main topic maybe \\\"Listing files without modifying image.bin\\\" sentence case, 3-7 words. Need concise. Return JSON only. Ensure sentence case. \\\"Listing files without modifying image.bin\\\" is 5 words? Listing(1) files2 without3 modifying4 image.bin5. Good. JSON.\",\"signature\":\"5dac318d-db2e-441f-aa62-7d808b6e6411\"},{\"type\":\"text\",\"text\":\"{\\\"title\\\": \\\"Listing files without modifying image.bin\\\"}\"}],\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":101,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":104,\"service_tier\":\"standard\"}}"
+    }
+  ],
+  "request": {
+    "model": "<model>",
+    "system": "<system>",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Here is the conversation so far:\nList all files in the current directory using bash. Do not modify image.bin.\n\nGenerate a 3-7 word sentence-case title that identifies this session."
+          }
+        ]
+      }
+    ],
+    "max_tokens": 128
+  }
+}

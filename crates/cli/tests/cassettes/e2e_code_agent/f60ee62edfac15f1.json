@@ -1,0 +1,26 @@
+{
+  "key": "f60ee62edfac15f1",
+  "responses": [
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"793cbb08-a469-4c65-833b-5e626e3973a0\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"We need answer. Need assess Glob pattern **/src/lib.rs. Tool call safe? Glob searches filesystem for matching paths. Potential risks: broad recursive traversal can be expensive/slow in large dirs, follow symlinks? Glob typically may traverse entire filesystem if cwd root? Pattern **/src/lib.rs can scan many directories, potentially causing high I/O/CPU and exposing file paths. It's read-only, no modification. If glob implementation follows symlinks could traverse outside intended tree or loops. Need concrete. 1-2 sentences. Mention safe mostly. Input pattern relative, likely cwd. No execution of files. Risks: performance and info disclosure of matching paths, symlink traversal. Need answer concise.\",\"signature\":\"793cbb08-a469-4c65-833b-5e626e3973a0\"},{\"type\":\"text\",\"text\":\"This is a read-only file search and is generally low risk, but `**/src/lib.rs` can recursively traverse a large directory tree, causing high I/O/CPU or slow performance if run from a broad location like `/`. It may also reveal file paths outside the intended project if the glob implementation follows symlinks.\"}],\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":109,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":213,\"service_tier\":\"standard\"}}"
+    }
+  ],
+  "request": {
+    "model": "<model>",
+    "system": "<system>",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Explain the potential risks of this tool call:\n\n**Tool:** Glob\n**Input:**\n```\n{\"pattern\":\"**/src/lib.rs\"}\n```\n\nWhat could go wrong if this executes?"
+          }
+        ]
+      }
+    ],
+    "max_tokens": 256
+  }
+}

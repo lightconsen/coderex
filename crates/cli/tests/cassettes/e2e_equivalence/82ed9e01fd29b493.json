@@ -1,0 +1,31 @@
+{
+  "key": "82ed9e01fd29b493",
+  "responses": [
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"e7a6acbe-f654-4443-99aa-5851edb1884f\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"The user wants a concise title. The conversation is about adding a triple function to src/lib.rs. Title: \\\"Add triple function to lib.rs\\\" - that's 6 words. Sentence case. Return JSON.\",\"signature\":\"e7a6acbe-f654-4443-99aa-5851edb1884f\"},{\"type\":\"text\",\"text\":\"{\\\"title\\\": \\\"Add triple function to lib.rs\\\"}\"}],\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":93,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":55,\"service_tier\":\"standard\"}}"
+    },
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"7d83c306-8378-4812-8cf5-333ce55dc1d5\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"The user wants a title for the conversation. The conversation is about adding a triple function to src/lib.rs. Need 3-7 word sentence-case title. Return JSON only.\",\"signature\":\"7d83c306-8378-4812-8cf5-333ce55dc1d5\"},{\"type\":\"text\",\"text\":\"{\\\"title\\\": \\\"Add triple function to lib.rs\\\"}\"}],\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":93,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":48,\"service_tier\":\"standard\"}}"
+    }
+  ],
+  "request": {
+    "model": "<model>",
+    "system": "<system>",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Here is the conversation so far:\nAdd a triple function to src/lib.rs.\n\nGenerate a 3-7 word sentence-case title that identifies this session."
+          }
+        ]
+      }
+    ],
+    "max_tokens": 128
+  }
+}

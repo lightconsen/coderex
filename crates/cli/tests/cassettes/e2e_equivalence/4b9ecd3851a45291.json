@@ -1,0 +1,26 @@
+{
+  "key": "4b9ecd3851a45291",
+  "responses": [
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"06624432-1d85-4627-addb-e7429190c980\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"We need answer as security advisor. Need analyze tool call. Command: cd into temp dir /private/var/folders/.../.tmpWIjFHa && ls -la .coderex/ 2>/dev/null && echo \\\"--- git ---\\\" && git log --oneline -5 2>&1 | head -20\\n\\nNeed explain potential risks 1-2 clear sentences. Focus concrete risks. Is it safe? It's read-only-ish. cd temp dir, ls hidden .coderex, git log. Risks: directory may be attacker-controlled? Temp dir path predictable? It's in /private/var/folders random temp. If attacker can create/control .tmpWIjFHa and .coderex or git repo, git log can invoke pager? Actually git log --oneline -5 piped to head; git may use pager? In non-tty, git disables pager? `git log` may run pager if configured? When stdout piped, pager maybe not. But git can execute config from repo? Git commands can run hooks? `git log` does not run hooks. But malicious `.git/config` can define pager? Git pager can execute command?\",\"signature\":\"06624432-1d85-4627-addb-e7429190c980\"}],\"stop_reason\":\"max_tokens\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":180,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":256,\"service_tier\":\"standard\"}}"
+    }
+  ],
+  "request": {
+    "model": "<model>",
+    "system": "<system>",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Explain the potential risks of this tool call:\n\n**Tool:** Bash\n**Input:**\n```\n{\"command\":\"cd <tmp> && ls -la .coderex/ 2>/dev/null && echo \\\"--- git ---\\\" && git log --oneline -5 2>&1 | head -20\"}\n```\n\nWhat could go wrong if this executes?"
+          }
+        ]
+      }
+    ],
+    "max_tokens": 256
+  }
+}

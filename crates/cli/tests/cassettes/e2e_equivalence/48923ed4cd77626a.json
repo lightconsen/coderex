@@ -1,0 +1,26 @@
+{
+  "key": "48923ed4cd77626a",
+  "responses": [
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"a6c72dd0-a34d-4efe-a358-a42b77d65405\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"We need answer only JSON object title. Need 3-7 word sentence-case title captures main topic. Conversation: change add function to multiply in src/lib.rs. Title concise. Sentence-case. Maybe \\\"Change add function to multiply\\\" = 4 words? Change(1) add2 function3 to4 multiply5. Good. Return only JSON.\",\"signature\":\"a6c72dd0-a34d-4efe-a358-a42b77d65405\"},{\"type\":\"text\",\"text\":\"{\\\"title\\\": \\\"Change add function to multiply\\\"}\"}],\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":97,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":82,\"service_tier\":\"standard\"}}"
+    }
+  ],
+  "request": {
+    "model": "<model>",
+    "system": "<system>",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Here is the conversation so far:\nIn src/lib.rs, change the add function to multiply instead.\n\nGenerate a 3-7 word sentence-case title that identifies this session."
+          }
+        ]
+      }
+    ],
+    "max_tokens": 128
+  }
+}

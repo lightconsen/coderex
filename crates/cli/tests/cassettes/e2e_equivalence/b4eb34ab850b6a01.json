@@ -1,0 +1,26 @@
+{
+  "key": "b4eb34ab850b6a01",
+  "responses": [
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"e6bbdf8c-227e-49b9-9dbf-f084cf693e14\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"We need answer security advisor. Need explain risks 1-2 sentences. Tool read file /root/secret.txt. Concrete risks: unauthorized access to sensitive root-owned file, credential/secret exfiltration, privilege boundary bypass. If process has permissions. Need note if no permission likely fails. 1-2 clear sentences.\",\"signature\":\"e6bbdf8c-227e-49b9-9dbf-f084cf693e14\"},{\"type\":\"text\",\"text\":\"Executing this reads a file explicitly named as a secret under `/root`, which could expose credentials or other sensitive data if the process has root-equivalent read access. If it lacks permission, the call will likely just fail; the main risk is unauthorized disclosure of protected content.\"}],\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":110,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":122,\"service_tier\":\"standard\"}}"
+    }
+  ],
+  "request": {
+    "model": "<model>",
+    "system": "<system>",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Explain the potential risks of this tool call:\n\n**Tool:** Read\n**Input:**\n```\n{\"file_path\":\"/root/secret.txt\"}\n```\n\nWhat could go wrong if this executes?"
+          }
+        ]
+      }
+    ],
+    "max_tokens": 256
+  }
+}

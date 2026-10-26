@@ -6,7 +6,6 @@ use coderex_core::engine::TerminalReason;
 use std::io::Write;
 
 #[tokio::test]
-#[ignore = "live LLM test — run with `source start.kimi.sh && cargo test -p coderex-cli -- --ignored`"]
 async fn read_tool_reads_file() {
     if !live::have_live_env() {
         eprintln!("{}", live::skip_msg());
@@ -35,7 +34,7 @@ async fn read_tool_reads_file() {
         "expected Completed"
     );
 
-    let events = rig.collect_events().await;
+    let events = rig.drain_events();
 
     assert!(
         live::has_tool_call(&events, "read"),
@@ -52,7 +51,6 @@ async fn read_tool_reads_file() {
 }
 
 #[tokio::test]
-#[ignore = "live LLM test — run with `source start.kimi.sh && cargo test -p coderex-cli -- --ignored`"]
 async fn read_then_bash_combined() {
     if !live::have_live_env() {
         eprintln!("{}", live::skip_msg());
@@ -76,7 +74,7 @@ async fn read_then_bash_combined() {
         .await;
     assert!(reason.is_ok(), "submit failed: {reason:?}");
 
-    let events = rig.collect_events().await;
+    let events = rig.drain_events();
 
     assert!(
         live::has_tool_call(&events, "read"),

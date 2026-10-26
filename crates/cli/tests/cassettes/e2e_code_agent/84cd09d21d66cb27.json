@@ -1,0 +1,26 @@
+{
+  "key": "84cd09d21d66cb27",
+  "responses": [
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"4d68ba1d-0102-4fd7-ace2-5c6f341dceac\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"We need answer. Need analyze tool call Bash command. Need explain risks 1-2 clear sentences, concrete not generic. Command: cd to temp dir /private/var/folders/.../.tmpFfhKIh && rustc --version 2>&1; echo \\\"---\\\"; cargo --version 2>&1. Need risks. It's basically checking Rust compiler and cargo versions. Potential risk: cd fails if temp dir missing/permissions, then due && the rustc part skipped but echo/cargo still run because semicolon after? Let's parse: cd ... && rustc --version 2>&1; echo \\\"---\\\"; cargo --version 2>&1. Shell precedence: && lower? In shell, ; separates lists. So first list: cd ... && rustc --version 2>&1. Then echo. Then cargo. If cd fails, rustc not run but echo and cargo run in current dir. Safe. If temp dir contains malicious? It just cd, no execution from there except rustc via PATH. Wait rustc and cargo resolved via PATH; if current directory? cd to temp dir, then running rustc. PATH typically doesn't include \\\".\\\"; but if PATH includes relative/empty entries, could execute\",\"signature\":\"4d68ba1d-0102-4fd7-ace2-5c6f341dceac\"}],\"stop_reason\":\"max_tokens\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":165,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":256,\"service_tier\":\"standard\"}}"
+    }
+  ],
+  "request": {
+    "model": "<model>",
+    "system": "<system>",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Explain the potential risks of this tool call:\n\n**Tool:** Bash\n**Input:**\n```\n{\"command\":\"cd <tmp> && rustc --version 2>&1; echo \\\"---\\\"; cargo --version 2>&1\"}\n```\n\nWhat could go wrong if this executes?"
+          }
+        ]
+      }
+    ],
+    "max_tokens": 256
+  }
+}

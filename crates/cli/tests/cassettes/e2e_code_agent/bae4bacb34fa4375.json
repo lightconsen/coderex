@@ -1,0 +1,26 @@
+{
+  "key": "bae4bacb34fa4375",
+  "responses": [
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"ee8bb69f-c6ec-43b0-9228-6f56453f0d1b\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"\\\"The user wants a 3-7 word sentence-case title for this conversation. The conversation is about refactoring src/lib.rs to extract duplicated age-prefix logic into a helper called format_user_label.\\n\\nTitle should capture main topic. Something like \\\"Refactor age-prefix logic into helper\\\" — that's 6 words. Sentence case: \\\"Refactor age-prefix logic into helper\\\". Good.\\n\\nReturn only JSON.\\\"\",\"signature\":\"ee8bb69f-c6ec-43b0-9228-6f56453f0d1b\"},{\"type\":\"text\",\"text\":\"{\\\"title\\\": \\\"Refactor age-prefix logic into helper\\\"}\"}],\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":115,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":103,\"service_tier\":\"standard\"}}"
+    }
+  ],
+  "request": {
+    "model": "<model>",
+    "system": "<system>",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Here is the conversation so far:\nRefactor src/lib.rs: extract the duplicated age-prefix logic into a shared helper function called `format_user_label`. Keep both public functions working.\n\nGenerate a 3-7 word sentence-case title that identifies this session."
+          }
+        ]
+      }
+    ],
+    "max_tokens": 128
+  }
+}

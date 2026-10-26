@@ -1,0 +1,26 @@
+{
+  "key": "e0a53d7e93730f7f",
+  "responses": [
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"a035ec88-65e6-4891-bb19-7e7e240c4a0a\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"We need answer security advisor explain potential risks of tool call in 1-2 clear sentences. Need inspect. Tool Write to src/models.rs content Rust structs. What could go wrong? It overwrites file, potentially destroying existing code. Content includes AuthRequest token String, but not logging. Risks: overwrite src/models.rs without backup, losing existing models; if file path incorrect or symlink could write arbitrary? Write tool maybe within workspace? Need focus concrete. Also adding AuthRequest with token: if Debug derived? AuthRequest derives Debug, Clone, Serialize, Deserialize. Debug on token can leak secrets if logged. Serialize can leak token if serialized. That's concrete. Need 1-2 sentences. Mention overwriting existing file and sensitive token exposure via derived Debug/Serialize. Since tool call writes file. Need say if safe? It appears potentially risky due overwrite and secret-bearing struct. Keep 1-2 clear sentences.\",\"signature\":\"a035ec88-65e6-4891-bb19-7e7e240c4a0a\"},{\"type\":\"text\",\"text\":\"This call can overwrite `src/models.rs`, silently destroying existing model code if the file already exists. It also adds an `AuthRequest` containing a secret token with derived `Debug` and `Serialize`, which can leak credentials if that struct is ever logged or serialized.\"}],\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":195,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":250,\"service_tier\":\"standard\"}}"
+    }
+  ],
+  "request": {
+    "model": "<model>",
+    "system": "<system>",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Explain the potential risks of this tool call:\n\n**Tool:** Write\n**Input:**\n```\n{\"file_path\":\"src/models.rs\",\"content\":\"use serde::{Deserialize, Serialize};\\n\\n#[derive(Debug)]\\npub struct User {\\n    pub id: u64,\\n    pub name: String,\\n}\\n\\n/// Body of a request to a protected route.\\n#[derive(Debug, Clone, Serialize, Deserialize)]\\npub struct AuthRequest {\\n    pub token: String,\\n}\\n\"}\n```\n\nWhat could go wrong if this executes?"
+          }
+        ]
+      }
+    ],
+    "max_tokens": 256
+  }
+}

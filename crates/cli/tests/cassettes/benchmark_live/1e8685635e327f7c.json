@@ -1,0 +1,26 @@
+{
+  "key": "1e8685635e327f7c",
+  "responses": [
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"81d0a01a-e056-4b3d-87bc-b980362067fd\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"We need answer security advisor, explain risks 1-2 sentences concrete. Tool Bash command pwd && ls -la. Safe read-only listing. Could reveal sensitive filenames/permissions in cwd if output exposed, but no modification. Need 1-2 clear sentences. If safe say briefly. Need mention if run in sensitive directory, listing exposes file names, hidden files, permissions to anyone seeing output; no execution of listed files, no writes. That's the only risk. Ensure concise.\",\"signature\":\"81d0a01a-e056-4b3d-87bc-b980362067fd\"},{\"type\":\"text\",\"text\":\"This is a read-only command and is generally safe: it only prints the current directory and lists its contents, without modifying or executing anything. The only concrete risk is information disclosure—if run in a sensitive directory, the output can reveal hidden filenames, ownership, and permissions to anyone who sees the result.\"}],\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":118,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":166,\"service_tier\":\"standard\"}}"
+    }
+  ],
+  "request": {
+    "model": "<model>",
+    "system": "<system>",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Explain the potential risks of this tool call:\n\n**Tool:** Bash\n**Input:**\n```\n{\"command\":\"pwd && ls -la\",\"description\":\"Show working directory and contents\"}\n```\n\nWhat could go wrong if this executes?"
+          }
+        ]
+      }
+    ],
+    "max_tokens": 256
+  }
+}

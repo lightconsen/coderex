@@ -1,0 +1,26 @@
+{
+  "key": "560b3148b8972203",
+  "responses": [
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"833150bc-b562-463c-a1f0-64d0476aae85\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"We need answer only JSON object title. Need parse conversation. User says conversation so far: \\\"Fix the bug in the factorial function in src/lib.rs so all tests pass.\\\" Then asks generate title. Need concise 3-7 word sentence-case. Identify session. Something like \\\"Fix factorial bug in src lib\\\" but sentence case? 6 words? \\\"Fix factorial function bug in lib.rs\\\" 6 words? Count Fix(1) factorial2 function3 bug4 in5 lib.rs6. Sentence case first word capital, rest lowercase except lib.rs. Title should capture main topic. Return JSON only. Need ensure valid JSON.\",\"signature\":\"833150bc-b562-463c-a1f0-64d0476aae85\"}],\"stop_reason\":\"max_tokens\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":100,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":128,\"service_tier\":\"standard\"}}"
+    }
+  ],
+  "request": {
+    "model": "<model>",
+    "system": "<system>",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Here is the conversation so far:\nFix the bug in the factorial function in src/lib.rs so all tests pass.\n\nGenerate a 3-7 word sentence-case title that identifies this session."
+          }
+        ]
+      }
+    ],
+    "max_tokens": 128
+  }
+}

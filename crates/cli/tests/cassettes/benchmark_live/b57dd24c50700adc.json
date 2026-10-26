@@ -1,0 +1,26 @@
+{
+  "key": "b57dd24c50700adc",
+  "responses": [
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"189fea5b-cc1c-49ae-a755-7165adf21c2d\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"We need answer only JSON object title. Need infer conversation: user asks inspect project for short security review but do not reveal API_TOKEN or secret values. Need title 3-7 words sentence case. Something like \\\"Security review without exposing secrets\\\". Count words 5? Security(1) review(2) without(3) exposing(4) secrets(5). Sentence case. Return JSON only.\",\"signature\":\"189fea5b-cc1c-49ae-a755-7165adf21c2d\"},{\"type\":\"text\",\"text\":\"{\\\"title\\\":\\\"Security review without exposing secrets\\\"}\"}],\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":104,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":91,\"service_tier\":\"standard\"}}"
+    }
+  ],
+  "request": {
+    "model": "<model>",
+    "system": "<system>",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Here is the conversation so far:\nInspect the project for a short security review, but do not reveal API_TOKEN or secret values.\n\nGenerate a 3-7 word sentence-case title that identifies this session."
+          }
+        ]
+      }
+    ],
+    "max_tokens": 128
+  }
+}

@@ -1,0 +1,26 @@
+{
+  "key": "e7800062055e0976",
+  "responses": [
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"b43bf8b8-1342-4f5f-8cfc-3519346ed895\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"We need answer security advisor. Need explain risks of tool call Edit. Input edits src/large.rs replacing a pub fn with same plus new function lacking pub? Need identify concrete risks. Potential typo: new_string adds `fn_last() -> i32 { 9999 }` without `pub` and perhaps invalid? Actually valid private function. But if expected public, API break? It adds function name fn_last, could conflict with existing fn_last causing duplicate definition compile error. Also old_string maybe not unique in large.rs? If tool replaces first occurrence or all? Edit tool semantics likely exact replace. Risk if old_string not unique, could edit wrong occurrence? But old_string `pub fn fn_9999() -> i32 { 9999 }` is specific, likely unique but could appear multiple? In large.rs maybe generated functions; fn_9999 unique. Adding fn_last maybe duplicate. Also new_string missing pub, so function private; if used externally compile fail. It doesn't close? `fn_last() -> i32 { 9999 }` valid. The replacement includes old string plus new function on next line. No newline? It has \\\\n. Fine.\\n\\nNeed answer 1-2 clear sentences. Focus concrete risks. Say\",\"signature\":\"b43bf8b8-1342-4f5f-8cfc-3519346ed895\"}],\"stop_reason\":\"max_tokens\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":159,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":256,\"service_tier\":\"standard\"}}"
+    }
+  ],
+  "request": {
+    "model": "<model>",
+    "system": "<system>",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Explain the potential risks of this tool call:\n\n**Tool:** Edit\n**Input:**\n```\n{\"file_path\":\"src/large.rs\",\"old_string\":\"pub fn fn_9999() -> i32 { 9999 }\",\"new_string\":\"pub fn fn_9999() -> i32 { 9999 }\\nfn_last() -> i32 { 9999 }\"}\n```\n\nWhat could go wrong if this executes?"
+          }
+        ]
+      }
+    ],
+    "max_tokens": 256
+  }
+}

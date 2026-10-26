@@ -1,0 +1,26 @@
+{
+  "key": "37225d3dc8cb7a5b",
+  "responses": [
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"0b160b3c-a8df-48cf-b88e-d23210927760\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"We need answer. Need assess tool echo message iteration 1. Risks minimal. Need 1-2 clear sentences. Focus concrete. If safe say briefly. Echo benign. Could maybe log sensitive? No. Input static non-sensitive. No side effects. Potential only log output if echo tool logs or renders untrusted? But message plain. Answer safe. Ensure 1-2 sentences.\",\"signature\":\"0b160b3c-a8df-48cf-b88e-d23210927760\"},{\"type\":\"text\",\"text\":\"This tool call is safe: it just echoes the static, non-sensitive string `\\\"iteration 1\\\"` with no file, network, or command execution side effects. The only minor consideration is that the message may appear in logs if the tool logs its inputs.\"}],\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":107,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":132,\"service_tier\":\"standard\"}}"
+    }
+  ],
+  "request": {
+    "model": "<model>",
+    "system": "<system>",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Explain the potential risks of this tool call:\n\n**Tool:** echo\n**Input:**\n```\n{\"message\":\"iteration 1\"}\n```\n\nWhat could go wrong if this executes?"
+          }
+        ]
+      }
+    ],
+    "max_tokens": 256
+  }
+}

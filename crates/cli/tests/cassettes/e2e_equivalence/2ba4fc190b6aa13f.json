@@ -1,0 +1,26 @@
+{
+  "key": "2ba4fc190b6aa13f",
+  "responses": [
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"684620f1-7fca-4709-b23c-7bfdc5e06ab4\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"We need answer only JSON object with title 3-7 words sentence case. Need infer conversation: user says trigger a loop by running same command repeatedly. Need title identify session. Concise. Maybe \\\"Repeated command loop trigger\\\" 4 words. Sentence case. Need return ONLY JSON.\",\"signature\":\"684620f1-7fca-4709-b23c-7bfdc5e06ab4\"},{\"type\":\"text\",\"text\":\"{\\\"title\\\": \\\"Repeated command loop trigger\\\"}\"}],\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":94,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":70,\"service_tier\":\"standard\"}}"
+    }
+  ],
+  "request": {
+    "model": "<model>",
+    "system": "<system>",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Here is the conversation so far:\nTrigger a loop by running the same command repeatedly.\n\nGenerate a 3-7 word sentence-case title that identifies this session."
+          }
+        ]
+      }
+    ],
+    "max_tokens": 128
+  }
+}

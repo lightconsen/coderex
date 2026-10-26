@@ -1,0 +1,26 @@
+{
+  "key": "1934231a4c77f4f8",
+  "responses": [
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"307b5fe8-36f4-410f-877e-b72a170ad813\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"We need answer only JSON title. Conversation user asks \\\"List all .rs files in this project.\\\" But no actual project context. Need title captures main topic. 3-7 words sentence case. {\\\"title\\\":\\\"List all Rust source files\\\"} Count words: List(1) all2 Rust3 source4 files5. Sentence case. Return only JSON.\",\"signature\":\"307b5fe8-36f4-410f-877e-b72a170ad813\"},{\"type\":\"text\",\"text\":\"{\\\"title\\\":\\\"List all Rust source files\\\"}\"}],\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":93,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":82,\"service_tier\":\"standard\"}}"
+    }
+  ],
+  "request": {
+    "model": "<model>",
+    "system": "<system>",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Here is the conversation so far:\nList all .rs files in this project.\n\nGenerate a 3-7 word sentence-case title that identifies this session."
+          }
+        ]
+      }
+    ],
+    "max_tokens": 128
+  }
+}

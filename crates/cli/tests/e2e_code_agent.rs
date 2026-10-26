@@ -1,28 +1,30 @@
 //! Full E2E code-agent tests using `coderex -p` (non-interactive / print mode).
 //!
-//! NOTE: These tests exercise text-generation capabilities. Actual tool execution
-//! (file write, edit, bash) requires the engine to pass `available_tools` to the
-//! LLM API. Currently `engine.rs:1504` passes `&[]` and `api_client.rs` does not
-//! include a `tools` field in the request body. Tests that require tool execution
-//! verify response text and opportunistically check filesystem.
+//! The LLM answers are replayed from tests/cassettes/e2e_code_agent, so the
+//! suite runs offline and deterministically while still driving real tool
+//! execution (file write, edit, bash, read) in the fixture directories.
 //!
 //! Run:
 //!   ./tests/run-e2e-code-agent.sh
+//!
+//! Re-record the cassettes once against a real endpoint with
+//! scripts/record-cassettes.sh --fresh.
 
 use std::io::{BufReader, Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Stdio};
-use std::sync::OnceLock;
 use std::thread;
 use std::time::{Duration, Instant};
+
+mod common;
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  Harness
 // ═══════════════════════════════════════════════════════════════════════════
 
-fn have_live_env() -> bool {
-    (std::env::var("ANTHROPIC_API_KEY").is_ok() && std::env::var("ANTHROPIC_BASE_URL").is_ok())
-        || (std::env::var("OPENAI_API_KEY").is_ok() && std::env::var("OPENAI_BASE_URL").is_ok())
+const fn have_live_env() -> bool {
+    // The cassette server provides the endpoint for every run.
+    common::provider_available()
 }
 
 const fn skip_msg() -> &'static str {
@@ -30,22 +32,7 @@ const fn skip_msg() -> &'static str {
 }
 
 fn binary_path() -> &'static Path {
-    static PATH: OnceLock<PathBuf> = OnceLock::new();
-    PATH.get_or_init(|| {
-        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let workspace = manifest
-            .parent()
-            .expect("manifest parent")
-            .parent()
-            .expect("workspace root");
-        let status = Command::new("cargo")
-            .args(["build", "--bin", "coderex"])
-            .current_dir(workspace)
-            .status()
-            .expect("cargo build");
-        assert!(status.success(), "failed to build coderex binary");
-        workspace.join("target/debug/coderex")
-    })
+    Path::new(env!("CARGO_BIN_EXE_coderex"))
 }
 
 #[derive(Debug)]
@@ -74,6 +61,7 @@ fn run_with_args(
     timeout_secs: u64,
 ) -> CoderexOutput {
     let mut cmd = Command::new(binary_path());
+    common::cassette("e2e_code_agent").configure_for(&mut cmd, cwd);
     cmd.arg("-p")
         .args(extra_args)
         .current_dir(cwd)
@@ -451,7 +439,6 @@ mod tests {
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[test]
-#[ignore = "live LLM test"]
 fn generate_fibonacci() {
     if !have_live_env() {
         eprintln!("{}", skip_msg());
@@ -476,7 +463,6 @@ fn generate_fibonacci() {
 }
 
 #[test]
-#[ignore = "live LLM test"]
 fn generate_api_endpoint() {
     if !have_live_env() {
         eprintln!("{}", skip_msg());
@@ -501,7 +487,6 @@ fn generate_api_endpoint() {
 }
 
 #[test]
-#[ignore = "live LLM test"]
 fn fix_calc_bug() {
     if !have_live_env() {
         eprintln!("{}", skip_msg());
@@ -526,7 +511,6 @@ fn fix_calc_bug() {
 }
 
 #[test]
-#[ignore = "live LLM test"]
 fn refactor_extract_helper() {
     if !have_live_env() {
         eprintln!("{}", skip_msg());
@@ -557,7 +541,6 @@ fn refactor_extract_helper() {
 }
 
 #[test]
-#[ignore = "live LLM test"]
 fn review_find_issues() {
     if !have_live_env() {
         eprintln!("{}", skip_msg());
@@ -588,7 +571,6 @@ fn review_find_issues() {
 }
 
 #[test]
-#[ignore = "live LLM test"]
 fn multi_file_auth() {
     if !have_live_env() {
         eprintln!("{}", skip_msg());
@@ -624,7 +606,6 @@ fn multi_file_auth() {
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[test]
-#[ignore = "live LLM test"]
 fn dirty_state_uncommitted_changes() {
     if !have_live_env() {
         eprintln!("{}", skip_msg());
@@ -676,7 +657,6 @@ fn dirty_state_uncommitted_changes() {
 }
 
 #[test]
-#[ignore = "live LLM test"]
 fn failing_tests_to_pass() {
     if !have_live_env() {
         eprintln!("{}", skip_msg());
@@ -705,7 +685,6 @@ fn failing_tests_to_pass() {
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[test]
-#[ignore = "live LLM test"]
 fn semantic_with_tests() {
     if !have_live_env() {
         eprintln!("{}", skip_msg());
@@ -735,7 +714,6 @@ fn semantic_with_tests() {
 }
 
 #[test]
-#[ignore = "live LLM test"]
 fn generated_code_compiles() {
     if !have_live_env() {
         eprintln!("{}", skip_msg());
@@ -764,7 +742,6 @@ fn generated_code_compiles() {
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[test]
-#[ignore = "live LLM test"]
 fn respects_gitignore() {
     if !have_live_env() {
         eprintln!("{}", skip_msg());
@@ -784,7 +761,6 @@ fn respects_gitignore() {
 }
 
 #[test]
-#[ignore = "live LLM test"]
 fn refuses_dangerous_request() {
     if !have_live_env() {
         eprintln!("{}", skip_msg());
@@ -819,7 +795,6 @@ fn refuses_dangerous_request() {
 }
 
 #[test]
-#[ignore = "live LLM test"]
 fn no_secrets_in_output() {
     if !have_live_env() {
         eprintln!("{}", skip_msg());
@@ -851,7 +826,6 @@ fn no_secrets_in_output() {
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[test]
-#[ignore = "live LLM test"]
 fn ambiguous_prompt() {
     if !have_live_env() {
         eprintln!("{}", skip_msg());
@@ -875,7 +849,6 @@ fn ambiguous_prompt() {
 }
 
 #[test]
-#[ignore = "live LLM test"]
 fn large_file_handling() {
     use std::fmt::Write as _;
 
@@ -911,7 +884,6 @@ fn large_file_handling() {
 }
 
 #[test]
-#[ignore = "live LLM test"]
 fn binary_file_ignored() {
     if !have_live_env() {
         eprintln!("{}", skip_msg());
@@ -946,7 +918,6 @@ fn binary_file_ignored() {
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[test]
-#[ignore = "live LLM test"]
 fn file_write_preserves_format() {
     if !have_live_env() {
         eprintln!("{}", skip_msg());
@@ -971,7 +942,6 @@ fn file_write_preserves_format() {
 }
 
 #[test]
-#[ignore = "live LLM test"]
 fn bash_injection_resistance() {
     if !have_live_env() {
         eprintln!("{}", skip_msg());
@@ -992,7 +962,6 @@ fn bash_injection_resistance() {
 }
 
 #[test]
-#[ignore = "live LLM test"]
 fn recovery_from_error() {
     if !have_live_env() {
         eprintln!("{}", skip_msg());

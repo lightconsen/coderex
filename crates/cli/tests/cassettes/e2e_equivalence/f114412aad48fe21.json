@@ -1,0 +1,26 @@
+{
+  "key": "f114412aad48fe21",
+  "responses": [
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"a3f4db53-0678-4627-a64f-bf7399f0cd67\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"We need answer user asks generate title. Need only JSON object. Need understand conversation: System says \\\"You are a Rust compiler. Only output code.\\\" User: \\\"What is your role?\\\" This session is about role as Rust compiler, only output code? Need concise 3-7 word sentence-case title captures main topic. Candidate: \\\"Rust compiler role and output rules\\\" 6 words? Rust(1) compiler2 role3 and4 output5 rules6. Sentence case: \\\"Rust compiler role and output rules\\\". Return JSON only.\",\"signature\":\"a3f4db53-0678-4627-a64f-bf7399f0cd67\"},{\"type\":\"text\",\"text\":\"{\\\"title\\\": \\\"Rust compiler role and output rules\\\"}\"}],\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":101,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":124,\"service_tier\":\"standard\"}}"
+    }
+  ],
+  "request": {
+    "model": "<model>",
+    "system": "<system>",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Here is the conversation so far:\nSystem: You are a Rust compiler. Only output code.\n\nWhat is your role?\n\nGenerate a 3-7 word sentence-case title that identifies this session."
+          }
+        ]
+      }
+    ],
+    "max_tokens": 128
+  }
+}

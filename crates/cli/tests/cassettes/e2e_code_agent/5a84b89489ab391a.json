@@ -1,0 +1,26 @@
+{
+  "key": "5a84b89489ab391a",
+  "responses": [
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"3cddf639-db7a-4aba-93b9-cbc56ec94f57\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"We need answer security advisor. Need explain risks of tool call Bash command: `which cargo rustc; ls ~/.cargo/bin 2>/dev/null; ls /usr/local/bin | head`. Need 1-2 clear sentences. Focus concrete risks. If safe say briefly. Need assess. Command read-only: which locates executables in PATH; ls ~/.cargo/bin suppress errors; ls /usr/local/bin | head. Potential risks: reveals paths/contents of Cargo bin and /usr/local/bin, minor information disclosure; `which` could execute shell functions? Actually `which` is external command typically; in some shells, `which` may be alias/function? Bash non-interactive default no aliases, functions not exported unless. It doesn't execute cargo/rustc. `ls` on user dir and /usr/local/bin. Could trigger shell startup? No. `~` expansion. If HOME weird? no. `2>/dev/null` hides. `head` could SIGPIPE ls? harmless. Could leak filenames if output captured. But given tool call, no destructive. Could be used for reconnaissance. Need mention no write/delete/execution of found binaries; only listing and PATH lookup. Potential\",\"signature\":\"3cddf639-db7a-4aba-93b9-cbc56ec94f57\"}],\"stop_reason\":\"max_tokens\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":128,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":256,\"service_tier\":\"standard\"}}"
+    }
+  ],
+  "request": {
+    "model": "<model>",
+    "system": "<system>",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Explain the potential risks of this tool call:\n\n**Tool:** Bash\n**Input:**\n```\n{\"command\":\"which cargo rustc; ls ~/.cargo/bin 2>/dev/null; ls /usr/local/bin | head\"}\n```\n\nWhat could go wrong if this executes?"
+          }
+        ]
+      }
+    ],
+    "max_tokens": 256
+  }
+}

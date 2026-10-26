@@ -1,0 +1,26 @@
+{
+  "key": "963388e36b8fda66",
+  "responses": [
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"826172e2-6eb3-4a09-9229-aae6fefbd0f6\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"We need answer security advisor. Need assess tool call Bash command cargo test | tail. Risks concrete. Need 1-2 clear sentences. Need mention executes project tests/build scripts arbitrary code, dependencies, network maybe, filesystem writes, env secrets, resource exhaustion within timeout. Piping tail hides output/exit status (pipeline exit status is tail unless pipefail). Potential risk: cargo test runs untrusted build.rs/proc macros/tests, can execute arbitrary code with user privileges, modify/delete files, exfiltrate secrets, network access; tail masks failures and truncates logs. Timeout 180 but could consume resources. Need concise 1-2 sentences. \\\"If project/dependencies untrusted, cargo test compiles and executes build scripts, proc macros, and test code, so it can run arbitrary commands with your privileges—read/exfiltrate files/env vars, make network calls, or modify files. The pipe to tail also hides most output and returns tail's exit status, so failures can be missed.\\\" That's two sentences. Good. Ensure \\\"if executes\\\" maybe safe if trusted repo. Need focus concrete. Final.\",\"signature\":\"826172e2-6eb3-4a09-9229-aae6fefbd0f6\"},{\"type\":\"text\",\"text\":\"`cargo test` compiles and executes project code, build scripts, proc macros, and tests, so\"}],\"stop_reason\":\"max_tokens\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":120,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":256,\"service_tier\":\"standard\"}}"
+    }
+  ],
+  "request": {
+    "model": "<model>",
+    "system": "<system>",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Explain the potential risks of this tool call:\n\n**Tool:** Bash\n**Input:**\n```\n{\"command\":\"cargo test 2>&1 | tail -20\",\"timeout\":180}\n```\n\nWhat could go wrong if this executes?"
+          }
+        ]
+      }
+    ],
+    "max_tokens": 256
+  }
+}

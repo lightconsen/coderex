@@ -1,0 +1,26 @@
+{
+  "key": "a818dfd404ade1a2",
+  "responses": [
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"f16818f4-aca6-49fc-92aa-b0e4640dc922\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"We need answer. Need assess Grep tool call pattern \\\\badd\\\\b output_mode content no path. Risks? Grep searches files for word \\\"add\\\" and outputs content. Potential risks: broad search across entire workspace can read/expose sensitive contents in output, especially if matches in secrets/config/logs; may be expensive/slow/huge output if large repo; no path scope means scans everything accessible. Also regex simple safe no ReDoS. Need 1-2 clear sentences. If safe? It's low risk but broad. Mention potential exposure and performance. Need concise.\",\"signature\":\"f16818f4-aca6-49fc-92aa-b0e4640dc922\"},{\"type\":\"text\",\"text\":\"This search is low-risk technically, but because it has no path scope it can scan the entire accessible workspace and return matching lines that may expose sensitive content from configs, logs, or secrets. It may also produce slow or overly large output in a big repository due to the broad “add” match.\"}],\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":115,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":180,\"service_tier\":\"standard\"}}"
+    }
+  ],
+  "request": {
+    "model": "<model>",
+    "system": "<system>",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Explain the potential risks of this tool call:\n\n**Tool:** Grep\n**Input:**\n```\n{\"pattern\":\"\\\\badd\\\\b\",\"output_mode\":\"content\"}\n```\n\nWhat could go wrong if this executes?"
+          }
+        ]
+      }
+    ],
+    "max_tokens": 256
+  }
+}

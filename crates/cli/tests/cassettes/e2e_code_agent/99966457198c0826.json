@@ -1,0 +1,26 @@
+{
+  "key": "99966457198c0826",
+  "responses": [
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"96036ef3-01c0-4ee1-96e1-a79ed4ac83ee\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"The user asks to generate a title. The conversation is about reviewing src/lib.rs and listing issues. Title should be 3-7 word sentence-case. Something like \\\"Reviewing src/lib.rs for code issues\\\". Sentence case. Count words: Reviewing(1) src/lib.rs(2) for(3) code(4) issues(5). Good. Return only JSON.\",\"signature\":\"96036ef3-01c0-4ee1-96e1-a79ed4ac83ee\"},{\"type\":\"text\",\"text\":\"{\\\"title\\\": \\\"Reviewing src/lib.rs for code issues\\\"}\"}],\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":113,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":92,\"service_tier\":\"standard\"}}"
+    }
+  ],
+  "request": {
+    "model": "<model>",
+    "system": "<system>",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Here is the conversation so far:\nReview src/lib.rs and list all issues you find (panics, division by zero, etc.). Do not modify any files, just report.\n\nGenerate a 3-7 word sentence-case title that identifies this session."
+          }
+        ]
+      }
+    ],
+    "max_tokens": 128
+  }
+}

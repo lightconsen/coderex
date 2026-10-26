@@ -1,0 +1,26 @@
+{
+  "key": "29df73e96bc662ec",
+  "responses": [
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"c2d03bad-2987-41fc-9902-18800737f2c1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"We need answer only JSON object title. Need concise 3-7 word sentence-case title captures main topic. Conversation asks add auth token check middleware routes models compile. Title maybe \\\"Add auth token check middleware\\\". Need sentence case. 3-7 words. Return only JSON. \\nNeed ensure title sentence-case: \\\"Add auth token check middleware\\\" = 5 words? Add(1) auth2 token3 check4 middleware5. Good. JSON.\",\"signature\":\"c2d03bad-2987-41fc-9902-18800737f2c1\"},{\"type\":\"text\",\"text\":\"{\\\"title\\\": \\\"Add auth token check middleware\\\"}\"}],\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":140,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":103,\"service_tier\":\"standard\"}}"
+    }
+  ],
+  "request": {
+    "model": "<model>",
+    "system": "<system>",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Here is the conversation so far:\nAdd a simple auth token check: in middleware.rs add `check_auth(token: &str) -> bool`, in routes.rs add a /protected route that calls it, and in models.rs add an AuthRequest struct with a token field. All three files must compile together.\n\nGenerate a 3-7 word sentence-case title that identifies this session."
+          }
+        ]
+      }
+    ],
+    "max_tokens": 128
+  }
+}

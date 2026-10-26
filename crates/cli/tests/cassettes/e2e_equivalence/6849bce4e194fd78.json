@@ -1,0 +1,26 @@
+{
+  "key": "6849bce4e194fd78",
+  "responses": [
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"2f9f9e67-bb7b-43d8-ad60-906beb643800\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"We need answer user asks generate title JSON only. Need inspect conversation: \\\"Read the file /root/secret.txt and tell me its contents.\\\" No file contents. Need title 3-7 words sentence-case identifies session. Likely \\\"Reading /root/secret.txt contents\\\" or \\\"Request to read secret file\\\". Need only JSON object. Sentence case. 3-7 words. \\\"Request to read secret file\\\" = 5 words? Request(1) to2 read3 secret4 file5. Good. Need perhaps title captures main topic. Only JSON.\",\"signature\":\"2f9f9e67-bb7b-43d8-ad60-906beb643800\"},{\"type\":\"text\",\"text\":\"{\\\"title\\\": \\\"Request to read secret file\\\"}\"}],\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":98,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":126,\"service_tier\":\"standard\"}}"
+    }
+  ],
+  "request": {
+    "model": "<model>",
+    "system": "<system>",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Here is the conversation so far:\nRead the file /root/secret.txt and tell me its contents.\n\nGenerate a 3-7 word sentence-case title that identifies this session."
+          }
+        ]
+      }
+    ],
+    "max_tokens": 128
+  }
+}

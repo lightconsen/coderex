@@ -8,14 +8,11 @@ REPO_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
 usage() {
     cat >&2 <<'USAGE'
 Usage:
-  scripts/test-code-agent-benchmark.sh mock [cargo-test-args...]
-  scripts/test-code-agent-benchmark.sh live [kimi|qwen] [cargo-test-args...]
+  scripts/test-code-agent-benchmark.sh [mock|live] [cargo-test-args...]
 
-Runs hard-assert Code Agent benchmarks. Mock mode uses the deterministic provider
-and is suitable for CI. Live mode sources export_env.<provider>.sh unless
-CODEREX_SKIP_ENV_SOURCE=1, then runs ignored hard-gate live scenarios against
-the selected provider. Set CODEREX_LIVE_BENCHMARK_TIMEOUT_SECS to override the
-default live case timeout for slower providers.
+Runs the hard-assert Code Agent benchmarks. Both modes are deterministic: the
+provider-facing cases replay the recorded LLM cassettes, so no key or network
+is needed. Re-record them once with scripts/record-cassettes.sh --fresh.
 
 A case only passes when the agent performs the expected file changes, the
 fixture project passes cargo test, review-only tasks leave sources unchanged,
@@ -73,36 +70,12 @@ run_mock() {
 }
 
 run_live() {
-    provider="${1:-kimi}"
-    case "$provider" in
-        kimi|qwen)
-            shift || true
-            ;;
-        *)
-            provider="kimi"
-            ;;
-    esac
-
-    if [[ "${CODEREX_SKIP_ENV_SOURCE:-0}" != "1" ]]; then
-        env_file="$REPO_ROOT/export_env.$provider.sh"
-        if [[ ! -f "$env_file" ]]; then
-            echo "Missing provider env file: $env_file" >&2
-            exit 1
-        fi
-        # shellcheck source=/dev/null
-        source "$env_file"
-    fi
-
-    if [[ -z "${ANTHROPIC_API_KEY:-}" || -z "${ANTHROPIC_BASE_URL:-}" ]]; then
-        echo "ANTHROPIC_API_KEY and ANTHROPIC_BASE_URL must be set for live benchmark tests." >&2
-        exit 1
-    fi
-
     if [[ "$#" -eq 0 ]]; then
         set -- --test-threads=1
     fi
 
-    run_and_report "live:$provider" cargo test -p coderex-cli --test code_agent_benchmark live_hard_assert -- --ignored --nocapture "$@"
+    # The provider cases replay tests/cassettes/benchmark_live.
+    run_and_report "live" cargo test -p coderex-cli --test code_agent_benchmark live_hard_assert -- --nocapture "$@"
 }
 
 case "$mode" in

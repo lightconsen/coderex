@@ -5,7 +5,7 @@
 //!
 //!   cargo run --bin mock-anthropic-server -- --port 9876 &
 //!   ANTHROPIC_API_KEY=mock ANTHROPIC_BASE_URL=http://127.0.0.1:9876 \
-//!       cargo test -p coderex-cli --test e2e_code_agent -- --ignored
+//!       cargo test -p coderex-cli --test e2e_code_agent
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};

@@ -1,0 +1,26 @@
+{
+  "key": "1191c99430c2bc9d",
+  "responses": [
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"95f7febc-f162-4fff-9492-e3156a280960\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"The user wants a title. The conversation is just \\\"Run bash to list all files.\\\" So the title should capture listing all files via bash. Keep 3-7 words, sentence case. Return only JSON.\\n\\nSomething like \\\"List all files with bash\\\" — 5 words. Good.\",\"signature\":\"95f7febc-f162-4fff-9492-e3156a280960\"},{\"type\":\"text\",\"text\":\"{\\\"title\\\": \\\"List all files with bash\\\"}\"}],\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":91,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":70,\"service_tier\":\"standard\"}}"
+    }
+  ],
+  "request": {
+    "model": "<model>",
+    "system": "<system>",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Here is the conversation so far:\nRun bash to list all files.\n\nGenerate a 3-7 word sentence-case title that identifies this session."
+          }
+        ]
+      }
+    ],
+    "max_tokens": 128
+  }
+}

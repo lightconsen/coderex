@@ -1,0 +1,26 @@
+{
+  "key": "476a559b0129ffb0",
+  "responses": [
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"7f8ea891-d1aa-4b5a-94a5-afb57a35d585\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"We need answer explain risks of Bash command whoami; pwd; echo HOME; ls -la / 2>&1. Need 1-2 clear sentences. Focus concrete risks. Is it safe? It's read-only reconnaissance. Could disclose environment details/root directory listing. No destructive. Potential risk: exposes username, working dir, home path, root filesystem permissions and filenames to logs/output; if output goes to untrusted place info leak. Also if in privileged context ls / may reveal sensitive filenames. Not execution of untrusted input. Need concise 1-2 sentences. Mention safe-ish.\",\"signature\":\"7f8ea891-d1aa-4b5a-94a5-afb57a35d585\"},{\"type\":\"text\",\"text\":\"This is essentially read-only reconnaissance: it discloses the current username, working directory, `$HOME` path, and a full listing of `/`, which could leak host/environment details if the output is captured or shared. It does not modify files or execute untrusted input, so the direct risk is low—mainly information disclosure.\"}],\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":125,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":194,\"service_tier\":\"standard\"}}"
+    }
+  ],
+  "request": {
+    "model": "<model>",
+    "system": "<system>",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Explain the potential risks of this tool call:\n\n**Tool:** Bash\n**Input:**\n```\n{\"command\":\"whoami; pwd; echo \\\"HOME=$HOME\\\"; ls -la / 2>&1\"}\n```\n\nWhat could go wrong if this executes?"
+          }
+        ]
+      }
+    ],
+    "max_tokens": 256
+  }
+}

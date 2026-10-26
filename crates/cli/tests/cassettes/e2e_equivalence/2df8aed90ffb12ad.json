@@ -1,0 +1,26 @@
+{
+  "key": "2df8aed90ffb12ad",
+  "responses": [
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"36a77d50-2782-464c-9332-83119ed0fe13\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"We need answer user asks generate title from conversation. Need ONLY JSON object. Need title 3-7 words sentence-case. Topic: Create src/utils.rs with helper greet function. Need concise. Maybe \\\"Create greet helper in utils.rs\\\" = 5 words? \\\"Create greet helper in utils.rs\\\" words Create(1) greet2 helper3 in4 utils.rs5. Sentence case. Return JSON only.\",\"signature\":\"36a77d50-2782-464c-9332-83119ed0fe13\"},{\"type\":\"text\",\"text\":\"{\\\"title\\\": \\\"Create greet helper in utils.rs\\\"}\"}],\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":103,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":95,\"service_tier\":\"standard\"}}"
+    }
+  ],
+  "request": {
+    "model": "<model>",
+    "system": "<system>",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Here is the conversation so far:\nCreate src/utils.rs with a helper function `greet(name: &str) -> String`.\n\nGenerate a 3-7 word sentence-case title that identifies this session."
+          }
+        ]
+      }
+    ],
+    "max_tokens": 128
+  }
+}

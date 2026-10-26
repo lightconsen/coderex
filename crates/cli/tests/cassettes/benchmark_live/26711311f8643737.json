@@ -1,0 +1,26 @@
+{
+  "key": "26711311f8643737",
+  "responses": [
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"707695c7-8c92-4c8d-9ede-d4aded165e5f\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"We need answer. Need assess tool call. Bash command: ls -la; echo \\\"---\\\"; cat Cargo.toml 2>/dev/null; echo \\\"---\\\"; ls -R src 2>/dev/null. Risks? It's read-only listing and cat manifest, recursive listing src. Potential risks: information disclosure of directory contents including hidden files, Cargo.toml and source tree structure; if run in sensitive dir, leaks filenames/config to output/logs. No modification/execution. Recursive ls could be large/slow or follow? ls -R does not follow symlinks by default? It lists dirs recursively, symlinks shown not traversed unless -L. Could be huge output / hang in large tree. cat Cargo.toml could include secrets? Cargo.toml usually not secrets but may include paths/registry tokens? Usually no. 2>/dev/null hides errors. Commands separated by ; so all run. Safe-ish but info disclosure. Need 1-2 sentences. Final.\",\"signature\":\"707695c7-8c92-4c8d-9ede-d4aded165e5f\"},{\"type\":\"text\",\"text\":\"The command is read-only, but it can disclose sensitive information by dumping hidden files, `Cargo.toml`, and the full `src` tree into logs/output if run in a sensitive directory.\"}],\"stop_reason\":\"max_tokens\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":139,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":256,\"service_tier\":\"standard\"}}"
+    }
+  ],
+  "request": {
+    "model": "<model>",
+    "system": "<system>",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Explain the potential risks of this tool call:\n\n**Tool:** Bash\n**Input:**\n```\n{\"command\":\"ls -la; echo \\\"---\\\"; cat Cargo.toml 2>/dev/null; echo \\\"---\\\"; ls -R src 2>/dev/null\"}\n```\n\nWhat could go wrong if this executes?"
+          }
+        ]
+      }
+    ],
+    "max_tokens": 256
+  }
+}

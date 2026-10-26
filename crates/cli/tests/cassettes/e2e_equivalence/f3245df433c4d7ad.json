@@ -1,0 +1,26 @@
+{
+  "key": "f3245df433c4d7ad",
+  "responses": [
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"8e1d44e3-dca4-41c1-95ce-3f2f58915444\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"We need answer only JSON object title. Need capture conversation: user asked write short poem about Rust. Need 3-7 word sentence-case title. Something like \\\"Short poem about Rust programming\\\". Count words: Short(1) poem2 about3 Rust4 programming5. Sentence case. Return JSON only.\",\"signature\":\"8e1d44e3-dca4-41c1-95ce-3f2f58915444\"},{\"type\":\"text\",\"text\":\"{\\\"title\\\": \\\"Short poem about Rust programming\\\"}\"}],\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":91,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":73,\"service_tier\":\"standard\"}}"
+    }
+  ],
+  "request": {
+    "model": "<model>",
+    "system": "<system>",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Here is the conversation so far:\nWrite a short poem about Rust.\n\nGenerate a 3-7 word sentence-case title that identifies this session."
+          }
+        ]
+      }
+    ],
+    "max_tokens": 128
+  }
+}

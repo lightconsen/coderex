@@ -1,0 +1,26 @@
+{
+  "key": "3a28c68c8ce148fc",
+  "responses": [
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"96f59823-de12-4339-b013-4c3a087d496d\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"We need answer only JSON object title 3-7 words sentence case captures main topic. Conversation: add recursive fibonacci function to src/lib.rs and test, don't change existing add. Title concise. Need maybe \\\"Add recursive fibonacci with test\\\". Count words 4? Add(1) recursive2 fibonacci3 with4 test5. Sentence case. Return JSON only.\",\"signature\":\"96f59823-de12-4339-b013-4c3a087d496d\"},{\"type\":\"text\",\"text\":\"{\\\"title\\\": \\\"Add recursive fibonacci with test\\\"}\"}],\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":107,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":85,\"service_tier\":\"standard\"}}"
+    }
+  ],
+  "request": {
+    "model": "<model>",
+    "system": "<system>",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Here is the conversation so far:\nAdd a recursive fibonacci function to src/lib.rs and a test for it. Do not change the existing add function.\n\nGenerate a 3-7 word sentence-case title that identifies this session."
+          }
+        ]
+      }
+    ],
+    "max_tokens": 128
+  }
+}

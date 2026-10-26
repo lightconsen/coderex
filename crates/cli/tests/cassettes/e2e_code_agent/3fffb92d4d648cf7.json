@@ -1,0 +1,26 @@
+{
+  "key": "3fffb92d4d648cf7",
+  "responses": [
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"36dadb57-7b92-4c7b-84d5-271e7bad1e26\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"We need answer security advisor 1-2 clear sentences. Need analyze tool call Bash command. Need explain potential risks concrete not generic. Command: cd /private/var/folders/.../.tmptuNkBd && ls -la && find . -name \\\"*.rs\\\" -not -path \\\"./target/*\\\" | head -20 && cat Cargo.toml 2>/dev/null. Risks? It's read-only listing and cat Cargo.toml within temp dir. Potential risks: cd into attacker-controlled temp directory? Path is in /var/folders temp, maybe not controlled? ls -la could reveal filenames/symlinks? find follows? By default find does not follow symlinks. cat Cargo.toml could read file, if Cargo.toml is symlink to sensitive file? cat follows symlinks; could exfiltrate contents of arbitrary file if directory has malicious symlink named Cargo.toml pointing to sensitive file, and output displayed. Also command chaining &&: if cd succeeds; if ls/find pipeline? head may cause SIGPIPE? Actually find | head may terminate find, but then && next command? Pipeline exit status is head's status (0), so\",\"signature\":\"36dadb57-7b92-4c7b-84d5-271e7bad1e26\"}],\"stop_reason\":\"max_tokens\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":183,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":256,\"service_tier\":\"standard\"}}"
+    }
+  ],
+  "request": {
+    "model": "<model>",
+    "system": "<system>",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Explain the potential risks of this tool call:\n\n**Tool:** Bash\n**Input:**\n```\n{\"command\":\"cd <tmp> && ls -la && find . -name \\\"*.rs\\\" -not -path \\\"./target/*\\\" | head -20 && cat Cargo.toml 2>/dev/null\"}\n```\n\nWhat could go wrong if this executes?"
+          }
+        ]
+      }
+    ],
+    "max_tokens": 256
+  }
+}

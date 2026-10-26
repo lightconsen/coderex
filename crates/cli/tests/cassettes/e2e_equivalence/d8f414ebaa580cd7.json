@@ -1,0 +1,26 @@
+{
+  "key": "d8f414ebaa580cd7",
+  "responses": [
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"fa716357-3780-4198-918c-b832e6e6fba2\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"The user wants a title for the conversation. The conversation is about searching for function definitions in src/lib.rs. Title should be 3-7 words, sentence case.\\n\\n\\\"Search for function definitions in lib.rs\\\" - 6 words. Or \\\"Finding function definitions in src/lib.rs\\\" - 6 words. Return JSON only.\",\"signature\":\"fa716357-3780-4198-918c-b832e6e6fba2\"},{\"type\":\"text\",\"text\":\"{\\\"title\\\": \\\"Search for function definitions in lib.rs\\\"}\"}],\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":94,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":80,\"service_tier\":\"standard\"}}"
+    }
+  ],
+  "request": {
+    "model": "<model>",
+    "system": "<system>",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Here is the conversation so far:\nSearch for all function definitions in src/lib.rs.\n\nGenerate a 3-7 word sentence-case title that identifies this session."
+          }
+        ]
+      }
+    ],
+    "max_tokens": 128
+  }
+}

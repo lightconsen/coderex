@@ -1,0 +1,46 @@
+{
+  "key": "d49f1807aaaa2507",
+  "responses": [
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"cbf062fa-7868-42e4-90b8-e53d1eb2049c\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"The user wants a title for the conversation. The conversation is just \\\"Add a fibonacci function to src/lib.rs.\\\" So title something like \\\"Add fibonacci function to lib.rs\\\". That's 5 words roughly. Sentence-case. Return JSON only.\",\"signature\":\"cbf062fa-7868-42e4-90b8-e53d1eb2049c\"},{\"type\":\"text\",\"text\":\"{\\\"title\\\": \\\"Add fibonacci function to src/lib.rs\\\"}\"}],\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":93,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":62,\"service_tier\":\"standard\"}}"
+    },
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"c4f3f020-b0e6-4e85-bfb2-a0aa0ee69f93\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"The user wants a title for the conversation. The conversation is just \\\"Add a fibonacci function to src/lib.rs.\\\" So the title should capture that. 3-7 words, sentence case. Return JSON object only.\\n\\nSomething like \\\"Add fibonacci function to src/lib.rs\\\" — that's 6 words? \\\"Add\\\"(1) \\\"fibonacci\\\"(2) \\\"function\\\"(3) \\\"to\\\"(4) \\\"src/lib.rs\\\"(5) — 5 words. Good.\\n\\nReturn only JSON.\",\"signature\":\"c4f3f020-b0e6-4e85-bfb2-a0aa0ee69f93\"},{\"type\":\"text\",\"text\":\"{\\\"title\\\": \\\"Add fibonacci function to src/lib.rs\\\"}\"}],\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":93,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":114,\"service_tier\":\"standard\"}}"
+    },
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"2163320e-3918-4fd5-b1b0-3a9879e34419\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"We need answer only JSON title. Need capture main topic. Conversation: \\\"Add a fibonacci function to src/lib.rs.\\\" Title sentence case 3-7 words. Maybe \\\"Add Fibonacci function to lib.rs\\\" = 5 words? Add(1) Fibonacci2 function3 to4 lib.rs5. Sentence case: \\\"Add Fibonacci function to lib.rs\\\". Return JSON only.\",\"signature\":\"2163320e-3918-4fd5-b1b0-3a9879e34419\"},{\"type\":\"text\",\"text\":\"{\\\"title\\\": \\\"Add Fibonacci function to lib.rs\\\"}\"}],\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":93,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":88,\"service_tier\":\"standard\"}}"
+    },
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"46c8ab06-809e-4018-8661-235a76303c4d\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"We need answer only JSON object title. Conversation asks add fibonacci function to src/lib.rs. Need concise 3-7 word sentence-case title main topic. Something like \\\"Add Fibonacci function to lib.rs\\\" Count words: Add(1) Fibonacci(2) function(3) to(4) lib.rs(5). Sentence case? \\\"Add Fibonacci function to lib.rs\\\" Good. Return ONLY JSON.\",\"signature\":\"46c8ab06-809e-4018-8661-235a76303c4d\"},{\"type\":\"text\",\"text\":\"{\\\"title\\\": \\\"Add Fibonacci function to lib.rs\\\"}\"}],\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":93,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":94,\"service_tier\":\"standard\"}}"
+    },
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"323ced49-6c6b-46d0-b03d-ab5894f6fa3f\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"We need answer only JSON object title. Conversation asks add fibonacci function to src/lib.rs. Title 3-7 words sentence case. Need concise. Maybe \\\"Add fibonacci function to lib.rs\\\" that's 5 words? Add(1) fibonacci2 function3 to4 lib.rs5. Sentence case. Return JSON only.\",\"signature\":\"323ced49-6c6b-46d0-b03d-ab5894f6fa3f\"},{\"type\":\"text\",\"text\":\"{\\\"title\\\": \\\"Add fibonacci function to lib.rs\\\"}\"}],\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":93,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":78,\"service_tier\":\"standard\"}}"
+    }
+  ],
+  "request": {
+    "model": "<model>",
+    "system": "<system>",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Here is the conversation so far:\nAdd a fibonacci function to src/lib.rs.\n\nGenerate a 3-7 word sentence-case title that identifies this session."
+          }
+        ]
+      }
+    ],
+    "max_tokens": 128
+  }
+}

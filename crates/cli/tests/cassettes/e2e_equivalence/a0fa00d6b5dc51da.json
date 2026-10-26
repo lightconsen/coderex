@@ -1,0 +1,26 @@
+{
+  "key": "a0fa00d6b5dc51da",
+  "responses": [
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"20e89986-b0bd-4ab0-9956-66d524b1ed20\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"We need answer user asks: \\\"Generate a concise 3-7 word sentence-case title that captures main topic... Return ONLY JSON object.\\\" Conversation so far: \\\"List all Rust source files in this project.\\\" Need title identifying session. Need only JSON. Title sentence case 3-7 words. Main topic: listing Rust source files. Maybe \\\"Listing Rust source files\\\" (4 words). Need sentence-case: \\\"Listing Rust source files\\\". JSON only.\",\"signature\":\"20e89986-b0bd-4ab0-9956-66d524b1ed20\"},{\"type\":\"text\",\"text\":\"{\\\"title\\\": \\\"Listing Rust source files\\\"}\"}],\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":93,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":102,\"service_tier\":\"standard\"}}"
+    }
+  ],
+  "request": {
+    "model": "<model>",
+    "system": "<system>",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Here is the conversation so far:\nList all Rust source files in this project.\n\nGenerate a 3-7 word sentence-case title that identifies this session."
+          }
+        ]
+      }
+    ],
+    "max_tokens": 128
+  }
+}

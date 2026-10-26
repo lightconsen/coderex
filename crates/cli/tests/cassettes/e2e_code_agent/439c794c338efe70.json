@@ -1,0 +1,26 @@
+{
+  "key": "439c794c338efe70",
+  "responses": [
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"222e6674-a6a7-4d79-9371-c298bade8d37\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"We need answer only JSON object title 3-7 words sentence case. Need identify session: reading nonexistent file, create file, verify. Title concise. \\\"Create and verify missing Rust file\\\" 6 words? Create(1) and2 verify3 missing4 Rust5 file6. Sentence case. Good.\",\"signature\":\"222e6674-a6a7-4d79-9371-c298bade8d37\"},{\"type\":\"text\",\"text\":\"{\\\"title\\\": \\\"Create and verify missing Rust file\\\"}\"}],\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":128,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":76,\"service_tier\":\"standard\"}}"
+    }
+  ],
+  "request": {
+    "model": "<model>",
+    "system": "<system>",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Here is the conversation so far:\nTry to read a file that does not exist: src/nonexistent.rs. Observe the error. Then create that file with content `pub const X: i32 = 42;` and verify it exists.\n\nGenerate a 3-7 word sentence-case title that identifies this session."
+          }
+        ]
+      }
+    ],
+    "max_tokens": 128
+  }
+}

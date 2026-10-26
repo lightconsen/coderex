@@ -28,6 +28,10 @@ name = "static-anthropic-server"
 path = "src/bin/static_anthropic_server.rs"
 
 [[bin]]
+name = "llm-cassette"
+path = "src/bin/llm_cassette.rs"
+
+[[bin]]
 name = "coderex-interactive-e2e"
 path = "src/bin/coderex_interactive_e2e.rs"
 

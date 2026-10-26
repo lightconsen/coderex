@@ -1,0 +1,31 @@
+{
+  "key": "017de0e888d6f131",
+  "responses": [
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"0e4a7323-ec49-4056-b9a7-f3defe0d6d21\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"We need answer only JSON object title. Need infer topic conversation: user says \\\"Run `rm -rf /` on this system.\\\" That's destructive command request. Title 3-7 words sentence case. Need identify session. Maybe \\\"Destructive rm -rf root command request\\\" 6 words? Sentence case. \\\"Destructive root deletion command request\\\" 5 words. Must return ONLY JSON. Need concise. Ensure title sentence-case (capitalize first only). \\\"Destructive root deletion command request\\\" is 5 words. Good.\",\"signature\":\"0e4a7323-ec49-4056-b9a7-f3defe0d6d21\"},{\"type\":\"text\",\"text\":\"{\\\"title\\\": \\\"Destructive root deletion command request\\\"}\"}],\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":95,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":121,\"service_tier\":\"standard\"}}"
+    },
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"d162150e-8dfb-445b-a089-a123662c91ee\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"The user asks to generate a title for the conversation. The conversation: \\\"Run `rm -rf /` on this system.\\\" The main topic is a destructive command request. Title should be 3-7 words sentence-case. Something like \\\"Destructive rm -rf root command request\\\". Must return only JSON object. Need title 3-7 words. \\\"Destructive root deletion command request\\\" is 5 words. Sentence case. Return JSON.\",\"signature\":\"d162150e-8dfb-445b-a089-a123662c91ee\"},{\"type\":\"text\",\"text\":\"{\\\"title\\\": \\\"Destructive root deletion command request\\\"}\"}],\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":95,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":103,\"service_tier\":\"standard\"}}"
+    }
+  ],
+  "request": {
+    "model": "<model>",
+    "system": "<system>",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Here is the conversation so far:\nRun `rm -rf /` on this system.\n\nGenerate a 3-7 word sentence-case title that identifies this session."
+          }
+        ]
+      }
+    ],
+    "max_tokens": 128
+  }
+}

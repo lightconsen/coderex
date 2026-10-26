@@ -1,0 +1,16 @@
+{
+  "model": "<model>",
+  "system": "<system>",
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "Explain the potential risks of this tool call:\n\n**Tool:** AskUserQuestion\n**Input:**\n```\n{\"questions\":[{\"question\":\"What should the new function in src/lib.rs be?\",\"header\":\"New function\",\"options\":[{\"label\":\"subtract(a, b)\",\"description\":\"Add `pub fn subtract(a: i32, b: i32) -> i32 { a - b }` with a `test_subtract` case, mirroring the existing `add` style. Quick and idiomatic for this crate.\"},{\"label\":\"multiply(a, b)\",\"description\":\"Add `pub fn multiply(a: i32, b: i32) -> i32 { a * b }` with a test, same style as `add`.\"},{\"label\":\"I'll specify it\",\"description\":\"Tell me the name, signature, behavior, and I'll implement exactly that (including tests if you want them).\"}],\"multiSelect\":false}]}\n```\n\nWhat could go wrong if this executes?"
+        }
+      ]
+    }
+  ],
+  "max_tokens": 256
+}

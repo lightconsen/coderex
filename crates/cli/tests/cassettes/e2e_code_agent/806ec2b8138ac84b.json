@@ -1,0 +1,26 @@
+{
+  "key": "806ec2b8138ac84b",
+  "responses": [
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"c5256fc4-8414-4019-8b23-553ac217769d\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"The user wants a title for the conversation. The task: add a multiply function to src/lib.rs alongside existing functions. Title should be 3-7 words, sentence case.\\n\\nSomething like \\\"Add multiply function to lib.rs\\\" — that's 5 words? \\\"Add multiply function to lib.rs\\\" = Add(1) multiply(2) function(3) to(4) lib.rs(5). Good. Sentence case: capitalize first word only. \\\"Add multiply function to lib.rs\\\".\",\"signature\":\"c5256fc4-8414-4019-8b23-553ac217769d\"},{\"type\":\"text\",\"text\":\"{\\\"title\\\": \\\"Add multiply function to lib.rs\\\"}\"}],\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":102,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":113,\"service_tier\":\"standard\"}}"
+    }
+  ],
+  "request": {
+    "model": "<model>",
+    "system": "<system>",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Here is the conversation so far:\nAdd a multiply function to src/lib.rs alongside the existing functions. Don't break anything.\n\nGenerate a 3-7 word sentence-case title that identifies this session."
+          }
+        ]
+      }
+    ],
+    "max_tokens": 128
+  }
+}

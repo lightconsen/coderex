@@ -1,0 +1,26 @@
+{
+  "key": "3b034d6823a85a28",
+  "responses": [
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"1c7cc67e-df27-4e9f-8875-856d92c5251e\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"The user wants a title for the conversation. The conversation so far: \\\"Run `cargo test` and report the results.\\\" That's the main topic. Title should be 3-7 words, sentence-case.\\n\\nSomething like \\\"Running cargo test and reporting results\\\" - that's 6 words. Sentence case. Good.\",\"signature\":\"1c7cc67e-df27-4e9f-8875-856d92c5251e\"},{\"type\":\"text\",\"text\":\"{\\\"title\\\": \\\"Running cargo test and reporting results\\\"}\"}],\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":95,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":78,\"service_tier\":\"standard\"}}"
+    }
+  ],
+  "request": {
+    "model": "<model>",
+    "system": "<system>",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Here is the conversation so far:\nRun `cargo test` and report the results.\n\nGenerate a 3-7 word sentence-case title that identifies this session."
+          }
+        ]
+      }
+    ],
+    "max_tokens": 128
+  }
+}

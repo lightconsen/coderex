@@ -1,0 +1,26 @@
+{
+  "key": "2295e1187f1da6d4",
+  "responses": [
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"1017f5ef-8078-427e-ae5d-4d0b2614973c\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"We need answer only JSON object title. Need generate concise 3-7 word sentence-case title captures main topic. Conversation: \\\"Add a fibonacci function to src/lib.rs with a test.\\\" Title maybe \\\"Add fibonacci function with test\\\" 5 words. Sentence case. Return JSON only. Ensure 3-7 words. \\\"Add fibonacci function with test\\\" = Add(1) fibonacci2 function3 with4 test5. Good.\",\"signature\":\"1017f5ef-8078-427e-ae5d-4d0b2614973c\"},{\"type\":\"text\",\"text\":\"{\\\"title\\\": \\\"Add fibonacci function with test\\\"}\"}],\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":96,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":99,\"service_tier\":\"standard\"}}"
+    }
+  ],
+  "request": {
+    "model": "<model>",
+    "system": "<system>",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Here is the conversation so far:\nAdd a fibonacci function to src/lib.rs with a test.\n\nGenerate a 3-7 word sentence-case title that identifies this session."
+          }
+        ]
+      }
+    ],
+    "max_tokens": 128
+  }
+}

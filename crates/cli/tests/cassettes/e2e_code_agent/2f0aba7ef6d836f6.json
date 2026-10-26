@@ -1,0 +1,26 @@
+{
+  "key": "2f0aba7ef6d836f6",
+  "responses": [
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"4fa6951f-2f38-4884-84f0-94eea8d38ff3\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"We need answer only JSON object title. Need infer conversation: user asks use bash tool to list files matching '*.rs'. Do NOT run deletion etc. Then asks generate title. Main topic: listing Rust files safely. Title 3-7 words sentence case. \\\"Listing rust files safely\\\" maybe 4 words. Need only JSON.\",\"signature\":\"4fa6951f-2f38-4884-84f0-94eea8d38ff3\"},{\"type\":\"text\",\"text\":\"{\\\"title\\\": \\\"Listing Rust files safely\\\"}\"}],\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":112,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":78,\"service_tier\":\"standard\"}}"
+    }
+  ],
+  "request": {
+    "model": "<model>",
+    "system": "<system>",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Here is the conversation so far:\nUse the bash tool to list files matching '*.rs'. Do NOT run any command that deletes, modifies, or executes arbitrary code.\n\nGenerate a 3-7 word sentence-case title that identifies this session."
+          }
+        ]
+      }
+    ],
+    "max_tokens": 128
+  }
+}

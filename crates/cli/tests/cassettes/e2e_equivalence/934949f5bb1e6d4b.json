@@ -1,0 +1,61 @@
+{
+  "key": "934949f5bb1e6d4b",
+  "responses": [
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"120a986e-f7e2-4329-bce1-f3d26107a45d\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"We need answer only JSON object title. Conversation: user \\\"Say hello briefly.\\\" Need title main topic. It's a simple greeting request. 3-7 words sentence-case. Title like \\\"Brief greeting request\\\". Need identify session. \\\"Brief hello request\\\" (3 words). Sentence case. Return only JSON.\",\"signature\":\"120a986e-f7e2-4329-bce1-f3d26107a45d\"},{\"type\":\"text\",\"text\":\"{\\\"title\\\": \\\"Brief hello request\\\"}\"}],\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":88,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":72,\"service_tier\":\"standard\"}}"
+    },
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"8603f91b-2ac1-4e24-83d6-8724ee418486\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"We need answer only JSON object title. Need infer conversation only user says \\\"Say hello briefly.\\\" Need generate concise 3-7 word sentence-case title identifying session. Likely \\\"Brief greeting request\\\" or \\\"Initial greeting and response\\\". Need 3-7 words sentence case. Return only JSON.\",\"signature\":\"8603f91b-2ac1-4e24-83d6-8724ee418486\"},{\"type\":\"text\",\"text\":\"{\\\"title\\\": \\\"Brief greeting request\\\"}\"}],\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":88,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":69,\"service_tier\":\"standard\"}}"
+    },
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"55772cbc-2e65-403f-9b96-78ba55e95274\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"We need answer to user? Need parse: They gave conversation so far \\\"Say hello briefly.\\\" Then ask \\\"Generate a 3-7 word sentence-case title that identifies this session.\\\" Need return ONLY JSON object with title. Need title based on main topic: maybe \\\"Brief greeting session\\\" or \\\"Initial greeting and session title\\\". Need 3-7 words sentence case. Must return only JSON. Need concise. Use sentence case: \\\"Brief greeting and session title\\\" is 5 words? Brief(1) greeting2 and3 session4 title5. Good. But \\\"captures main topic\\\" conversation is just hello and title generation\",\"signature\":\"55772cbc-2e65-403f-9b96-78ba55e95274\"}],\"stop_reason\":\"max_tokens\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":88,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":128,\"service_tier\":\"standard\"}}"
+    },
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"445d4abd-8d6f-4d91-bba3-6917dafdcc63\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"The user wants a title for the conversation. The conversation: \\\"Say hello briefly.\\\" So the topic is a brief greeting request. Title 3-7 words, sentence case.\\n\\n\\\"Brief greeting request\\\" — 3 words. Or \\\"Request for a brief greeting\\\" — 5 words. Return JSON only.\",\"signature\":\"445d4abd-8d6f-4d91-bba3-6917dafdcc63\"},{\"type\":\"text\",\"text\":\"{\\\"title\\\": \\\"Request for a brief greeting\\\"}\"}],\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":88,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":74,\"service_tier\":\"standard\"}}"
+    },
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"f313556a-7a99-4d5c-bb62-384371d7cb18\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"We need answer JSON only title. Conversation: user says \\\"Say hello briefly.\\\" Then asks generate title. Need title captures main topic. This is just greeting/session initiation. 3-7 words sentence case. E.g. \\\"Brief greeting and session title\\\" 5 words? \\\"Brief greeting request\\\" 3 words. Need identify session. Return only JSON.\",\"signature\":\"f313556a-7a99-4d5c-bb62-384371d7cb18\"},{\"type\":\"text\",\"text\":\"{\\\"title\\\": \\\"Brief greeting request\\\"}\"}],\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":88,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":83,\"service_tier\":\"standard\"}}"
+    },
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"f51797a2-965e-4994-a5b6-3c71959e152b\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"We need answer only JSON title. Need infer conversation? User: \\\"Say hello briefly. Generate a 3-7 word sentence-case title that identifies this session.\\\" There's no prior content except this request. Need title capturing main topic. Likely \\\"Brief greeting and session title request\\\" but sentence case 3-7 words. Need only JSON. Title should identify session. Maybe \\\"Brief greeting and title request\\\" 5 words. sentence case (capitalize first only). Return JSON.\",\"signature\":\"f51797a2-965e-4994-a5b6-3c71959e152b\"},{\"type\":\"text\",\"text\":\"{\\\"title\\\": \\\"Brief greeting and title request\\\"}\"}],\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":88,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":110,\"service_tier\":\"standard\"}}"
+    },
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"4bd97518-3120-4e4c-b198-80dc9ee3192a\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"We need answer only JSON object with title. Need understand conversation so far: user says \\\"Say hello briefly. Generate a 3-7 word sentence-case title that identifies this session.\\\" Actually the conversation? We need generate title for conversation. Main topic is greeting and title generation? Need concise 3-7 word sentence-case title. Return ONLY JSON. Title should identify session. Something like \\\"Brief greeting and session title\\\". 5 words? \\\"Brief greeting and session title\\\" sentence case. Need only JSON.\",\"signature\":\"4bd97518-3120-4e4c-b198-80dc9ee3192a\"},{\"type\":\"text\",\"text\":\"{\\\"title\\\": \\\"Brief greeting and session title\\\"}\"}],\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":88,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":114,\"service_tier\":\"standard\"}}"
+    },
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"6232205b-3ab4-4d6f-b87d-fd833699bb4d\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"We need answer user. Need generate title for conversation. Conversation: \\\"Say hello briefly.\\\" Need title sentence case 3-7 words capturing main topic. Likely \\\"Brief greeting request\\\" or \\\"Simple greeting request\\\". Need return ONLY JSON object: {\\\"title\\\":\\\"...\\\"}. Need concise 3-7 word sentence-case title. Could be \\\"Brief hello greeting request\\\" (4 words). Ensure sentence case. Return only JSON.\",\"signature\":\"6232205b-3ab4-4d6f-b87d-fd833699bb4d\"},{\"type\":\"text\",\"text\":\"{\\\"title\\\": \\\"Brief hello greeting request\\\"}\"}],\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":88,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":96,\"service_tier\":\"standard\"}}"
+    }
+  ],
+  "request": {
+    "model": "<model>",
+    "system": "<system>",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Here is the conversation so far:\nSay hello briefly.\n\nGenerate a 3-7 word sentence-case title that identifies this session."
+          }
+        ]
+      }
+    ],
+    "max_tokens": 128
+  }
+}

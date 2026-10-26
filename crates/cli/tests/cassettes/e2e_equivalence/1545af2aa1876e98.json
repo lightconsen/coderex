@@ -1,0 +1,26 @@
+{
+  "key": "1545af2aa1876e98",
+  "responses": [
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"54fdf25b-3ad8-416f-b389-b958c4d8d7e6\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"The user asks to generate a title. But there's also \\\"Trigger an API error and report what happened.\\\" Hmm, the conversation so far is: user says \\\"Trigger an API error and report what happened.\\\" Then asks for a title. I should just return the JSON title. The title should capture main topic: \\\"Triggering and reporting an API error\\\" — sentence case, 3-7 words. Maybe \\\"Triggering an API error for testing\\\" (6 words). Return only JSON.\",\"signature\":\"54fdf25b-3ad8-416f-b389-b958c4d8d7e6\"},{\"type\":\"text\",\"text\":\"{\\\"title\\\": \\\"Triggering and reporting an API error\\\"}\"}],\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":93,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":114,\"service_tier\":\"standard\"}}"
+    }
+  ],
+  "request": {
+    "model": "<model>",
+    "system": "<system>",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Here is the conversation so far:\nTrigger an API error and report what happened.\n\nGenerate a 3-7 word sentence-case title that identifies this session."
+          }
+        ]
+      }
+    ],
+    "max_tokens": 128
+  }
+}

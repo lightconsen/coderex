@@ -1,0 +1,26 @@
+{
+  "key": "629d16827fb62da6",
+  "responses": [
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"d0346f78-cafa-454d-85be-e25c0896f557\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"We need answer only JSON object title. Need capture main topic: adding POST /users endpoint route. 3-7 words sentence case. Something like \\\"Add POST users endpoint route\\\" = 5 words. Sentence case. Need concise. Return only JSON.\",\"signature\":\"d0346f78-cafa-454d-85be-e25c0896f557\"},{\"type\":\"text\",\"text\":\"{\\\"title\\\": \\\"Add POST users endpoint route\\\"}\"}],\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":113,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":63,\"service_tier\":\"standard\"}}"
+    }
+  ],
+  "request": {
+    "model": "<model>",
+    "system": "<system>",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Here is the conversation so far:\nAdd a POST /users endpoint that accepts a JSON body with name and email fields and returns 201 Created. Add the route to the Router.\n\nGenerate a 3-7 word sentence-case title that identifies this session."
+          }
+        ]
+      }
+    ],
+    "max_tokens": 128
+  }
+}

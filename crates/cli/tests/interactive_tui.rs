@@ -1,3 +1,6 @@
+#[path = "common/mod.rs"]
+mod common;
+
 use assert_cmd::cargo::cargo_bin;
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -649,21 +652,6 @@ fn assert_raw_absent(session: &PtySession, needles: &[&str]) {
             "raw output unexpectedly contained {needle:?}\n--- raw ---\n{raw}"
         );
     }
-}
-
-fn have_live_env() -> bool {
-    (std::env::var("ANTHROPIC_API_KEY").is_ok() && std::env::var("ANTHROPIC_BASE_URL").is_ok())
-        || (std::env::var("OPENAI_API_KEY").is_ok() && std::env::var("OPENAI_BASE_URL").is_ok())
-}
-
-fn live_model() -> Option<String> {
-    std::env::var("ANTHROPIC_MODEL")
-        .ok()
-        .or_else(|| std::env::var("OPENAI_MODEL").ok())
-}
-
-fn provider_env_matches(expected: &str) -> bool {
-    live_model().is_some_and(|model| model.to_lowercase().contains(expected))
 }
 
 #[test]
@@ -1945,18 +1933,28 @@ fn resume_restores_persisted_plan_and_activity() {
     }
 }
 
+/// Launch the TUI against the replayed LLM cassette.
+fn launch_with_cassette(dir: &Path) -> PtySession {
+    let cassette = common::cassette("interactive_tui_live");
+    let envs = vec![
+        (
+            "ANTHROPIC_BASE_URL".to_string(),
+            cassette.base_url().to_string(),
+        ),
+        ("ANTHROPIC_API_KEY".to_string(), "cassette".to_string()),
+        ("ANTHROPIC_AUTH_TOKEN".to_string(), "cassette".to_string()),
+        (
+            "CODEREX_CUSTOM_HEADERS".to_string(),
+            format!("X-Cassette-Cwd: {}", dir.display()),
+        ),
+    ];
+    PtySession::launch(dir, &envs, common::MODEL)
+}
+
 #[test]
-#[ignore = "requires live Kimi environment"]
-fn interactive_kimi_live_smoke() {
-    if !have_live_env() || !provider_env_matches("k2") {
-        return;
-    }
+fn interactive_live_read_smoke() {
     let dir = setup_project_dir();
-    let mut session = PtySession::launch(
-        dir.path(),
-        &[],
-        &live_model().unwrap_or_else(|| "K2.6".into()),
-    );
+    let mut session = launch_with_cassette(dir.path());
     session.wait_for_text("CodeRex v", LIVE_TIMEOUT);
     session.send_line("Use the Read tool to show content of src/lib.rs and summarize it");
     session.wait_for_any_text(
@@ -1964,7 +1962,7 @@ fn interactive_kimi_live_smoke() {
         LIVE_TIMEOUT,
     );
     session.wait_for_text("Completed in", LIVE_TIMEOUT);
-    assert_raw_contains_any(&session, &["pubfnadd", "a+b"], "live Kimi read tool output");
+    assert_raw_contains_any(&session, &["pubfnadd", "a+b"], "live read tool output");
     assert_raw_absent(
         &session,
         &["provider returned no visible response", "Query failed"],
@@ -1973,17 +1971,9 @@ fn interactive_kimi_live_smoke() {
 }
 
 #[test]
-#[ignore = "requires live Kimi environment"]
-fn interactive_kimi_directory_listing_smoke() {
-    if !have_live_env() || !provider_env_matches("k2") {
-        return;
-    }
+fn interactive_live_directory_listing_smoke() {
     let dir = setup_project_dir();
-    let mut session = PtySession::launch(
-        dir.path(),
-        &[],
-        &live_model().unwrap_or_else(|| "K2.6".into()),
-    );
+    let mut session = launch_with_cassette(dir.path());
     session.wait_for_text("CodeRex v", LIVE_TIMEOUT);
     session.send_line("show current dir");
     let screen = session.wait_for_any_text(&["coderex", "/tmp", "tmp"], LIVE_TIMEOUT);
@@ -1993,31 +1983,4 @@ fn interactive_kimi_directory_listing_smoke() {
     let screen = session.wait_for_any_text(&["Cargo.toml", "src", ".coderex"], LIVE_TIMEOUT);
     drop(session);
     assert!(screen.contains("Cargo.toml") || screen.contains("src") || screen.contains(".coderex"));
-}
-
-#[test]
-#[ignore = "requires live Qwen environment"]
-fn interactive_qwen_live_smoke() {
-    if !have_live_env() || !provider_env_matches("qwen") {
-        return;
-    }
-    let dir = setup_project_dir();
-    let mut session = PtySession::launch(
-        dir.path(),
-        &[],
-        &live_model().unwrap_or_else(|| "qwen3.6-plus".into()),
-    );
-    session.wait_for_text("CodeRex v", LIVE_TIMEOUT);
-    session.send_line("Use the Read tool to show content of src/lib.rs and summarize it");
-    session.wait_for_any_text(
-        &["Reading src/lib.rs...", "pub fn add", "a + b"],
-        LIVE_TIMEOUT,
-    );
-    session.wait_for_text("Completed in", LIVE_TIMEOUT);
-    assert_raw_contains_any(&session, &["pubfnadd", "a+b"], "live Qwen read tool output");
-    assert_raw_absent(
-        &session,
-        &["provider returned no visible response", "Query failed"],
-    );
-    drop(session);
 }

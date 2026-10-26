@@ -12,49 +12,31 @@
 //! slash commands, MCP, bridge, server, UI. See module headers below.
 //!
 //! ## Running
-//! Mock server (fast, deterministic):
-//!   ./tests/run-mock-anthropic-server.sh
-//!   source export_env.local.sh
-//!   cargo test -p coderex-cli --test e2e_equivalence -- --ignored
+//!   cargo test -p coderex-cli --test e2e_equivalence
 //!
-//! Live Kimi API (slow, non-deterministic):
-//!   source export_env.kimi.sh
-//!   cargo test -p coderex-cli --test e2e_equivalence -- --ignored --test-threads=1
+//! The provider calls replay tests/cassettes/e2e_equivalence, so no key or
+//! network is needed. Refresh them with scripts/record-cassettes.sh --fresh.
 
 use std::io::{BufReader, Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Stdio};
-use std::sync::OnceLock;
 use std::thread;
 use std::time::{Duration, Instant};
+
+mod common;
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  Harness (shared pattern with e2e_code_agent.rs)
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[allow(dead_code)]
-fn have_live_env() -> bool {
-    (std::env::var("ANTHROPIC_API_KEY").is_ok() && std::env::var("ANTHROPIC_BASE_URL").is_ok())
-        || (std::env::var("OPENAI_API_KEY").is_ok() && std::env::var("OPENAI_BASE_URL").is_ok())
+const fn have_live_env() -> bool {
+    // The cassette server provides the endpoint for every run.
+    common::provider_available()
 }
 
 fn binary_path() -> &'static Path {
-    static PATH: OnceLock<PathBuf> = OnceLock::new();
-    PATH.get_or_init(|| {
-        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let workspace = manifest
-            .parent()
-            .expect("manifest parent")
-            .parent()
-            .expect("workspace root");
-        let status = Command::new("cargo")
-            .args(["build", "--bin", "coderex"])
-            .current_dir(workspace)
-            .status()
-            .expect("cargo build");
-        assert!(status.success(), "failed to build coderex binary");
-        workspace.join("target/debug/coderex")
-    })
+    Path::new(env!("CARGO_BIN_EXE_coderex"))
 }
 
 #[derive(Debug)]
@@ -69,6 +51,7 @@ struct CoderexOutput {
 
 fn run(cwd: &Path, prompt: &str, timeout_secs: u64) -> CoderexOutput {
     let mut cmd = Command::new(binary_path());
+    common::cassette("e2e_equivalence").configure_for(&mut cmd, cwd);
     cmd.arg("-p")
         .arg("--dangerously-skip-permissions")
         .current_dir(cwd)
@@ -134,8 +117,8 @@ fn run_with_args(
     extra_args: &[&str],
     timeout_secs: u64,
 ) -> CoderexOutput {
-    eprintln!("DEBUG run_with_args: prompt={prompt:?}, extra_args={extra_args:?}");
     let mut cmd = Command::new(binary_path());
+    common::cassette("e2e_equivalence").configure_for(&mut cmd, cwd);
     cmd.arg("-p")
         .args(extra_args)
         .current_dir(cwd)
@@ -198,6 +181,7 @@ fn run_with_args(
 /// Run the coderex binary with arbitrary arguments (non-interactive mode).
 fn run_command(cwd: &Path, args: &[&str], timeout_secs: u64) -> CoderexOutput {
     let mut cmd = Command::new(binary_path());
+    common::cassette("e2e_equivalence").configure_for(&mut cmd, cwd);
     cmd.args(args)
         .current_dir(cwd)
         .stdin(Stdio::null())
@@ -355,7 +339,6 @@ edition = "2021"
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[test]
-#[ignore = "live LLM test"]
 fn engine_single_turn_response() {
     let dir = tempfile::tempdir().unwrap();
     create_rust_lib(dir.path());
@@ -368,7 +351,6 @@ fn engine_single_turn_response() {
 }
 
 #[test]
-#[ignore = "live LLM test"]
 fn engine_multi_turn_tool_loop() {
     let dir = tempfile::tempdir().unwrap();
     create_rust_lib(dir.path());
@@ -395,7 +377,6 @@ fn engine_multi_turn_tool_loop() {
 }
 
 #[test]
-#[ignore = "live LLM test"]
 fn engine_streaming_output_delivered() {
     let dir = tempfile::tempdir().unwrap();
     create_rust_lib(dir.path());
@@ -408,7 +389,6 @@ fn engine_streaming_output_delivered() {
 }
 
 #[test]
-#[ignore = "live LLM test"]
 fn engine_max_turns_termination() {
     let dir = tempfile::tempdir().unwrap();
     create_rust_lib(dir.path());
@@ -430,7 +410,6 @@ fn engine_max_turns_termination() {
 }
 
 #[test]
-#[ignore = "live LLM test"]
 fn engine_error_recovery_nonexistent_file() {
     let dir = tempfile::tempdir().unwrap();
     create_rust_lib(dir.path());
@@ -450,7 +429,6 @@ fn engine_error_recovery_nonexistent_file() {
 }
 
 #[test]
-#[ignore = "live LLM test"]
 fn engine_multi_turn_5_rounds() {
     let dir = tempfile::tempdir().unwrap();
     create_rust_lib(dir.path());
@@ -475,7 +453,6 @@ fn engine_multi_turn_5_rounds() {
 }
 
 #[test]
-#[ignore = "live LLM test"]
 fn engine_termination_budget_exhausted() {
     let dir = tempfile::tempdir().unwrap();
     create_rust_lib(dir.path());
@@ -501,7 +478,6 @@ fn engine_termination_budget_exhausted() {
 }
 
 #[test]
-#[ignore = "live LLM test"]
 fn engine_termination_api_error() {
     let dir = tempfile::tempdir().unwrap();
     create_rust_lib(dir.path());
@@ -523,7 +499,6 @@ fn engine_termination_api_error() {
 }
 
 #[test]
-#[ignore = "live LLM test"]
 fn engine_termination_loop_detected() {
     let dir = tempfile::tempdir().unwrap();
     create_rust_lib(dir.path());
@@ -547,7 +522,6 @@ fn engine_termination_loop_detected() {
 }
 
 #[test]
-#[ignore = "live LLM test"]
 fn engine_structured_output() {
     let dir = tempfile::tempdir().unwrap();
     create_rust_lib(dir.path());
@@ -579,7 +553,6 @@ fn engine_structured_output() {
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[test]
-#[ignore = "live LLM test"]
 fn tool_read_file() {
     let dir = tempfile::tempdir().unwrap();
     create_rust_lib(dir.path());
@@ -610,7 +583,6 @@ fn tool_read_file() {
 }
 
 #[test]
-#[ignore = "live LLM test"]
 fn tool_write_new_file() {
     let dir = tempfile::tempdir().unwrap();
     create_rust_lib(dir.path());
@@ -631,7 +603,6 @@ fn tool_write_new_file() {
 }
 
 #[test]
-#[ignore = "live LLM test"]
 fn tool_edit_existing_file() {
     let dir = tempfile::tempdir().unwrap();
     create_rust_lib(dir.path());
@@ -647,7 +618,6 @@ fn tool_edit_existing_file() {
 }
 
 #[test]
-#[ignore = "live LLM test"]
 fn tool_bash_execution() {
     let dir = tempfile::tempdir().unwrap();
     create_rust_lib(dir.path());
@@ -663,7 +633,6 @@ fn tool_bash_execution() {
 }
 
 #[test]
-#[ignore = "live LLM test"]
 fn tool_glob_file_discovery() {
     let dir = tempfile::tempdir().unwrap();
     create_rust_lib(dir.path());
@@ -686,7 +655,6 @@ fn tool_glob_file_discovery() {
 }
 
 #[test]
-#[ignore = "live LLM test"]
 fn tool_grep_search() {
     let dir = tempfile::tempdir().unwrap();
     create_rust_lib(dir.path());
@@ -706,7 +674,6 @@ fn tool_grep_search() {
 }
 
 #[test]
-#[ignore = "live LLM test"]
 fn tool_dangerous_command_blocked() {
     let dir = tempfile::tempdir().unwrap();
     create_rust_lib(dir.path());
@@ -728,7 +695,6 @@ fn tool_dangerous_command_blocked() {
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[test]
-#[ignore = "live LLM test"]
 fn permission_default_allows_reads() {
     let dir = tempfile::tempdir().unwrap();
     create_rust_lib(dir.path());
@@ -749,7 +715,6 @@ fn permission_default_allows_reads() {
 }
 
 #[test]
-#[ignore = "live LLM test"]
 fn permission_accept_edits_auto_allows_writes() {
     let dir = tempfile::tempdir().unwrap();
     create_rust_lib(dir.path());
@@ -770,7 +735,6 @@ fn permission_accept_edits_auto_allows_writes() {
 }
 
 #[test]
-#[ignore = "live LLM test"]
 fn permission_plan_mode_readonly() {
     let dir = tempfile::tempdir().unwrap();
     create_rust_lib(dir.path());
@@ -792,7 +756,6 @@ fn permission_plan_mode_readonly() {
 }
 
 #[test]
-#[ignore = "live LLM test"]
 fn permission_bypass_dangerous() {
     let dir = tempfile::tempdir().unwrap();
     create_rust_lib(dir.path());
@@ -815,7 +778,6 @@ fn permission_bypass_dangerous() {
 }
 
 #[test]
-#[ignore = "live LLM test"]
 fn permission_default_write_needs_confirmation() {
     let dir = tempfile::tempdir().unwrap();
     create_rust_lib(dir.path());
@@ -838,7 +800,6 @@ fn permission_default_write_needs_confirmation() {
 }
 
 #[test]
-#[ignore = "live LLM test"]
 fn permission_default_dangerous_shell_needs_confirmation() {
     let dir = tempfile::tempdir().unwrap();
     create_rust_lib(dir.path());
@@ -862,7 +823,6 @@ fn permission_default_dangerous_shell_needs_confirmation() {
 }
 
 #[test]
-#[ignore = "live LLM test"]
 fn permission_bypass_permissions_auto_allows() {
     let dir = tempfile::tempdir().unwrap();
     create_rust_lib(dir.path());
@@ -882,7 +842,6 @@ fn permission_bypass_permissions_auto_allows() {
 }
 
 #[test]
-#[ignore = "live LLM test"]
 fn permission_dontask_auto_denies_all() {
     let dir = tempfile::tempdir().unwrap();
     create_rust_lib(dir.path());
@@ -904,7 +863,6 @@ fn permission_dontask_auto_denies_all() {
 }
 
 #[test]
-#[ignore = "live LLM test"]
 fn permission_plan_mode_denies_write() {
     let dir = tempfile::tempdir().unwrap();
     create_rust_lib(dir.path());
@@ -932,7 +890,6 @@ fn permission_plan_mode_denies_write() {
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[test]
-#[ignore = "live LLM test"]
 fn memory_session_messages_accumulate() {
     let dir = tempfile::tempdir().unwrap();
     create_rust_lib(dir.path());
@@ -958,7 +915,6 @@ fn memory_session_messages_accumulate() {
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[test]
-#[ignore = "requires CLI binary build"]
 fn hook_settings_load_without_crash() {
     let dir = tempfile::tempdir().unwrap();
     create_rust_lib(dir.path());
@@ -1006,7 +962,6 @@ fn hook_settings_load_without_crash() {
 }
 
 #[test]
-#[ignore = "requires CLI binary build"]
 fn hook_settings_sources_shows_hooks() {
     let dir = tempfile::tempdir().unwrap();
     create_rust_lib(dir.path());
@@ -1043,7 +998,6 @@ fn hook_settings_sources_shows_hooks() {
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[test]
-#[ignore = "requires CLI binary build"]
 fn agent_cli_lists_available_agents() {
     let dir = tempfile::tempdir().unwrap();
     create_rust_lib(dir.path());
@@ -1052,13 +1006,12 @@ fn agent_cli_lists_available_agents() {
     eprintln!("stdout:\n{}", out.stdout);
 
     assert_eq!(out.exit_code, Some(0), "agents command should succeed");
-    assert!(out.stdout.contains("advisor"), "expected advisor agent");
-    assert!(out.stdout.contains("bughunter"), "expected bughunter agent");
-    assert!(out.stdout.contains("reviewer"), "expected reviewer agent");
+    for agent in ["general_purpose", "explore", "plan", "verification"] {
+        assert!(out.stdout.contains(agent), "expected {agent} agent");
+    }
 }
 
 #[test]
-#[ignore = "requires CLI binary build"]
 fn agent_cli_detailed_shows_descriptions() {
     let dir = tempfile::tempdir().unwrap();
     create_rust_lib(dir.path());
@@ -1068,16 +1021,20 @@ fn agent_cli_detailed_shows_descriptions() {
 
     assert_eq!(out.exit_code, Some(0));
     assert!(
-        out.stdout.contains("Code review") || out.stdout.contains("architectural"),
-        "expected description for advisor agent"
+        out.stdout.contains("General multi-step tasks"),
+        "expected description for the general_purpose agent"
     );
     assert!(
-        out.stdout.contains("Bug detection") || out.stdout.contains("root cause"),
-        "expected description for bughunter agent"
+        out.stdout.contains("Codebase exploration"),
+        "expected description for the explore agent"
     );
     assert!(
-        out.stdout.contains("review") || out.stdout.contains("PR"),
-        "expected description for reviewer agent"
+        out.stdout.contains("Implementation planning"),
+        "expected description for the plan agent"
+    );
+    assert!(
+        out.stdout.contains("Review and verification"),
+        "expected description for the verification agent"
     );
 }
 
@@ -1099,7 +1056,6 @@ fn agent_cli_detailed_shows_descriptions() {
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[test]
-#[ignore = "live LLM test"]
 fn config_cli_model_override() {
     let dir = tempfile::tempdir().unwrap();
     create_rust_lib(dir.path());
@@ -1119,7 +1075,6 @@ fn config_cli_model_override() {
 }
 
 #[test]
-#[ignore = "live LLM test"]
 fn config_cli_system_prompt_override() {
     let dir = tempfile::tempdir().unwrap();
     create_rust_lib(dir.path());
@@ -1142,7 +1097,6 @@ fn config_cli_system_prompt_override() {
 }
 
 #[test]
-#[ignore = "live LLM test"]
 fn config_cli_allowed_tools() {
     let dir = tempfile::tempdir().unwrap();
     create_rust_lib(dir.path());
@@ -1163,7 +1117,6 @@ fn config_cli_allowed_tools() {
 }
 
 #[test]
-#[ignore = "live LLM test"]
 fn config_cli_settings_override() {
     let dir = tempfile::tempdir().unwrap();
     create_rust_lib(dir.path());
@@ -1191,7 +1144,6 @@ fn config_cli_settings_override() {
 }
 
 #[test]
-#[ignore = "live LLM test"]
 fn config_cli_setting_sources_shows_origins() {
     let dir = tempfile::tempdir().unwrap();
     create_rust_lib(dir.path());
@@ -1225,7 +1177,6 @@ fn config_cli_setting_sources_shows_origins() {
 }
 
 #[test]
-#[ignore = "live LLM test"]
 fn config_cli_project_settings_loaded() {
     let dir = tempfile::tempdir().unwrap();
     create_rust_lib(dir.path());
@@ -1262,7 +1213,6 @@ fn config_cli_project_settings_loaded() {
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[test]
-#[ignore = "live LLM test"]
 fn api_client_streaming_sse() {
     let dir = tempfile::tempdir().unwrap();
     create_rust_lib(dir.path());
@@ -1279,7 +1229,6 @@ fn api_client_streaming_sse() {
 }
 
 #[test]
-#[ignore = "live LLM test"]
 fn api_client_retry_on_failure() {
     let dir = tempfile::tempdir().unwrap();
     create_rust_lib(dir.path());
@@ -1297,7 +1246,6 @@ fn api_client_retry_on_failure() {
 }
 
 #[test]
-#[ignore = "live LLM test"]
 fn api_client_budget_tracking() {
     let dir = tempfile::tempdir().unwrap();
     create_rust_lib(dir.path());
@@ -1316,7 +1264,6 @@ fn api_client_budget_tracking() {
 }
 
 #[test]
-#[ignore = "live LLM test"]
 fn api_client_model_flag_selects_model() {
     let dir = tempfile::tempdir().unwrap();
     create_rust_lib(dir.path());
@@ -1350,7 +1297,6 @@ fn api_client_model_flag_selects_model() {
 }
 
 #[test]
-#[ignore = "live LLM test"]
 fn api_client_cost_budget_exhausted_output() {
     let dir = tempfile::tempdir().unwrap();
     create_rust_lib(dir.path());
@@ -1532,7 +1478,6 @@ fn mcp_cli_test_server_not_found() {
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[test]
-#[ignore = "live LLM test"]
 fn parity_tool_sequence_idempotent() {
     let dir = tempfile::tempdir().unwrap();
     create_rust_lib(dir.path());
@@ -1571,7 +1516,6 @@ fn parity_tool_sequence_idempotent() {
 }
 
 #[test]
-#[ignore = "live LLM test"]
 fn parity_error_handling_graceful() {
     let dir = tempfile::tempdir().unwrap();
     create_rust_lib(dir.path());

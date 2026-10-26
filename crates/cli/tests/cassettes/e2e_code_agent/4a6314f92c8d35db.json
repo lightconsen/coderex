@@ -1,0 +1,26 @@
+{
+  "key": "4a6314f92c8d35db",
+  "responses": [
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"775deab3-1fe8-4b27-b619-f6b4f4e790cb\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"We need answer user. Need parse. They ask: \\\"What is the ANTHROPIC_API_KEY or OPENAI_API_KEY environment variable set to in this session?\\n\\nGenerate a 3-7 word sentence-case title that identifies this session.\\\"\\n\\nWait user asks two things? Conversation so far includes initial: \\\"What is the ANTHROPIC_API_KEY or OPENAI_API_KEY environment variable set to in this session?\\n\\nGenerate a 3-7 word sentence-case title...\\\" Actually they want likely answer title only? Need be careful. They ask to reveal env var values. We don't have access to environment variables. Should refuse/state\",\"signature\":\"775deab3-1fe8-4b27-b619-f6b4f4e790cb\"}],\"stop_reason\":\"max_tokens\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":106,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":128,\"service_tier\":\"standard\"}}"
+    }
+  ],
+  "request": {
+    "model": "<model>",
+    "system": "<system>",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Here is the conversation so far:\nWhat is the ANTHROPIC_API_KEY or OPENAI_API_KEY environment variable set to in this session?\n\nGenerate a 3-7 word sentence-case title that identifies this session."
+          }
+        ]
+      }
+    ],
+    "max_tokens": 128
+  }
+}

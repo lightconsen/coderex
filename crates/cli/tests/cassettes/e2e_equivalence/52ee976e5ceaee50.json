@@ -1,0 +1,26 @@
+{
+  "key": "52ee976e5ceaee50",
+  "responses": [
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"6125558a-bd84-4fff-b090-1c00aa3a466d\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"We need answer only JSON object with title 3-7 words sentence case. Conversation: user says \\\"Say hi briefly.\\\" Then asks generate title. Need title identifying session. Likely \\\"Brief greeting and session title request\\\" (6 words? Brief(1) greeting2 and3 session4 title5 request6). Sentence case. Return JSON only.\",\"signature\":\"6125558a-bd84-4fff-b090-1c00aa3a466d\"},{\"type\":\"text\",\"text\":\"{\\\"title\\\": \\\"Brief greeting and session title request\\\"}\"}],\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":88,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":83,\"service_tier\":\"standard\"}}"
+    }
+  ],
+  "request": {
+    "model": "<model>",
+    "system": "<system>",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Here is the conversation so far:\nSay hi briefly.\n\nGenerate a 3-7 word sentence-case title that identifies this session."
+          }
+        ]
+      }
+    ],
+    "max_tokens": 128
+  }
+}

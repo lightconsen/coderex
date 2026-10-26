@@ -1,0 +1,26 @@
+{
+  "key": "c43b731858d89a13",
+  "responses": [
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"6a99c337-5072-4f36-bd7f-742befc82515\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"We need answer. Tool CurrentDir input empty. Need explain risks 1-2 sentences concrete. CurrentDir likely returns current working directory. Risks minimal: discloses path may reveal usernames, directory structure, project names, sensitive naming. No mutation. If output exposed/logged. Say appears low risk. Need concise.\",\"signature\":\"6a99c337-5072-4f36-bd7f-742befc82515\"},{\"type\":\"text\",\"text\":\"This call appears low risk: `CurrentDir` with `{}` only retrieves the current working directory and does not modify files or execute commands. The main concrete risk is information disclosure—the returned path may reveal usernames, project names, or internal directory structure if exposed in logs or to untrusted users.\"}],\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":102,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":130,\"service_tier\":\"standard\"}}"
+    }
+  ],
+  "request": {
+    "model": "<model>",
+    "system": "<system>",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Explain the potential risks of this tool call:\n\n**Tool:** CurrentDir\n**Input:**\n```\n{}\n```\n\nWhat could go wrong if this executes?"
+          }
+        ]
+      }
+    ],
+    "max_tokens": 256
+  }
+}

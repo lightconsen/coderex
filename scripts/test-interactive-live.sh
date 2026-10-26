@@ -38,39 +38,37 @@ case "$provider" in
         ;;
 esac
 
-if [[ "${CODEREX_SKIP_ENV_SOURCE:-0}" != "1" ]]; then
-    env_file="$REPO_ROOT/export_env.$provider.sh"
-    if [[ ! -f "$env_file" ]]; then
-        echo "Missing provider env file: $env_file" >&2
+require_live_env() {
+    if [[ "${CODEREX_SKIP_ENV_SOURCE:-0}" != "1" ]]; then
+        env_file="$REPO_ROOT/export_env.$provider.sh"
+        if [[ ! -f "$env_file" ]]; then
+            echo "Missing provider env file: $env_file" >&2
+            exit 1
+        fi
+        # shellcheck source=/dev/null
+        source "$env_file"
+    fi
+
+    if [[ -z "${ANTHROPIC_API_KEY:-}" || -z "${ANTHROPIC_BASE_URL:-}" ]]; then
+        echo "ANTHROPIC_API_KEY and ANTHROPIC_BASE_URL must be set for live tests." >&2
         exit 1
     fi
-    # shellcheck source=/dev/null
-    source "$env_file"
-fi
-
-if [[ -z "${ANTHROPIC_API_KEY:-}" || -z "${ANTHROPIC_BASE_URL:-}" ]]; then
-    echo "ANTHROPIC_API_KEY and ANTHROPIC_BASE_URL must be set for live tests." >&2
-    exit 1
-fi
+}
 
 cd "$REPO_ROOT"
 
 run_smoke() {
-    case "$provider" in
-        kimi)
-            cargo test -p coderex-cli --test interactive_tui interactive_kimi -- --ignored --nocapture
-            ;;
-        qwen)
-            cargo test -p coderex-cli --test interactive_tui interactive_qwen -- --ignored --nocapture
-            ;;
-    esac
+    # Replays tests/cassettes/interactive_tui_live; no provider needed.
+    cargo test -p coderex-cli --test interactive_tui interactive_live -- --nocapture
 }
 
 run_read() {
-    cargo test -p coderex-cli --test e2e_equivalence tool_read_file -- --ignored --nocapture
+    # Replays tests/cassettes/e2e_equivalence.
+    cargo test -p coderex-cli --test e2e_equivalence tool_read_file -- --nocapture
 }
 
 run_reported_sequence() {
+    require_live_env
     tmpdir=$(mktemp -d)
     cleanup() {
         rm -rf "$tmpdir"
@@ -122,6 +120,7 @@ JSON
 }
 
 run_permission_sequence() {
+    require_live_env
     tmpdir=$(mktemp -d)
     cleanup() {
         rm -rf "$tmpdir"

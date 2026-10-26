@@ -1,0 +1,31 @@
+{
+  "key": "41e0eb45756ed9c8",
+  "responses": [
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"d9136c57-6ed1-4595-9c99-74a4418194b9\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"We need answer. Need assess Glob pattern **/* in some tool. Security advisor. Need explain potential risks in 1-2 clear sentences. Focus concrete. Tool Glob likely file pattern listing. Pattern **/* matches all files recursively. Risks: information disclosure if output exposed, performance/DoS on large filesystem, follows? Glob typically lists paths, may traverse symlinks? Need concrete. If no root specified, relative to workspace? Could enumerate entire accessible tree, exposing sensitive filenames/paths, and on huge dirs cause resource exhaustion. Mention if sandboxed/read-only and output not exposed low risk. Need 1-2 sentences.\",\"signature\":\"d9136c57-6ed1-4595-9c99-74a4418194b9\"},{\"type\":\"text\",\"text\":\"`**/*` recursively enumerates every file path in the accessible directory tree, which can disclose sensitive filenames or structure if the output is exposed, and can cause slowdowns or resource exhaustion on very large or deeply nested directories. It is low risk only if the tool is sandboxed to a non-sensitive workspace and output is not shared.\"}],\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":106,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":203,\"service_tier\":\"standard\"}}"
+    },
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"b6f63d1e-24dd-4d62-b528-8e222e45747d\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"We need answer security advisor. Tool Glob pattern **/* likely enumerates all files recursively from cwd. Risks: information disclosure if results include sensitive files/secrets, performance/resource exhaustion in huge dirs, follows? Glob doesn't read contents but returns paths. Could expose hidden? Pattern **/* may not match dotfiles depending implementation. Need 1-2 sentences concrete. Mention broad recursive listing can leak sensitive path names and overwhelm output/perf; if tool follows symlinks could traverse outside intended root? Glob often doesn't follow symlinks? Need be accurate. Tool call executes glob. Risks: unbounded recursive filesystem enumeration can be slow/DoS and reveal sensitive filenames/locations; if results include paths outside sandbox via symlinks or cwd scope, info leak. 1-2 sentences.\",\"signature\":\"b6f63d1e-24dd-4d62-b528-8e222e45747d\"},{\"type\":\"text\",\"text\":\"Globbing `**/*` recursively enumerates the entire working tree, which can expose sensitive filenames/paths (e.g., secrets, configs, private keys) and be slow or resource-intensive on large directories. If symlinks or an overly broad working directory are involved, it may also reveal paths outside the intended scope.\"}],\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":106,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":234,\"service_tier\":\"standard\"}}"
+    }
+  ],
+  "request": {
+    "model": "<model>",
+    "system": "<system>",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Explain the potential risks of this tool call:\n\n**Tool:** Glob\n**Input:**\n```\n{\"pattern\":\"**/*\"}\n```\n\nWhat could go wrong if this executes?"
+          }
+        ]
+      }
+    ],
+    "max_tokens": 256
+  }
+}

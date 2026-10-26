@@ -1,0 +1,26 @@
+{
+  "key": "1aacab0d2f74a09e",
+  "responses": [
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"9c1af556-cadb-4ddc-a47b-12687c731a9e\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"We need answer 1-2 clear sentences, security advisor. Need explain risks of tool call. Command cd to temp dir, ls -la, cat Cargo.toml; echo; command -v rustc. Risks: cat Cargo.toml in attacker-controlled temp dir? It reads file content, could be malicious? Cargo.toml is text, but cat output could contain terminal escape sequences / control chars, possibly manipulate terminal, hide content, clipboard? ls -la in temp dir could list filenames with control chars. cd path fixed. command -v rustc harmless. Main concrete risk: reading/displaying untrusted Cargo.toml from temp dir could include terminal escape sequences or secrets? Also if Cargo.toml is symlink to sensitive file, cat will follow and disclose arbitrary readable file. ls -la follows? ls -la shows symlink target? It doesn't dereference symlink for content, but cat does. If temp dir is attacker-writable, a symlink Cargo.toml could point to sensitive files (SSH keys, env files) and exfiltrate via output. Also terminal escape injection via filenames/content. Need 1-2 sentences. Mention if safe\",\"signature\":\"9c1af556-cadb-4ddc-a47b-12687c731a9e\"}],\"stop_reason\":\"max_tokens\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":166,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":256,\"service_tier\":\"standard\"}}"
+    }
+  ],
+  "request": {
+    "model": "<model>",
+    "system": "<system>",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Explain the potential risks of this tool call:\n\n**Tool:** Bash\n**Input:**\n```\n{\"command\":\"cd <tmp> && ls -la && cat Cargo.toml; echo \\\"---\\\"; command -v rustc\"}\n```\n\nWhat could go wrong if this executes?"
+          }
+        ]
+      }
+    ],
+    "max_tokens": 256
+  }
+}

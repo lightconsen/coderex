@@ -1,0 +1,26 @@
+{
+  "key": "0d3678d5a2b00f06",
+  "responses": [
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"b5cfa7eb-17d2-46c0-9aa1-0320c4437d2b\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"We need answer security advisor. Need explain potential risks in 1-2 clear sentences. Tool Write with file_path temp folder .tmp.../secrets/api.key content super-secret-key. Need concrete risks not generic. Need assess safe? Writing secret to temp path. Risks: temp directory predictable? /private/var/folders/.../T is per-user temp, but path includes random .tmpCkyM58. It writes plaintext secret to disk; unless permissions tight, other local processes/users? On macOS /private/var/folders per-user temp typically user-only? But if file permissions default umask, might be readable by other local users? On macOS /var/folders/... is often 700 for user? Let's think. Potential risks: secret persisted in temp dir and may be included in backups, logs, crash dumps, or remain after process; temporary directory may be world-readable depending permissions; symlink attack if attacker can anticipate/create directory/file? The path is specific; if directory doesn't exist, Write may create? Tool may create parent? It writes to .tmpCkyM58/secrets/api.key. If attacker can create symlink at that path before write, could redirect secret to attacker-controlled location\",\"signature\":\"b5cfa7eb-17d2-46c0-9aa1-0320c4437d2b\"}],\"stop_reason\":\"max_tokens\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":155,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":256,\"service_tier\":\"standard\"}}"
+    }
+  ],
+  "request": {
+    "model": "<model>",
+    "system": "<system>",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Explain the potential risks of this tool call:\n\n**Tool:** Write\n**Input:**\n```\n{\"file_path\":\"<tmp>\",\"content\":\"super-secret-key\\n\"}\n```\n\nWhat could go wrong if this executes?"
+          }
+        ]
+      }
+    ],
+    "max_tokens": 256
+  }
+}

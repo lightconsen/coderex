@@ -1,0 +1,26 @@
+{
+  "key": "07ce3cae1845bb1e",
+  "responses": [
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"29b45364-4dee-4b62-a8c0-4cc4605d64c9\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"We need answer only JSON title. Need concise 3-7 word sentence-case title captures main topic. Conversation: add generic Stack<T> struct with push pop is_empty methods to src/lib.rs include unit tests. Title maybe \\\"Generic stack with unit tests\\\" 5 words sentence case. Need JSON object only. Ensure 3-7 words. \\\"Generic stack with unit tests\\\" = 5. Good.\",\"signature\":\"29b45364-4dee-4b62-a8c0-4cc4605d64c9\"},{\"type\":\"text\",\"text\":\"{\\\"title\\\": \\\"Generic stack with unit tests\\\"}\"}],\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":109,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":94,\"service_tier\":\"standard\"}}"
+    }
+  ],
+  "request": {
+    "model": "<model>",
+    "system": "<system>",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Here is the conversation so far:\nAdd a generic Stack<T> struct with push, pop, and is_empty methods to src/lib.rs. Include unit tests.\n\nGenerate a 3-7 word sentence-case title that identifies this session."
+          }
+        ]
+      }
+    ],
+    "max_tokens": 128
+  }
+}

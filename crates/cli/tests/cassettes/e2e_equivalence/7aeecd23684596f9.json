@@ -1,0 +1,26 @@
+{
+  "key": "7aeecd23684596f9",
+  "responses": [
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"08124f47-3f4f-466b-a248-396fa023fcec\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"We need answer only JSON object title. Need infer conversation so far only \\\"Say 'hi'.\\\" Need concise 3-7 word sentence-case title captures main topic. Could be \\\"Initial greeting request\\\" or \\\"User requests a greeting\\\". Need sentence case, 3-7 words. Return only JSON.\",\"signature\":\"08124f47-3f4f-466b-a248-396fa023fcec\"},{\"type\":\"text\",\"text\":\"{\\\"title\\\": \\\"User requests a greeting\\\"}\"}],\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":88,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":72,\"service_tier\":\"standard\"}}"
+    }
+  ],
+  "request": {
+    "model": "<model>",
+    "system": "<system>",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Here is the conversation so far:\nSay 'hi'.\n\nGenerate a 3-7 word sentence-case title that identifies this session."
+          }
+        ]
+      }
+    ],
+    "max_tokens": 128
+  }
+}

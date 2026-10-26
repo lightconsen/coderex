@@ -1,0 +1,26 @@
+{
+  "key": "d55ce19458689e37",
+  "responses": [
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"883bdda1-dec0-4545-a1fa-25a4b16718a5\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"We need answer security advisor explain risks tool call 1-2 clear sentences concrete not generic. Need assess command. Bash cd temp hidden dir, ls -la, cat Cargo.toml, find src -type f | head -50. Risks: executing in temp dir controlled path; could be attacker-created temp dir with symlinks? cat Cargo.toml could read sensitive? It cats local Cargo.toml in that temp dir only. find src -type f could traverse symlinks? find default does not follow symlinks, but if src symlink? find src -type f: if src is symlink to directory, find doesn't follow symlink by default, so won't list contents? Actually if starting point is symlink, find does not follow? GNU find: -P default, never follow symlinks, if starting point symlink, just prints it? It may not descend. Not huge. ls -la reveals filenames/permissions in temp dir; cat Cargo.toml can execute? No, just reads. But Cargo.toml could contain terminal escape sequences? cat to terminal could inject control chars affecting terminal, but not code execution unless terminal vulnerable. Also path in /private/var/fold\",\"signature\":\"883bdda1-dec0-4545-a1fa-25a4b16718a5\"}],\"stop_reason\":\"max_tokens\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":180,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":256,\"service_tier\":\"standard\"}}"
+    }
+  ],
+  "request": {
+    "model": "<model>",
+    "system": "<system>",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Explain the potential risks of this tool call:\n\n**Tool:** Bash\n**Input:**\n```\n{\"command\":\"cd <tmp> && ls -la && echo \\\"--- CARGO ---\\\" && cat Cargo.toml && echo \\\"--- TREE ---\\\" && find src -type f | head -50\"}\n```\n\nWhat could go wrong if this executes?"
+          }
+        ]
+      }
+    ],
+    "max_tokens": 256
+  }
+}

@@ -1,0 +1,26 @@
+{
+  "key": "0f12757185b27d03",
+  "responses": [
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"8c7d127b-f07a-4db5-8c91-18e2ea58fa03\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"The user asks about risks of a bash command: `which -a cargo rustc 2>&1; ls -la /Users/lando/.cargo/bin 2>&1 | head`\\n\\nThis is a read-only reconnaissance command. Risks: minor information disclosure (reveals paths, usernames, installed toolchain versions/binaries), no mutation, no network, no privilege escalation. Could leak environment details if output is shared. Essentially safe.\\n\\nAnswer in 1-2 sentences, concrete.\",\"signature\":\"8c7d127b-f07a-4db5-8c91-18e2ea58fa03\"},{\"type\":\"text\",\"text\":\"This is essentially a safe, read-only reconnaissance command: `which` and `ls` only inspect the filesystem/PATH and cannot modify, delete, or execute anything, and there's no network access or privilege elevation involved. The only real risk is minor information disclosure — the output reveals the local username (`lando`), installed Rust toolchain binaries, and directory permissions/timestamps, which could aid an attacker if the transcript is shared publicly.\"}],\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":132,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":192,\"service_tier\":\"standard\"}}"
+    }
+  ],
+  "request": {
+    "model": "<model>",
+    "system": "<system>",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Explain the potential risks of this tool call:\n\n**Tool:** Bash\n**Input:**\n```\n{\"command\":\"which -a cargo rustc 2>&1; ls -la /Users/lando/.cargo/bin 2>&1 | head\"}\n```\n\nWhat could go wrong if this executes?"
+          }
+        ]
+      }
+    ],
+    "max_tokens": 256
+  }
+}

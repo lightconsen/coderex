@@ -5,7 +5,6 @@ mod live;
 use coderex_core::engine::TerminalReason;
 
 #[tokio::test]
-#[ignore = "live LLM test — run with `source start.kimi.sh && cargo test -p coderex-cli -- --ignored`"]
 async fn bash_tool_lists_files() {
     if !live::have_live_env() {
         eprintln!("{}", live::skip_msg());
@@ -23,7 +22,7 @@ async fn bash_tool_lists_files() {
         "expected Completed"
     );
 
-    let events = rig.collect_events().await;
+    let events = rig.drain_events();
 
     assert!(
         live::has_tool_call(&events, "bash"),
@@ -41,7 +40,6 @@ async fn bash_tool_lists_files() {
 }
 
 #[tokio::test]
-#[ignore = "live LLM test — run with `source start.kimi.sh && cargo test -p coderex-cli -- --ignored`"]
 async fn bash_tool_echo_test() {
     if !live::have_live_env() {
         eprintln!("{}", live::skip_msg());
@@ -54,7 +52,7 @@ async fn bash_tool_echo_test() {
         .await;
     assert!(reason.is_ok(), "submit failed: {reason:?}");
 
-    let events = rig.collect_events().await;
+    let events = rig.drain_events();
 
     assert!(
         live::has_tool_call(&events, "bash"),

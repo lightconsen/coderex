@@ -1,0 +1,26 @@
+{
+  "key": "c9719af7ad4cb00a",
+  "responses": [
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"4e87c6e1-3b5c-49de-ac7f-c11d93ce8ac7\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"We need answer only JSON object title. Need infer conversation: user asks read content of src/nonexistent.rs and report what find. Main topic: reading nonexistent file / file does not exist. Need concise 3-7 word sentence-case title. Title maybe \\\"Reading a nonexistent Rust file\\\" (5 words? Reading(1) a2 nonexistent3 Rust4 file5). Sentence-case. JSON only.\",\"signature\":\"4e87c6e1-3b5c-49de-ac7f-c11d93ce8ac7\"},{\"type\":\"text\",\"text\":\"{\\\"title\\\": \\\"Reading a nonexistent Rust file\\\"}\"}],\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":100,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":98,\"service_tier\":\"standard\"}}"
+    }
+  ],
+  "request": {
+    "model": "<model>",
+    "system": "<system>",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Here is the conversation so far:\nRead the content of src/nonexistent.rs and report what you find.\n\nGenerate a 3-7 word sentence-case title that identifies this session."
+          }
+        ]
+      }
+    ],
+    "max_tokens": 128
+  }
+}

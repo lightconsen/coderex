@@ -1,0 +1,26 @@
+{
+  "key": "4a49a5933bc5683d",
+  "responses": [
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"04141815-f71a-49d9-b9bd-d7cb17fa4c69\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"The user wants a title for the conversation. The conversation is about adding a triple function to src/lib.rs after the add function. Need 3-7 word sentence-case title.\\n\\n\\\"Add triple function to lib.rs\\\" - that's 5 words. Sentence case. Good.\",\"signature\":\"04141815-f71a-49d9-b9bd-d7cb17fa4c69\"},{\"type\":\"text\",\"text\":\"{\\\"title\\\": \\\"Add triple function to lib.rs\\\"}\"}],\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":130,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":68,\"service_tier\":\"standard\"}}"
+    }
+  ],
+  "request": {
+    "model": "<model>",
+    "system": "<system>",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Here is the conversation so far:\nAdd a `pub fn triple(x: i32) -> i32 { x * 3 }` function to src/lib.rs, placing it right after the `add` function. Preserve all existing code and formatting exactly.\n\nGenerate a 3-7 word sentence-case title that identifies this session."
+          }
+        ]
+      }
+    ],
+    "max_tokens": 128
+  }
+}

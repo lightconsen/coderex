@@ -1,0 +1,26 @@
+{
+  "key": "058d51b633eeaf10",
+  "responses": [
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"01d72e29-ef40-4658-a66b-e2dccca37adb\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"We need answer. Need assess tool call. Command cd to temp dir .tmp1t5nus then rustc --version, echo exit. Risks? It's simple. Could fail if dir missing, rustc absent. cd && means if cd fails no rustc due &&? Actually command \\\"cd ... && rustc --version 2>&1; echo \\\\\\\"exit=$?\\\\\\\"\\\" precedence: && and ;. If cd fails, rustc not run, echo $? after cd? Let's parse: cd && rustc; echo. If cd fails, && short-circuits, then ; echo exit=$? where $? is cd failure. If cd succeeds, rustc runs, echo exit status of rustc. Safe. Potential risk: executing rustc in a temp directory could invoke local config? rustc --version does not compile, no Cargo, no build scripts. It may read rustup proxy/environment? But low. Current working dir in temp maybe untrusted contents but rustc --version doesn't read local files except maybe rust-toolchain? Important: rustc directly is not rustup? If `rustc` is rustup proxy? Actually rustc may be rustup shim, which reads rust-toolchain.t\",\"signature\":\"01d72e29-ef40-4658-a66b-e2dccca37adb\"}],\"stop_reason\":\"max_tokens\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":160,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":256,\"service_tier\":\"standard\"}}"
+    }
+  ],
+  "request": {
+    "model": "<model>",
+    "system": "<system>",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Explain the potential risks of this tool call:\n\n**Tool:** Bash\n**Input:**\n```\n{\"command\":\"cd <tmp> && rustc --version 2>&1; echo \\\"exit=$?\\\"\"}\n```\n\nWhat could go wrong if this executes?"
+          }
+        ]
+      }
+    ],
+    "max_tokens": 256
+  }
+}

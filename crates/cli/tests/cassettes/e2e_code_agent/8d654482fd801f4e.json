@@ -1,0 +1,26 @@
+{
+  "key": "8d654482fd801f4e",
+  "responses": [
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"a4bce675-3cff-4e65-a479-519f9970da45\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"We need answer security advisor. We need explain potential risks of tool call Write to src/main.rs with content. Need 1-2 clear sentences. Focus concrete risks. Tool call writes file. Need assess risks: overwrites existing src/main.rs without confirmation, potential destruction of code; content binds server to 0.0.0.0:3000, exposes service on all interfaces if run; create_user echoes request body back (not harmful). No auth, no validation, but only code. Also write to source path could alter project. Need 1-2 sentences. Mention overwrite and bind all interfaces. If safe? It is potentially risky. Need concise. Maybe: \\\"This will overwrite src/main.rs, destroying any existing code there, and the written program binds an unauthenticated HTTP server to 0.0.0.0:3000, exposing it on all network interfaces if run. The handler also echoes arbitrary input but doesn't execute it.\\\" Need 1-2 sentences. That's 2. Good.\",\"signature\":\"a4bce675-3cff-4e65-a479-519f9970da45\"},{\"type\":\"text\",\"text\":\"This will overwrite `src/main.rs`, potentially destroying existing code, and the written program binds an unauthenticated HTTP server to `0.0.0.0:3000`, exposing it on all network\"}],\"stop_reason\":\"max_tokens\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":332,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":256,\"service_tier\":\"standard\"}}"
+    }
+  ],
+  "request": {
+    "model": "<model>",
+    "system": "<system>",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Explain the potential risks of this tool call:\n\n**Tool:** Write\n**Input:**\n```\n{\"file_path\":\"src/main.rs\",\"content\":\"use axum::{\\n    http::StatusCode,\\n    routing::{get, post},\\n    Json, Router,\\n};\\nuse serde::{Deserialize, Serialize};\\n\\n#[derive(Debug, Deserialize, Serialize)]\\nstruct CreateUser {\\n    name: String,\\n    email: String,\\n}\\n\\nasync fn create_user(Json(payload): Json<CreateUser>) -> (StatusCode, Json<CreateUser>) {\\n    (StatusCode::CREATED, Json(payload))\\n}\\n\\n#[tokio::main]\\nasync fn main() {\\n    let app = Router::new()\\n        .route(\\\"/\\\", get(|| async { \\\"Hello\\\" }))\\n        .route(\\\"/users\\\", post(create_user));\\n    let listener = tokio::net::TcpListener::bind(\\\"0.0.0.0:3000\\\").await.unwrap();\\n    axum::serve(listener, app).await.unwrap();\\n}\\n\"}\n```\n\nWhat could go wrong if this executes?"
+          }
+        ]
+      }
+    ],
+    "max_tokens": 256
+  }
+}

@@ -1,0 +1,26 @@
+{
+  "key": "27e409ecc9004b0f",
+  "responses": [
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"bce9ac5d-cf3a-42d4-b9c3-8d2257923f6a\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"The user asks: \\\"Read src/lib.rs and summarize it.\\\" Then asks to generate a title. But there's no actual conversation content beyond that — only the initial request. We need a title capturing main topic. The topic is reading and summarizing src/lib.rs. Title sentence case, 3-7 words. \\\"Summarize src/lib.rs\\\" is 3 words. Maybe \\\"Read and summarize src/lib.rs\\\" 5 words. Return JSON only.\",\"signature\":\"bce9ac5d-cf3a-42d4-b9c3-8d2257923f6a\"},{\"type\":\"text\",\"text\":\"{\\\"title\\\": \\\"Read and summarize src/lib.rs\\\"}\"}],\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":92,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":104,\"service_tier\":\"standard\"}}"
+    }
+  ],
+  "request": {
+    "model": "<model>",
+    "system": "<system>",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Here is the conversation so far:\nRead src/lib.rs and summarize it.\n\nGenerate a 3-7 word sentence-case title that identifies this session."
+          }
+        ]
+      }
+    ],
+    "max_tokens": 128
+  }
+}

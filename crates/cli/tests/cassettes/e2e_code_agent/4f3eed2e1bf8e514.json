@@ -1,0 +1,26 @@
+{
+  "key": "4f3eed2e1bf8e514",
+  "responses": [
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"3eabf778-f86c-45c6-bc57-526d860d2c88\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"We need answer security advisor. Need explain risks of bash command. Need 1-2 clear sentences. Focus concrete risks. Tool call: find . -type f -name \\\"*.rs\\\" | head -50; echo \\\"---\\\"; cat Cargo.toml 2>/dev/null. Risks? It's read-only, lists Rust files limited to 50 and cats Cargo.toml. Potential risks: running in untrusted directory? find traverses entire current directory tree, could be slow/expensive on huge dirs, follows? No -L, so doesn't follow symlinks by default. It may access filenames with weird chars? Output only. head -50 causes SIGPIPE to find possibly? minor. cat Cargo.toml could expose sensitive contents if Cargo.toml contains secrets? Usually manifest, but may include private registry tokens? Cargo.toml can contain credentials? Cargo credentials usually in .cargo/credentials, not Cargo.toml. Could have private repo URLs, dependency info. But command only reads. If executed in sensitive directory, outputs file names and Cargo.toml to model/logs, potential info disclosure. Also if current directory is attacker-controlled, filenames could\",\"signature\":\"3eabf778-f86c-45c6-bc57-526d860d2c88\"}],\"stop_reason\":\"max_tokens\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":149,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":256,\"service_tier\":\"standard\"}}"
+    }
+  ],
+  "request": {
+    "model": "<model>",
+    "system": "<system>",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Explain the potential risks of this tool call:\n\n**Tool:** Bash\n**Input:**\n```\n{\"command\":\"find . -type f -name \\\"*.rs\\\" | head -50; echo \\\"---\\\"; cat Cargo.toml 2>/dev/null\",\"description\":\"Find Rust files and read Cargo.toml\"}\n```\n\nWhat could go wrong if this executes?"
+          }
+        ]
+      }
+    ],
+    "max_tokens": 256
+  }
+}

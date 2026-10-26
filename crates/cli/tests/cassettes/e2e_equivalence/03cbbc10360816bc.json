@@ -1,0 +1,26 @@
+{
+  "key": "03cbbc10360816bc",
+  "responses": [
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"b1bdb201-ab4a-4402-a2a6-00d660bf1b8e\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"We need answer only JSON title. Need infer conversation: user requested add fibonacci function to src/lib.rs, then tell what added. Need title 3-7 words sentence-case. Something like \\\"Adding Fibonacci function to lib\\\". Need count words: Adding(1) Fibonacci(2) function(3) to(4) lib(5). Sentence case? \\\"Adding Fibonacci function to lib\\\" maybe lib lowercase but okay. Or \\\"Fibonacci function added to lib.rs\\\" words 5? Fibonacci1 function2 added3 to4 lib.rs5. Sentence-case: \\\"Fibonacci function added to lib.rs\\\" good. Return JSON only.\",\"signature\":\"b1bdb201-ab4a-4402-a2a6-00d660bf1b8e\"}],\"stop_reason\":\"max_tokens\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":101,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":128,\"service_tier\":\"standard\"}}"
+    }
+  ],
+  "request": {
+    "model": "<model>",
+    "system": "<system>",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Here is the conversation so far:\nAdd a fibonacci function to src/lib.rs. Then tell me what you just added.\n\nGenerate a 3-7 word sentence-case title that identifies this session."
+          }
+        ]
+      }
+    ],
+    "max_tokens": 128
+  }
+}

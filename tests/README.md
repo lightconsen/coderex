@@ -1,13 +1,12 @@
 # CodeRex Test Strategy
 
-This directory documents the three-tier testing strategy for CodeRex.
+CodeRex has three test tiers.
 
 | Tier | What | Speed | Determinism | Command |
 |------|------|-------|-------------|---------|
 | **Unit** | Single module, isolated logic | < 1 s | 100% | `cargo test -p <crate>` |
 | **Integration** | Cross-crate interactions | ~5 s | 100% | `cargo test --test <name>` |
-| **E2E Mock** | Full CLI against mock server | ~20 s | 100% | See below |
-| **E2E Live** | Full CLI against real Kimi API | ~2 min | Depends on LLM | See below |
+| **E2E** | Full CLI / engine against a provider | ~2 min | Recorded replay | See below |
 
 ---
 
@@ -16,87 +15,71 @@ This directory documents the three-tier testing strategy for CodeRex.
 Every crate has inline unit tests in `src/` files:
 
 ```bash
-# Run all unit tests for a specific crate
 cargo test -p coderex-core
-cargo test -p coderex-tools
-cargo test -p coderex-plugins
-
-# Run all unit tests across the workspace
 cargo test --workspace --lib
 ```
 
-Example: `crates/core/src/types.rs` contains `#[cfg(test)]` blocks for `Message`
-serde round-trips and `ToolCall` validation.
-
----
-
 ## Integration Tests
 
-Integration tests live in each crate's `tests/` directory or at the workspace level.
-They verify cross-module contracts without spawning the full CLI binary.
+Integration tests live in each crate's `tests/` directory and verify
+cross-module contracts without spawning the full CLI binary.
 
 ```bash
-# Run integration tests for a specific crate
-cargo test -p coderex-cli --test e2e_code_agent -- --ignored
-
-# Run all integration tests in the workspace
+cargo test -p coderex-core --test engine_integration
 cargo test --workspace --tests
 ```
 
----
+## E2E Tests and LLM Cassettes
 
-## E2E Tests
+The provider-backed suites (`e2e_code_agent`, `e2e_equivalence`,
+`code_agent_benchmark`, the `live_*` tests) drive the real binary or engine and
+need an Anthropic-compatible endpoint. They are **not** `#[ignore]`d: the test
+harness starts `llm-cassette` automatically, and it replays the recordings
+committed under `crates/cli/tests/cassettes/<suite>/`. No key, network or
+external server is needed for a normal `cargo test` or CI run.
 
-E2E tests exercise the full `coderex` binary end-to-end, including the REPL,
-tool dispatch, and LLM API integration. There are two variants:
-
-### E2E with Mock Server (fast, deterministic, CI-friendly)
-
-The `mock-anthropic-server` binary simulates Anthropic's streaming SSE API and
-returns predetermined `tool_use` blocks. This allows testing tool execution
-without calling a real LLM.
+The suites are still available under the usual runner scripts:
 
 ```bash
-# 1. Start the mock server in a terminal
-./target/debug/mock-anthropic-server --port 9876
-
-# 2. In another terminal, source mock credentials and run tests
-source export_env.local.sh
-cargo test -p coderex-cli --test e2e_code_agent -- --ignored
-
-# Or use the helper scripts
-./tests/run-mock-anthropic-server.sh --port 9876
 ./tests/run-e2e-code-agent.sh
 ./tests/run-e2e-equivalence.sh
+./tests/run-e2e-full.sh
 ```
 
-**What it tests:**
-- Tool call assembly from SSE deltas (`Write`, `Edit`, `Bash`)
-- Multi-turn conversation loops (tool result → next assistant message)
-- File system effects (writing `src/lib.rs`, editing in place)
-- Loop detection and budget limits
-- Permission boundaries (dangerous commands rejected)
+### How the recordings work
 
-### E2E with Live Kimi API (slow, non-deterministic)
+`llm-cassette` keys a request by a canonicalized body: the system prompt,
+tool-result text, images, thinking blocks, `cache_control` markers, the model
+name and volatile values (temp paths, timestamps, UUIDs) are removed, and the
+tool list is sorted. The same test therefore matches its recording even though
+its temporary directory, tool output and tool registration order differ.
 
-These tests run against the real Kimi API and verify CodeRex behaves correctly
-with an actual LLM.
+### Re-recording
+
+After changing a suite's prompts or assertions, refresh its recordings once
+against a real endpoint:
 
 ```bash
-# 1. Source live API credentials
-source export_env.kimi.sh
-
-# 2. Run tests (single-threaded to avoid rate limits)
-cargo test -p coderex-cli --test e2e_code_agent -- --ignored --test-threads=1
-
-# Or use the helper script
-./tests/run-e2e-code-agent.sh
+scripts/record-cassettes.sh --fresh
 ```
 
-**Requirements:**
-- `ANTHROPIC_API_KEY` + `ANTHROPIC_BASE_URL` or `OPENAI_API_KEY` + `OPENAI_BASE_URL` must be set
-- Tests are marked `#[ignore = "live LLM test"]` and require `--ignored`
-- Single-threaded execution (`--test-threads=1`) to avoid rate limits
+The script reads the endpoint and key from `$CODEREX_SETTINGS`
+(`~/.coderex/settings.json` by default), runs the suites with
+`CODEREX_CASSETTE_MODE=record`, and never prints the key. Commit the updated
+`crates/cli/tests/cassettes/` files.
+
+If a replay cannot find a recording, the cassette returns HTTP 404 with a
+`cassette_missing` error and writes the unmatched canonical request to
+`crates/cli/tests/cassettes/<suite>/_missing_<key>.json` for inspection.
+
+### What the E2E suites cover
+
+- Tool call assembly and multi-turn loops (`Write`, `Edit`, `Bash`, `Read`)
+- File-system effects and permission boundaries
+- Loop detection, budget limits and interrupts
+- Resume: transcript projection, plans/activity and hook arming
+- Wire protocol and stream-json frames
+- The full TUI through a PTY (permissions, themes, signals, notifications)
 
 ---
 
@@ -104,75 +87,25 @@ cargo test -p coderex-cli --test e2e_code_agent -- --ignored --test-threads=1
 
 ### Unit Test
 
-Add `#[cfg(test)]` at the bottom of the source file:
-
-```rust
-// crates/core/src/types.rs
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn message_assistant_roundtrip() {
-        let msg = Message::assistant("hello");
-        assert!(matches!(msg.role, Role::Assistant));
-        assert_eq!(msg.content_text(), Some("hello"));
-    }
-}
-```
-
-Run: `cargo test -p coderex-core message_assistant_roundtrip`
+Add `#[cfg(test)]` at the bottom of the source file and run
+`cargo test -p coderex-core <name>`.
 
 ### Integration Test
 
-Create `crates/<crate>/tests/<name>.rs`:
+Create `crates/<crate>/tests/<name>.rs` and run
+`cargo test -p <crate> --test <name>`.
 
-```rust
-// crates/tools/tests/dispatcher.rs
-use coderex_tools::{ToolRegistry, RegistryToolDispatcher};
+### Provider-backed E2E Test
 
-#[tokio::test]
-async fn dispatcher_routes_to_correct_tool() {
-    let registry = ToolRegistry::new();
-    let dispatcher = RegistryToolDispatcher::new(registry);
-    // ... test cross-crate interaction
-}
-```
-
-Run: `cargo test -p coderex-tools --test dispatcher`
-
-### E2E Test
-
-Add a test to `crates/cli/tests/e2e_code_agent.rs`:
-
-```rust
-#[test]
-#[ignore = "live LLM test"]
-fn my_new_scenario() {
-    let tmp = tempdir();
-    let out = run(tmp.path(), "my prompt here", 60);
-    assert!(out.stdout.contains("expected output"));
-}
-```
-
-For mock-server-only tests (no `#[ignore]` needed), add a separate test file
-in `crates/cli/tests/` that uses `ANTHROPIC_API_KEY=mock`.
+Add the test to `crates/cli/tests/e2e_code_agent.rs` (or another suite with a
+cassette). Use the suite's `run` helper; it points the child at the cassette
+server. Record the new request once with `scripts/record-cassettes.sh
+--fresh`, then commit the cassette.
 
 ---
 
-## CI Integration
+## CI
 
-Unit and integration tests run on every PR. E2E mock tests run on every PR.
-E2E live tests run nightly or on demand.
-
-```yaml
-# Example CI step
-- name: Unit + Integration Tests
-  run: cargo test --workspace --lib --tests
-
-- name: E2E Mock Tests
-  run: |
-    ./target/debug/mock-anthropic-server --port 9876 &
-    source export_env.local.sh
-    cargo test -p coderex-cli --test e2e_code_agent -- --ignored
-```
+The regular workspace test job runs the E2E suites too; the cassettes make
+them deterministic and offline. There is no separate provider job and no
+secret is needed in CI.

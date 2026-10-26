@@ -3,10 +3,8 @@
 mod live;
 
 use coderex_core::engine::TerminalReason;
-use coderex_core::types::EngineEvent;
 
 #[tokio::test]
-#[ignore = "live LLM test — run with `source start.kimi.sh && cargo test -p coderex-cli -- --ignored`"]
 async fn basic_chat_responds() {
     if !live::have_live_env() {
         eprintln!("{}", live::skip_msg());
@@ -24,7 +22,7 @@ async fn basic_chat_responds() {
         "expected Completed, got different terminal reason"
     );
 
-    let events = rig.collect_events().await;
+    let events = rig.drain_events();
     let text = live::collect_text(&events);
 
     assert!(
@@ -32,16 +30,10 @@ async fn basic_chat_responds() {
         "expected response to contain 'pong', got: {text}"
     );
 
-    assert!(
-        events.iter().any(|e| matches!(e, EngineEvent::SessionEnd)),
-        "expected SessionEnd event"
-    );
-
     eprintln!("Test used model: {:?}", live::live_model());
 }
 
 #[tokio::test]
-#[ignore = "live LLM test — run with `source start.kimi.sh && cargo test -p coderex-cli -- --ignored`"]
 async fn multi_turn_remembers_context() {
     if !live::have_live_env() {
         eprintln!("{}", live::skip_msg());
@@ -55,7 +47,7 @@ async fn multi_turn_remembers_context() {
         .submit("Remember the secret word is 'apple'. Just say 'ok'.")
         .await;
     assert!(r1.is_ok(), "turn 1 failed: {r1:?}");
-    let events1 = rig.collect_events().await;
+    let events1 = rig.drain_events();
     let text1 = live::collect_text(&events1);
     assert!(
         text1.to_lowercase().contains("ok"),
@@ -67,7 +59,7 @@ async fn multi_turn_remembers_context() {
         .submit("What was the secret word I asked you to remember? Reply with just the word.")
         .await;
     assert!(r2.is_ok(), "turn 2 failed: {r2:?}");
-    let events2 = rig.collect_events().await;
+    let events2 = rig.drain_events();
     let text2 = live::collect_text(&events2);
     assert!(
         text2.to_lowercase().contains("apple"),

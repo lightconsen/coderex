@@ -1,0 +1,26 @@
+{
+  "key": "311f513725018967",
+  "responses": [
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"17b008a2-6655-49fd-95f2-d130a79cebcc\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"We need answer. Need analyze tool call risks. Command find . -type f -name \\\"*.rs\\\" -o -name \\\"Cargo.toml\\\" | head -50. Need explain potential risks 1-2 sentences concrete. Is it safe? Need note precedence: -type f applies only to first predicate due -o; second matches Cargo.toml regardless type? But find . -type f -name \\\"*.rs\\\" -o -name \\\"Cargo.toml\\\": expression = ( -type f -name \\\"*.rs\\\" ) -o ( -name \\\"Cargo.toml\\\" ). So Cargo.toml directories? name exact Cargo.toml, could be directory named Cargo.toml? possible but unlikely. Pipe head causes SIGPIPE maybe find exits with 141, but not dangerous. Read-only. It traverses entire current directory tree potentially including symlinks? find default doesn't follow symlinks. Could be slow/large; head stops early after 50 lines but find may get SIGPIPE. No destructive risk. It may traverse sensitive directories under . if cwd is broad (e.g., home), listing filenames only, no content. Output may include paths. If\",\"signature\":\"17b008a2-6655-49fd-95f2-d130a79cebcc\"}],\"stop_reason\":\"max_tokens\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":130,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":256,\"service_tier\":\"standard\"}}"
+    }
+  ],
+  "request": {
+    "model": "<model>",
+    "system": "<system>",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Explain the potential risks of this tool call:\n\n**Tool:** Bash\n**Input:**\n```\n{\"command\":\"find . -type f -name \\\"*.rs\\\" -o -name \\\"Cargo.toml\\\" | head -50\"}\n```\n\nWhat could go wrong if this executes?"
+          }
+        ]
+      }
+    ],
+    "max_tokens": 256
+  }
+}

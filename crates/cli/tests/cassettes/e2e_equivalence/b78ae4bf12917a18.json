@@ -1,0 +1,26 @@
+{
+  "key": "b78ae4bf12917a18",
+  "responses": [
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"8c95f435-90c9-42dc-8f55-458b74e63a0d\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"The user wants a title for the conversation. The conversation is about executing a multi-turn sequence of bash commands. Need 3-7 word sentence-case title. Return only JSON object.\",\"signature\":\"8c95f435-90c9-42dc-8f55-458b74e63a0d\"},{\"type\":\"text\",\"text\":\"{\\\"title\\\": \\\"Executing a multi-turn bash command sequence\\\"}\"}],\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":93,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":51,\"service_tier\":\"standard\"}}"
+    }
+  ],
+  "request": {
+    "model": "<model>",
+    "system": "<system>",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Here is the conversation so far:\nExecute a multi-turn sequence of bash commands.\n\nGenerate a 3-7 word sentence-case title that identifies this session."
+          }
+        ]
+      }
+    ],
+    "max_tokens": 128
+  }
+}

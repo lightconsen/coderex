@@ -35,9 +35,12 @@ Some suites need extra setup:
   through a real PTY. Source `export_env.local.sh` first: it points at the
   repository's mock Anthropic server, so no API key is needed
   (`source export_env.local.sh`).
-- The live-provider eval is opt-in and needs credentials; see
-  [`docs/evals.md`](docs/evals.md). CI skips it when `ANTHROPIC_API_KEY` is
-  absent.
+- The provider-backed E2E suites (`e2e_code_agent`, `e2e_equivalence`,
+  `code_agent_benchmark`, `live_*`) replay committed LLM cassettes through the
+  `llm-cassette` binary, so they need no key or network. After changing a
+  suite's prompts or assertions, refresh its recordings once with
+  `scripts/record-cassettes.sh --fresh`; see
+  [`tests/README.md`](tests/README.md).
 - Platform-gated tests (`#[cfg(target_os = ...)]`) only run on their platform.
   CI runs the suite on Linux, Windows and macOS.
 

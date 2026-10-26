@@ -1,0 +1,31 @@
+{
+  "key": "b01a46b111cff876",
+  "responses": [
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"817457cd-a003-4eaa-9fb1-767eaf186822\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"We need answer user asks generate concise 3-7 word sentence-case title captures main topic conversation. Conversation so far: \\\"Say hello.\\\" That's it. Need title identifying session. Likely \\\"Saying hello\\\" or \\\"Simple hello greeting\\\". Need return ONLY JSON object. Sentence case. 3-7 words. Since main topic is greeting/hello. Need maybe \\\"Simple greeting and hello request\\\" (5 words). But title should capture conversation: user says \\\"Say hello.\\\" We can title \\\"Saying hello in conversation\\\" (4 words). Sentence case: \\\"Saying hello in conversation\\\". Return only JSON.\",\"signature\":\"817457cd-a003-4eaa-9fb1-767eaf186822\"},{\"type\":\"text\",\"text\":\"{\\\"\"}],\"stop_reason\":\"max_tokens\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":87,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":128,\"service_tier\":\"standard\"}}"
+    },
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"d18e4a20-e4c9-44bb-ae6f-f6a17ae5de16\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"We need answer only JSON title. Need infer conversation: user said \\\"Say hello.\\\" Need title capturing main topic. Concise 3-7 words sentence case. Maybe \\\"Initial greeting request\\\" or \\\"User asks for greeting\\\". Need identify session. Return only JSON.\",\"signature\":\"d18e4a20-e4c9-44bb-ae6f-f6a17ae5de16\"},{\"type\":\"text\",\"text\":\"{\\\"title\\\": \\\"User asks for greeting\\\"}\"}],\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":87,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":64,\"service_tier\":\"standard\"}}"
+    }
+  ],
+  "request": {
+    "model": "<model>",
+    "system": "<system>",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Here is the conversation so far:\nSay hello.\n\nGenerate a 3-7 word sentence-case title that identifies this session."
+          }
+        ]
+      }
+    ],
+    "max_tokens": 128
+  }
+}

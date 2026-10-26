@@ -1,8 +1,9 @@
-//! Live LLM E2E test harness — runs against a real API.
+//! LLM E2E harness.
 //!
-//! Set environment variables before running:
-//!   source start.kimi.sh
-//!   cargo test -p coderex-cli -- --ignored
+//! The tests run against the `llm-cassette` replacement server: it replays the
+//! recordings in `tests/cassettes/live/`, so no key or network is required.
+//! `scripts/record-cassettes.sh` refreshes those recordings against a real
+//! Anthropic-compatible endpoint.
 
 use coderex_core::api_client::{AnthropicApiClient, ApiConfig};
 use coderex_core::permissions::PermissionMode;
@@ -13,13 +14,39 @@ use coderex_tools::{
     register_builtin_tools,
 };
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+
+#[path = "../common/mod.rs"]
+mod common;
+
+static CASSETTE: OnceLock<Arc<common::Cassette>> = OnceLock::new();
+
+/// Start the cassette endpoint and point this process's API client at it.
+///
+/// The live harness builds an in-process client from environment variables,
+/// so unlike the suites that spawn a child binary the endpoint has to be
+/// placed in this process's environment.
+#[allow(unsafe_code)] // Environment mutation is unsafe in edition 2024.
+fn setup_cassette() {
+    CASSETTE.get_or_init(|| {
+        let cassette = common::cassette("live");
+        // SAFETY: the test binary calls this once, before any API client is
+        // built. The remaining threads are the tests themselves, which all
+        // reach the endpoint through these variables.
+        unsafe {
+            std::env::set_var("ANTHROPIC_BASE_URL", cassette.base_url());
+            std::env::set_var("ANTHROPIC_API_KEY", "cassette");
+            std::env::set_var("ANTHROPIC_MODEL", common::MODEL);
+        }
+        cassette
+    });
+}
 
 /// Check if live API credentials are available.
 #[must_use]
 pub fn have_live_env() -> bool {
-    (std::env::var("ANTHROPIC_API_KEY").is_ok() && std::env::var("ANTHROPIC_BASE_URL").is_ok())
-        || (std::env::var("OPENAI_API_KEY").is_ok() && std::env::var("OPENAI_BASE_URL").is_ok())
+    setup_cassette();
+    true
 }
 
 /// Skip message when env is missing.
@@ -31,6 +58,7 @@ pub const fn skip_msg() -> &'static str {
 /// Build a real API client from environment.
 #[must_use]
 pub fn live_api_client() -> AnthropicApiClient {
+    setup_cassette();
     let key = std::env::var("ANTHROPIC_API_KEY")
         .or_else(|_| std::env::var("OPENAI_API_KEY"))
         .expect("ANTHROPIC_API_KEY or OPENAI_API_KEY not set");
@@ -46,10 +74,8 @@ pub fn live_api_client() -> AnthropicApiClient {
 /// Build a model ID from environment or default.
 #[must_use]
 pub fn live_model() -> ModelId {
-    let model = std::env::var("ANTHROPIC_MODEL")
-        .or_else(|_| std::env::var("OPENAI_MODEL"))
-        .unwrap_or_else(|_| "claude-sonnet-4-6".into());
-    ModelId(model)
+    setup_cassette();
+    ModelId(common::MODEL.to_string())
 }
 
 /// Build a TestRig with real API client and real builtin tools.
@@ -90,7 +116,8 @@ pub fn has_tool_call(events: &[coderex_core::types::EngineEvent], name: &str) ->
     events.iter().any(|e| {
         matches!(
             e,
-            coderex_core::types::EngineEvent::ToolCallStart { name: n, .. } if n == name
+            coderex_core::types::EngineEvent::ToolCallStart { name: n, .. }
+                if n.eq_ignore_ascii_case(name)
         )
     })
 }

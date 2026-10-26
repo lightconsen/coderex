@@ -1,0 +1,26 @@
+{
+  "key": "3f05a23933ea9e63",
+  "responses": [
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"97e9adc3-8f43-4bed-9dc9-eb8edcd26761\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"We need answer security advisor. Need explain potential risks of tool call AskUserQuestion input. Need 1-2 clear sentences. Focus concrete risks not generic. Tool is AskUserQuestion, likely asks user multiple choice questions. Input asks about bash sequence and safety. Potential risks: social engineering / user may choose \\\"Go ahead freely\\\" or paste commands, leading to execution of destructive/mutating commands? But tool call itself only asks questions, no execution. Need say appears safe/low risk because it only elicits preferences; risk is downstream if subsequent agent uses answers to run bash commands, especially \\\"Go ahead freely\\\" or pasted commands could authorize destructive writes/installs. 1-2 sentences.\\n\\nNeed mention no direct side effects. \\\"The call itself only presents multiple-choice questions and does not execute commands, so direct risk is minimal. The concrete risk is that it can collect broad authorization—especially 'Go ahead freely' or pasted commands—that a later bash tool might use to run installs/builds/writes or unsafe commands without further confirmation.\\\" That's 2 sentences. Ensure clear.\",\"signature\":\"97e9adc3-8f43-4bed-9dc9-eb8edcd26761\"},{\"type\":\"text\",\"text\":\"The call itself only asks multiple-choice questions and does not execute anything, so direct risk is minimal. The concrete risk is that it can capture broad authorization—especially\"}],\"stop_reason\":\"max_tokens\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":375,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":256,\"service_tier\":\"standard\"}}"
+    }
+  ],
+  "request": {
+    "model": "<model>",
+    "system": "<system>",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Explain the potential risks of this tool call:\n\n**Tool:** AskUserQuestion\n**Input:**\n```\n{\"questions\":[{\"question\":\"What should the multi-turn bash sequence actually do?\",\"header\":\"Sequence\",\"options\":[{\"label\":\"You'll paste the commands\",\"description\":\"You give me an explicit list (e.g. `pwd`, `ls -la`, `git status`, `npm test`). I run them one at a time, in order, reporting output after each.\"},{\"label\":\"Read-only project recon\",\"description\":\"I run a safe inspection sequence of my own: pwd, ls, git status/branch/log, dependency manifests, test config. No writes, no installs, nothing destructive.\"},{\"label\":\"Build / test / verify\",\"description\":\"I run install → lint → build → test in sequence, stopping at the first failure. This may modify lockfiles, caches, and build output.\"}],\"multiSelect\":false},{\"question\":\"How careful should I be about side effects?\",\"header\":\"Safety\",\"options\":[{\"label\":\"Ask before each mutating step\",\"description\":\"Anything that writes files, installs packages, or touches git gets a confirmation prompt first.\"},{\"label\":\"Read-only only\",\"description\":\"Refuse anything that changes state; just inspect and report.\"},{\"label\":\"Go ahead freely\",\"description\":\"Run the whole sequence without stopping, including writes/installs.\"}],\"multiSelect\":false}]}\n```\n\nWhat could go wrong if this executes?"
+          }
+        ]
+      }
+    ],
+    "max_tokens": 256
+  }
+}

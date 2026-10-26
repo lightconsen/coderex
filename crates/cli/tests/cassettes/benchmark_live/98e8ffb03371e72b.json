@@ -1,0 +1,26 @@
+{
+  "key": "98e8ffb03371e72b",
+  "responses": [
+    {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"id\":\"afa7c993-73b7-4a1e-ae18-1d99b671b916\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"The user wants a title for the conversation. The conversation is about reviewing src/lib.rs for issues, reporting findings only.\\n\\nTitle: 3-7 words, sentence case. \\\"Reviewing src/lib.rs for issues\\\" - that's 5 words. Good.\",\"signature\":\"afa7c993-73b7-4a1e-ae18-1d99b671b916\"},{\"type\":\"text\",\"text\":\"{\\\"title\\\": \\\"Reviewing src/lib.rs for issues\\\"}\"}],\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":101,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":66,\"service_tier\":\"standard\"}}"
+    }
+  ],
+  "request": {
+    "model": "<model>",
+    "system": "<system>",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Here is the conversation so far:\nReview src/lib.rs for issues. Do not modify any files; only report findings.\n\nGenerate a 3-7 word sentence-case title that identifies this session."
+          }
+        ]
+      }
+    ],
+    "max_tokens": 128
+  }
+}

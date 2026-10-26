@@ -164,10 +164,8 @@ cargo test --workspace
 # Specific crate
 cargo test -p coderex-core
 
-# E2E tests (mock server)
-./tests/run-mock-anthropic-server.sh --port 9876 &
-source export_env.local.sh
-cargo test -p coderex-cli --test e2e_code_agent -- --ignored
+# Provider-backed E2E tests (replay recorded LLM cassettes)
+cargo test -p coderex-cli --test e2e_code_agent
 ```
 
 ### Lint
