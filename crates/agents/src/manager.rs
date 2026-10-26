@@ -13,7 +13,9 @@ use coderex_core::hook_executor::HookExecutor;
 use coderex_core::job_record::{JobKind, JobRecord, JobState, JobStore};
 use coderex_core::orchestrator::{BackgroundFeatureRequest, QueryResult, run_background_feature};
 use coderex_core::permission_engine::{BackgroundAgentDenyHook, PermissionEngine};
-use coderex_core::permissions::{PermissionChecker, PermissionMode};
+use coderex_core::permissions::{
+    PermissionChecker, PermissionMode, PermissionRuleSpec, RuleCompileContext,
+};
 use coderex_core::sandbox::SandboxConfig;
 use coderex_core::state::SessionState;
 use coderex_core::task::{TaskHandle, TaskKind, TaskManager, now_ms};
@@ -1032,12 +1034,13 @@ impl AgentManager {
         instance.prompt = system_prompt.clone();
 
         let agent_id = task_id.clone();
-        let permission_mode = self
-            .permission_checker
-            .as_ref()
-            .map_or_else(PermissionMode::default, |checker| {
-                checker.lock().unwrap().mode()
-            });
+        let (permission_mode, permission_rules) = self.permission_checker.as_ref().map_or_else(
+            || (PermissionMode::default(), Vec::new()),
+            |checker| {
+                let checker = checker.lock().unwrap();
+                (checker.mode(), checker.rule_specs())
+            },
+        );
 
         if let Some(ref api_client) = self.api_client {
             let client = api_client.clone_box();
@@ -1085,6 +1088,7 @@ impl AgentManager {
                     user_prompt,
                     working_directory,
                     permission_mode,
+                    permission_rules,
                     confirmation_bus,
                     max_tokens,
                     max_duration,
@@ -1726,6 +1730,7 @@ async fn run_agent_task(
     user_prompt: String,
     working_directory: PathBuf,
     permission_mode: PermissionMode,
+    permission_rules: Vec<PermissionRuleSpec>,
     confirmation_bus: Option<ConfirmationBus>,
     max_tokens: u32,
     max_duration: u64,
@@ -1811,7 +1816,19 @@ async fn run_agent_task(
             }
         }
 
-        let checker = PermissionChecker::new(permission_mode);
+        let mut checker = PermissionChecker::new(permission_mode);
+        // A child gets the parent's rules recompiled against its own working
+        // directory, so relative patterns follow a worktree.
+        if !permission_rules.is_empty() {
+            let home = home::home_dir();
+            let ctx = RuleCompileContext {
+                cwd: &working_directory,
+                home: home.as_deref(),
+            };
+            if let Err(error) = checker.add_specs(&permission_rules, &ctx) {
+                tracing::error!(%error, "sub-agent permission rules were not compiled");
+            }
+        }
         let mut permission_engine = PermissionEngine::new(checker);
         // A background child runs with `agent_id = Some(..)`, which makes its
         // permission requests background-agent requests. The hook is installed
@@ -3770,5 +3787,97 @@ mod tests {
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("agent_1"));
         assert!(json.contains("hello"));
+    }
+
+    /// Tool executor whose rule subjects are known without a registry, so the
+    /// child engine can exercise rules in this crate.
+    struct SubjectExecutor;
+
+    #[async_trait::async_trait]
+    impl ToolExecutor for SubjectExecutor {
+        async fn execute(
+            &self,
+            tool_call_id: &str,
+            _tool_name: &str,
+            _input: &serde_json::Value,
+        ) -> coderex_core::tool_executor::ToolDispatchOutcome {
+            coderex_core::tool_executor::ToolDispatchOutcome {
+                result: coderex_core::types::ToolResult {
+                    tool_call_id: tool_call_id.to_string(),
+                    output: "read the note".into(),
+                    is_error: false,
+                    images: Vec::new(),
+                },
+            }
+        }
+
+        fn rule_subjects(&self, _tool_name: &str, _input: &serde_json::Value) -> Vec<String> {
+            vec!["note.txt".into(), "/tmp/note.txt".into()]
+        }
+    }
+
+    /// A synchronous sub-agent inherits the parent's rules, recompiled against
+    /// its own working directory.
+    #[tokio::test]
+    async fn a_subagent_inherits_the_parents_permission_rules() {
+        use coderex_core::permissions::{PermissionRuleSpec, RuleCompileContext};
+
+        let mut mgr = make_manager();
+        mgr.set_api_client(Box::new(ScriptedApi {
+            calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }));
+        mgr.set_tool_executor_factory(|_, _| Box::new(SubjectExecutor));
+
+        let checker = Arc::new(std::sync::Mutex::new(PermissionChecker::new(
+            PermissionMode::Default,
+        )));
+        checker
+            .lock()
+            .unwrap()
+            .add_specs(
+                &[PermissionRuleSpec::parse(
+                    "Read(./note.txt)",
+                    coderex_core::permissions::PermissionAction::Deny,
+                )
+                .unwrap()],
+                &RuleCompileContext {
+                    cwd: Path::new("/tmp"),
+                    home: None,
+                },
+            )
+            .unwrap();
+        mgr.set_permission_checker(Arc::clone(&checker));
+        let mut events = mgr.subscribe_all().expect("broadcast channel");
+
+        let instance = mgr
+            .spawn_agent(
+                AgentType::GeneralPurpose,
+                "read the note",
+                SpawnOptions {
+                    cwd: Some(PathBuf::from("/tmp")),
+                    ..SpawnOptions::default()
+                },
+                "sess_rules",
+                "/tmp",
+                0,
+            )
+            .await
+            .unwrap();
+        let agent_id = instance.task_handle.id.clone();
+        mgr.wait_for_completion(&agent_id).await.unwrap();
+
+        let mut denial = None;
+        while let Ok(observed) = events.try_recv() {
+            if let EngineEvent::ToolCallEnd { result, .. } = observed.event {
+                if result.is_error {
+                    denial = Some(result.output);
+                }
+            }
+        }
+        let denial = denial.expect("the child tool call was never reported");
+        assert!(
+            denial.contains("Read(./note.txt)"),
+            "the child did not inherit the parent rule: {denial}"
+        );
     }
 }

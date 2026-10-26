@@ -263,6 +263,24 @@ impl PermissionEngine {
         path: Option<PathBuf>,
         context: HashMap<String, String>,
     ) -> Result<(PermissionRequest, PermissionResult), PermissionRequestError> {
+        self.evaluate_with_subjects(tool_name, arguments, path, context, Vec::new())
+            .await
+    }
+
+    /// Evaluate a call whose rule subjects are already known.
+    ///
+    /// `subjects` are the values a permission rule is judged against (the Bash
+    /// command, the file path, ...). The engine gets them from its tool
+    /// executor; callers that have no executor pass an empty list and only
+    /// whole-tool rules apply.
+    pub async fn evaluate_with_subjects(
+        &mut self,
+        tool_name: &str,
+        arguments: String,
+        path: Option<PathBuf>,
+        context: HashMap<String, String>,
+        mut subjects: Vec<String>,
+    ) -> Result<(PermissionRequest, PermissionResult), PermissionRequestError> {
         let mode = {
             let checker = self.checker.lock().unwrap();
             checker.mode()
@@ -297,11 +315,19 @@ impl PermissionEngine {
         let arguments: serde_json::Value =
             serde_json::from_str(&request.arguments).unwrap_or(serde_json::Value::Null);
         let exemptions = self.exemptions_for(tool_name, &arguments);
+        // The caller may have supplied only a path; add it to the subjects so
+        // programmatic callers keep their path rules working.
+        if let Some(path) = request.path.as_ref() {
+            let raw = path.to_string_lossy().to_string();
+            if !subjects.contains(&raw) {
+                subjects.push(raw);
+            }
+        }
         let result = {
             let checker = self.checker.lock().unwrap();
-            let path_ref = request.path.as_deref();
-            checker.check_with_exemptions(tool_name, path_ref, Some(exemptions))
+            checker.check_with_subjects(tool_name, &subjects, Some(exemptions))
         };
+        tracing::debug!(tool = %tool_name, ?result, "permission decision");
 
         // Phase 2.5: shell security analysis
         //

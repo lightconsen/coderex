@@ -12,6 +12,7 @@ Configuration layers: defaults → user config (`~/.coderex/settings.json`) → 
 - **`Settings`** (`settings.rs`) — Strongly-typed configuration struct with `config_version`, `api_key`, `provider`, `context_window`, and validation.
 - **`ProviderSettings`** (`settings.rs`) — `base_url` and `request_timeout_secs` for the Anthropic-protocol endpoint, so an Anthropic-compatible provider is configured in `settings.json` instead of a per-provider environment wrapper. Only the **user** and **managed** layers contribute this block: a repository-controlled settings file must not redirect the endpoint that receives the API key. Validation requires an `http(s)://` URL and a timeout greater than zero.
 - **`ContextWindowSettings`** (`settings.rs`) — Per-model context-window overrides plus an optional default.
+- **`PermissionsSettings`** (`settings.rs`) — Claude-compatible `allow`/`deny`/`ask` rule strings; parsed/validated at load, compiled against the session cwd by `permission_rules::install_settings_rules`.
 - **`RuntimeOverrides`** (`settings.rs`) — Environment-variable and CLI-arg overrides.
 - **`ConfigError`** (`settings.rs`) — Error enum with `Io`, `Json`, `Validation`, `UnknownField`, and `TooLarge` variants.
 - **`ConfigDiff`/`ConfigDiffEntry`** (`settings.rs`) — Structured diff between current settings and defaults with `render()` for human-readable output.
@@ -40,11 +41,13 @@ managed sources (managed_settings.json → macOS plist → Windows registry; see
 Environment variables / CLI args
 ```
 
-Every key is **winner-take-all** under merge: a higher layer replaces the whole
-value rather than merging into it (the `telemetry` sub-config is replaced
-wholesale, not field-by-field). Claude's `WINNER_ONLY_UNDER_MERGE` key table
-therefore has no counterpart here — the property already holds for all keys, and
-no key is excluded from it.
+Every key is **winner-take-all** under merge except `permissions`: a higher
+layer replaces the whole value rather than merging into it (the `telemetry`
+sub-config is replaced wholesale, not field-by-field). Permission rules are
+unioned across layers (defaults → user → project → local → managed) with stable
+deduplication, because the layers are additive: a user allow must survive a
+project layer that only adds a deny. A higher layer can neutralize a lower allow
+with a deny/ask rule, but cannot delete it.
 
 ### Context Window Overrides
 
@@ -165,6 +168,54 @@ Terminal.app renders 24-bit background sequences unreliably. Terminals that
 advertise truecolor through `COLORTERM` or a `-direct` `TERM` keep the exact
 palette.
 
+### Permission Rules (`permissions.allow` / `deny` / `ask`)
+
+CodeRex reads the Claude-compatible rule block from any settings layer:
+
+```json
+{
+  "permissions": {
+    "allow": ["Bash(git status)", "Bash(ls:*)", "Read(./docs/**)"],
+    "deny":  ["Bash(rm:*)", "Read(./.env)", "Read(~/secrets/**)"],
+    "ask":   ["Edit", "Write(src/prod/**)"]
+  }
+}
+```
+
+Supported syntax:
+
+| Form | Meaning |
+|---|---|
+| `Tool` | the whole tool is allowed/denied/asked (`Edit`). |
+| `Tool(glob)` | a path glob matched against the call's rule subject (Read/Write/Edit `file_path`, a file list, …). |
+| `Bash(command)` | exact command match. |
+| `Bash(prefix:*)` | the command starts with `prefix` at a word boundary (`git diff:*` matches `git diff --stat`, not `git differences`). |
+| `Bash(glob)` | a glob over the whole command (`Bash(*)`, `Bash(ls *.rs)`). |
+
+Path patterns follow Claude's spellings: `./x` and bare `src/**` are relative to
+the session cwd, `~/x` to the home directory, `//tmp/x` and `/etc/**` are
+absolute. `*` does not cross `/`; `**` does. Matching is lexical (no symlink
+canonicalization) and happens against both the argument as written and a
+cwd/home-resolved absolute form. Bash rules are matched against the command
+(`RuleContentField`), never against the command's slash-containing arguments.
+
+Precedence inside the rule set is **deny > ask > allow**. A configured deny is
+evaluated before the plan/accept-edits shortcuts; `bypass-permissions` and
+`dont-ask` remain hard mode overrides and ignore rules. Rules are installed in
+the REPL, served sessions, and sub-agents (a child recompiles them against its
+own working directory).
+
+Malformed rules reject the **whole settings file** (the next layer wins), like
+any other invalid value. Unknown subkeys such as `defaultMode` or
+`additionalDirectories` are ignored for Claude-file compatibility; those two
+features are not implemented.
+
+> **Security note:** project and local settings may grant `allow` rules, for
+> full Claude compatibility. Cloning a repository therefore can pre-approve
+> tools. Managed `deny`/`ask` rules still win, but review repository permission
+> blocks like any other executable configuration. Plugins may never set
+> `permissions`.
+
 ### Source Policies (repository-controlled files cannot relax privacy)
 
 `load_settings_file` applies two policies after parsing, both keyed on the
@@ -172,6 +223,9 @@ settings *source*:
 
 - **`permission_mode`** — project/local settings may not set `auto` or
   `bypass-permissions`; the value is dropped so the next layer wins.
+- **`permissions`** — deliberately **not** restricted: project/local settings
+  may grant allow rules (see the security note above); plugin-supplied
+  `permissions` is never taken.
 - **`telemetry_enabled`** — project/local settings may only **disable**
   telemetry. An attempt to set `true` is dropped, so a repository-committed
   `.coderex/settings.json` can never turn telemetry on for a user who has not
@@ -214,7 +268,7 @@ The registry has no boolean or float type, so a few keys are normalized:
 | `telemetry_enabled` | `REG_DWORD` or `REG_SZ` | `0`/`false` ⇒ `false`, non-zero/`true` ⇒ `true` |
 | `config_version` | `REG_DWORD`/`REG_QWORD`, or numeric `REG_SZ` | unsigned integer |
 | `max_budget_usd` | `REG_SZ` | decimal number |
-| `telemetry`, `hooks`, `mcp_servers`, `context_window` | `REG_SZ` | JSON value |
+| `telemetry`, `hooks`, `mcp_servers`, `context_window`, `permissions` | `REG_SZ` | JSON value |
 | other supported names | `REG_SZ`, `REG_DWORD`, `REG_QWORD`, `REG_MULTI_SZ` | string, number, number, array |
 
 Unknown value names and unparseable values cause the whole registry carrier to

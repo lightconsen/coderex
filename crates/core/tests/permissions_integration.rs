@@ -464,3 +464,120 @@ async fn auto_mode_dangerous_tools_require_approval() {
         "Bash should require approval in Auto mode"
     );
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Settings-style rules — parsed specs and explicit subjects
+// ═══════════════════════════════════════════════════════════════════════════
+
+use coderex_core::permissions::{PermissionRuleSpec, RuleCompileContext};
+
+fn rule(raw: &str, action: PermissionAction) -> PermissionRuleSpec {
+    PermissionRuleSpec::parse(raw, action).unwrap_or_else(|error| panic!("{raw}: {error}"))
+}
+
+fn engine_with_rules(specs: &[PermissionRuleSpec], cwd: &Path) -> PermissionEngine {
+    let mut checker = PermissionChecker::new(PermissionMode::Default);
+    checker
+        .add_specs(specs, &RuleCompileContext { cwd, home: None })
+        .unwrap();
+    PermissionEngine::new(checker)
+}
+
+#[tokio::test]
+async fn settings_style_bash_rules_match_the_command_subject() {
+    let mut engine = engine_with_rules(
+        &[
+            rule("Bash(rm:*)", PermissionAction::Deny),
+            rule("Bash(ls:*)", PermissionAction::Allow),
+        ],
+        Path::new("/proj"),
+    );
+
+    let (_req, denied) = engine
+        .evaluate_with_subjects(
+            "Bash",
+            r#"{"command":"rm -rf /tmp/x"}"#.into(),
+            None,
+            ctx(),
+            vec!["rm -rf /tmp/x".into()],
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(denied, PermissionResult::Deny { .. }),
+        "{denied:?}"
+    );
+
+    let (_req, allowed) = engine
+        .evaluate_with_subjects(
+            "Bash",
+            r#"{"command":"ls -la"}"#.into(),
+            None,
+            ctx(),
+            vec!["ls -la".into()],
+        )
+        .await
+        .unwrap();
+    assert!(allowed.is_allowed(), "{allowed:?}");
+
+    let (_req, unrelated) = engine
+        .evaluate_with_subjects(
+            "Bash",
+            r#"{"command":"git status"}"#.into(),
+            None,
+            ctx(),
+            vec!["git status".into()],
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(unrelated, PermissionResult::Ask { .. }),
+        "an unmatched dangerous command should ask: {unrelated:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_ask_rule_beats_an_allow_rule_in_the_engine() {
+    let mut engine = engine_with_rules(
+        &[
+            rule("Bash(echo:*)", PermissionAction::Allow),
+            rule("Bash(echo hi:*)", PermissionAction::Ask),
+        ],
+        Path::new("/proj"),
+    );
+    let (_req, result) = engine
+        .evaluate_with_subjects(
+            "Bash",
+            r#"{"command":"echo hi"}"#.into(),
+            None,
+            ctx(),
+            vec!["echo hi".into()],
+        )
+        .await
+        .unwrap();
+    assert!(matches!(result, PermissionResult::Ask { .. }), "{result:?}");
+}
+
+#[tokio::test]
+async fn path_rules_match_raw_and_absolute_subjects() {
+    let mut engine = engine_with_rules(
+        &[rule("Read(./.env)", PermissionAction::Deny)],
+        Path::new("/proj"),
+    );
+    for subject in [".env", "/proj/.env"] {
+        let (_req, result) = engine
+            .evaluate_with_subjects(
+                "Read",
+                r#"{"file_path":".env"}"#.into(),
+                None,
+                ctx(),
+                vec![subject.into()],
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(result, PermissionResult::Deny { .. }),
+            "{subject} should match: {result:?}"
+        );
+    }
+}

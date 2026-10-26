@@ -2248,6 +2248,11 @@ pub struct ReplLoop {
     skip_permissions: bool,
     /// Permission mode override (--permissions).
     permission_mode: Option<PermissionMode>,
+    /// Settings-defined allow/deny/ask rules, installed once by
+    /// `apply_cli_config`.
+    permission_rules: Option<coderex_config::PermissionsSettings>,
+    /// Whether the rules above have already been compiled into the checker.
+    permission_rules_installed: bool,
     /// Disable session persistence (--no-session-persistence).
     no_persistence: bool,
     /// Disable slash commands (--disable-slash-commands).
@@ -2347,6 +2352,10 @@ impl coderex_core::tool_executor::ToolExecutor for ArcToolExecutor {
     ) -> coderex_core::tool_executor::ToolDispatchOutcome {
         self.0.execute(tool_call_id, tool_name, input).await
     }
+
+    fn rule_subjects(&self, tool_name: &str, input: &serde_json::Value) -> Vec<String> {
+        self.0.rule_subjects(tool_name, input)
+    }
 }
 
 /// Tool executor that falls back to plugin tools when the primary reports "not found".
@@ -2372,6 +2381,15 @@ impl coderex_core::tool_executor::ToolExecutor for PluginToolFallbackExecutor {
 
         if primary.result.is_error && primary_tool_was_missing(&primary.result.output, tool_name) {
             self.plugin.execute(tool_call_id, tool_name, input).await
+        } else {
+            primary
+        }
+    }
+
+    fn rule_subjects(&self, tool_name: &str, input: &serde_json::Value) -> Vec<String> {
+        let primary = self.primary.rule_subjects(tool_name, input);
+        if primary.is_empty() {
+            self.plugin.rule_subjects(tool_name, input)
         } else {
             primary
         }
@@ -2529,6 +2547,8 @@ impl ReplLoop {
             pending_setup: None,
             skip_permissions: false,
             permission_mode: None,
+            permission_rules: None,
+            permission_rules_installed: false,
             no_persistence: false,
             no_slash_commands: false,
             json_schema: None,
@@ -2932,6 +2952,8 @@ impl ReplLoop {
             pending_setup: None,
             skip_permissions: false,
             permission_mode: None,
+            permission_rules: None,
+            permission_rules_installed: false,
             no_persistence: false,
             no_slash_commands: false,
             json_schema: None,
@@ -3241,6 +3263,17 @@ impl ReplLoop {
 
     pub const fn with_permission_mode(&mut self, mode: Option<PermissionMode>) {
         self.permission_mode = mode;
+    }
+
+    /// Install Claude-compatible permission rules from settings.
+    ///
+    /// They are compiled against the session cwd once, by `apply_cli_config`.
+    pub fn with_permission_rules(
+        &mut self,
+        permissions: Option<coderex_config::PermissionsSettings>,
+    ) {
+        self.permission_rules = permissions;
+        self.permission_rules_installed = false;
     }
 
     /// Lifecycle hooks from settings, installed by `apply_cli_config`.
@@ -3598,6 +3631,28 @@ impl ReplLoop {
                 let mut c = checker.lock().unwrap();
                 c.set_mode(mode);
             }
+        }
+
+        // 1b. Settings-defined permission rules. Installed once, after the
+        // mode, so a later `apply_cli_config` call does not duplicate them.
+        if !self.permission_rules_installed {
+            let rules = self.permission_rules.clone();
+            if let (Some(rules), Some(engine)) = (rules, self.engine.as_ref()) {
+                let checker = engine.permission_checker();
+                let mut guard = checker.lock().unwrap();
+                match coderex_config::permission_rules::install_settings_rules(
+                    &mut guard,
+                    Some(&rules),
+                    std::path::Path::new(&self.cwd),
+                    None,
+                ) {
+                    Ok(count) => tracing::debug!("installed {count} permission rule(s)"),
+                    Err(error) => {
+                        tracing::warn!(%error, "permission rules were not installed")
+                    }
+                }
+            }
+            self.permission_rules_installed = true;
         }
 
         // 2. Disable slash commands

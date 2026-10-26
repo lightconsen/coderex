@@ -160,6 +160,7 @@ fn settings_json_serde_roundtrip() {
         config_version: CURRENT_SCHEMA_VERSION,
         model: Some("custom-model".into()),
         permission_mode: Some("plan".into()),
+        permissions: None,
         max_budget_usd: Some(15.5),
         telemetry_enabled: Some(false),
         telemetry: Some(coderex_config::settings::TelemetrySubConfig {
@@ -650,4 +651,68 @@ fn config_service_project_config_missing_is_ok() {
     );
     let resolved = service.resolve().unwrap();
     assert_eq!(resolved.model, Some("claude-sonnet-4-6".into()));
+}
+
+#[test]
+fn project_settings_may_grant_permission_allow_rules() {
+    let dir = tempfile::tempdir().unwrap();
+    let user = dir.path().join("user.json");
+    let project = dir.path().join("project.json");
+    write_settings(&user, r#"{"config_version": 4}"#);
+    write_settings(
+        &project,
+        r#"{"permissions": {"allow": ["Bash(ls:*)"], "deny": ["Read(./.env)"]}}"#,
+    );
+
+    let resolved = ConfigService::new(user, Some(project)).resolve().unwrap();
+    let rules = resolved.permissions.expect("project rules");
+    assert_eq!(rules.allow, vec!["Bash(ls:*)"]);
+    assert_eq!(rules.deny, vec!["Read(./.env)"]);
+}
+
+#[test]
+fn permission_rule_layers_union_across_sources() {
+    let dir = tempfile::tempdir().unwrap();
+    let user = dir.path().join("user.json");
+    let project = dir.path().join("project.json");
+    write_settings(
+        &user,
+        r#"{"permissions": {"allow": ["Bash(ls:*)"], "ask": ["Edit"]}}"#,
+    );
+    write_settings(
+        &project,
+        r#"{"permissions": {"deny": ["Bash(rm:*)"], "allow": ["Read(./docs/**)"]}}"#,
+    );
+
+    let resolved = ConfigService::new(user, Some(project)).resolve().unwrap();
+    let rules = resolved.permissions.expect("rules");
+    assert_eq!(rules.allow, vec!["Bash(ls:*)", "Read(./docs/**)"]);
+    assert_eq!(rules.deny, vec!["Bash(rm:*)"]);
+    assert_eq!(rules.ask, vec!["Edit"]);
+}
+
+#[test]
+fn a_malformed_project_rule_falls_back_and_keeps_user_rules() {
+    let dir = tempfile::tempdir().unwrap();
+    let user = dir.path().join("user.json");
+    let project = dir.path().join("project.json");
+    write_settings(&user, r#"{"permissions": {"allow": ["Bash(ls:*)"]}}"#);
+    write_settings(
+        &project,
+        r#"{"permissions": {"deny": ["Bash("]}, "model": "project-model"}"#,
+    );
+
+    let resolved = ConfigService::new(user, Some(project)).resolve().unwrap();
+    let rules = resolved.permissions.expect("user rules survive");
+    assert_eq!(rules.allow, vec!["Bash(ls:*)"]);
+    assert!(rules.deny.is_empty());
+    assert_ne!(
+        resolved.model.as_deref(),
+        Some("project-model"),
+        "the malformed project file must be ignored whole"
+    );
+}
+
+fn write_settings(path: &PathBuf, json: &str) {
+    std::fs::write(path, json).expect("write settings");
 }

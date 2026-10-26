@@ -138,8 +138,10 @@ fn registry_string_value(name: &str, raw: &str) -> Result<serde_json::Value, Con
             .parse::<f64>()
             .map(|budget| json!(budget))
             .map_err(|_| registry_validation(name, "must be a decimal number")),
-        "telemetry" | "hooks" | "mcp_servers" | "context_window" => serde_json::from_str(raw)
-            .map_err(|e| registry_validation(name, format!("must contain a JSON value: {e}"))),
+        "telemetry" | "hooks" | "mcp_servers" | "context_window" | "permissions" => {
+            { serde_json::from_str(raw) }
+                .map_err(|e| registry_validation(name, format!("must contain a JSON value: {e}")))
+        }
         _ => Ok(json!(raw)),
     }
 }
@@ -305,6 +307,29 @@ mod tests {
         assert_eq!(settings.max_budget_usd, Some(12.5));
         assert_eq!(settings.context_window.unwrap().default, Some(64_000));
         assert!(settings.mcp_servers.is_some());
+    }
+
+    /// A REG_SZ permissions value is JSON, like the other structured keys.
+    #[test]
+    fn registry_permissions_is_a_json_value() {
+        let values = vec![(
+            "permissions".to_string(),
+            RegistryValue::String(
+                r#"{"allow":["Bash(ls:*)"],"deny":["Read(./.env)"],"ask":["Edit"]}"#.to_string(),
+            ),
+        )];
+        let json = serde_json::Value::Object(registry_values_to_json(&values).unwrap());
+        let settings: Settings = serde_json::from_value(json).unwrap();
+        let rules = settings.permissions.expect("rules");
+        assert_eq!(rules.allow, vec!["Bash(ls:*)"]);
+        assert_eq!(rules.deny, vec!["Read(./.env)"]);
+        assert_eq!(rules.ask, vec!["Edit"]);
+
+        let invalid = vec![(
+            "permissions".to_string(),
+            RegistryValue::String("not json".to_string()),
+        )];
+        assert!(registry_values_to_json(&invalid).is_err());
     }
 
     #[test]

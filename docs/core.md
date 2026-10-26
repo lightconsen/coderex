@@ -15,7 +15,8 @@ The foundational engine of CodeRex. Manages LLM API communication, conversation 
 - **`StreamEvent`** (`api_client.rs`) — SSE parsing results: TextDelta, ThinkingDelta, SignatureDelta, ToolCallBlockStart/End, ToolCallInputDelta, UsageSummary, StopReason, StreamEnd, Error.
 - **`StreamingToolCallAssembler`** (`engine.rs`) — Accumulates streaming tool call JSON fragments into complete `ToolCall`s, and thinking/signature deltas into the turn's `ThinkingBlock`.
 - **`StructuredOutputValidator`** (`engine.rs`) — Custom JSON schema validator.
-- **`PermissionEngine`** (`permission_engine.rs`) — Evaluates whether tool calls are allowed, need approval, or denied. Supports hooks (`PermissionHook`, `ExplainPermissionHook`, `AutoApproveHook`, `BackgroundAgentDenyHook`).
+- **`PermissionEngine`** (`permission_engine.rs`) — Evaluates whether tool calls are allowed, need approval, or denied. Supports hooks (`PermissionHook`, `ExplainPermissionHook`, `AutoApproveHook`, `BackgroundAgentDenyHook`). `evaluate_with_subjects` takes the call's rule subjects (Bash command, file path(s)) from the tool executor.
+- **`PermissionRuleSpec`** (`permissions.rs`) — Parsed Claude-style rule (`Tool`, `Tool(glob)`, `Bash(prefix:*)`, `Bash(glob)`); `PermissionChecker::add_spec` compiles it against a `RuleCompileContext { cwd, home }`. `ToolExecutor::rule_subjects` supplies the values rules match; precedence is deny > ask > allow.
 - **`PermissionManager`** (`permission_manager.rs`) — Higher-level permission rule management with rule groups and persistent rule storage.
 - **`ConfirmationBus`** (`confirmation_bus.rs`) — Decoupled confirmation request/response channel for tool call permissions.
 - **`TokenBudget`** (`budget.rs`) — Tracks per-session and per-turn token consumption.

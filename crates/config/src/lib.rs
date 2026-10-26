@@ -6,6 +6,7 @@ pub mod dirs;
 pub mod experiments;
 pub mod flags;
 pub mod managed;
+pub mod permission_rules;
 pub mod secret_store;
 pub mod settings;
 
@@ -31,8 +32,8 @@ pub use remote_settings::{
 pub use settings::ConfigWatcher;
 pub use settings::{
     CURRENT_SCHEMA_VERSION, ConfigDiff, ConfigDiffEntry, ConfigError, ConfigService, HookLayers,
-    MarketplaceSetting, PluginHostSettings, ProviderSettings, RuntimeOverrides, SessionOverrides,
-    Settings, config_home, migrate_settings, resolve_api_key,
+    MarketplaceSetting, PermissionsSettings, PluginHostSettings, ProviderSettings,
+    RuntimeOverrides, SessionOverrides, Settings, config_home, migrate_settings, resolve_api_key,
 };
 #[cfg(feature = "enterprise")]
 pub use trusted_device::{

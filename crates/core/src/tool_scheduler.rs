@@ -134,12 +134,14 @@ pub async fn run_tool_calls<S: std::hash::BuildHasher + Sync>(
         }
 
         // 4. Permission check
+        let subjects = tools.rule_subjects(&call.name, &call.input);
         let (_request, perm_result) = permission_engine
-            .evaluate(
+            .evaluate_with_subjects(
                 &call.name,
                 call.input.to_string(),
                 None,
                 permission_context_for(options.agent_id.as_deref(), &call.id),
+                subjects,
             )
             .await
             .map_err(|e| format!("permission check failed: {e}"))?;

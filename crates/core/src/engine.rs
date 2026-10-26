@@ -4855,13 +4855,15 @@ impl QueryEngine {
         });
 
         // 3. Permission check
+        let subjects = self.tools.rule_subjects(&call.name, &call.input);
         let (_request, perm_result) = self
             .permission_engine
-            .evaluate(
+            .evaluate_with_subjects(
                 &call.name,
                 call.input.to_string(),
                 None,
                 crate::tool_scheduler::permission_context_for(turn.agent_id.as_deref(), &call.id),
+                subjects,
             )
             .await
             .map_err(|e| format!("permission check failed: {e}"))?;
@@ -5222,13 +5224,17 @@ impl QueryEngine {
         // Re-run permission check (should now pass with BypassPermissions).
         // Capture the result before `?` so an evaluation error cannot leave the
         // shared checker stuck in BypassPermissions.
+        let subjects = self
+            .tools
+            .rule_subjects(&elevation.tool_name, &elevation.input);
         let permission_result = self
             .permission_engine
-            .evaluate(
+            .evaluate_with_subjects(
                 &elevation.tool_name,
                 elevation.input.to_string(),
                 None,
                 permission_context_for(turn.agent_id.as_deref(), &elevation.tool_call_id),
+                subjects,
             )
             .await;
 

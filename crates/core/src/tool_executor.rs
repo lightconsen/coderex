@@ -49,6 +49,16 @@ pub trait ToolExecutor: Send + Sync {
         tool_name: &str,
         input: &Value,
     ) -> ToolDispatchOutcome;
+
+    /// The values a permission rule is judged against for this call.
+    ///
+    /// Tools declare a `RuleContentField` (Bash's command, Read's
+    /// `file_path`, a file list, ...); the executor is the layer that can
+    /// read it because it owns the registry. An executor that exposes no
+    /// content returns nothing, and only whole-tool rules apply.
+    fn rule_subjects(&self, _tool_name: &str, _input: &Value) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 /// No-op tool executor — used when no concrete tool registry is wired.

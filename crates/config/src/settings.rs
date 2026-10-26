@@ -1,4 +1,5 @@
 //! Settings loading, merging, validation, schema migration, and resolution.
+use coderex_core::permissions::{PermissionAction, PermissionRuleSpec};
 
 use coderex_core::types::ContextWindowOverrides;
 use serde::{Deserialize, Serialize};
@@ -70,10 +71,11 @@ pub const MAX_SETTINGS_FILE_BYTES: u64 = 2 * 1024 * 1024;
 /// and managed layers may set it (the project layers are stripped in
 /// [`Settings::resolve`]), so a repository-controlled file still cannot
 /// inject environment variables into a session.
-const KNOWN_SETTINGS_FIELDS: [&str; 18] = [
+const KNOWN_SETTINGS_FIELDS: [&str; 19] = [
     "config_version",
     "model",
     "permission_mode",
+    "permissions",
     "max_budget_usd",
     "telemetry_enabled",
     "telemetry",
@@ -314,6 +316,72 @@ pub struct ProviderSettings {
     pub request_timeout_secs: Option<u64>,
 }
 
+/// Claude-compatible permission rules from a settings layer.
+///
+/// Rules are raw Claude-style strings (`Bash(git diff:*)`, `Read(./.env)`).
+/// They are parsed and validated when the file loads; compilation against the
+/// session working directory happens when they are installed into a checker.
+///
+/// Unlike every other settings key, rules are **unioned** across layers rather
+/// than replaced: a lower layer's allow cannot be deleted by a higher one, but
+/// a higher layer's deny/ask still wins by precedence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct PermissionsSettings {
+    /// Rules that allow a matching call.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow: Vec<String>,
+    /// Rules that deny a matching call.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deny: Vec<String>,
+    /// Rules that force a prompt for a matching call.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ask: Vec<String>,
+}
+
+impl PermissionsSettings {
+    /// Whether this layer carries no rules.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.allow.is_empty() && self.deny.is_empty() && self.ask.is_empty()
+    }
+
+    /// Append `other`'s rules after this layer's, stable-deduplicated.
+    #[must_use]
+    pub fn union(&self, other: &Self) -> Self {
+        let mut merged = self.clone();
+        merge_rules(&mut merged.allow, &other.allow);
+        merge_rules(&mut merged.deny, &other.deny);
+        merge_rules(&mut merged.ask, &other.ask);
+        merged
+    }
+
+    fn validate(&self) -> Result<(), ConfigError> {
+        for (field, action, rules) in [
+            ("allow", PermissionAction::Allow, &self.allow),
+            ("deny", PermissionAction::Deny, &self.deny),
+            ("ask", PermissionAction::Ask, &self.ask),
+        ] {
+            for (index, raw) in rules.iter().enumerate() {
+                PermissionRuleSpec::parse(raw, action).map_err(|error| {
+                    ConfigError::Validation {
+                        field: format!("permissions.{field}[{index}]"),
+                        message: format!("invalid permission rule {raw:?}: {error}"),
+                    }
+                })?;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn merge_rules(target: &mut Vec<String>, source: &[String]) {
+    for rule in source {
+        if !target.contains(rule) {
+            target.push(rule.clone());
+        }
+    }
+}
+
 /// Resolved settings after merging all sources.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Settings {
@@ -324,6 +392,9 @@ pub struct Settings {
     pub model: Option<String>,
     /// Permission mode.
     pub permission_mode: Option<String>,
+    /// Claude-compatible allow/deny/ask rules.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permissions: Option<PermissionsSettings>,
     /// Maximum budget in USD.
     pub max_budget_usd: Option<f64>,
     /// Whether telemetry (crash reports, usage analytics) is enabled.
@@ -392,6 +463,7 @@ impl Settings {
             config_version: CURRENT_SCHEMA_VERSION,
             model: Some("claude-sonnet-4-6".into()),
             permission_mode: Some("default".into()),
+            permissions: None,
             max_budget_usd: None,
             telemetry_enabled: None,
             telemetry: None,
@@ -514,6 +586,9 @@ impl Settings {
                 });
             }
         }
+        if let Some(ref permissions) = self.permissions {
+            permissions.validate()?;
+        }
         if let Some(ref context_window) = self.context_window {
             if context_window.default == Some(0) {
                 return Err(ConfigError::Validation {
@@ -556,10 +631,11 @@ impl Settings {
     ///
     /// Values from `other` override `self` when they are `Some`.
     ///
-    /// Every key is winner-take-all: the higher-priority layer replaces the
-    /// whole value rather than merging into it (the `telemetry` sub-config is
-    /// replaced wholesale, not field-by-field). This is why there is no separate
-    /// "winner-only under merge" key table — the property holds for all keys.
+    /// Every key is winner-take-all except `permissions`: the higher-priority
+    /// layer replaces the whole value rather than merging into it (the
+    /// `telemetry` sub-config is replaced wholesale, not field-by-field).
+    /// Permission rules are the exception because the layers are additive: a
+    /// user allow must survive a project layer that only adds a deny.
     #[must_use]
     pub fn merge(&self, other: &Self) -> Self {
         Self {
@@ -569,6 +645,12 @@ impl Settings {
                 .permission_mode
                 .clone()
                 .or_else(|| self.permission_mode.clone()),
+            permissions: match (&self.permissions, &other.permissions) {
+                (None, None) => None,
+                (Some(lower), None) => Some(lower.clone()),
+                (None, Some(higher)) => Some(higher.clone()),
+                (Some(lower), Some(higher)) => Some(lower.union(higher)),
+            },
             max_budget_usd: other.max_budget_usd.or(self.max_budget_usd),
             telemetry_enabled: other.telemetry_enabled.or(self.telemetry_enabled),
             telemetry: other.telemetry.clone().or_else(|| self.telemetry.clone()),
@@ -606,6 +688,7 @@ impl Settings {
         let keys = [
             "model",
             "permission_mode",
+            "permissions",
             "max_budget_usd",
             "telemetry_enabled",
             "telemetry",
@@ -1695,6 +1778,7 @@ mod tests {
             config_version: 0,
             model: Some("old-model".into()),
             permission_mode: Some("default".into()),
+            permissions: None,
             max_budget_usd: None,
             telemetry_enabled: Some(true),
             telemetry: None,
@@ -2650,6 +2734,106 @@ mod tests {
         assert_eq!(
             loaded.context_window.unwrap().models.get("alias"),
             Some(&128_000)
+        );
+    }
+}
+
+#[cfg(test)]
+mod permissions_settings_tests {
+    use super::*;
+
+    fn permissions(allow: &[&str], deny: &[&str], ask: &[&str]) -> PermissionsSettings {
+        PermissionsSettings {
+            allow: allow.iter().map(|rule| (*rule).to_string()).collect(),
+            deny: deny.iter().map(|rule| (*rule).to_string()).collect(),
+            ask: ask.iter().map(|rule| (*rule).to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn permissions_parse_and_round_trip() {
+        let settings: Settings = serde_json::from_value(serde_json::json!({
+            "permissions": {
+                "allow": ["Bash(ls:*)"],
+                "deny": ["Read(./.env)"],
+                "ask": ["Edit"],
+                "defaultMode": "acceptEdits",
+                "additionalDirectories": ["/tmp"]
+            }
+        }))
+        .expect("Claude-compatible shape parses; unsupported subkeys are ignored");
+        let rules = settings.permissions.expect("rules");
+        assert_eq!(rules.allow, vec!["Bash(ls:*)"]);
+        assert_eq!(rules.deny, vec!["Read(./.env)"]);
+        assert_eq!(rules.ask, vec!["Edit"]);
+
+        let json = serde_json::to_value(permissions(&["Bash"], &[], &[])).unwrap();
+        assert_eq!(json, serde_json::json!({"allow": ["Bash"]}));
+        assert_eq!(
+            serde_json::to_value(PermissionsSettings::default()).unwrap(),
+            serde_json::json!({})
+        );
+    }
+
+    #[test]
+    fn merging_unions_rule_layers_in_order_without_duplicates() {
+        let user = Settings {
+            permissions: Some(permissions(&["Bash(ls:*)"], &[], &[])),
+            ..Settings::defaults()
+        };
+        let project = Settings {
+            permissions: Some(permissions(&["Bash(ls:*)"], &["Bash(rm:*)"], &[])),
+            ..Settings::defaults()
+        };
+        let managed = Settings {
+            permissions: Some(permissions(&["Read(./docs/**)"], &[], &["Edit"])),
+            ..Settings::defaults()
+        };
+
+        let merged = user.merge(&project).merge(&managed);
+        let rules = merged.permissions.expect("rules");
+        assert_eq!(rules.allow, vec!["Bash(ls:*)", "Read(./docs/**)"]);
+        assert_eq!(rules.deny, vec!["Bash(rm:*)"]);
+        assert_eq!(rules.ask, vec!["Edit"]);
+    }
+
+    #[test]
+    fn every_action_validates_its_rules() {
+        for (field, rules) in [
+            ("allow", permissions(&["Bash("], &[], &[])),
+            ("deny", permissions(&[], &["Read([)"], &[])),
+            ("ask", permissions(&[], &[], &["Bash()"])),
+        ] {
+            let settings = Settings {
+                permissions: Some(rules),
+                ..Settings::defaults()
+            };
+            let error = settings.validate().expect_err("invalid rule must fail");
+            match error {
+                ConfigError::Validation {
+                    field: error_field,
+                    message,
+                } => {
+                    assert!(error_field.starts_with(&format!("permissions.{field}[0]")));
+                    assert!(message.contains("invalid permission rule"), "{message}");
+                }
+                other => panic!("unexpected error: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn the_diff_reports_permission_rules() {
+        let settings = Settings {
+            permissions: Some(permissions(&["Bash(ls:*)"], &[], &[])),
+            ..Settings::defaults()
+        };
+        let diff = settings.diff_from_defaults("user");
+        assert!(
+            diff.changes
+                .iter()
+                .any(|change| change.key == "permissions"),
+            "{diff:?}"
         );
     }
 }

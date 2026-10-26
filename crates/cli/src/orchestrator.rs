@@ -490,6 +490,9 @@ const PLUGIN_SETTINGS_NEVER_TAKEN: &[&str] = &[
     "env",
     "provider",
     "config_version",
+    // A plugin that could grant itself allow rules would be approving its own
+    // tool calls with the user's authority.
+    "permissions",
 ];
 
 /// Plugin `settings` keys a plugin may only make stricter.
@@ -528,6 +531,7 @@ fn settings_with_every_key() -> Settings {
         vim_mode: Some(false),
         statusline: Some(coderex_config::settings::StatuslineSettings::default()),
         prompt_caching: Some(false),
+        permissions: Some(coderex_config::PermissionsSettings::default()),
         ..Settings::default()
     }
 }
@@ -2466,6 +2470,12 @@ impl StartupOrchestrator {
             .and_then(|s| s.permission_mode.as_deref())
             .and_then(|m| m.parse::<coderex_core::permissions::PermissionMode>().ok());
         repl.with_permission_mode(perm_mode);
+        repl.with_permission_rules(
+            self.ctx
+                .settings
+                .as_ref()
+                .and_then(|settings| settings.permissions.clone()),
+        );
         repl.with_no_persistence(self.ctx.no_persistence);
         repl.with_no_slash_commands(self.ctx.no_slash_commands);
         repl.with_json_schema(self.ctx.json_schema.clone());
@@ -2981,6 +2991,10 @@ impl StartupOrchestrator {
             context_window,
             self.ctx.mcp_manager.clone(),
             permission_mode,
+            self.ctx
+                .settings
+                .as_ref()
+                .and_then(|settings| settings.permissions.clone()),
             self.ctx.effort.as_deref(),
             self.prompt_caching_from_settings(),
             self.api_key_from_settings(),
@@ -3080,6 +3094,7 @@ impl StartupOrchestrator {
         context_window: coderex_core::types::ContextWindowResolver,
         mcp_manager: Option<std::sync::Arc<coderex_mcp::manager::McpManager>>,
         permission_mode: coderex_core::permissions::PermissionMode,
+        permissions: Option<coderex_config::PermissionsSettings>,
         effort: Option<&str>,
         prompt_caching: Option<bool>,
         api_key: Option<&str>,
@@ -3143,9 +3158,17 @@ impl StartupOrchestrator {
             // configured `auto`/`bypass-permissions` mode and the classifier,
             // explanation and background-deny hooks were all ignored on this
             // path while they were active in the REPL.
-            let mut permission_engine = coderex_core::permission_engine::PermissionEngine::new(
-                coderex_core::permissions::PermissionChecker::new(permission_mode),
-            );
+            let mut checker = coderex_core::permissions::PermissionChecker::new(permission_mode);
+            if let Err(error) = coderex_config::permission_rules::install_settings_rules(
+                &mut checker,
+                permissions.as_ref(),
+                std::path::Path::new(&cwd),
+                None,
+            ) {
+                tracing::error!(%error, "served session permission rules were not installed");
+            }
+            let mut permission_engine =
+                coderex_core::permission_engine::PermissionEngine::new(checker);
             permission_engine.add_hook(std::sync::Arc::new(
                 coderex_core::permission_engine::ExplainPermissionHook::new_with_event_tx(
                     api_client.clone_box(),
@@ -3935,6 +3958,7 @@ mod tests {
             "env": {"LD_PRELOAD": "/tmp/x.so"},
             "permission_mode": "bypass-permissions",
             "telemetry_enabled": false,
+            "permissions": {"allow": ["Bash"]},
         }));
 
         let settings = orch.ctx.settings.as_ref().unwrap();
@@ -3944,6 +3968,10 @@ mod tests {
         assert!(settings.hooks.is_none());
         assert!(settings.mcp_servers.is_none());
         assert!(settings.api_key.is_none());
+        assert!(
+            settings.permissions.is_none(),
+            "a plugin must not set rules"
+        );
         // Telemetry may be turned off by a plugin, never on; here it was on
         // and the plugin asked to turn it off, which is allowed.
         assert_eq!(settings.telemetry_enabled, Some(false));

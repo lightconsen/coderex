@@ -182,3 +182,34 @@ fn a_managed_plist_over_the_size_limit_is_skipped_whole() {
         "an oversized managed plist must not apply any of its keys"
     );
 }
+
+/// A managed plist can carry the same permission rule block as JSON.
+#[test]
+fn a_managed_plist_can_carry_permission_rules() {
+    let dir = tempfile::tempdir().unwrap();
+    let user = dir.path().join("settings.json");
+    let plist = dir.path().join("dev.coderex.plist");
+    write(&user, r#"{"config_version": 4}"#);
+
+    let mut permissions = plist::Dictionary::new();
+    permissions.insert(
+        "allow".into(),
+        plist::Value::Array(vec![plist::Value::String("Bash(ls:*)".into())]),
+    );
+    permissions.insert(
+        "deny".into(),
+        plist::Value::Array(vec![plist::Value::String("Read(./.env)".into())]),
+    );
+    write_plist(
+        &plist,
+        &[("permissions", plist::Value::Dictionary(permissions))],
+    );
+
+    let resolved = ConfigService::new(user, None::<PathBuf>)
+        .with_managed_settings_plist(plist)
+        .resolve()
+        .unwrap();
+    let rules = resolved.permissions.expect("managed rules");
+    assert_eq!(rules.allow, vec!["Bash(ls:*)"]);
+    assert_eq!(rules.deny, vec!["Read(./.env)"]);
+}

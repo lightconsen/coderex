@@ -378,6 +378,23 @@ impl CoreToolExecutor for RegistryToolDispatcher {
             .collect()
     }
 
+    fn rule_subjects(&self, tool_name: &str, input: &Value) -> Vec<String> {
+        let Some(tool) = self.registry.get_tool_arc(tool_name) else {
+            tracing::debug!(tool = %tool_name, "rule_subjects: no such tool");
+            return Vec::new();
+        };
+        let cwd = self.cwd.read().clone();
+        let field = tool.capabilities().rule_content_field;
+        let subjects = rule_content_subjects(field, input, &cwd);
+        tracing::debug!(
+            tool = %tool_name,
+            ?field,
+            subject_count = subjects.len(),
+            "rule_subjects"
+        );
+        subjects
+    }
+
     async fn execute(
         &self,
         tool_call_id: &str,
@@ -686,6 +703,81 @@ pub fn rule_content_arguments(
         Some(RuleContentField::List(name)) => list_argument(input, name),
         None => path_arguments(input),
     }
+}
+
+/// The subject strings a permission rule matches for this call.
+///
+/// Unlike [`rule_content_arguments`], this returns the forms a *user-written
+/// rule* is expected to match: the command for a shell tool (never path-shaped),
+/// and for file tools both the argument as written and a cwd/home-resolved
+/// absolute form. The rule compiler normalizes patterns the same way.
+#[must_use]
+pub fn rule_content_subjects(
+    field: Option<RuleContentField>,
+    input: &Value,
+    cwd: &std::path::Path,
+) -> Vec<String> {
+    if matches!(field, Some(RuleContentField::Scalar("command"))) {
+        return scalar_argument(input, "command")
+            .map(|command| vec![command.to_string_lossy().to_string()])
+            .unwrap_or_default();
+    }
+
+    let mut subjects = Vec::new();
+    for path in rule_content_arguments(field, input) {
+        for subject in subject_forms(&path, cwd) {
+            if !subjects.contains(&subject) {
+                subjects.push(subject);
+            }
+        }
+    }
+    subjects
+}
+
+/// The raw and absolute forms of one path argument.
+#[allow(clippy::option_if_let_else)]
+fn subject_forms(path: &std::path::Path, cwd: &std::path::Path) -> Vec<String> {
+    let raw = normalize_separators(&path.to_string_lossy());
+    let mut forms = vec![raw.clone()];
+
+    let expanded = if let Some(rest) = raw.strip_prefix("//") {
+        Some(std::path::PathBuf::from(format!("/{rest}")))
+    } else if raw == "~" {
+        home::home_dir()
+    } else if let Some(rest) = raw.strip_prefix("~/") {
+        home::home_dir().map(|home| home.join(rest))
+    } else if raw.starts_with('/') {
+        Some(path.to_path_buf())
+    } else {
+        Some(cwd.join(path))
+    };
+
+    if let Some(expanded) = expanded {
+        let absolute = normalize_separators(&lexical_absolute(&expanded));
+        if !forms.contains(&absolute) {
+            forms.push(absolute);
+        }
+    }
+    forms
+}
+
+fn normalize_separators(value: &str) -> String {
+    value.replace('\\', "/")
+}
+
+/// Resolve `.`/`..` without touching the filesystem (targets may not exist).
+fn lexical_absolute(path: &std::path::Path) -> String {
+    let mut out = std::path::PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out.to_string_lossy().into_owned()
 }
 
 /// One string argument, if it is a non-empty string.
@@ -1766,5 +1858,66 @@ mod tests {
         let dispatcher = dispatcher_with_webfetch_and_echo();
         dispatcher.set_cwd(PathBuf::from("/tmp/moved"));
         assert_eq!(dispatcher.cwd(), PathBuf::from("/tmp/moved"));
+    }
+}
+
+#[cfg(test)]
+mod subject_tests {
+    use super::*;
+    use crate::tool::RuleContentField;
+    use serde_json::json;
+
+    #[test]
+    fn a_command_field_yields_the_command_only() {
+        let subjects = rule_content_subjects(
+            Some(RuleContentField::Scalar("command")),
+            &json!({"command": "cat /etc/passwd"}),
+            std::path::Path::new("/proj"),
+        );
+        assert_eq!(subjects, vec!["cat /etc/passwd"]);
+    }
+
+    #[test]
+    fn a_declared_path_field_yields_raw_and_absolute_forms() {
+        let subjects = rule_content_subjects(
+            Some(RuleContentField::Scalar("file_path")),
+            &json!({"file_path": "src/lib.rs"}),
+            std::path::Path::new("/proj"),
+        );
+        assert_eq!(subjects, vec!["src/lib.rs", "/proj/src/lib.rs"]);
+    }
+
+    #[test]
+    fn an_undeclared_tool_falls_back_to_file_path() {
+        let subjects = rule_content_subjects(
+            None,
+            &json!({"file_path": "src/lib.rs", "content": "text"}),
+            std::path::Path::new("/proj"),
+        );
+        assert_eq!(subjects, vec!["src/lib.rs", "/proj/src/lib.rs"]);
+        assert!(
+            !subjects.iter().any(|subject| subject.contains("text")),
+            "file content must not be a subject: {subjects:?}"
+        );
+    }
+
+    #[test]
+    fn a_list_field_offers_every_entry() {
+        let subjects = rule_content_subjects(
+            Some(RuleContentField::List("files")),
+            &json!({"files": ["a.txt", {"path": "/tmp/b.txt"}]}),
+            std::path::Path::new("/proj"),
+        );
+        assert_eq!(subjects, vec!["a.txt", "/proj/a.txt", "/tmp/b.txt"]);
+    }
+
+    #[test]
+    fn dotdot_is_resolved_without_touching_the_filesystem() {
+        let subjects = rule_content_subjects(
+            Some(RuleContentField::Scalar("file_path")),
+            &json!({"file_path": "../x"}),
+            std::path::Path::new("/proj/sub"),
+        );
+        assert_eq!(subjects, vec!["../x", "/proj/x"]);
     }
 }

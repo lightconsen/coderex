@@ -78,9 +78,39 @@ fn workspace() -> tempfile::TempDir {
 }
 
 fn run(cwd: &Path, home: &Path, base_url: &str, plist: Option<&Path>) -> std::process::Output {
+    run_prompt(
+        cwd,
+        home,
+        base_url,
+        plist,
+        "add a recursive fibonacci function to src/lib.rs with unit tests",
+    )
+}
+
+fn run_prompt(
+    cwd: &Path,
+    home: &Path,
+    base_url: &str,
+    plist: Option<&Path>,
+    prompt: &str,
+) -> std::process::Output {
+    run_prompt_with_format(cwd, home, base_url, plist, prompt, false)
+}
+
+fn run_prompt_with_format(
+    cwd: &Path,
+    home: &Path,
+    base_url: &str,
+    plist: Option<&Path>,
+    prompt: &str,
+    stream_json: bool,
+) -> std::process::Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_coderex"));
+    command.arg("-p");
+    if stream_json {
+        command.args(["--output-format", "stream-json"]);
+    }
     command
-        .args(["-p"])
         .current_dir(cwd)
         .env("ANTHROPIC_API_KEY", "mock")
         .env("ANTHROPIC_BASE_URL", base_url)
@@ -103,7 +133,7 @@ fn run(cwd: &Path, home: &Path, base_url: &str, plist: Option<&Path>) -> std::pr
         .stdin
         .take()
         .expect("stdin")
-        .write_all(b"add a recursive fibonacci function to src/lib.rs with unit tests\n")
+        .write_all(format!("{prompt}\n").as_bytes())
         .expect("write prompt");
     child.wait_with_output().expect("wait")
 }
@@ -153,5 +183,55 @@ fn a_managed_plist_can_enable_bypass_that_user_settings_cannot() {
             .unwrap()
             .contains("fibonacci"),
         "the managed plist's permission mode was not applied"
+    );
+}
+
+/// A managed plist can carry permission rules, and they reach the binary.
+#[test]
+fn a_managed_plist_can_allow_a_command() {
+    let home = config_home();
+    let managed_dir = tempfile::tempdir().expect("managed");
+    let plist = managed_dir.path().join("dev.coderex.plist");
+    std::fs::write(
+        &plist,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>config_version</key><integer>4</integer>
+    <key>telemetry_enabled</key><false/>
+    <key>permissions</key>
+    <dict>
+        <key>allow</key>
+        <array><string>Bash(echo:*)</string></array>
+        <key>deny</key>
+        <array><string>Read(./.env)</string></array>
+    </dict>
+</dict>
+</plist>
+"#,
+    )
+    .expect("write plist");
+
+    let workspace = tempfile::tempdir().expect("workspace");
+    std::fs::create_dir_all(workspace.path().join("src")).unwrap();
+    let (mut provider, base_url) = start_static_provider();
+    let output = run_prompt_with_format(
+        workspace.path(),
+        home.path(),
+        &base_url,
+        Some(&plist),
+        "run a safe echo",
+        true,
+    );
+    let _ = provider.kill();
+    let _ = provider.wait();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}\n{stdout}");
+    assert!(
+        stdout.contains("auto-safe"),
+        "the managed allow rule did not reach the session:\n{stdout}\n{stderr}"
     );
 }
