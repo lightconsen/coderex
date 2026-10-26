@@ -1269,44 +1269,67 @@ fn clear_permission_overlay(ui_state: &mut coderex_ui::state::UiState) {
     }
 }
 
+/// Tool results longer than this many lines are folded when a session is
+/// resumed, so a replayed session does not dump every historical tool output.
+/// Ctrl+O expands them.
+const RESTORE_FOLD_LINES: usize = 12;
+
 fn core_message_to_ui_message(
     message: &coderex_core::types::Message,
+    tool_names: &std::collections::HashMap<String, String>,
 ) -> coderex_ui::message_list::Message {
-    let (role, content, tool_name) = match (&message.role, &message.content) {
+    let (role, content, tool_name, folded) = match (&message.role, &message.content) {
         (coderex_core::types::Role::User, coderex_core::types::MessageContent::Text(text)) => (
             coderex_ui::message_list::MessageRole::User,
             text.clone(),
             None,
+            false,
         ),
         (coderex_core::types::Role::Assistant, coderex_core::types::MessageContent::Text(text)) => {
             (
                 coderex_ui::message_list::MessageRole::Assistant,
                 text.clone(),
                 None,
+                false,
             )
         }
         (coderex_core::types::Role::System, coderex_core::types::MessageContent::Text(text)) => (
             coderex_ui::message_list::MessageRole::System,
             text.clone(),
             None,
+            false,
         ),
-        (coderex_core::types::Role::Tool, coderex_core::types::MessageContent::ToolCall(call)) => (
+        // The engine stores tool calls on the assistant turn, not on a Tool
+        // role. Matching only `Role::Tool` here made a resumed transcript show
+        // the raw `ToolCall { .. }` debug dump instead of the call.
+        (
+            coderex_core::types::Role::Assistant | coderex_core::types::Role::Tool,
+            coderex_core::types::MessageContent::ToolCall(call),
+        ) => (
             coderex_ui::message_list::MessageRole::ToolCall,
             call.activity_summary(),
             Some(call.name.clone()),
+            false,
         ),
         (
             coderex_core::types::Role::Tool,
             coderex_core::types::MessageContent::ToolResult(result),
-        ) => (
-            coderex_ui::message_list::MessageRole::ToolResult,
-            result.output.clone(),
-            Some(result.tool_call_id.clone()),
-        ),
+        ) => {
+            let folded = result.output.lines().count() > RESTORE_FOLD_LINES;
+            (
+                coderex_ui::message_list::MessageRole::ToolResult,
+                result.output.clone(),
+                // The result carries the call id, not the tool name; the map
+                // was built from the calls in the same transcript.
+                tool_names.get(&result.tool_call_id).cloned(),
+                folded,
+            )
+        }
         (_, content) => (
             coderex_ui::message_list::MessageRole::System,
             format!("{content:?}"),
             None,
+            false,
         ),
     };
 
@@ -1315,7 +1338,7 @@ fn core_message_to_ui_message(
         content: content.into(),
         tool_name: tool_name.map(Into::into),
         streaming: false,
-        folded: false,
+        folded,
     }
 }
 
@@ -1323,10 +1346,30 @@ fn restore_transcript_messages(
     ui_state: &mut coderex_ui::state::UiState,
     messages: &[coderex_core::types::Message],
 ) {
+    // Tool results carry only the call id. Build the id -> name map first so
+    // the restored rows keep their tool identity (needed for labels, the Read
+    // highlighter, and a meaningful failure message).
+    let mut tool_names = std::collections::HashMap::new();
+    for message in messages {
+        if let coderex_core::types::MessageContent::ToolCall(call) = &message.content {
+            tool_names.insert(call.id.clone(), call.name.clone());
+        }
+    }
+
     ui_state.messages = coderex_ui::message_list::MessageView::new(1000);
     ui_state.messages.start = 0;
     for message in messages {
-        ui_state.messages.push(core_message_to_ui_message(message));
+        // Thinking is provider state, not conversation: it must not reappear
+        // in the transcript as a debug row after a resume.
+        if matches!(
+            message.content,
+            coderex_core::types::MessageContent::Thinking(_)
+        ) {
+            continue;
+        }
+        ui_state
+            .messages
+            .push(core_message_to_ui_message(message, &tool_names));
     }
 }
 
@@ -1932,6 +1975,30 @@ impl HeadlessHookWatcher {
     async fn stop(mut self) {
         self.watcher.take();
         let _ = self.task.await;
+    }
+}
+
+/// Whether an interactive TUI currently owns the terminal.
+///
+/// The process-wide SIGTERM handler exits the daemon/headless modes directly;
+/// while the TUI is active it must step aside, because only the TUI can restore
+/// the alternate screen and raw mode before exiting.
+pub(crate) static TUI_ACTIVE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Marks the TUI as owning the terminal until this value is dropped.
+struct TuiActiveGuard;
+
+impl TuiActiveGuard {
+    fn enter() -> Self {
+        TUI_ACTIVE.store(true, std::sync::atomic::Ordering::SeqCst);
+        Self
+    }
+}
+
+impl Drop for TuiActiveGuard {
+    fn drop(&mut self) {
+        TUI_ACTIVE.store(false, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -4479,6 +4546,16 @@ impl ReplLoop {
             return Err(anyhow::anyhow!("{error}"));
         }
 
+        // Register the signal streams before taking over the terminal, and
+        // mark the TUI active so the process-wide SIGTERM handler steps aside
+        // and lets this loop restore the terminal.
+        #[cfg(unix)]
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        #[cfg(unix)]
+        let mut hangup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
+        let _tui_active = TuiActiveGuard::enter();
+
         // Static `watch` configuration is known before the first turn; add it
         // now so a FileChanged hook observes it from the start.
         #[cfg(feature = "hot-reload")]
@@ -4635,9 +4712,46 @@ impl ReplLoop {
         let mut mod_ui_focus = ModUiFocus::default();
         let mut last_stream_snapshot = Instant::now();
 
+        // A signalled TUI must not leave the terminal in the alternate screen
+        // with raw mode on. Exit through the same cleanup path as Ctrl+D and
+        // report the conventional 128+signal status. Windows has no SIGHUP,
+        // and its Ctrl+C never reaches here as a signal.
+        #[cfg(unix)]
+        let signal_wait = async {
+            tokio::select! {
+                _ = terminate.recv() => 143_i32,
+                _ = hangup.recv() => 129_i32,
+            }
+        };
+        #[cfg(not(unix))]
+        let signal_wait = std::future::pending::<i32>();
+        tokio::pin!(signal_wait);
+        let mut signal_exit: Option<i32> = None;
+
+        // Terminal notifications are a property of the environment, computed
+        // once. Unsupported terminals simply get no sequence.
+        let notify_osc9 = coderex_ui::terminal_notification::env_supports_osc9_notification();
+        let notify_progress = coderex_ui::terminal_notification::env_supports_terminal_progress();
+        let notify_tmux = coderex_ui::terminal_notification::env_is_inside_tmux();
+        let mut progress_active = false;
+
         let result = loop {
             if !self.running {
                 break Ok(());
+            }
+
+            // Report thinking as indeterminate progress and clear it when the
+            // turn ends, on terminals where OSC 9;4 is safe.
+            if thinking != progress_active {
+                progress_active = thinking;
+                if notify_progress {
+                    let sequence = if thinking {
+                        coderex_ui::terminal_notification::progress_sequence(None, notify_tmux)
+                    } else {
+                        coderex_ui::terminal_notification::clear_progress_sequence(notify_tmux)
+                    };
+                    let _ = coderex_ui::terminal_notification::write_sequences(&[sequence]);
+                }
             }
 
             // The timeout circuit breaker is sticky. Tell the person once,
@@ -4853,6 +4967,10 @@ impl ReplLoop {
             }
 
             tokio::select! {
+                code = &mut signal_wait => {
+                    signal_exit = Some(code);
+                    break Ok(());
+                }
                 Some(event) = ct_rx.recv() => {
                     match event {
                         Event::Key(key) => {
@@ -5791,7 +5909,13 @@ impl ReplLoop {
                                 "Awaiting approval",
                                 true,
                             );
-                            ui_state.notifications.warn(label);
+                            ui_state.notifications.warn(label.clone());
+                            coderex_ui::terminal_notification::emit(
+                                "CodeRex",
+                                &format!("Permission needed: {label}"),
+                                notify_osc9,
+                                notify_tmux,
+                            );
                             self.persist_interactive_snapshot(&ui_state);
                         }
                         EngineEvent::AgentEvent { agent_id, event } => {
@@ -5957,12 +6081,24 @@ impl ReplLoop {
                                 });
                             }
                             ui_state.notifications.success("Turn completed");
+                            coderex_ui::terminal_notification::emit(
+                                "CodeRex",
+                                "Turn completed",
+                                notify_osc9,
+                                notify_tmux,
+                            );
                             // Trigger background features after successful turn
                             let prompt_text = self.history.last().cloned().unwrap_or_default();
                             self.trigger_background_features(&prompt_text);
                         }
                         Err(e) => {
                             ui_state.notifications.err("Turn failed");
+                            coderex_ui::terminal_notification::emit(
+                                "CodeRex",
+                                &format!("Turn failed: {e}"),
+                                notify_osc9,
+                                notify_tmux,
+                            );
                             ui_state.messages.push(Message {
                                 role: MessageRole::System,
                                 content: format!("Query failed: {e}").into(),
@@ -6148,6 +6284,9 @@ impl ReplLoop {
         self.event_rx = event_rx;
         self.stop_artifact_serving().await;
 
+        if let Some(code) = signal_exit {
+            std::process::exit(code);
+        }
         result
     }
 
@@ -10228,6 +10367,63 @@ mod tests {
         repl.apply_cli_config();
         assert!(repl.vim_mode_enabled, "vim_mode was not applied");
         assert_eq!(repl.current_theme, "light");
+    }
+
+    /// Ported from kimi-code's message-replay contract: a resumed transcript
+    /// must not show provider thinking, must keep each tool result's identity,
+    /// and must fold a long historical output.
+    #[test]
+    fn resume_projection_drops_thinking_and_folds_long_tool_output() {
+        use coderex_core::types::{
+            Message, MessageContent, Role, ThinkingBlock, ToolCall, ToolResult,
+        };
+        use coderex_ui::message_list::MessageRole;
+
+        let call = ToolCall {
+            id: "call_1".into(),
+            name: "Read".into(),
+            input: serde_json::json!({"file_path": "src/lib.rs"}),
+        };
+        let result = |output: &str| coderex_core::types::Message {
+            role: Role::Tool,
+            content: MessageContent::ToolResult(ToolResult {
+                tool_call_id: "call_1".into(),
+                output: output.into(),
+                is_error: false,
+                images: Vec::new(),
+            }),
+        };
+        let messages = vec![
+            coderex_core::types::Message {
+                role: Role::Assistant,
+                content: MessageContent::Thinking(ThinkingBlock {
+                    thinking: "provider state".into(),
+                    signature: "sig".into(),
+                }),
+            },
+            coderex_core::types::Message {
+                role: Role::Assistant,
+                content: MessageContent::ToolCall(call),
+            },
+            result("short output"),
+            result(&"line\n".repeat(20)),
+        ];
+
+        let mut ui = coderex_ui::state::UiState::new();
+        restore_transcript_messages(&mut ui, &messages);
+        let rows = &ui.messages.messages;
+
+        assert_eq!(rows.len(), 3, "thinking must not be restored");
+        assert_eq!(rows[0].role, MessageRole::ToolCall);
+        assert_eq!(rows[0].tool_name.as_deref(), Some("Read"));
+        assert_eq!(rows[1].role, MessageRole::ToolResult);
+        assert_eq!(
+            rows[1].tool_name.as_deref(),
+            Some("Read"),
+            "a tool result must keep the name of the call it answers"
+        );
+        assert!(!rows[1].folded);
+        assert!(rows[2].folded, "a long historical output should be folded");
     }
 
     /// Themes installed as files under `~/.coderex/themes` must reach the

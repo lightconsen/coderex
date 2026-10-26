@@ -438,6 +438,25 @@ impl PtySession {
             thread::sleep(Duration::from_millis(50));
         }
     }
+
+    #[cfg(unix)]
+    fn wait_for_exit_code(&mut self, timeout: Duration) -> u32 {
+        let deadline = Instant::now() + timeout;
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(status)) => return status.exit_code(),
+                Ok(None) => {}
+                Err(err) => panic!("failed to poll child exit: {err}"),
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for coderex to exit\n--- screen ---\n{}\n--- raw ---\n{}",
+                self.screen_text(),
+                self.raw_text()
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
 }
 
 impl Drop for PtySession {
@@ -457,6 +476,21 @@ fn session_without_engine(cwd: &Path) -> PtySession {
 fn session_with_static_server(cwd: &Path) -> (StaticServer, PtySession) {
     let server = StaticServer::start();
     let session = PtySession::launch(cwd, &server.envs(), "K2.6");
+    (server, session)
+}
+
+fn session_with_static_server_envs(
+    cwd: &Path,
+    extra: &[(&str, &str)],
+) -> (StaticServer, PtySession) {
+    let server = StaticServer::start();
+    let mut envs = server.envs();
+    envs.extend(
+        extra
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string())),
+    );
+    let session = PtySession::launch(cwd, &envs, "K2.6");
     (server, session)
 }
 
@@ -643,6 +677,189 @@ fn startup_renders_prompt_and_default_regions() {
     assert!(session.raw_text().contains("❯"));
     assert!(!session.raw_text().contains("[DEBUG] args.print"));
     drop(session);
+}
+
+/// Kill the TUI with a signal and assert it leaves the terminal usable.
+#[cfg(unix)]
+fn signalled_tui_exit_code(signal: &str) -> u32 {
+    let dir = setup_project_dir();
+    let mut session = session_without_engine(dir.path());
+    session.wait_for_text("CodeRex v", SCREEN_TIMEOUT);
+
+    let pid = session.child.process_id().expect("coderex pid");
+    let status = std::process::Command::new("kill")
+        .arg(format!("-{signal}"))
+        .arg(pid.to_string())
+        .status()
+        .expect("run kill");
+    assert!(status.success(), "kill -{signal} failed");
+
+    let code = session.wait_for_exit_code(SCREEN_TIMEOUT);
+    // The reader thread may still be consuming the final bytes.
+    thread::sleep(Duration::from_millis(150));
+    let raw = session.raw_text();
+    assert!(
+        raw.contains("\u{1b}[?1049l"),
+        "the alternate screen was not left after SIG{signal}"
+    );
+    assert!(
+        raw.contains("\u{1b}[?1000l") || raw.contains("\u{1b}[?1006l"),
+        "mouse capture was not disabled after SIG{signal}"
+    );
+    code
+}
+
+#[cfg(unix)]
+#[test]
+fn sigterm_restores_the_terminal_and_exits_143() {
+    assert_eq!(signalled_tui_exit_code("TERM"), 143);
+}
+
+#[cfg(unix)]
+#[test]
+fn sighup_restores_the_terminal_and_exits_129() {
+    assert_eq!(signalled_tui_exit_code("HUP"), 129);
+}
+
+fn gate_hits(path: &Path) -> usize {
+    std::fs::read_to_string(path).map_or(0, |text| text.lines().count())
+}
+
+fn wait_for_gate_hits(path: &Path, minimum: usize, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    while gate_hits(path) < minimum {
+        assert!(
+            Instant::now() < deadline,
+            "the hook did not fire; {} hit(s) after {timeout:?}",
+            gate_hits(path)
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Ported from qwen-code's skill-hooks-resume contract: a hook that blocked a
+/// tool in the first session must still fire after the session is resumed. The
+/// hit counter distinguishes a fresh block from session 1's replayed transcript.
+#[cfg(unix)]
+#[test]
+fn a_pretooluse_hook_still_blocks_after_resume() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = setup_project_dir();
+    let gate = dir.path().join("gate.sh");
+    let hits = dir.path().join("gate-hits.log");
+    std::fs::write(
+        &gate,
+        format!(
+            "#!/bin/sh\nprintf 'hit\\n' >> '{}'\nprintf '%s\\n' '{{\"action\":\"stop\",\"additional_context\":\"gate blocked the write\"}}'\nexit 0\n",
+            hits.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&gate, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::create_dir_all(dir.path().join(".coderex")).unwrap();
+    std::fs::write(
+        dir.path().join(".coderex/settings.json"),
+        serde_json::json!({
+            "config_version": 4,
+            "hooks": [{
+                "event": "PreToolUse",
+                "if": "Write(*)",
+                "command": gate.display().to_string(),
+                "timeout_ms": 5000,
+                // The hook writes its hit log into the workspace; the test is
+                // about the resume invariant, not about OS confinement.
+                "sandbox": {"enabled": false}
+            }]
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let prompt = "add a recursive fibonacci function to src/lib.rs with unit tests";
+
+    // First session: the hook fires and the write never lands.
+    {
+        let (_server, mut session) = session_with_static_server_persistent(dir.path());
+        session.wait_for_text("CodeRex v", SCREEN_TIMEOUT);
+        session.send_line(prompt);
+        wait_for_gate_hits(&hits, 1, SCREEN_TIMEOUT);
+        session.wait_for_text("Completed in", SCREEN_TIMEOUT);
+        session.ctrl_d();
+        session.wait_for_exit(SCREEN_TIMEOUT);
+    }
+    let after_first = gate_hits(&hits);
+    assert!(after_first >= 1);
+    assert!(
+        !std::fs::read_to_string(dir.path().join("src/lib.rs"))
+            .unwrap()
+            .contains("fibonacci"),
+        "the blocked write landed in the first session"
+    );
+
+    // Resumed session: the transcript comes back, and the hook must be armed
+    // again. The counter, not the transcript, is the evidence.
+    {
+        let (_server, mut session) = session_with_static_server_persistent(dir.path());
+        session.wait_for_text("CodeRex v", SCREEN_TIMEOUT);
+        session.send_line("/resume");
+        let resumed = session.wait_for_text("Resumed session:", SCREEN_TIMEOUT);
+        assert!(resumed.contains("Loaded"));
+        session.send_line(prompt);
+        wait_for_gate_hits(&hits, after_first + 1, SCREEN_TIMEOUT);
+        session.ctrl_d();
+        session.wait_for_exit(SCREEN_TIMEOUT);
+    }
+    assert!(
+        gate_hits(&hits) > after_first,
+        "the hook did not fire after resuming"
+    );
+    assert!(
+        !std::fs::read_to_string(dir.path().join("src/lib.rs"))
+            .unwrap()
+            .contains("fibonacci"),
+        "the blocked write landed after resuming"
+    );
+}
+
+/// Ported from kimi-code's terminal-notification contract: a terminal that
+/// supports OSC 9 receives the notification when a turn completes, and the
+/// payload is exactly the formatted message.
+#[test]
+fn a_completed_turn_emits_a_desktop_notification() {
+    let dir = setup_project_dir();
+    let (_server, mut session) =
+        session_with_static_server_envs(dir.path(), &[("TERM_PROGRAM", "iTerm.app")]);
+    session.wait_for_text("CodeRex v", SCREEN_TIMEOUT);
+
+    session.send_line("hello");
+    session.wait_for_text("Hello!", SCREEN_TIMEOUT);
+    session.wait_for_text("Completed in", SCREEN_TIMEOUT);
+
+    let raw = session.raw_text();
+    assert!(
+        raw.contains("\u{1b}]9;CodeRex: Turn completed\u{7}"),
+        "no OSC 9 notification in the terminal stream"
+    );
+}
+
+/// A terminal outside the allow-list (Terminal.app) must not receive an OSC 9
+/// payload.
+#[test]
+fn an_unsupported_terminal_gets_no_osc9_notification() {
+    let dir = setup_project_dir();
+    let (_server, mut session) =
+        session_with_static_server_envs(dir.path(), &[("TERM_PROGRAM", "Apple_Terminal")]);
+    session.wait_for_text("CodeRex v", SCREEN_TIMEOUT);
+
+    session.send_line("hello");
+    session.wait_for_text("Hello!", SCREEN_TIMEOUT);
+    session.wait_for_text("Completed in", SCREEN_TIMEOUT);
+
+    assert!(
+        !session.raw_text().contains("\u{1b}]9;"),
+        "OSC 9 was sent to a terminal that does not support it"
+    );
 }
 
 /// A piped command's later segments arrive with their slash still on; the

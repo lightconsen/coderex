@@ -2608,6 +2608,56 @@ mod layout_tests {
         );
     }
 
+    /// A transcript taller than the screen must never push the input box or
+    /// its rules off the viewport. Ported from kimi-code's fullscreen-layout
+    /// contract (the editor's borders stay visible at every terminal size).
+    #[test]
+    fn the_chrome_survives_a_transcript_taller_than_the_screen() {
+        for (width, height) in [(120_u16, 30_u16), (80, 24), (40, 12), (30, 10)] {
+            let mut state = UiState::default();
+            for index in 0..80 {
+                state.messages.push(Message {
+                    role: MessageRole::Assistant,
+                    content: format!("message {index} {}", "lorem ipsum ".repeat(20)).into(),
+                    tool_name: None,
+                    streaming: false,
+                    folded: false,
+                });
+            }
+            let buffer = render_to_buffer(width, height, &mut state);
+            let rows: Vec<String> = (0..height).map(|y| row_text(&buffer, y)).collect();
+            let full = height >= 20;
+            let chunks = chunks_for(height, 0, false, full, 1, full);
+
+            assert!(
+                rows[chunks[INPUT_IDX].y as usize].contains('❯'),
+                "input missing at {width}x{height}:\n{}",
+                rows.join("\n")
+            );
+            for index in [RULE_IDX, RULE_BELOW_IDX] {
+                let row = &rows[chunks[index].y as usize];
+                assert!(
+                    row.chars().all(|c| c == '─'),
+                    "rule {index} missing at {width}x{height}: {row:?}"
+                );
+            }
+            assert!(
+                chunks[0].height >= 1,
+                "transcript has no room at {width}x{height}"
+            );
+            if full {
+                assert_eq!(chunks[STATUSLINE_IDX].height, 3);
+                assert_eq!(chunks[PERMISSION_IDX].height, 2);
+                assert!(
+                    !rows[(chunks[STATUSLINE_IDX].y + 1) as usize]
+                        .trim()
+                        .is_empty()
+                );
+                assert!(rows[chunks[PERMISSION_IDX].y as usize].contains("Permissions:"));
+            }
+        }
+    }
+
     /// The permission bar has one blank row below it, so its text does not sit
     /// against the bottom edge of the terminal.
     #[test]

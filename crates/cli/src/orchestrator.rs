@@ -821,6 +821,15 @@ impl StartupOrchestrator {
                 loop {
                     tokio::select! {
                         _ = sigterm.recv() => {
+                            if crate::repl::TUI_ACTIVE
+                                .load(std::sync::atomic::Ordering::SeqCst)
+                            {
+                                // The TUI owns the terminal: only it can leave
+                                // the alternate screen and raw mode. Its own
+                                // SIGTERM branch performs the cleanup and exits
+                                // with 143.
+                                continue;
+                            }
                             tracing::info!("Received SIGTERM — shutting down gracefully");
                             let _ = crate::daemon::remove_pid_file();
                             // Save recovery snapshot before exit

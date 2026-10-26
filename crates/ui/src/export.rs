@@ -104,18 +104,16 @@ fn format_markdown(messages: &[&Message]) -> String {
                 out.push('\n');
             }
             coderex_core::types::MessageContent::ToolCall(tc) => {
-                let _ = write!(
-                    out,
-                    "```json\n{{\"tool\": \"{}\", \"id\": \"{}\"}}\n```\n",
-                    tc.name, tc.id
-                );
+                // Serialize rather than interpolate: a tool name or id with a
+                // quote or newline must not produce invalid JSON in the fence.
+                let payload = serde_json::json!({"tool": tc.name, "id": tc.id});
+                let json = serde_json::to_string_pretty(&payload).unwrap_or_default();
+                let _ = writeln!(out, "```json\n{json}\n```");
             }
             coderex_core::types::MessageContent::ToolResult(tr) => {
-                let _ = write!(
-                    out,
-                    "```json\n{{\"result\": \"{}\", \"id\": \"{}\"}}\n```\n",
-                    tr.output, tr.tool_call_id
-                );
+                let payload = serde_json::json!({"result": tr.output, "id": tr.tool_call_id});
+                let json = serde_json::to_string_pretty(&payload).unwrap_or_default();
+                let _ = writeln!(out, "```json\n{json}\n```");
             }
             // Provider state, not conversation.
             coderex_core::types::MessageContent::Thinking(_) => {}
@@ -284,5 +282,59 @@ mod tests {
         let output = export_messages(&msgs, &selector, ExportFormat::Json);
         // Should not panic
         let _: Vec<serde_json::Value> = serde_json::from_str(&output).unwrap();
+    }
+
+    /// Tool output is embedded in a Markdown JSON fence; quotes, newlines and
+    /// backslashes must be escaped so the fence stays parseable. Ported from
+    /// kimi-code's export-markdown contract cases.
+    #[test]
+    fn markdown_tool_fences_are_valid_json() {
+        use coderex_core::types::{MessageContent, Role, ToolCall, ToolResult};
+
+        let output = "first\nsecond \"quoted\" \\ backslash";
+        let msgs = vec![
+            Message {
+                role: Role::Assistant,
+                content: MessageContent::ToolCall(ToolCall {
+                    id: "call\"1".into(),
+                    name: "Write".into(),
+                    input: serde_json::json!({}),
+                }),
+            },
+            Message {
+                role: Role::Tool,
+                content: MessageContent::ToolResult(ToolResult {
+                    tool_call_id: "call\"1".into(),
+                    output: output.into(),
+                    is_error: false,
+                    images: Vec::new(),
+                }),
+            },
+        ];
+        let selector = MessageSelector::new(msgs.len());
+        let markdown = export_messages(&msgs, &selector, ExportFormat::Markdown);
+
+        let mut fences = markdown
+            .split("```json")
+            .skip(1)
+            .map(|rest| rest.split("```").next().expect("closing fence"));
+        let call: serde_json::Value = serde_json::from_str(fences.next().expect("call fence"))
+            .expect("call fence is valid JSON");
+        assert_eq!(call["tool"], "Write");
+        assert_eq!(call["id"], "call\"1");
+
+        let result: serde_json::Value = serde_json::from_str(fences.next().expect("result fence"))
+            .expect("result fence is valid JSON");
+        assert_eq!(result["result"], output);
+        assert_eq!(result["id"], "call\"1");
+    }
+
+    #[test]
+    fn json_export_preserves_quotes_newlines_and_unicode() {
+        let msgs = vec![Message::assistant("quote \" line\n汉字")];
+        let selector = MessageSelector::new(msgs.len());
+        let output = export_messages(&msgs, &selector, ExportFormat::Json);
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&output).unwrap();
+        assert_eq!(parsed[0]["content"], "quote \" line\n汉字");
     }
 }

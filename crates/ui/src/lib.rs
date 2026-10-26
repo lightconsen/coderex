@@ -16,6 +16,7 @@ pub mod statusline;
 pub mod statusline_setup;
 pub mod surface;
 pub mod terminal;
+pub mod terminal_notification;
 pub mod terminal_profile;
 pub mod themes;
 pub mod vim;
