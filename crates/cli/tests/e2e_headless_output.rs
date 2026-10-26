@@ -125,3 +125,31 @@ fn stdout_is_the_answer_without_a_title_banner() {
         "unexpected answer:\n{stdout}"
     );
 }
+
+/// A transcript directory that cannot be written must not end the session:
+/// the answer still arrives, and the failure is not a panic.
+#[test]
+fn a_read_only_transcript_directory_does_not_fail_the_turn() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().expect("workspace");
+    let transcripts = dir.path().join(".coderex/transcripts");
+    std::fs::create_dir_all(&transcripts).unwrap();
+    let mut permissions = std::fs::metadata(&transcripts).unwrap().permissions();
+    permissions.set_mode(0o555);
+    std::fs::set_permissions(&transcripts, permissions).unwrap();
+    let (mut provider, base_url) = start_static_provider();
+
+    let output = run_headless(dir.path(), &base_url, "hello");
+
+    let mut permissions = std::fs::metadata(&transcripts).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&transcripts, permissions).unwrap();
+    let _ = provider.kill();
+    let _ = provider.wait();
+
+    assert!(
+        output.contains(HELLO_ANSWER),
+        "the answer was lost when the transcript could not be written: {output}"
+    );
+}
