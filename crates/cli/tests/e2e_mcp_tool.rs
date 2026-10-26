@@ -12,6 +12,7 @@ use std::time::Duration;
 
 const MOCK_SERVER: &str = r#"#!/usr/bin/env python3
 import json
+import os
 import sys
 
 for line in sys.stdin:
@@ -42,6 +43,10 @@ for line in sys.stdin:
             "name": "image",
             "description": "Return a small PNG",
             "inputSchema": {"type": "object", "properties": {}}
+        }, {
+            "name": "probe",
+            "description": "Try to read a path outside the sandbox grants",
+            "inputSchema": {"type": "object", "properties": {}}
         }]}}), flush=True)
     elif method == "tools/call":
         arguments = (request.get("params") or {}).get("arguments") or {}
@@ -50,6 +55,13 @@ for line in sys.stdin:
             content = [{"type": "text", "text": json.dumps({"action": "stop"})}]
         elif name == "image":
             content = [{"type": "image", "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==", "mimeType": "image/png"}]
+        elif name == "probe":
+            try:
+                with open(os.environ["PROBE_PATH"], "w") as probe:
+                    probe.write("probe")
+                content = [{"type": "text", "text": "write-ok"}]
+            except Exception as error:
+                content = [{"type": "text", "text": "write-denied:" + type(error).__name__ + ":" + str(error)}]
         else:
             content = [{"type": "text", "text": "mock-echo:" + str(arguments.get("text", ""))}]
         print(json.dumps({"jsonrpc": "2.0", "id": rid, "result": {
@@ -367,5 +379,99 @@ fn an_mcp_image_result_reaches_the_provider_as_an_image_block() {
     assert!(
         carried_image,
         "the image never became a provider image block; requests:\n{requests}"
+    );
+}
+
+/// The MCP server is confined by default; the documented environment switch
+/// really lifts the confinement.
+#[test]
+fn the_mcp_sandbox_escape_hatch_lifts_the_confinement() {
+    fn run_with_sandbox(env: Option<&str>) -> String {
+        let dir = tempfile::tempdir().expect("workspace");
+        let script = write_mock_server();
+        let probe_path = format!(
+            "/var/tmp/coderex-mcp-probe-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        std::fs::write(
+            dir.path().join(".mcp.json"),
+            serde_json::json!({
+                "mcpServers": {
+                    "mock": {
+                        "command": script.to_str().unwrap(),
+                        "args": [],
+                        "env": {"PROBE_PATH": probe_path}
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let _ = std::fs::remove_file(&probe_path);
+        let config_home = tempfile::tempdir().expect("config home");
+        std::fs::write(
+            config_home.path().join("settings.json"),
+            r#"{"config_version": 4, "telemetry_enabled": false}"#,
+        )
+        .unwrap();
+        let (mut provider, base_url) = start_static_provider();
+        let mut command = Command::new(env!("CARGO_BIN_EXE_coderex"));
+        command
+            .args([
+                "-p",
+                "--dangerously-skip-permissions",
+                "--output-format",
+                "stream-json",
+            ])
+            .current_dir(dir.path())
+            .env("ANTHROPIC_API_KEY", "mock")
+            .env("ANTHROPIC_BASE_URL", &base_url)
+            .env("ANTHROPIC_MODEL", "claude-sonnet-4-6")
+            .env("CLAUDE_CONFIG_DIR", config_home.path())
+            .env("CODEREX_LOG", "off")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        match env {
+            Some(value) => {
+                command.env("CODEREX_MCP_SANDBOX", value);
+            }
+            None => {
+                command.env_remove("CODEREX_MCP_SANDBOX");
+            }
+        }
+        let mut child = command.spawn().expect("spawn coderex");
+        child
+            .stdin
+            .take()
+            .expect("stdin")
+            .write_all(b"call the mock probe tool\n")
+            .expect("write prompt");
+        let output = child.wait_with_output().expect("wait");
+        let _ = provider.kill();
+        let _ = provider.wait();
+        let _ = std::fs::remove_file(&script);
+        let _ = std::fs::remove_file(&probe_path);
+        assert!(
+            output.status.success(),
+            "coderex failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+
+    let sandboxed = run_with_sandbox(None);
+    assert!(
+        sandboxed.contains("write-denied"),
+        "a sandboxed MCP server wrote outside its grants:\n{sandboxed}"
+    );
+    let unconfined = run_with_sandbox(Some("0"));
+    assert!(
+        unconfined.contains("write-ok"),
+        "CODEREX_MCP_SANDBOX=0 did not lift the confinement:\n{unconfined}"
     );
 }
