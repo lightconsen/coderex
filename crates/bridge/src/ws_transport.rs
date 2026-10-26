@@ -58,8 +58,6 @@ pub struct WebSocketTransport {
     config: WsTransportConfig,
     /// Whether currently connected.
     connected: bool,
-    /// Sender to the read loop (messages from WS -> internal).
-    tx: tokio::sync::mpsc::UnboundedSender<TransportMessage>,
     /// Receiver from the read loop.
     rx: tokio::sync::mpsc::UnboundedReceiver<TransportMessage>,
     /// Sender from the write loop (internal -> WS).
@@ -85,14 +83,13 @@ impl WebSocketTransport {
     /// Create a new WebSocket transport from the given configuration.
     #[must_use]
     pub fn new(config: WsTransportConfig) -> Self {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<TransportMessage>();
+        let (_, rx) = tokio::sync::mpsc::unbounded_channel::<TransportMessage>();
         let (write_tx, _) = tokio::sync::mpsc::unbounded_channel::<TransportMessage>();
 
         Self {
             connection_id: config.connection_id.clone(),
             config,
             connected: false,
-            tx,
             rx,
             write_tx,
             reader_handle: None,
@@ -137,15 +134,17 @@ impl WebSocketTransport {
         let (write_send, write_recv) = tokio::sync::mpsc::unbounded_channel::<TransportMessage>();
         self.write_tx = write_send;
 
+        // The reader owns the only sender: keeping one here would keep the
+        // channel open after the socket closed, so `receive()` would block
+        // forever and the orchestrator's reconnect path would never run.
         let (tx_inner, rx_inner) = tokio::sync::mpsc::unbounded_channel::<TransportMessage>();
-        self.tx = tx_inner;
         self.rx = rx_inner;
 
         // Split the stream
         let (mut ws_write, mut ws_read) = ws_stream.split();
 
         // Spawn reader task: WS -> internal channel
-        let reader_tx = self.tx.clone();
+        let reader_tx = tx_inner;
         let reader_handle = tokio::spawn(async move {
             while let Some(msg) = ws_read.next().await {
                 match msg {

@@ -154,6 +154,7 @@ async fn bridge_runs_an_assignment_and_relays_its_output() {
     let ws = TcpListener::bind("127.0.0.1:0").await.expect("ws bind");
     let ws_port = ws.local_addr().expect("addr").port();
     let (line_tx, mut line_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let (write_tx, mut write_rx) = tokio::sync::mpsc::unbounded_channel::<(String, String)>();
     let ws_task = tokio::spawn(async move {
         let Ok(Ok((socket, _))) = tokio::time::timeout(Duration::from_secs(20), ws.accept()).await
         else {
@@ -186,6 +187,19 @@ async fn bridge_runs_an_assignment_and_relays_its_output() {
                     {
                         let _ = line_tx.send(line.to_string());
                     }
+                }
+                "session_write" => {
+                    let epoch = frame["metadata"]["worker_epoch"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string();
+                    let state = serde_json::from_str::<serde_json::Value>(
+                        frame["payload"].as_str().unwrap_or("{}"),
+                    )
+                    .ok()
+                    .and_then(|payload| payload["state"].as_str().map(str::to_string))
+                    .unwrap_or_default();
+                    let _ = write_tx.send((epoch, state));
                 }
                 _ => {}
             }
@@ -244,6 +258,12 @@ async fn bridge_runs_an_assignment_and_relays_its_output() {
             }
         }
     }
+    // The completed session's state write is fenced by the epoch the control
+    // plane assigned at registration. A `running` write arrives first.
+    let (epoch, state) = tokio::time::timeout(Duration::from_secs(10), write_rx.recv())
+        .await
+        .expect("no session_write reached the gateway")
+        .expect("write channel closed");
     let _ = bridge.kill();
     let _ = bridge.wait();
     let _ = provider.kill();
@@ -253,8 +273,184 @@ async fn bridge_runs_an_assignment_and_relays_its_output() {
     let _ = http_task.await;
     let _ = ws_task.await;
 
+    assert_eq!(epoch, "1", "the write was not fenced by the worker epoch");
+    assert_eq!(state, "running");
     assert!(
         saw_answer,
         "the session's answer never reached the gateway; relayed lines: {relayed:?}"
+    );
+}
+
+/// A dropped gateway is not the end of the worker: it reconnects and asks for
+/// the stream from one past the last frame it saw.
+#[tokio::test]
+async fn bridge_reconnects_and_resumes_from_the_last_sequence() {
+    let repo = tempfile::tempdir().expect("repo");
+    std::fs::create_dir_all(repo.path().join("src")).unwrap();
+    std::fs::write(
+        repo.path().join("src/lib.rs"),
+        "pub fn add(a: i32, b: i32) -> i32 { a + b }\n",
+    )
+    .unwrap();
+    let (mut provider, provider_url) = start_static_provider();
+
+    // ── fake control plane ────────────────────────────────────────────────
+    let http = TcpListener::bind("127.0.0.1:0").await.expect("http bind");
+    let http_port = http.local_addr().expect("addr").port();
+    let assignment = serde_json::json!({
+        "assignment_id": "a1",
+        "session_id": "s1",
+        "working_directory": repo.path().display().to_string(),
+        "prompt": "hello",
+        "spawn_mode": "single_session"
+    });
+    let served = Arc::new(Mutex::new(false));
+    let served_task = Arc::clone(&served);
+    let http_task = tokio::spawn(async move {
+        loop {
+            let Ok(Ok((mut socket, _))) =
+                tokio::time::timeout(Duration::from_secs(30), http.accept()).await
+            else {
+                break;
+            };
+            let (headers, _) = read_http(&mut socket).await;
+            let request_line = headers.lines().next().unwrap_or_default().to_string();
+            let body = if request_line.contains("/api/environments/register") {
+                r#"{"worker_epoch":1}"#.to_string()
+            } else if request_line.contains("/claim") || request_line.contains("/capacity") {
+                "{}".to_string()
+            } else if request_line.contains("/assignments") {
+                let mut served = served_task.lock().unwrap();
+                let body = if *served {
+                    r#"{"assignments":[],"count":0}"#.to_string()
+                } else {
+                    *served = true;
+                    serde_json::json!({"assignments": [assignment], "count": 1}).to_string()
+                };
+                drop(served);
+                body
+            } else {
+                "{}".to_string()
+            };
+            write_http(&mut socket, &body).await;
+        }
+    });
+
+    // ── fake gateway: drop the first connection, then read the resume ─────
+    let ws = TcpListener::bind("127.0.0.1:0").await.expect("ws bind");
+    let ws_port = ws.local_addr().expect("addr").port();
+    let (resume_tx, mut resume_rx) = tokio::sync::mpsc::unbounded_channel::<u64>();
+    let ws_task = tokio::spawn(async move {
+        let Ok(Ok((socket, _))) = tokio::time::timeout(Duration::from_secs(30), ws.accept()).await
+        else {
+            return;
+        };
+        let Ok(mut first) = tokio_tungstenite::accept_async(socket).await else {
+            return;
+        };
+        // Tell the worker that sequence 7 reached it, then drop the socket.
+        // A reconnect must ask for 8, not replay from the start.
+        let ack = serde_json::json!({
+            "type": "heartbeat_ack",
+            "correlation_id": "hb-1",
+            "payload": "{}",
+            "metadata": {"sequence_num": "7"}
+        });
+        let _ = first.send(Message::Text(ack.to_string().into())).await;
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        let _ = first.close(None).await;
+        drop(first);
+
+        let Ok(Ok((socket, _))) = tokio::time::timeout(Duration::from_secs(30), ws.accept()).await
+        else {
+            return;
+        };
+        let Ok(mut second) = tokio_tungstenite::accept_async(socket).await else {
+            return;
+        };
+        while let Some(Ok(message)) = second.next().await {
+            let Message::Text(text) = message else {
+                continue;
+            };
+            let Ok(frame) = serde_json::from_str::<serde_json::Value>(&text) else {
+                continue;
+            };
+            match frame["type"].as_str().unwrap_or_default() {
+                "heartbeat" => {
+                    let ack = serde_json::json!({
+                        "type": "heartbeat_ack",
+                        "correlation_id": frame["correlation_id"],
+                        "payload": "{}",
+                        "metadata": {"sequence_num": "9"}
+                    });
+                    let _ = second.send(Message::Text(ack.to_string().into())).await;
+                }
+                "resume" => {
+                    let payload: serde_json::Value =
+                        serde_json::from_str(frame["payload"].as_str().unwrap_or("{}"))
+                            .unwrap_or_default();
+                    let from = payload["from_sequence_num"].as_u64().unwrap_or(0);
+                    let _ = resume_tx.send(from);
+                }
+                _ => {}
+            }
+        }
+    });
+
+    // ── run the bridge ───────────────────────────────────────────────────
+    let config_home = tempfile::tempdir().expect("config home");
+    std::fs::write(
+        config_home.path().join("settings.json"),
+        r#"{"config_version": 4, "telemetry_enabled": false}"#,
+    )
+    .unwrap();
+    let mut bridge = Command::new(env!("CARGO_BIN_EXE_coderex"))
+        .args([
+            "bridge",
+            "--control-plane-url",
+            &format!("http://127.0.0.1:{http_port}"),
+            "--env-id",
+            "test-env",
+            "--transport-url",
+            &format!("ws://127.0.0.1:{ws_port}"),
+            "--repo-root",
+            repo.path().to_str().unwrap(),
+            "--max-concurrent",
+            "1",
+            "--poll-interval-secs",
+            "1",
+            "--heartbeat-interval-secs",
+            "1",
+            "--heartbeat-timeout-secs",
+            "3",
+        ])
+        .current_dir(repo.path())
+        .env("ANTHROPIC_API_KEY", "mock")
+        .env("ANTHROPIC_BASE_URL", &provider_url)
+        .env("ANTHROPIC_MODEL", "claude-sonnet-4-6")
+        .env("CLAUDE_CONFIG_DIR", config_home.path())
+        .env("CODEREX_LOG", "off")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn coderex bridge");
+
+    let from = tokio::time::timeout(Duration::from_secs(40), resume_rx.recv())
+        .await
+        .expect("the bridge never reconnected")
+        .expect("resume channel closed");
+    let _ = bridge.kill();
+    let _ = bridge.wait();
+    let _ = provider.kill();
+    let _ = provider.wait();
+    http_task.abort();
+    ws_task.abort();
+    let _ = http_task.await;
+    let _ = ws_task.await;
+
+    assert_eq!(
+        from, 8,
+        "the resume should start one past the last sequence (7), got {from}"
     );
 }
