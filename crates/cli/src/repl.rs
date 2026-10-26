@@ -3877,7 +3877,9 @@ impl ReplLoop {
         }
 
         let mut installed_hook_count = 0;
-        if !hook_sources.is_empty() {
+        // Mods are hooks too: a session with `CODEREX_MODS` but no settings
+        // hooks must still build the registry and attach the JS executor.
+        if !hook_sources.is_empty() || coderex_mods::is_enabled() {
             let hook_count: usize = hook_sources
                 .iter()
                 .map(|(_, value)| count_configured_hooks(value))
@@ -6467,6 +6469,29 @@ impl ReplLoop {
     /// Drain pending events from the event channel, appending text deltas to
     /// the output.
     fn drain_events(&mut self, output: &mut String) {
+        self.drain_events_inner(output, None, "");
+    }
+
+    /// Drain events that arrived before the turn, framing them for a host.
+    ///
+    /// A mod's `SessionStart` UI is emitted before `submit_prompt` reaches its
+    /// turn loop; draining it without the sink would silently drop the
+    /// `mod_ui` frame while still appending the rendered block to the answer.
+    fn drain_events_with_sink(
+        &mut self,
+        output: &mut String,
+        protocol: &mut Option<coderex_events::MessageSink<Box<dyn std::io::Write + Send + Sync>>>,
+        session_id: &str,
+    ) {
+        self.drain_events_inner(output, protocol.as_mut(), session_id);
+    }
+
+    fn drain_events_inner(
+        &mut self,
+        output: &mut String,
+        mut protocol: Option<&mut coderex_events::MessageSink<Box<dyn std::io::Write + Send + Sync>>>,
+        session_id: &str,
+    ) {
         // Collect first: recording needs `&mut self`, while the receiver
         // borrows `self.event_rx`.
         let events: Vec<EngineEvent> = self
@@ -6476,6 +6501,12 @@ impl ReplLoop {
             .unwrap_or_default();
         for event in events {
             self.record_engine_event_telemetry(&event);
+            if let Some(sink) = protocol.as_mut()
+                && let Some(frame) = protocol_frame(&event, session_id)
+                && let Err(error) = sink.emit(&frame)
+            {
+                tracing::warn!("could not write a protocol frame: {error}");
+            }
             match event {
                 EngineEvent::TextDelta(delta) => output.push_str(&delta),
                 EngineEvent::ModUi(elements) => append_mod_ui_block(output, &elements),
@@ -7628,13 +7659,14 @@ impl ReplLoop {
             dispatcher.set_elicit_tx(Some(elicit_tx));
         }
 
-        let mut output = String::new();
-        self.drain_events(&mut output);
-
         // The protocol stream, if this run was asked for one. Taken out of
-        // `self` so the turn can hold it across the loop below without
-        // borrowing the whole REPL.
+        // `self` before the pre-turn drain so a mod's SessionStart UI (and any
+        // other event emitted before the turn) is still framed for the host.
         let mut protocol = self.protocol_sink.take();
+        let session_id = self.current_session_id().unwrap_or_default();
+
+        let mut output = String::new();
+        self.drain_events_with_sink(&mut output, &mut protocol, &session_id);
 
         // The headless control channel, when the host asked for one and can
         // answer: the engine's `Ask` becomes a `control_request` on the
@@ -7671,7 +7703,6 @@ impl ReplLoop {
             spawn_headless_control_reader(bus.clone(), std::sync::Arc::clone(&permission_approvals))
         });
 
-        let session_id = self.current_session_id().unwrap_or_default();
         let turn_started = std::time::Instant::now();
         // Watched in the loop rather than drained at the end, so the host sees
         // the turn as it happens instead of all at once when it is over.
