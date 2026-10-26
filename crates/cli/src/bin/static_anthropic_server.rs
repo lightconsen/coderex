@@ -477,6 +477,27 @@ fn build_json_response(prompt: &str, has_tool_result: bool, responses: &StaticRe
     if !has_tool_result
         && prompt
             .to_lowercase()
+            .contains("run a shell command in the background")
+    {
+        return serde_json::json!({
+            "id": "msg_static_bash",
+            "type": "message",
+            "role": "assistant",
+            "content": [{
+                "type": "tool_use",
+                "id": "tool_background_bash",
+                "name": "Bash",
+                "input": {"command": "echo ran > background_marker.txt"}
+            }],
+            "stop_reason": "tool_use",
+            "stop_sequence": null,
+            "usage": {"input_tokens": 10, "output_tokens": 20}
+        })
+        .to_string();
+    }
+    if !has_tool_result
+        && prompt
+            .to_lowercase()
             .contains("write a file inside the worktree")
     {
         return serde_json::json!({
@@ -704,6 +725,11 @@ fn select_tools(prompt: &str) -> Vec<Tool> {
         vec![Tool::Write {
             file: "src/lib.rs".into(),
             content: "pub fn safe_noop() -> bool {\n    true\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n\n    #[test]\n    fn safe_noop_returns_true() {\n        assert!(safe_noop());\n    }\n}\n".into(),
+        }]
+    } else if p.contains("spawn a background subagent to run a command") {
+        vec![Tool::Raw {
+            name: "Agent".into(),
+            input_json: r#"{"description":"run a background command","prompt":"run a shell command in the background","run_in_background":true}"#.into(),
         }]
     } else if p.contains("spawn a subagent in a worktree") {
         vec![Tool::Raw {

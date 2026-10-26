@@ -1231,6 +1231,54 @@ fn a_subagent_forks_the_parent_conversation() {
     );
 }
 
+/// A background sub-agent is not watched by the person, so its permission
+/// requests are background-agent requests: the deny hook refuses its Bash and
+/// the command never runs.
+#[test]
+fn a_background_subagent_cannot_run_shell_tools() {
+    let dir = setup_project_dir();
+    let home = tempfile::tempdir().expect("home");
+    let logs = home.path().join(".coderex").join("agent_logs");
+    let server = StaticServer::start();
+    let mut envs = server.envs();
+    envs.push(("HOME".into(), home.path().display().to_string()));
+    let mut session = PtySession::launch_with_args(
+        dir.path(),
+        &envs,
+        "K2.6",
+        false,
+        &["--dangerously-skip-permissions"],
+    );
+    session.wait_for_text("CodeRex v", SCREEN_TIMEOUT);
+
+    session.send_line("spawn a background subagent to run a command");
+
+    let deadline = Instant::now() + SCREEN_TIMEOUT;
+    let mut denied = false;
+    while Instant::now() < deadline {
+        let entry = std::fs::read_dir(&logs)
+            .ok()
+            .into_iter()
+            .flatten()
+            .flatten()
+            .find(|entry| entry.path().extension().is_some_and(|ext| ext == "jsonl"));
+        if let Some(entry) = entry
+            && let Ok(log) = std::fs::read_to_string(entry.path())
+            && log.contains("denied in background agent mode")
+        {
+            denied = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    drop(session);
+    assert!(denied, "the background agent's tool request was not denied");
+    assert!(
+        !dir.path().join("background_marker.txt").exists(),
+        "a background sub-agent ran a shell command"
+    );
+}
+
 #[test]
 fn two_turn_transcript_is_preserved() {
     let dir = setup_project_dir();
