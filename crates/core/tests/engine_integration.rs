@@ -7,7 +7,7 @@
 
 use async_trait::async_trait;
 use coderex_core::api_client::{ApiClient, ApiError, ApiResponse, StreamEvent};
-use coderex_core::engine::{QueryEngine, SubmitOptions, TerminalReason};
+use coderex_core::engine::{QueryEngine, SubmitOptions, TerminalReason, TurnState};
 use coderex_core::permission_engine::PermissionEngine;
 use coderex_core::permissions::{PermissionChecker, PermissionMode};
 use coderex_core::state::SessionState;
@@ -443,10 +443,67 @@ async fn multi_turn_context_accumulated() {
     assert!(matches!(msgs[4].role, coderex_core::types::Role::Assistant));
 }
 
+/// The internal state graph has unit tests, but this asserts the sequence a
+/// real tool-using turn reports through the public observer.
+#[tokio::test]
+async fn a_tool_turn_reports_its_state_sequence() {
+    use std::sync::{Arc, Mutex};
+
+    let responses = vec![
+        tool_response(vec![ToolCall {
+            id: "tc_1".into(),
+            name: "Read".into(),
+            input: serde_json::json!({"file_path": "src/lib.rs"}),
+        }]),
+        text_response("Done."),
+    ];
+    let api = Box::new(SequenceMock::new(responses));
+    let tools = Box::new(EchoToolExecutor);
+    let (mut engine, _rx) = make_engine(api, tools);
+
+    let observed = Arc::new(Mutex::new(Vec::<(TurnState, TurnState)>::new()));
+    let sink = Arc::clone(&observed);
+    engine.set_transition_observer(Arc::new(move |from, to| {
+        sink.lock().expect("transition log").push((from, to));
+    }));
+
+    let mut options = SubmitOptions::default();
+    options.handle_elicitation = false;
+    engine.submit("read a file".into(), options).await.unwrap();
+
+    let transitions = observed.lock().expect("transition log").clone();
+    for (from, to) in &transitions {
+        assert!(
+            from.can_transition_to(*to),
+            "the turn made an illegal transition: {from:?} -> {to:?}"
+        );
+    }
+    let expected = [
+        (TurnState::Initialize, TurnState::BuildContext),
+        (TurnState::BuildContext, TurnState::RunPreSubmitHooks),
+        (TurnState::RunPreSubmitHooks, TurnState::StartRequest),
+        (TurnState::StartRequest, TurnState::StreamAssistant),
+        (TurnState::StreamAssistant, TurnState::ExecuteTools),
+        (TurnState::ExecuteTools, TurnState::ApplyToolResults),
+        (TurnState::ApplyToolResults, TurnState::EvaluateContinuation),
+        (TurnState::EvaluateContinuation, TurnState::StopHooks),
+        (TurnState::StopHooks, TurnState::Finalize),
+        // The tool turn continues in a second loop iteration.
+        (TurnState::Initialize, TurnState::BuildContext),
+        (TurnState::BuildContext, TurnState::RunPreSubmitHooks),
+        (TurnState::RunPreSubmitHooks, TurnState::StartRequest),
+        (TurnState::StartRequest, TurnState::StreamAssistant),
+        (TurnState::StreamAssistant, TurnState::EvaluateContinuation),
+        (TurnState::EvaluateContinuation, TurnState::StopHooks),
+        (TurnState::StopHooks, TurnState::Finalize),
+        (TurnState::Finalize, TurnState::Terminated),
+    ];
+    assert_eq!(transitions, expected, "the turn's state sequence changed");
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 //  1.3 Streaming Response
 // ═══════════════════════════════════════════════════════════════════════════
-
 #[tokio::test]
 async fn streaming_text_deltas_emitted() {
     let api = Box::new(StreamingMock {

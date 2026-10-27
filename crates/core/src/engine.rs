@@ -684,6 +684,13 @@ impl Default for SubmitOptions {
     }
 }
 
+/// Callback invoked for every state transition a turn makes.
+///
+/// The engine's internal recorder is `#[cfg(test)]`; this observer is the
+/// production-safe way for an embedder (or an integration test) to see the
+/// sequence a real turn took.
+pub type TransitionObserver = Arc<dyn Fn(TurnState, TurnState) + Send + Sync>;
+
 // ─── TurnRuntime ────────────────────────────────────────────────────────────
 
 /// Per-turn runtime data — state, messages, pending items, budget.
@@ -722,6 +729,8 @@ pub struct TurnRuntime {
     /// `Reactive` compaction is for a response the model ran out of room for;
     /// that fact lives on the response, not in the context estimate.
     pub last_stop_reason: Option<String>,
+    /// Optional observer called after every transition.
+    pub transition_observer: Option<TransitionObserver>,
 }
 
 impl TurnRuntime {
@@ -742,6 +751,7 @@ impl TurnRuntime {
             agent_id: None,
             terminal_reason: None,
             last_stop_reason: None,
+            transition_observer: None,
         }
     }
 
@@ -775,6 +785,9 @@ impl TurnRuntime {
     /// bookkeeping mistake into a failed turn, and the work is not what is
     /// wrong.
     pub fn transition_to(&mut self, new_state: TurnState) {
+        if let Some(observer) = &self.transition_observer {
+            observer(self.state, new_state);
+        }
         #[cfg(test)]
         record_transition(self.state, new_state);
 
@@ -790,7 +803,7 @@ impl TurnRuntime {
 
     /// Terminate with a reason.
     pub fn terminate(&mut self, reason: TerminalReason) {
-        self.state = TurnState::Terminated;
+        self.transition_to(TurnState::Terminated);
         self.terminal_reason = Some(reason);
     }
 }
@@ -1496,6 +1509,9 @@ pub struct QueryEngine {
     ///
     /// Defaults to [`Self::DEFAULT_MAX_TOKENS`]; a session selected with
     /// `--agent` may lower or raise it from the agent definition.
+    /// Optional observer for turn state transitions, used by integration tests
+    /// and embedders that render the lifecycle.
+    transition_observer: Option<TransitionObserver>,
     max_tokens: u32,
 }
 
@@ -1777,6 +1793,7 @@ impl QueryEngine {
             last_request_at: Arc::new(Mutex::new(None)),
             session_started: false,
             cache_ttl_timer: None,
+            transition_observer: None,
             max_tokens: Self::DEFAULT_MAX_TOKENS,
         }
     }
@@ -1894,6 +1911,15 @@ impl QueryEngine {
     /// question mid-turn.
     pub fn set_elicitation_handler(&mut self, handler: Box<dyn ElicitationHandler + Send + Sync>) {
         self.elicitation_handler = handler;
+    }
+
+    /// Observe every turn state transition.
+    ///
+    /// The callback runs on the turn's thread after each legal or illegal
+    /// `transition_to` and after `terminate`. It is a diagnostic surface: the
+    /// engine does not wait for it and must not be mutated from it.
+    pub fn set_transition_observer(&mut self, observer: TransitionObserver) {
+        self.transition_observer = Some(observer);
     }
 
     /// Set the hook executor for lifecycle hooks.
@@ -2541,6 +2567,8 @@ impl QueryEngine {
 
         let mut turn = TurnRuntime::new(budget);
         turn.agent_id = options.agent_id.clone();
+        turn.transition_observer = self.transition_observer.clone();
+        turn.transition_observer = self.transition_observer.clone();
         let mut turn_number = self.current_turn + 1;
         let mut last_reason = TerminalReason::Completed;
         let mut provider_resumes: u32 = 0;
@@ -2643,6 +2671,9 @@ impl QueryEngine {
             }
         }
 
+        if !turn.state.is_terminal() {
+            turn.terminate(last_reason.clone());
+        }
         Ok(turn.terminal_reason.unwrap_or(last_reason))
     }
 
@@ -2769,6 +2800,9 @@ impl QueryEngine {
             }
         }
 
+        if !turn.state.is_terminal() {
+            turn.terminate(last_reason.clone());
+        }
         Ok(turn.terminal_reason.unwrap_or(last_reason))
     }
 

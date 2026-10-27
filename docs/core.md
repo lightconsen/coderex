@@ -9,7 +9,7 @@ The foundational engine of CodeRex. Manages LLM API communication, conversation 
 ### Key Types
 
 - **`QueryEngine`** (`engine.rs`) — The main conversation orchestrator. Manages turns through a 14-state state machine (`TurnState`).
-- **`TurnState`** (`engine.rs`) — State machine: Initialize -> BuildContext -> RunPreSubmitHooks -> StartRequest -> StreamAssistant -> ExecuteTools -> AwaitPermission -> AwaitElicitation -> ApplyToolResults -> EvaluateContinuation -> CompactRecovery -> StopHooks -> Finalize -> Terminated.
+- **`TurnState`** (`engine.rs`) — State machine: Initialize -> BuildContext -> RunPreSubmitHooks -> StartRequest -> StreamAssistant -> ExecuteTools -> AwaitPermission -> AwaitElicitation -> ApplyToolResults -> EvaluateContinuation -> CompactRecovery -> StopHooks -> Finalize -> Terminated. `QueryEngine::set_transition_observer` installs a callback that sees every `(from, to)` pair in release builds; integration tests use it to assert the exact sequence of a tool-using turn.
 - **`TurnRuntime`** (`engine.rs`) — Per-turn mutable state: messages, pending tool calls, budget, recovery count, terminal reason.
 - **`ApiClient` trait** (`api_client.rs`) — Abstraction over LLM providers. `AnthropicApiClient` is the primary impl.
 - **`StreamEvent`** (`api_client.rs`) — SSE parsing results: TextDelta, ThinkingDelta, SignatureDelta, ToolCallBlockStart/End, ToolCallInputDelta, UsageSummary, StopReason, StreamEnd, Error.
