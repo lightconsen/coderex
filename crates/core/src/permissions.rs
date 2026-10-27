@@ -311,9 +311,6 @@ impl PermissionRuleSpec {
                     ));
                 }
                 let close = raw.len() - 1;
-                if close <= open + 1 {
-                    return Err(PermissionRuleParseError::EmptySpecifier(raw.to_string()));
-                }
                 (
                     raw[..open].trim(),
                     Some(raw[open + 1..close].trim().to_string()),
@@ -1174,6 +1171,153 @@ mod tests {
     use super::*;
 
     #[test]
+    fn rule_subjects_keep_their_form() {
+        let subject = RuleSubject::from("Read(./.env)".to_string());
+        assert_eq!(subject.forms, vec!["Read(./.env)"]);
+        assert!(subject.opaque.is_none());
+        assert_ne!(subject, RuleSubject::default());
+    }
+
+    #[test]
+    fn exemptions_report_whether_they_are_empty() {
+        assert!(ToolRuleExemptions::NONE.is_empty());
+        assert!(
+            !ToolRuleExemptions {
+                ignores_whole_tool_allow_rule: true,
+                suppresses_always_allow_rule: false,
+            }
+            .is_empty()
+        );
+        assert!(
+            !ToolRuleExemptions {
+                ignores_whole_tool_allow_rule: false,
+                suppresses_always_allow_rule: true,
+            }
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn setting_the_mode_replaces_it() {
+        let mut checker = PermissionChecker::new(PermissionMode::Default);
+        checker.set_mode(PermissionMode::Plan);
+        assert_eq!(checker.mode(), PermissionMode::Plan);
+    }
+
+    #[test]
+    fn only_editing_tools_are_edit_tools() {
+        let checker = PermissionChecker::new(PermissionMode::Default);
+        for tool in ["write", "edit", "multi_edit", "notebook_edit", "Write"] {
+            assert!(checker.is_edit_tool(tool), "{tool}");
+        }
+        for tool in ["read", "grep", "bash", "glob", "list_dir"] {
+            assert!(!checker.is_edit_tool(tool), "{tool}");
+        }
+    }
+
+    #[test]
+    fn a_dot_prefixed_pattern_has_both_spellings() {
+        let cwd = Path::new("/proj");
+        let context = RuleCompileContext { cwd, home: None };
+        let variants = path_pattern_variants("./docs/**", &context);
+        assert!(variants.contains(&"./docs/**".to_string()), "{variants:?}");
+        assert!(variants.contains(&"docs/**".to_string()), "{variants:?}");
+        assert!(
+            variants.iter().any(|variant| variant.starts_with("/proj/")),
+            "{variants:?}"
+        );
+        assert!(
+            path_pattern_variants("/", &context).len() == 1,
+            "a bare slash must not be rewritten"
+        );
+    }
+
+    #[test]
+    fn add_spec_installs_the_rule() {
+        let cwd = Path::new("/proj");
+        let context = RuleCompileContext { cwd, home: None };
+        let mut checker = PermissionChecker::new(PermissionMode::Default);
+        let mut add = |spec: PermissionRuleSpec| {
+            checker.add_spec(&spec, &context).unwrap();
+        };
+        add(PermissionRuleSpec::parse("Bash(echo:*)", PermissionAction::Allow).unwrap());
+        assert_eq!(checker.rule_specs().len(), 1);
+        assert!(matches!(
+            checker.check_with_subjects("Bash", &[RuleSubject::single("echo hi")], None),
+            PermissionResult::Allow
+        ));
+    }
+
+    #[test]
+    fn add_specs_is_atomic() {
+        let cwd = Path::new("/proj");
+        let context = RuleCompileContext { cwd, home: None };
+        let mut checker = PermissionChecker::new(PermissionMode::Default);
+        let good = PermissionRuleSpec::parse("Bash(echo:*)", PermissionAction::Allow).unwrap();
+        // A glob that cannot compile makes the whole batch fail.
+        let bad = PermissionRuleSpec {
+            tool_name: "Read".into(),
+            action: PermissionAction::Allow,
+            matcher: RuleMatcher::Glob {
+                patterns: vec!["[".into()],
+            },
+            description: "Read([)".into(),
+        };
+        assert!(checker.add_specs(&[good, bad], &context).is_err());
+        assert!(
+            checker.rule_specs().is_empty(),
+            "partial batch was installed"
+        );
+    }
+
+    #[test]
+    fn a_whole_tool_allow_still_fails_closed_on_an_opaque_command() {
+        let cwd = Path::new("/proj");
+        let context = RuleCompileContext { cwd, home: None };
+        let mut checker = PermissionChecker::new(PermissionMode::Default);
+        checker
+            .add_spec(
+                &PermissionRuleSpec::parse("Bash", PermissionAction::Allow).unwrap(),
+                &context,
+            )
+            .unwrap();
+        assert!(matches!(
+            checker.check_with_subjects("Bash", &[RuleSubject::single("echo hi")], None),
+            PermissionResult::Allow
+        ));
+        let opaque = RuleSubject::single("sudo rm -rf /").with_opaque("wrapped");
+        assert!(matches!(
+            checker.check_with_subjects("Bash", std::slice::from_ref(&opaque), None),
+            PermissionResult::Ask { .. }
+        ));
+    }
+
+    #[test]
+    fn an_exempt_tool_cannot_use_a_whole_tool_rule_to_cover_segments() {
+        let cwd = Path::new("/proj");
+        let context = RuleCompileContext { cwd, home: None };
+        let mut checker = PermissionChecker::new(PermissionMode::Default);
+        checker
+            .add_spec(
+                &PermissionRuleSpec::parse("Bash", PermissionAction::Allow).unwrap(),
+                &context,
+            )
+            .unwrap();
+        let exemptions = ToolRuleExemptions {
+            ignores_whole_tool_allow_rule: true,
+            suppresses_always_allow_rule: false,
+        };
+        assert!(matches!(
+            checker.check_with_subjects(
+                "Bash",
+                &[RuleSubject::single("echo hi")],
+                Some(exemptions)
+            ),
+            PermissionResult::Ask { .. }
+        ));
+    }
+
+    #[test]
     fn bypass_mode_allows_everything() {
         let checker = PermissionChecker::new(PermissionMode::BypassPermissions);
         assert!(matches!(
@@ -1822,6 +1966,22 @@ mod rule_spec_tests {
             RuleMatcher::BashPrefix {
                 prefix: "git diff".into()
             }
+        );
+        assert!(
+            PermissionRuleSpec::parse("Bash()", PermissionAction::Allow).is_err(),
+            "an empty specifier is not a whole-tool rule"
+        );
+        assert!(
+            PermissionRuleSpec::parse("Bash( )", PermissionAction::Allow).is_err(),
+            "a whitespace-only specifier is empty after trimming"
+        );
+        assert!(
+            PermissionRuleSpec::parse("Bad Tool(./x)", PermissionAction::Allow).is_err(),
+            "a tool name with whitespace is not a rule"
+        );
+        assert!(
+            PermissionRuleSpec::parse("Bad)(./x)", PermissionAction::Allow).is_err(),
+            "a tool name with a closing parenthesis is not a rule"
         );
         assert_eq!(
             parsed("Bash(*)", PermissionAction::Allow).matcher,

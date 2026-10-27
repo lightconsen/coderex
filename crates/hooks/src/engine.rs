@@ -3771,6 +3771,90 @@ mod tests {
     }
 
     #[test]
+    fn hook_type_as_str_matches_the_wire_names() {
+        for (kind, name) in [
+            (HookType::Command, "command"),
+            (HookType::Http, "http"),
+            (HookType::Prompt, "prompt"),
+            (HookType::McpTool, "mcp_tool"),
+            (HookType::Agent, "agent"),
+        ] {
+            assert_eq!(kind.as_str(), name);
+        }
+    }
+
+    #[test]
+    fn a_hook_labels_itself_by_its_target() {
+        let base = || HookConfig {
+            watch: None,
+            event: "PreToolUse".to_string(),
+            kind: HookType::Command,
+            tier: HookTier::Core,
+            command: String::new(),
+            http: None,
+            prompt: None,
+            model: None,
+            mcp: None,
+            env: HashMap::new(),
+            cwd: None,
+            internal: false,
+            timeout_ms: 5000,
+            priority: 0,
+            dry_run: false,
+            stream: false,
+            max_cpu_seconds: None,
+            max_memory_mb: None,
+            max_file_size_mb: None,
+            sandbox: None,
+        };
+        let mut command = base();
+        command.command = "echo hi".into();
+        assert_eq!(command.label(), "echo hi");
+
+        let mut http = base();
+        http.http = Some(HttpHook {
+            url: "https://example.test/hook".into(),
+            headers: HashMap::new(),
+            allowed_env_vars: Vec::new(),
+            block_private_hosts: false,
+        });
+        assert_eq!(http.label(), "https://example.test/hook");
+
+        let mut mcp = base();
+        mcp.mcp = Some(McpToolHook {
+            server: "s".into(),
+            tool: "t".into(),
+            input: serde_json::json!({}),
+        });
+        assert_eq!(mcp.label(), "t");
+
+        let mut prompt = base();
+        prompt.prompt = Some("is this ok?".into());
+        assert_eq!(prompt.label(), "is this ok?");
+
+        assert_eq!(base().label(), "");
+    }
+
+    #[test]
+    fn every_hook_kind_has_a_stable_wire_name() {
+        for value in [
+            serde_json::json!({"event": "Stop", "type": "command", "command": "x"}),
+            serde_json::json!({"event": "Stop", "type": "http", "url": "https://e.test/h"}),
+            serde_json::json!({"event": "Stop", "type": "prompt", "prompt": "p"}),
+            serde_json::json!({"event": "Stop", "type": "agent", "prompt": "p"}),
+            serde_json::json!({"event": "Stop", "type": "mcp_tool", "server": "s", "tool": "t"}),
+        ] {
+            let registry = HookRegistry::load_from_settings(&serde_json::json!({
+                "hooks": [value.clone()]
+            }))
+            .unwrap();
+            let matches = registry.matches_for_event(&HookEvent::Stop);
+            assert_eq!(matches.len(), 1, "{value}");
+            assert!(!matches[0].kind.as_str().is_empty(), "{value}");
+        }
+    }
+
+    #[test]
     fn a_condition_parses_tool_rules_and_globs() {
         let rule = HookCondition::parse("Bash(git*)");
         assert_eq!(rule.as_str(), "Bash(git*)");

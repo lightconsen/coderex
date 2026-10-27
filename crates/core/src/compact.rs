@@ -228,19 +228,15 @@ pub fn micro_compact(messages: &[Message], params: MicroCompactParams) -> Compac
 /// and a diff ends with its last hunk, so neither is reduced to a bare head.
 #[must_use]
 pub fn truncate_tool_output(output: &str, head_tokens: usize, tail_tokens: usize) -> String {
-    if PromptCompiler::estimate_tokens(output) <= head_tokens + tail_tokens {
-        return output.to_string();
-    }
     let chars: Vec<char> = output.chars().collect();
-    // The budgets below are char-denominated (≈ tokens × 4) but the check
-    // above counts *bytes*, so multi-byte output can clear the token budget
-    // while still holding fewer chars than `head + tail`. Clamp both ends to
-    // the string and never let them overlap: an overlap duplicates the text
-    // and returns something longer than the input, the opposite of what a
-    // compact pass is for. When the budgets cover the whole string there is
-    // nothing in the middle to elide, so the output passes through untouched.
+    // The budgets are char-denominated (≈ tokens × 4), while the token
+    // estimate counts bytes. Clamp both ends to the string and never let them
+    // overlap: an overlap duplicates the text and returns something longer
+    // than the input, the opposite of what a compact pass is for. When the
+    // budgets cover the whole string there is nothing in the middle to elide,
+    // so the output passes through untouched.
     let head_chars = (head_tokens * 4).min(chars.len());
-    let tail_chars = (tail_tokens * 4).min(chars.len() - head_chars);
+    let tail_chars = (tail_tokens * 4).min(chars.len());
     if head_chars + tail_chars >= chars.len() {
         return output.to_string();
     }
@@ -274,11 +270,7 @@ pub fn auto_compact(messages: &[Message], threshold: usize) -> CompactResult {
 
     let tokens_after_micro = total_token_estimate(&micro.messages);
     if tokens_after_micro <= threshold {
-        return CompactResult {
-            tokens_removed: tokens_after_micro
-                .saturating_sub(total_token_estimate(&micro.messages)),
-            ..micro
-        };
+        return micro;
     }
 
     // Additional pass: remove older pure-text assistant messages
@@ -933,6 +925,13 @@ mod tests {
         })
     }
 
+    /// A stable rendering of a message's content, for assertions. `Message`
+    /// does not implement `PartialEq`, and compaction must preserve content
+    /// exactly as the provider sees it.
+    fn content_json(message: &Message) -> String {
+        serde_json::to_string(&message.content).unwrap_or_default()
+    }
+
     /// A paired assistant ToolCall + tool result exchange, as produced by
     /// a real turn. `micro_compact` needs the ToolCall side to resolve the
     /// tool name for the whitelist check.
@@ -1165,6 +1164,27 @@ mod tests {
     }
 
     #[test]
+    fn truncate_tool_output_uses_four_chars_per_token() {
+        let output = "h".repeat(100) + &"m".repeat(800) + &"t".repeat(100);
+        let truncated = truncate_tool_output(&output, 10, 5);
+        assert!(truncated.starts_with(&"h".repeat(40)), "{truncated}");
+        assert!(truncated.ends_with(&"t".repeat(20)), "{truncated}");
+        // 1000 bytes / 4 = 250 tokens, minus the 10 + 5 kept.
+        assert!(
+            truncated.contains("[... ~235 tokens elided ...]"),
+            "{truncated}"
+        );
+    }
+
+    #[test]
+    fn truncate_tool_output_budget_is_the_sum_of_both_ends() {
+        // 600 bytes ≈ 150 tokens; head 100 + tail 100 covers it, so nothing
+        // is elided even though neither end alone does.
+        let output = "x".repeat(600);
+        assert_eq!(truncate_tool_output(&output, 100, 100), output);
+    }
+
+    #[test]
     fn truncate_tool_output_passthrough_below_threshold() {
         let output = "small output";
         assert_eq!(truncate_tool_output(output, 1_000, 500), output);
@@ -1199,18 +1219,297 @@ mod tests {
     }
 
     #[test]
-    fn auto_compact_triggers_at_threshold() {
+    fn reactive_compaction_triggers_on_max_tokens_or_the_threshold() {
+        assert!(should_reactive_compact("max_tokens", 0, 100));
+        assert!(!should_reactive_compact("end_turn", 100, 100));
+        assert!(should_reactive_compact("end_turn", 101, 100));
+        for tokens in [0, 99, 100, 101] {
+            assert_eq!(
+                should_reactive_compact("end_turn", tokens, 100),
+                tokens > 100
+            );
+        }
+    }
+
+    #[test]
+    fn cache_ttl_wake_uses_the_ninety_percent_rule_at_the_edges() {
+        use std::time::Duration;
+        // TTL equal to the early-exit window: falling back to 90% is the only
+        // non-zero answer.
+        assert_eq!(
+            cache_ttl_wake_after(Duration::from_secs(30), Duration::from_secs(30)),
+            Duration::from_secs(27)
+        );
+        // A zero early exit means "90% only", not "TTL − 0".
+        assert_eq!(
+            cache_ttl_wake_after(Duration::from_secs(300), Duration::ZERO),
+            Duration::from_secs(270)
+        );
+        // The earlier of 90% and TTL − early wins; here they are equal.
+        assert_eq!(
+            cache_ttl_wake_after(Duration::from_secs(100), Duration::from_secs(10)),
+            Duration::from_secs(90)
+        );
+    }
+
+    #[test]
+    fn truncate_middle_splits_the_budget_two_to_one() {
+        let text = "a".repeat(1000);
+        let out = truncate_middle(&text, 340);
+        // budget = 340 - 40 = 300; head = 200, tail = 100.
+        assert!(out.starts_with(&"a".repeat(200)));
+        assert!(out.ends_with(&"a".repeat(100)));
+        assert!(out.contains("[... 700 chars elided ...]"), "{out}");
+        let head = out.split('\n').next().unwrap();
+        let tail = out.rsplit('\n').next().unwrap();
+        assert_eq!(head.chars().count(), 200);
+        assert_eq!(tail.chars().count(), 100);
+    }
+
+    #[test]
+    fn truncate_middle_never_panics_on_a_tiny_budget() {
+        let out = truncate_middle(&"a".repeat(100), 1);
+        assert_ne!(out, "");
+        assert!(out.contains("chars elided"));
+    }
+
+    #[test]
+    fn build_summary_input_is_empty_for_an_empty_range() {
+        let messages = make_conversation(2);
+        let split = SummarySplit {
+            summarize_from: 1,
+            summarize_to: 1,
+        };
+        assert_eq!(
+            build_summary_input(&messages, &split, 1_000),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn build_summary_input_keeps_the_newest_message_at_the_boundary() {
+        let messages = vec![
+            make_user_text("a".repeat(400).as_str()),
+            make_user_text("b".repeat(400).as_str()),
+            make_user_text("c".repeat(400).as_str()),
+        ];
+        let split = SummarySplit {
+            summarize_from: 0,
+            summarize_to: 3,
+        };
+        let all = build_summary_input(&messages, &split, 1_000);
+        assert_eq!(all.len(), 3);
+        // Exactly two messages' worth of chars: drops the oldest, keeps the
+        // newest.
+        let two = build_summary_input(&messages, &split, 250);
+        assert_eq!(two.len(), 2);
+        assert_eq!(two.last(), all.last());
+    }
+
+    #[test]
+    fn extract_recent_file_paths_ignores_non_read_tools_and_blank_paths() {
+        let messages = vec![
+            Message {
+                role: Role::Assistant,
+                content: MessageContent::ToolCall(crate::types::ToolCall {
+                    id: "write".into(),
+                    name: "Write".into(),
+                    input: serde_json::json!({"file_path": "written.rs"}),
+                }),
+            },
+            Message {
+                role: Role::Assistant,
+                content: MessageContent::ToolCall(crate::types::ToolCall {
+                    id: "blank".into(),
+                    name: "Read".into(),
+                    input: serde_json::json!({"file_path": "  "}),
+                }),
+            },
+        ];
+        let split = SummarySplit {
+            summarize_from: 0,
+            summarize_to: 2,
+        };
+        assert_eq!(
+            extract_recent_file_paths(&messages, &split, 5),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn reactive_compact_omits_the_boundary_when_nothing_is_skipped() {
+        let messages = vec![
+            make_user_text("anchor"),
+            make_assistant_text("reply"),
+            make_user_text("next"),
+            make_assistant_text("reply"),
+        ];
+        // keep 2 of 2 turns: user_indices.len() == keep + 1 is a no-op.
+        let result = reactive_compact(&messages, 2);
+        assert!(!result.boundary_inserted);
+        assert_eq!(result.messages.len(), messages.len());
+    }
+
+    #[test]
+    fn reactive_compact_keeps_exactly_keep_plus_one_turns() {
+        let messages = vec![
+            make_user_text("anchor"),
+            make_assistant_text("a"),
+            make_user_text("second"),
+            make_assistant_text("b"),
+            make_user_text("third"),
+            make_assistant_text("c"),
+        ];
+        // Three user messages with keep_recent_turns = 2: len == keep + 1, so
+        // this is still the no-op branch.
+        let result = reactive_compact(&messages, 2);
+        assert_eq!(result.messages.len(), messages.len());
+        assert!(!result.boundary_inserted);
+    }
+
+    #[test]
+    fn reactive_compact_boundary_needs_a_real_gap() {
+        // A leading assistant message makes the anchor index 1; the first
+        // kept turn starts at index 2, which is *adjacent* to the anchor.
+        let messages = vec![
+            make_assistant_text("prelude"),
+            make_user_text("anchor"),
+            make_assistant_text("tail"),
+            make_user_text("last"),
+        ];
+        let result = reactive_compact(&messages, 1);
+        assert_eq!(
+            content_json(&result.messages[0]),
+            content_json(&messages[0])
+        );
+        assert!(
+            !result.boundary_inserted,
+            "an adjacent tail must not gain a boundary: {:?}",
+            result.messages.len()
+        );
+        assert_eq!(result.messages.len(), messages.len());
+    }
+
+    #[test]
+    fn snip_compact_keeps_the_boundary_only_when_messages_are_dropped() {
+        let messages = vec![
+            make_user_text("anchor"),
+            make_assistant_text("middle"),
+            make_assistant_text("tail"),
+        ];
+        let no_drop = snip_compact(&messages, 1_000);
+        assert!(!no_drop.boundary_inserted);
+        let dropped = snip_compact(&messages, 1);
+        assert!(dropped.boundary_inserted);
+        assert!(matches!(dropped.messages[1].role, Role::System));
+    }
+
+    #[test]
+    fn auto_compact_ignores_assistant_messages_that_are_not_text() {
         let messages = vec![
             make_user_text("start"),
-            make_assistant_text(&"x".repeat(2000)),
-            make_user_text("middle"),
-            make_assistant_text(&"y".repeat(2000)),
+            Message {
+                role: Role::Assistant,
+                content: MessageContent::ToolCall(crate::types::ToolCall {
+                    id: "tc".into(),
+                    name: "Read".into(),
+                    input: serde_json::json!({}),
+                }),
+            },
             make_user_text("end"),
         ];
+        let result = auto_compact(&messages, 1);
+        assert_eq!(result.messages.len(), messages.len());
+    }
 
-        // Low threshold should trigger
-        let result = auto_compact(&messages, 100);
-        assert!(matches!(result.strategy, CompactStrategy::Auto));
+    #[test]
+    fn auto_compact_triggers_at_threshold() {
+        assert!(!should_auto_compact(
+            99,
+            100,
+            &crate::budget::TokenBudget::with_defaults()
+        ));
+        assert!(!should_auto_compact(
+            100,
+            100,
+            &crate::budget::TokenBudget::with_defaults()
+        ));
+        assert!(should_auto_compact(
+            101,
+            100,
+            &crate::budget::TokenBudget::with_defaults()
+        ));
+        let threshold: usize = 100;
+        for tokens in [0, 99, 100, 101, 1_000] {
+            assert_eq!(
+                should_auto_compact(
+                    tokens,
+                    threshold,
+                    &crate::budget::TokenBudget::with_defaults()
+                ),
+                tokens > threshold
+            );
+        }
+    }
+
+    #[test]
+    fn thinking_tokens_include_both_text_and_signature() {
+        use crate::PromptCompiler;
+        let block = crate::types::ThinkingBlock {
+            thinking: "r".repeat(400),
+            signature: "signature-token".into(),
+        };
+        let message = Message {
+            role: Role::Assistant,
+            content: MessageContent::Thinking(block.clone()),
+        };
+        assert_eq!(
+            message_token_estimate(&message),
+            PromptCompiler::estimate_tokens(&block.thinking)
+                + PromptCompiler::estimate_tokens(&block.signature)
+        );
+        // The signature is not free: a message with only a signature still
+        // estimates above zero.
+        let signature_only = Message {
+            role: Role::Assistant,
+            content: MessageContent::Thinking(crate::types::ThinkingBlock {
+                thinking: String::new(),
+                signature: "s".repeat(400),
+            }),
+        };
+        assert!(message_token_estimate(&signature_only) > 0);
+        assert!(
+            message_token_estimate(&message) > message_token_estimate(&signature_only),
+            "the thinking text must add to the estimate"
+        );
+    }
+
+    #[test]
+    fn micro_compact_truncates_every_result_before_keep_recent() {
+        let mut messages = Vec::new();
+        for index in 0..4 {
+            messages.extend(make_tool_exchange(
+                &format!("tc_{index}"),
+                "read",
+                &"x".repeat(40_000),
+            ));
+        }
+        let result = micro_compact(
+            &messages,
+            MicroCompactParams {
+                keep_recent: 1,
+                ..Default::default()
+            },
+        );
+        let truncated = result
+            .messages
+            .iter()
+            .filter_map(|message| match &message.content {
+                MessageContent::ToolResult(tool) => Some(tool.output.contains("tokens elided")),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(truncated, vec![true, true, true, false], "{truncated:?}");
     }
 
     #[test]
@@ -1280,6 +1579,191 @@ mod tests {
         if let MessageContent::Text(s) = &first.content {
             assert_eq!(s, "must preserve this");
         }
+    }
+
+    #[test]
+    fn auto_compact_below_threshold_is_the_micro_result() {
+        let messages = vec![make_user_text("hello"), make_assistant_text("world")];
+        let micro = micro_compact(&messages, MicroCompactParams::default());
+        let result = auto_compact(&messages, 10000);
+        assert_eq!(result.strategy, CompactStrategy::Micro);
+        assert_eq!(result.messages.len(), micro.messages.len());
+        assert_eq!(result.tokens_removed, micro.tokens_removed);
+    }
+
+    #[test]
+    fn auto_compact_removes_half_of_the_older_assistant_text() {
+        let messages = vec![
+            make_user_text("start"),
+            make_assistant_text(&"a".repeat(400)),
+            make_assistant_text(&"b".repeat(400)),
+            make_assistant_text(&"c".repeat(400)),
+            make_assistant_text(&"d".repeat(400)),
+            make_user_text("end"),
+        ];
+        let result = auto_compact(&messages, 1);
+        assert_eq!(result.strategy, CompactStrategy::Auto);
+        // Four assistant text messages: half (two) are removed.
+        let assistants = result
+            .messages
+            .iter()
+            .filter(|m| matches!(m.role, Role::Assistant))
+            .count();
+        assert_eq!(assistants, 2);
+        assert!(result.tokens_removed > 0);
+    }
+
+    #[test]
+    fn auto_compact_with_one_assistant_text_removes_nothing_else() {
+        let messages = vec![
+            make_user_text("start"),
+            make_assistant_text(&"a".repeat(400)),
+            make_user_text("end"),
+        ];
+        let result = auto_compact(&messages, 1);
+        assert_eq!(
+            result
+                .messages
+                .iter()
+                .filter(|m| matches!(m.role, Role::Assistant))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn reactive_compact_removes_the_middle_and_inserts_a_boundary() {
+        let mut messages = vec![make_user_text("initial query")];
+        for i in 0..10 {
+            messages.push(make_assistant_text(&format!("response {i}").repeat(20)));
+            messages.push(make_user_text(&format!("follow-up {i}")));
+        }
+        let result = reactive_compact(&messages, 2);
+        assert!(result.boundary_inserted);
+        assert_eq!(result.boundary_index, Some(1));
+        assert!(
+            result
+                .messages
+                .iter()
+                .any(|m| matches!(m.role, Role::System)
+                    && matches!(&m.content, MessageContent::Text(t)
+                    if t.contains("<coderex_compact_boundary>")))
+        );
+        // The first user message and the last two turns survive.
+        assert_eq!(
+            content_json(&result.messages[0]),
+            content_json(&messages[0])
+        );
+        assert_eq!(
+            content_json(result.messages.last().unwrap()),
+            content_json(messages.last().unwrap())
+        );
+        assert!(result.tokens_removed > 0);
+    }
+
+    #[test]
+    fn reactive_compact_with_few_turns_is_a_no_op() {
+        let messages = vec![
+            make_user_text("one"),
+            make_assistant_text("reply"),
+            make_user_text("two"),
+            make_assistant_text("reply"),
+        ];
+        let result = reactive_compact(&messages, 3);
+        assert_eq!(result.messages.len(), messages.len());
+        assert!(
+            result
+                .messages
+                .iter()
+                .zip(&messages)
+                .all(|(left, right)| left.role == right.role
+                    && content_json(left) == content_json(right))
+        );
+        assert_eq!(result.tokens_removed, 0);
+        assert!(!result.boundary_inserted);
+    }
+
+    #[test]
+    fn reactive_compact_always_preserves_the_first_user_message() {
+        let messages = vec![
+            make_assistant_text("prelude"),
+            make_user_text("anchor"),
+            make_assistant_text(&"x".repeat(1000)),
+            make_user_text("later"),
+            make_assistant_text(&"y".repeat(1000)),
+            make_user_text("latest"),
+        ];
+        let result = reactive_compact(&messages, 1);
+        assert_eq!(
+            content_json(&result.messages[0]),
+            content_json(&messages[1])
+        );
+        assert_eq!(
+            result.messages[1].role,
+            Role::System,
+            "a boundary must separate the anchor from the tail"
+        );
+    }
+
+    #[test]
+    fn snip_compact_stops_after_accumulating_the_target() {
+        let messages = vec![
+            make_user_text("anchor"),
+            make_assistant_text(&"a".repeat(100)),
+            make_assistant_text(&"b".repeat(100)),
+            make_assistant_text(&"c".repeat(100)),
+        ];
+        let result = snip_compact(&messages, 30);
+        assert!(result.boundary_inserted);
+        // The tail is the smallest suffix that reaches the target.
+        assert_eq!(
+            content_json(&result.messages[0]),
+            content_json(&messages[0])
+        );
+        assert_eq!(
+            content_json(result.messages.last().unwrap()),
+            content_json(messages.last().unwrap())
+        );
+        assert!(result.messages.len() < messages.len());
+    }
+
+    #[test]
+    fn snip_compact_at_the_target_is_a_no_op() {
+        let messages = vec![
+            make_user_text("anchor"),
+            make_assistant_text(&"a".repeat(100)),
+        ];
+        let tokens = total_token_estimate(&messages);
+        let result = snip_compact(&messages, tokens);
+        assert_eq!(result.messages.len(), messages.len());
+        assert!(
+            result
+                .messages
+                .iter()
+                .zip(&messages)
+                .all(|(left, right)| left.role == right.role
+                    && content_json(left) == content_json(right))
+        );
+        assert!(!result.boundary_inserted);
+    }
+
+    #[test]
+    fn boundary_insertion_is_clamped_to_the_list() {
+        let mut messages = vec![make_user_text("a")];
+        insert_compact_boundary(&mut messages, 0);
+        assert!(matches!(messages[0].role, Role::System));
+        assert_eq!(messages.len(), 2);
+        insert_compact_boundary(&mut messages, usize::MAX);
+        assert!(matches!(messages.last().unwrap().role, Role::System));
+        assert_eq!(messages.len(), 3);
+    }
+
+    #[test]
+    fn insert_compact_boundary_messages_adds_a_boundary() {
+        let mut messages = Vec::new();
+        insert_compact_boundary_messages(&mut messages);
+        assert_eq!(messages.len(), 1);
+        assert!(matches!(messages[0].role, Role::System));
     }
 
     #[test]
@@ -1531,6 +2015,137 @@ mod tests {
         let split = summary_split(&messages, 3);
         // Nothing to summarize: tail covers everything after the head.
         assert!(split.summarize_from >= split.summarize_to);
+    }
+
+    #[test]
+    fn summary_split_without_a_user_message_starts_at_zero() {
+        let messages = vec![make_assistant_text("only a reply")];
+        let split = summary_split(&messages, 3);
+        assert_eq!(split.summarize_from, 0);
+        assert_eq!(split.summarize_to, 0);
+    }
+
+    #[test]
+    fn the_first_user_index_is_found_after_a_leading_assistant() {
+        let messages = vec![
+            make_assistant_text("prelude"),
+            make_user_text("first user"),
+            make_user_text("second user"),
+        ];
+        assert_eq!(first_user_index(&messages), Some(1));
+        assert_eq!(first_user_index(&[make_assistant_text("x")]), None);
+    }
+
+    #[test]
+    fn summary_rendering_describes_each_message_kind() {
+        let tool_call = MessageContent::ToolCall(crate::types::ToolCall {
+            id: "tc_1".into(),
+            name: "Read".into(),
+            input: serde_json::json!({"file_path": "src/lib.rs"}),
+        });
+        let rendered = render_message_for_summary(&Message {
+            role: Role::Assistant,
+            content: tool_call,
+        });
+        assert!(rendered.contains("tool call"), "{rendered}");
+        assert!(rendered.contains("Read"), "{rendered}");
+
+        let result = render_message_for_summary(&Message::tool(ToolResult {
+            tool_call_id: "tc_1".into(),
+            output: "x".repeat(5000),
+            is_error: false,
+            images: Vec::new(),
+        }));
+        assert!(result.contains("tool result for tc_1"), "{result}");
+        assert!(result.contains("chars elided"), "{result}");
+
+        let thinking = render_message_for_summary(&Message {
+            role: Role::Assistant,
+            content: MessageContent::Thinking(crate::types::ThinkingBlock {
+                thinking: "hidden".into(),
+                signature: String::new(),
+            }),
+        });
+        assert!(thinking.is_empty(), "thinking must not be summarized");
+    }
+
+    #[test]
+    fn build_summary_input_drops_old_messages_from_the_front() {
+        let messages = make_conversation(6);
+        let split = summary_split(&messages, 3);
+        let input = build_summary_input(&messages, &split, 1_000);
+        let tiny = build_summary_input(&messages, &split, 10);
+        assert!(!input.is_empty());
+        assert!(tiny.len() <= input.len());
+        assert!(
+            tiny.is_empty() || tiny.last() == input.last(),
+            "the newest message must be kept"
+        );
+    }
+
+    #[test]
+    fn assemble_summary_result_without_a_head_has_no_boundary() {
+        let messages = vec![make_user_text("anchor"), make_assistant_text("reply")];
+        let split = SummarySplit {
+            summarize_from: 0,
+            summarize_to: 0,
+        };
+        let result = assemble_summary_result(&messages, &split, "summary", 10, 5);
+        assert!(
+            !result
+                .messages
+                .iter()
+                .any(|m| matches!(m.role, Role::System))
+        );
+        assert_eq!(result.boundary_index, Some(0));
+    }
+
+    #[test]
+    fn truncate_middle_keeps_the_head_and_tail() {
+        let text = format!("{}MIDDLE{}", "h".repeat(400), "t".repeat(200));
+        let truncated = truncate_middle(&text, 120);
+        assert!(truncated.starts_with('h'));
+        assert!(truncated.ends_with('t'));
+        assert!(truncated.contains("chars elided"));
+        assert!(truncated.chars().count() < text.chars().count());
+    }
+
+    #[test]
+    fn truncate_middle_passes_short_text_through() {
+        assert_eq!(truncate_middle("short", 100), "short");
+        assert_eq!(truncate_middle("", 100), "");
+    }
+
+    #[test]
+    fn extract_recent_file_paths_stops_at_the_interval() {
+        let messages = vec![
+            make_user_text("anchor"),
+            Message {
+                role: Role::Assistant,
+                content: MessageContent::ToolCall(crate::types::ToolCall {
+                    id: "before".into(),
+                    name: "Read".into(),
+                    input: serde_json::json!({"file_path": "outside.rs"}),
+                }),
+            },
+            Message {
+                role: Role::Assistant,
+                content: MessageContent::ToolCall(crate::types::ToolCall {
+                    id: "inside".into(),
+                    name: "Read".into(),
+                    input: serde_json::json!({"file_path": "inside.rs"}),
+                }),
+            },
+        ];
+        let split = SummarySplit {
+            summarize_from: 2,
+            summarize_to: 3,
+        };
+        assert_eq!(
+            extract_recent_file_paths(&messages, &split, 5),
+            vec!["inside.rs".to_string()]
+        );
+        assert!(extract_recent_file_paths(&messages, &split, 0).is_empty());
     }
 
     #[test]

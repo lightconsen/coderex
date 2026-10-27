@@ -27,6 +27,11 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
+# Debug info makes each mutant rebuild much larger and slower; mutation runs
+# only need test pass/fail. Callers can override these if they need backtraces.
+export CARGO_PROFILE_TEST_DEBUG="${CARGO_PROFILE_TEST_DEBUG:-0}"
+export CARGO_PROFILE_DEV_DEBUG="${CARGO_PROFILE_DEV_DEBUG:-0}"
+
 scope="${1:-permission-engine}"
 if [[ $# -gt 0 ]]; then
     shift
@@ -92,6 +97,8 @@ fi
 for file in "${files[@]}"; do
     args+=(--file "$file")
 done
+# Caller options must precede the `--` that starts cargo test arguments.
+args+=("$@")
 if [[ -n "${MUTATION_TEST_FILTER:-}" ]]; then
     args+=(-- "$MUTATION_TEST_FILTER")
 fi
@@ -102,7 +109,7 @@ echo "output: target/mutants"
 echo
 
 status=0
-cargo mutants "${args[@]}" "$@" || status=$?
+cargo mutants "${args[@]}" || status=$?
 
 if [[ -d target/mutants/mutants.out ]]; then
     echo

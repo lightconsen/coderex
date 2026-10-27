@@ -1005,6 +1005,105 @@ mod tests {
         let channel = JsonRpcChannel::new("echo", vec![], HashMap::new());
         assert!(!channel.is_initialized());
         assert!(!channel.is_running());
+        assert!(!channel.event_stream_active());
+        let debug = format!("{channel:?}");
+        assert!(debug.contains("echo"), "{debug}");
+    }
+
+    #[derive(Debug)]
+    struct EchoHandler;
+
+    #[async_trait::async_trait]
+    impl InboundRequestHandler for EchoHandler {
+        async fn handle(
+            &self,
+            method: &str,
+            _params: Option<&Value>,
+        ) -> Result<Value, JsonRpcError> {
+            Ok(serde_json::json!({ "method": method }))
+        }
+    }
+
+    #[tokio::test]
+    async fn shared_inbound_handler_install_clear_and_answer() {
+        let slot = SharedInboundHandler::new();
+        assert!(!slot.has_handler());
+        let error = slot
+            .handle("elicitation/create", None)
+            .await
+            .expect_err("an empty slot must refuse");
+        assert_eq!(error.code, METHOD_NOT_FOUND);
+
+        slot.install(std::sync::Arc::new(EchoHandler));
+        assert!(slot.has_handler());
+        let answer = slot
+            .handle("elicitation/create", None)
+            .await
+            .expect("installed handler answers");
+        assert_eq!(answer["method"], "elicitation/create");
+
+        slot.clear();
+        assert!(!slot.has_handler());
+        assert!(slot.handle("elicitation/create", None).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn set_inbound_handler_reaches_the_channel() {
+        let mut channel = JsonRpcChannel::new("echo", vec![], HashMap::new());
+        assert!(channel.handler.is_none());
+        channel.set_inbound_handler(std::sync::Arc::new(EchoHandler));
+        assert!(channel.handler.is_some());
+    }
+
+    #[tokio::test]
+    async fn http_channel_exposes_its_stream_state() {
+        let mut channel = JsonRpcChannel::new_http("http://127.0.0.1:9/mcp", HashMap::new())
+            .expect("http channel");
+        // No stream has been started yet.
+        assert!(!channel.event_stream_active());
+        assert!(channel.event_stream_state().is_some());
+        // Stopping a stream that never started is a no-op, not a panic.
+        channel.stop_event_stream().await;
+        assert!(!channel.event_stream_active());
+        assert!(channel.session_id().is_none());
+        let _ = channel.terminate().await;
+    }
+
+    #[tokio::test]
+    async fn a_stdio_channel_has_no_stream_state() {
+        let channel = JsonRpcChannel::new("echo", vec![], HashMap::new());
+        assert!(channel.event_stream_state().is_none());
+        assert!(!channel.event_stream_active());
+    }
+
+    #[tokio::test]
+    async fn set_notification_handler_reaches_the_channel() {
+        #[derive(Debug)]
+        struct Sink;
+        #[async_trait::async_trait]
+        impl ServerNotificationHandler for Sink {
+            async fn handle_notification(&self, _method: &str, _params: Option<&Value>) {}
+        }
+        let mut channel = JsonRpcChannel::new("echo", vec![], HashMap::new());
+        assert!(channel.notification_handler.is_none());
+        channel.set_notification_handler(std::sync::Arc::new(Sink));
+        assert!(channel.notification_handler.is_some());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_notification_is_written_as_one_json_line() {
+        let mut channel = JsonRpcChannel::new("cat", vec![], HashMap::new());
+        channel.spawn().await.unwrap();
+        channel
+            .send_notification("initialized", None)
+            .await
+            .expect("notification");
+        let line = read_child_line(&mut channel).await;
+        let value: Value = serde_json::from_str(&line).expect("json line");
+        assert_eq!(value["method"], "initialized");
+        assert!(value.get("id").is_none(), "{value}");
+        let _ = channel.terminate().await;
     }
 
     #[tokio::test]

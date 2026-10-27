@@ -326,13 +326,7 @@ impl PermissionEngine {
         // The caller may have supplied only a path; add it to the subjects so
         // programmatic callers keep their path rules working.
         if let Some(path) = request.path.as_ref() {
-            let raw = path.to_string_lossy().to_string();
-            let present = subjects
-                .iter()
-                .any(|subject| subject.forms.iter().any(|form| form == &raw));
-            if !present {
-                subjects.push(RuleSubject::single(raw));
-            }
+            add_request_path(&mut subjects, path);
         }
         let result = {
             let checker = self.checker.lock().unwrap();
@@ -717,6 +711,17 @@ impl PermissionHook for AutoClassifierHook {
     }
 }
 
+/// Add a programmatic caller's `path` to the rule subjects once.
+fn add_request_path(subjects: &mut Vec<RuleSubject>, path: &std::path::Path) {
+    let raw = path.to_string_lossy().to_string();
+    let present = subjects
+        .iter()
+        .any(|subject| subject.forms.iter().any(|form| form == &raw));
+    if !present {
+        subjects.push(RuleSubject::single(raw));
+    }
+}
+
 /// Parse the shell command carried by a shell tool call, if present.
 ///
 /// Tool arguments in any other tool are data, not a command to analyze.
@@ -813,6 +818,29 @@ mod tests {
         assert!(matches!(result, Some(PermissionResult::Deny { .. })));
     }
 
+    #[tokio::test]
+    async fn background_agent_deny_hook_ignores_interactive_context() {
+        let hook = BackgroundAgentDenyHook;
+        for context in [
+            HashMap::new(),
+            HashMap::from([("execution_mode".to_string(), "interactive".to_string())]),
+        ] {
+            let request = PermissionRequest {
+                id: "test_interactive".into(),
+                tool_name: "bash".into(),
+                arguments: "{}".into(),
+                path: None,
+                context,
+                created_at: Utc::now(),
+            };
+            let result = hook
+                .evaluate(&request, PermissionMode::Default)
+                .await
+                .unwrap();
+            assert!(result.is_none(), "interactive context was denied");
+        }
+    }
+
     #[test]
     fn pending_store_add_resolve() {
         let mut store = PendingPermissionStore::new(None);
@@ -847,6 +875,102 @@ mod tests {
         assert_eq!(pending[0].id, "test_1");
         store.resolve("test_1", PermissionResponse::Approved);
         assert!(store.pending().is_empty());
+    }
+
+    #[test]
+    fn pending_count_tracks_the_store() {
+        let mut store = PendingPermissionStore::new(None);
+        assert_eq!(store.pending_count(), 0);
+        store.add(make_request("bash"));
+        let mut second = make_request("read");
+        second.id = "test_2".into();
+        store.add(second);
+        assert_eq!(store.pending_count(), 2);
+        store.resolve("test_1", PermissionResponse::Approved);
+        assert_eq!(store.pending_count(), 1);
+    }
+
+    #[test]
+    fn the_engine_reports_its_pending_count() {
+        let mut engine = PermissionEngine::new(PermissionChecker::new(PermissionMode::Default));
+        assert_eq!(engine.pending_count(), 0);
+        engine.pending.add(make_request("bash"));
+        assert_eq!(engine.pending_count(), 1);
+        let mut second = make_request("read");
+        second.id = "test_2".into();
+        engine.pending.add(second);
+        assert_eq!(engine.pending_count(), 2);
+        engine
+            .pending
+            .resolve("test_1", PermissionResponse::Approved);
+        assert_eq!(engine.pending_count(), 1);
+    }
+
+    #[test]
+    fn adding_a_request_path_is_idempotent() {
+        let mut subjects = Vec::new();
+        add_request_path(&mut subjects, std::path::Path::new("./src/lib.rs"));
+        add_request_path(&mut subjects, std::path::Path::new("./src/lib.rs"));
+        assert_eq!(subjects.len(), 1);
+        add_request_path(&mut subjects, std::path::Path::new("./src/main.rs"));
+        assert_eq!(subjects.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn approving_for_the_session_records_the_tool() {
+        let mut engine = PermissionEngine::new(PermissionChecker::new(PermissionMode::Default));
+        engine.pending.add(make_request("bash"));
+        engine
+            .respond("test_1", PermissionResponse::ApproveSession)
+            .unwrap();
+        let checker = engine.checker();
+        assert!(matches!(
+            checker.lock().unwrap().check("bash", None),
+            PermissionResult::Allow
+        ));
+    }
+
+    #[tokio::test]
+    async fn denying_does_not_record_a_session_approval() {
+        let mut engine = PermissionEngine::new(PermissionChecker::new(PermissionMode::Default));
+        engine.pending.add(make_request("bash"));
+        engine
+            .respond("test_1", PermissionResponse::Denied)
+            .unwrap();
+        let checker = engine.checker();
+        assert!(matches!(
+            checker.lock().unwrap().check("bash", None),
+            PermissionResult::Ask { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn respond_reports_a_persist_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut engine = PermissionEngine::new(PermissionChecker::new(PermissionMode::Default));
+        engine.set_persist_path(dir.path().join("missing/pending.json"));
+        engine.pending.add(make_request("bash"));
+        assert!(
+            engine
+                .respond("test_1", PermissionResponse::Approved)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn shell_security_only_inspects_shell_tools() {
+        assert!(shell_security_in("Read", r#"{"command":"rm -rf /"}"#).is_none());
+        assert!(shell_security_in("bash", r#"{"command":"ls"}"#).is_some());
+        assert!(privilege_escalation_in("Read", r#"{"command":"sudo ls"}"#).is_none());
+        assert_eq!(
+            privilege_escalation_in("bash", r#"{"command":"sudo ls"}"#).as_deref(),
+            Some("sudo")
+        );
+        assert_eq!(
+            privilege_escalation_in("powershell", r#"{"command":"sudo ls"}"#).as_deref(),
+            Some("sudo")
+        );
+        assert!(privilege_escalation_in("bash", r#"{"command":"ls"}"#).is_none());
     }
 
     #[test]
@@ -1012,7 +1136,8 @@ mod tests {
             }
         }
 
-        let hook = ExplainPermissionHook::new(Box::new(MockApiClient));
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let hook = ExplainPermissionHook::new_with_event_tx(Box::new(MockApiClient), event_tx);
         let request = make_request("Write");
         let result = hook
             .evaluate(&request, PermissionMode::Default)
@@ -1020,6 +1145,15 @@ mod tests {
             .unwrap();
         // Should always pass through (not short-circuit)
         assert!(result.is_none());
+        let event = event_rx.recv().await.expect("explanation event");
+        assert!(
+            matches!(
+                event,
+                crate::types::EngineEvent::PermissionExplanation { ref tool, .. }
+                    if tool == "Write"
+            ),
+            "{event:?}"
+        );
     }
 
     #[tokio::test]

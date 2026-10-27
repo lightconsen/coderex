@@ -353,6 +353,8 @@ mod tests {
             "./sh",
             dir.path()
         ));
+        assert!(guard_program_origin("./sh", dir.path()).is_err());
+        assert!(guard_program_origin("/bin/sh", dir.path()).is_ok());
     }
 }
 
