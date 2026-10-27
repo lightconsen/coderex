@@ -230,13 +230,22 @@ keywords have their inner command recovered as an additional segment, so a deny
 rule still sees what they will run. For **deny/ask**, matching any segment
 applies to the whole call. For **allow**, every segment must be covered by at
 least one allow rule (rules compose), so `cd repo && git diff` is not
-auto-approved by a rule that only covers `git diff`. `PowerShell(...)` and `pwsh(...)` use the same command
-semantics as `Bash(...)`: `:*` prefix matching, per-segment matching over `;`/
-`|`/`&&`, and the same opaque analysis. PowerShell-specific wrappers and
-cmdlets (`Start-Process`, `Invoke-Expression`/`iex`, `Invoke-Command`,
-`Start-Job`, `cmd`, ...) are treated as opaque rather than modelled. The
+auto-approved by a rule that only covers `git diff`. `PowerShell(...)` and
+`pwsh(...)` use the same command semantics as `Bash(...)`: `:*` prefix
+matching, per-segment matching over `;`/`|`/`&&`, and the same opaque
+analysis. PowerShell-specific wrappers and cmdlets (`Start-Process`,
+`Invoke-Expression`/`iex`, `Invoke-Command`, `Start-Job`, `cmd`, ...) are
+treated as opaque rather than modelled. Script blocks (`ForEach-Object { ... }`,
+`Where-Object { ... }`), the `&` call operator and `-EncodedCommand` are opaque
+too; their inner text is still split into segments so a deny rule can see a
+command inside the block, but an allow rule never auto-approves it. The
 `PowerShell` tool runs `pwsh -NoProfile -NonInteractive -Command ...` with the
 same sanitized environment as Bash.
+
+Wrappers whose arguments run another command are recovered for deny matching:
+`awk` `system(...)`/`| "cmd"`, `sed`'s `e` command, `docker`/`podman exec`,
+`kubectl exec`, and `ssh host command`. They remain opaque, so allow rules do
+not approve them automatically.
 
 A construct the analysis cannot fully model — shell functions/aliases, `source`,
 `eval`, control flow, directly executed scripts (`./deploy.sh`), nested

@@ -2044,9 +2044,16 @@ mod subject_tests {
             &json!({"command": "Get-ChildItem | Where-Object { $_.Name -eq 'x' }"}),
             std::path::Path::new("/proj"),
         );
-        assert_eq!(subjects.len(), 2, "{subjects:?}");
+        assert!(subjects.len() >= 2, "{subjects:?}");
         assert!(
-            subjects.iter().all(|subject| subject.opaque.is_none()),
+            subjects.iter().all(|subject| subject.opaque.is_some()),
+            "a script block must fail closed: {subjects:?}"
+        );
+        assert!(
+            subjects.iter().any(|subject| subject
+                .forms
+                .iter()
+                .any(|form| form.starts_with("Where-Object"))),
             "{subjects:?}"
         );
 

@@ -270,6 +270,10 @@ fn opaque_reason(command: &str, segments: &[String]) -> Option<String> {
         "php",
         "lua",
         "osascript",
+        "awk",
+        "gawk",
+        "mawk",
+        "sed",
         "pwsh",
         "powershell",
         "cmd",
@@ -299,6 +303,17 @@ fn opaque_reason(command: &str, segments: &[String]) -> Option<String> {
             "command substitution, process substitution or a here-document cannot be fully analyzed"
                 .to_string(),
         );
+    }
+    if trimmed.to_ascii_lowercase().contains("-encodedcommand") {
+        return Some(
+            "PowerShell -EncodedCommand hides the command from static analysis".to_string(),
+        );
+    }
+    if has_script_block(trimmed) {
+        return Some("a shell/PowerShell script block cannot be fully analyzed".to_string());
+    }
+    if trimmed.starts_with('&') && !trimmed.starts_with("&&") {
+        return Some("the PowerShell call operator can execute a dynamic command".to_string());
     }
 
     for segment in segments {
@@ -421,7 +436,75 @@ fn collect_segments(command: &str, out: &mut Vec<String>) {
         for nested in nested_scripts(stage) {
             collect_segments(&nested, out);
         }
+        for block in script_block_scripts(stage) {
+            collect_segments(&block, out);
+        }
     }
+}
+
+/// Text inside `{ ... }` blocks that look like command groups, not brace
+/// expansion. A block must contain whitespace or a command separator; `{1..3}`
+/// and `${VAR}` are not blocks.
+fn script_block_scripts(input: &str) -> Vec<String> {
+    let chars: Vec<char> = input.chars().collect();
+    let mut blocks = Vec::new();
+    let mut index = 0;
+    let mut quote: Option<char> = None;
+    while index < chars.len() {
+        let ch = chars[index];
+        if ch == '\\' && quote != Some('\'') {
+            index += 2;
+            continue;
+        }
+        if let Some(active) = quote {
+            if ch == active {
+                quote = None;
+            }
+            index += 1;
+            continue;
+        }
+        if ch == '\'' || ch == '"' {
+            quote = Some(ch);
+            index += 1;
+            continue;
+        }
+        if ch == '{' && chars.get(index.wrapping_sub(1)) != Some(&'$') {
+            let mut depth = 1;
+            let mut cursor = index + 1;
+            let mut inner = String::new();
+            while cursor < chars.len() && depth > 0 {
+                match chars[cursor] {
+                    '{' => {
+                        depth += 1;
+                        inner.push('{');
+                    }
+                    '}' => {
+                        depth -= 1;
+                        if depth > 0 {
+                            inner.push('}');
+                        }
+                    }
+                    other => inner.push(other),
+                }
+                cursor += 1;
+            }
+            if depth == 0
+                && (inner.contains(char::is_whitespace)
+                    || inner.contains(';')
+                    || inner.contains('|'))
+            {
+                blocks.push(inner.trim().to_string());
+            }
+            index = cursor;
+            continue;
+        }
+        index += 1;
+    }
+    blocks
+}
+
+fn has_script_block(input: &str) -> bool {
+    !script_block_scripts(input).is_empty()
 }
 
 /// The command after `find ... -exec` / `-ok`.
@@ -484,6 +567,28 @@ fn wrapper_script(stage: &str) -> Option<String> {
         "nice" | "ionice" | "nohup" | "command" | "builtin" | "exec" | "stdbuf" | "xargs"
         | "parallel" => after_options(args, &["-n", "-P", "-I", "-L", "-s", "-a", "-d", "-E"]),
         "watch" => after_options(args, &["-n", "-d", "-q", "-t"]),
+        "ssh" => {
+            let rest = after_options(
+                args,
+                &[
+                    "-p", "-i", "-L", "-R", "-D", "-o", "-F", "-J", "-l", "-c", "-m", "-s", "-w",
+                    "-b", "-E", "-e",
+                ],
+            );
+            rest.get(1..).unwrap_or_default()
+        }
+        "docker" | "podman" => {
+            return join_tokens(container_exec_command(args));
+        }
+        "kubectl" => {
+            return join_tokens(kubectl_exec_command(args));
+        }
+        "awk" | "gawk" | "mawk" => {
+            return awk_program_command(args);
+        }
+        "sed" => {
+            return sed_script_command(args);
+        }
         "script" => {
             if let Some(index) = args.iter().position(|token| token == "-c") {
                 return args.get(index + 1).map(|token| unquote(token));
@@ -516,6 +621,186 @@ fn after_options<'a>(args: &'a [String], value_options: &[&str]) -> &'a [String]
         break;
     }
     args.get(index..).unwrap_or_default()
+}
+
+fn join_tokens(tokens: Option<Vec<String>>) -> Option<String> {
+    let tokens: Vec<String> = tokens?.iter().map(|token| unquote(token)).collect();
+    (!tokens.is_empty()).then(|| tokens.join(" "))
+}
+
+/// `docker exec [opts] CONTAINER COMMAND ...` / `podman exec`.
+fn container_exec_command(args: &[String]) -> Option<Vec<String>> {
+    let index = args.iter().position(|token| token == "exec")?;
+    let rest = after_options(
+        &args[index + 1..],
+        &[
+            "-u",
+            "--user",
+            "-w",
+            "--workdir",
+            "-e",
+            "--env",
+            "--env-file",
+            "--detach-keys",
+        ],
+    );
+    Some(rest.get(1..)?.to_vec())
+}
+
+/// `kubectl exec [opts] POD -- COMMAND ...` (or the no-`--` spelling).
+fn kubectl_exec_command(args: &[String]) -> Option<Vec<String>> {
+    let index = args.iter().position(|token| token == "exec")?;
+    let rest = &args[index + 1..];
+    if let Some(separator) = rest.iter().position(|token| token == "--") {
+        return Some(rest[separator + 1..].to_vec());
+    }
+    let rest = after_options(
+        rest,
+        &[
+            "-c",
+            "-n",
+            "--container",
+            "--namespace",
+            "--context",
+            "--kubeconfig",
+            "-f",
+        ],
+    );
+    Some(rest.get(1..)?.to_vec())
+}
+
+/// The command an awk program runs through `system(...)` or `| "cmd"`.
+fn awk_program_command(args: &[String]) -> Option<String> {
+    let mut index = 0;
+    while index < args.len() {
+        let token = &args[index];
+        match token.as_str() {
+            "-f" | "--file" => return None,
+            "-v" | "-F" | "--field-separator" => {
+                index += 2;
+                continue;
+            }
+            other if other.starts_with("-f") || other.starts_with("-v") => {
+                index += 1;
+                continue;
+            }
+            other if other.starts_with('-') => {
+                index += 1;
+                continue;
+            }
+            _ => {}
+        }
+        let program = unquote(token);
+        return awk_exec_in(&program);
+    }
+    None
+}
+
+fn awk_exec_in(program: &str) -> Option<String> {
+    if let Some(index) = program.find("system") {
+        let rest = &program[index + "system".len()..];
+        let rest = rest.trim_start().strip_prefix('(')?;
+        if let Some(command) = quoted_prefix(rest.trim_start()) {
+            return Some(command);
+        }
+    }
+    // `print ... | "command"` and `getline ... | "command"`.
+    let (_, after) = program.split_once('|')?;
+    quoted_prefix(after.trim_start())
+}
+
+/// A quoted string at the start of `text`, with backslash escapes resolved.
+fn quoted_prefix(text: &str) -> Option<String> {
+    let mut chars = text.chars();
+    let quote = chars.next()?;
+    if quote != '\'' && quote != '"' {
+        return None;
+    }
+    let mut out = String::new();
+    let mut escaped = false;
+    for ch in chars {
+        if escaped {
+            out.push(ch);
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if ch == quote {
+            return Some(out);
+        }
+        out.push(ch);
+    }
+    None
+}
+
+/// Commands a sed script runs with the `e` command.
+fn sed_script_command(args: &[String]) -> Option<String> {
+    let mut scripts = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "-f" | "--file" => return None,
+            "-e" | "--expression" => {
+                scripts.push(args.get(index + 1).cloned().unwrap_or_default());
+                index += 2;
+                continue;
+            }
+            token if token.starts_with("--expression=") => {
+                scripts.push(token["--expression=".len()..].to_string());
+                index += 1;
+                continue;
+            }
+            token if token.starts_with('-') => {
+                index += 1;
+                continue;
+            }
+            _ => {
+                scripts.push(args[index].clone());
+                index += 1;
+            }
+        }
+    }
+    for script in scripts {
+        let script = unquote(&script);
+        if let Some(command) = sed_exec_in(&script) {
+            return Some(command);
+        }
+    }
+    None
+}
+
+fn sed_exec_in(script: &str) -> Option<String> {
+    for part in script.split([';', '\n']) {
+        let mut rest = part.trim();
+        // Strip a simple address (`1`, `$`, `/regex/`, `1,5`, `!`).
+        loop {
+            let Some(ch) = rest.chars().next() else {
+                break;
+            };
+            if ch.is_ascii_digit() || ch == '$' || ch == '!' || ch.is_whitespace() {
+                rest = &rest[ch.len_utf8()..];
+                continue;
+            }
+            if ch == '/' {
+                let Some(end) = rest[1..].find('/') else {
+                    break;
+                };
+                rest = &rest[end + 2..];
+                continue;
+            }
+            break;
+        }
+        if let Some(command) = rest.strip_prefix('e') {
+            let command = command.strip_prefix(' ').unwrap_or(command).trim();
+            if !command.is_empty() {
+                return Some(command.to_string());
+            }
+        }
+    }
+    None
 }
 
 /// Skip `NAME=value` assignment tokens (used by `env` and `sudo`).
@@ -1310,6 +1595,8 @@ mod command_analysis_tests {
             "a; b || c | d",
             "echo ok 2>&1",
             "echo 'a && b'",
+            "echo {1..3}",
+            "echo ${HOME}",
         ] {
             assert!(
                 analyze_command(command).opaque.is_none(),
@@ -1334,6 +1621,16 @@ mod command_analysis_tests {
             ("time rm -rf /tmp/x", "rm -rf /tmp/x"),
             ("time -p rm -rf /tmp/x", "rm -rf /tmp/x"),
             ("! rm -rf /tmp/x", "rm -rf /tmp/x"),
+            ("docker exec ctr rm -rf /data", "rm -rf /data"),
+            ("podman exec -it ctr rm -rf /data", "rm -rf /data"),
+            ("kubectl exec pod -- rm -rf /data", "rm -rf /data"),
+            ("ssh host rm -rf /data", "rm -rf /data"),
+            ("awk 'BEGIN { system(\"rm -rf /data\") }'", "rm -rf /data"),
+            ("sed '1e rm -rf /data' file.txt", "rm -rf /data"),
+            (
+                "Get-ChildItem | ForEach-Object { Remove-Item -Recurse C:\\x }",
+                "Remove-Item -Recurse C:\\x",
+            ),
         ] {
             let analysis = analyze_command(command);
             assert!(
@@ -1370,6 +1667,9 @@ mod command_analysis_tests {
             "./deploy.sh",
             "cat <<EOF\nrm -rf /tmp/x\nEOF",
             "cat <(rm -rf /tmp/x)",
+            "powershell -EncodedCommand ZgBvAG8A",
+            "& 'Remove-Item' x",
+            "Get-ChildItem | ForEach-Object { Remove-Item x }",
         ] {
             let analysis = analyze_command(command);
             assert!(
