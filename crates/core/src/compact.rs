@@ -922,6 +922,7 @@ pub fn file_restore_message(paths: &[String]) -> Option<Message> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     fn make_tool_result(output: &str) -> Message {
         Message::tool(ToolResult {
@@ -1730,5 +1731,57 @@ mod tests {
             Duration::ZERO,
             early
         ));
+    }
+
+    fn level_rank(level: ContextLevel) -> u8 {
+        match level {
+            ContextLevel::Ok => 0,
+            ContextLevel::Warn => 1,
+            ContextLevel::Compact => 2,
+            ContextLevel::Blocked => 3,
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn threshold_lines_stay_ordered_for_realistic_windows(
+            window in 20_000usize..1_000_000,
+        ) {
+            let thresholds = CompactThresholds::resolve_for_window(
+                &CompactConfig::default(),
+                window,
+            );
+            prop_assert!(thresholds.warn <= thresholds.auto, "{thresholds:?}");
+            prop_assert!(thresholds.auto <= thresholds.blocked, "{thresholds:?}");
+            prop_assert!(thresholds.blocked <= window, "{thresholds:?}");
+        }
+
+        #[test]
+        fn context_level_is_monotonic_in_estimated_tokens(
+            window in 20_000usize..1_000_000,
+            first in 0usize..1_000_000,
+            delta in 0usize..100_000,
+        ) {
+            let thresholds = CompactThresholds::resolve_for_window(
+                &CompactConfig::default(),
+                window,
+            );
+            let second = first.saturating_add(delta);
+            prop_assert!(
+                level_rank(thresholds.level(first)) <= level_rank(thresholds.level(second)),
+                "window={window} first={first} second={second} thresholds={thresholds:?}"
+            );
+        }
+
+        #[test]
+        fn max_tokens_always_selects_reactive_compaction(tokens in 0usize..1_000_000) {
+            let strategy = select_compact_strategy(
+                "max_tokens",
+                tokens,
+                &ModelId::sonnet(),
+                &CompactConfig::default(),
+            );
+            prop_assert_eq!(strategy, CompactStrategy::Reactive);
+        }
     }
 }

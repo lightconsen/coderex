@@ -283,6 +283,7 @@ pub fn decode_request(line: &str) -> Option<Result<WireRequest, serde_json::Erro
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     #[test]
     fn roundtrip_text_delta() {
@@ -328,5 +329,69 @@ mod tests {
     fn event_has_snake_case_tag() {
         let json = encode_event(&WireEvent::CompactBoundary);
         assert!(json.contains("\"type\":\"compact_boundary\""));
+    }
+
+    proptest! {
+        #[test]
+        fn text_delta_roundtrips_any_string(delta in any::<String>()) {
+            let event = WireEvent::TextDelta { delta };
+            let encoded = encode_event(&event);
+            let decoded = decode_event(&encoded)
+                .expect("one line")
+                .expect("valid wire event");
+            prop_assert_eq!(decoded, event);
+        }
+
+        #[test]
+        fn tool_call_start_roundtrips_any_strings(
+            id in any::<String>(),
+            name in any::<String>(),
+            summary in any::<String>(),
+        ) {
+            let event = WireEvent::ToolCallStart { id, name, summary };
+            let encoded = encode_event(&event);
+            let decoded = decode_event(&encoded)
+                .expect("one line")
+                .expect("valid wire event");
+            prop_assert_eq!(decoded, event);
+        }
+
+        #[test]
+        fn usage_summary_roundtrips_any_counts(
+            input_tokens in any::<usize>(),
+            output_tokens in any::<usize>(),
+            cache_read_tokens in any::<usize>(),
+            cache_creation_tokens in any::<usize>(),
+        ) {
+            let event = WireEvent::UsageSummary {
+                input_tokens,
+                output_tokens,
+                cache_read_tokens,
+                cache_creation_tokens,
+            };
+            let encoded = encode_event(&event);
+            let decoded = decode_event(&encoded)
+                .expect("one line")
+                .expect("valid wire event");
+            prop_assert_eq!(decoded, event);
+        }
+
+        #[test]
+        fn submit_request_roundtrips_any_strings(
+            prompt in any::<String>(),
+            system_prompt in proptest::option::of(any::<String>()),
+            max_turns in proptest::option::of(any::<u32>()),
+        ) {
+            let request = WireRequest::Submit {
+                prompt,
+                system_prompt,
+                max_turns,
+            };
+            let encoded = encode_request(&request);
+            let decoded = decode_request(&encoded)
+                .expect("one line")
+                .expect("valid wire request");
+            prop_assert_eq!(decoded, request);
+        }
     }
 }

@@ -111,6 +111,7 @@ pub fn is_path_allowed(path: &std::path::Path, allowed: &[std::path::PathBuf]) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
     use std::path::PathBuf;
 
     #[test]
@@ -150,5 +151,48 @@ mod tests {
     fn path_allowed_when_no_restrictions() {
         let allowed: Vec<PathBuf> = vec![];
         assert!(is_path_allowed(Path::new("/anywhere"), &allowed));
+    }
+
+    fn path_components() -> impl Strategy<Value = Vec<String>> {
+        proptest::collection::vec("[a-z0-9_-]{1,8}", 1..4)
+    }
+
+    proptest! {
+        #[test]
+        fn every_canonical_descendant_of_an_allowed_root_is_allowed(
+            components in path_components(),
+        ) {
+            let root = tempfile::tempdir().unwrap();
+            let mut path = root.path().to_path_buf();
+            for component in &components {
+                path.push(component);
+            }
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "x").unwrap();
+
+            let allowed = vec![std::fs::canonicalize(root.path()).unwrap()];
+            prop_assert!(is_path_allowed(&path, &allowed), "{}", path.display());
+        }
+
+        #[test]
+        fn a_sibling_root_is_not_inside_the_allowed_root(
+            right in path_components(),
+        ) {
+            let root = tempfile::tempdir().unwrap();
+            let allowed_root = root.path().join("allowed");
+            std::fs::create_dir(&allowed_root).unwrap();
+            let allowed_root = std::fs::canonicalize(&allowed_root).unwrap();
+            let mut outside = root.path().to_path_buf();
+            for component in &right {
+                outside.push(component);
+            }
+            std::fs::create_dir_all(outside.parent().unwrap()).unwrap();
+            std::fs::write(&outside, "x").unwrap();
+            let outside = std::fs::canonicalize(&outside).unwrap();
+
+            let allowed = vec![allowed_root.clone()];
+            prop_assume!(!outside.starts_with(&allowed_root));
+            prop_assert!(!is_path_allowed(&outside, &allowed), "{}", outside.display());
+        }
     }
 }

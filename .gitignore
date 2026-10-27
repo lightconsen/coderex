@@ -26,3 +26,12 @@ screenshot/
 # LLVM coverage profile fragments from child processes
 *.profraw
 *.profdata
+
+# libFuzzer-generated corpus entries (SHA-1 names); committed seeds are seed.txt
+fuzz/corpus/*/[0-9a-f]*
+fuzz/target/
+fuzz/artifacts/
+
+# Python bytecode from helper scripts
+__pycache__/
+*.pyc

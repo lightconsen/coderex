@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 11f16a92ccda84d52f235377b022eb53f8d6c745f23a1332da7af1b1fc1e7ba8 # shrinks to lower = Some(PermissionsSettings { allow: [], deny: [], ask: ["", ""] }), higher = Some(PermissionsSettings { allow: [], deny: [], ask: [] })

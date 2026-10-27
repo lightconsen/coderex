@@ -58,3 +58,4 @@ windows-sys = { version = "0.59", features = [
 tempfile.workspace = true
 wiremock.workspace = true
 tokio.workspace = true
+proptest.workspace = true

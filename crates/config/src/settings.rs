@@ -1479,6 +1479,115 @@ impl ConfigWatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+
+    fn rule_vector() -> impl Strategy<Value = Vec<String>> {
+        proptest::collection::vec("[A-Za-z0-9()*.:/_ -]{0,40}", 0..6)
+    }
+
+    fn permission_layer() -> impl Strategy<Value = Option<PermissionsSettings>> {
+        (
+            proptest::option::of(rule_vector()),
+            proptest::option::of(rule_vector()),
+            proptest::option::of(rule_vector()),
+        )
+            .prop_map(|(allow, deny, ask)| {
+                Some(PermissionsSettings {
+                    allow: allow.unwrap_or_default(),
+                    deny: deny.unwrap_or_default(),
+                    ask: ask.unwrap_or_default(),
+                })
+            })
+    }
+
+    fn merged_rules(lower: &[String], higher: &[String]) -> Vec<String> {
+        let mut out = lower.to_vec();
+        for rule in higher {
+            if !out.contains(rule) {
+                out.push(rule.clone());
+            }
+        }
+        out
+    }
+
+    proptest! {
+        #[test]
+        fn merging_permissions_is_idempotent(
+            lower in permission_layer(),
+            higher in permission_layer(),
+        ) {
+            let base = Settings {
+                permissions: lower,
+                ..Settings::default()
+            };
+            let top = Settings {
+                permissions: higher,
+                ..Settings::default()
+            };
+            let once = base.merge(&top);
+            let twice = once.merge(&top);
+            let first = once.permissions.as_ref();
+            let second = twice.permissions.as_ref();
+            prop_assert_eq!(
+                first.map(|rules| &rules.allow),
+                second.map(|rules| &rules.allow)
+            );
+            prop_assert_eq!(
+                first.map(|rules| &rules.deny),
+                second.map(|rules| &rules.deny)
+            );
+            prop_assert_eq!(
+                first.map(|rules| &rules.ask),
+                second.map(|rules| &rules.ask)
+            );
+        }
+
+        #[test]
+        fn merging_permissions_keeps_a_stable_deduplicated_union(
+            lower in permission_layer(),
+            higher in permission_layer(),
+        ) {
+            let lower = lower.unwrap_or_default();
+            let higher = higher.unwrap_or_default();
+            let merged = Settings {
+                permissions: Some(lower.clone()),
+                ..Settings::default()
+            }
+            .merge(&Settings {
+                permissions: Some(higher.clone()),
+                ..Settings::default()
+            });
+            let rules = merged.permissions.expect("permissions survive");
+            prop_assert_eq!(&rules.allow, &merged_rules(&lower.allow, &higher.allow));
+            prop_assert_eq!(&rules.deny, &merged_rules(&lower.deny, &higher.deny));
+            prop_assert_eq!(&rules.ask, &merged_rules(&lower.ask, &higher.ask));
+        }
+
+        #[test]
+        fn scalar_layers_are_winner_take_all(
+            lower_model in proptest::option::of("[a-z-]{0,20}"),
+            higher_model in proptest::option::of("[a-z-]{0,20}"),
+            lower_mode in proptest::option::of("[a-z-]{0,20}"),
+            higher_mode in proptest::option::of("[a-z-]{0,20}"),
+        ) {
+            let lower = Settings {
+                model: lower_model.clone(),
+                permission_mode: lower_mode.clone(),
+                ..Settings::default()
+            };
+            let higher = Settings {
+                model: higher_model.clone(),
+                permission_mode: higher_mode.clone(),
+                ..Settings::default()
+            };
+            let merged = lower.merge(&higher);
+            prop_assert_eq!(merged.model, higher_model.or(lower_model));
+            prop_assert_eq!(
+                merged.permission_mode,
+                higher_mode.or(lower_mode)
+            );
+        }
+    }
 
     #[test]
     fn settings_defaults_are_correct() {

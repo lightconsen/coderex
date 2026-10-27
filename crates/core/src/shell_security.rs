@@ -415,6 +415,9 @@ fn collect_segments(command: &str, out: &mut Vec<String>) {
         if let Some(command) = wrapper_script(stage) {
             collect_segments(&command, out);
         }
+        if let Some(command) = keyword_script(stage) {
+            collect_segments(&command, out);
+        }
         for nested in nested_scripts(stage) {
             collect_segments(&nested, out);
         }
@@ -436,6 +439,22 @@ fn find_exec_command(stage: &str) -> Option<String> {
         .take_while(|token| !matches!(token.as_str(), ";" | "+" | r"\;"))
         .map(|token| unquote(token))
         .collect();
+    (!command.is_empty()).then(|| command.join(" "))
+}
+
+/// The command after a shell keyword that does not change what runs:
+/// `time rm x`, `time -p rm x`, `! rm x`.
+fn keyword_script(stage: &str) -> Option<String> {
+    let stage = strip_leading_env_assignments(stage);
+    let tokens = tokenize(stage);
+    let program = tokens.first()?.rsplit('/').next()?.to_ascii_lowercase();
+    let args = tokens.get(1..).unwrap_or_default();
+    let command = match program.as_str() {
+        "time" => after_options(args, &["-o", "-f"]),
+        "!" => args,
+        _ => return None,
+    };
+    let command: Vec<String> = command.iter().map(|token| unquote(token)).collect();
     (!command.is_empty()).then(|| command.join(" "))
 }
 
@@ -1281,6 +1300,7 @@ mod command_segment_tests {
 #[cfg(test)]
 mod command_analysis_tests {
     use super::*;
+    use proptest::prelude::*;
 
     #[test]
     fn plain_and_chained_commands_are_fully_modeled() {
@@ -1310,6 +1330,10 @@ mod command_analysis_tests {
             ("xargs rm -rf", "rm -rf"),
             ("su -c 'rm -rf /tmp/x'", "rm -rf /tmp/x"),
             ("find . -exec rm -rf {} ;", "rm -rf {}"),
+            ("find . -exec rm -rf {} +", "rm -rf {}"),
+            ("time rm -rf /tmp/x", "rm -rf /tmp/x"),
+            ("time -p rm -rf /tmp/x", "rm -rf /tmp/x"),
+            ("! rm -rf /tmp/x", "rm -rf /tmp/x"),
         ] {
             let analysis = analyze_command(command);
             assert!(
@@ -1352,6 +1376,20 @@ mod command_analysis_tests {
                 analysis.opaque.is_some(),
                 "{command:?} should be opaque: {analysis:?}"
             );
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn analysis_is_deterministic_for_any_command(command in any::<String>()) {
+            let first = analyze_command(&command);
+            let second = analyze_command(&command);
+            prop_assert_eq!(first, second);
+        }
+
+        #[test]
+        fn whitespace_only_commands_have_no_segments(whitespace in "[ \t\n]{0,200}") {
+            prop_assert!(command_segments(&whitespace).is_empty());
         }
     }
 }
