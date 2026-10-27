@@ -56,6 +56,29 @@ for `core`, `cli` and `tools`, and 65% for the other crates; the script reports
 them but does not fail the build. See [`docs/coverage.md`](docs/coverage.md) for
 the current baseline and the lowest-coverage modules.
 
+The remaining verification tools are scripts so a local machine, cron, a
+self-hosted Linux runner or CI can run the same commands:
+
+```bash
+scripts/record-cassettes.sh --check     # metadata, staleness, size, secrets
+scripts/record-cassettes.sh --backfill  # metadata for older recordings
+scripts/record-cassettes.sh --prune --dry-run
+scripts/mutation.sh permission-engine   # cargo-mutants, bounded scope
+MUTATION_TEST_FILTER=permission_engine::tests scripts/mutation.sh permission-engine
+scripts/fuzz.sh 60                      # cargo-fuzz, 60s per target
+python3 scripts/soak.py                 # 200-turn PTY soak
+scripts/install-smoke.sh                # real install.sh against a fake release
+scripts/nightly.sh                      # orchestrate the checks above
+```
+
+`scripts/nightly.sh` defaults to coverage + cassette check + fuzz + soak and
+leaves mutation off (`RUN_MUTATION=1` enables it); every step logs under
+`target/nightly/<timestamp>/`.
+
+Mutation testing and fuzzing need `cargo install cargo-mutants --locked` and
+`cargo install cargo-fuzz --locked`; fuzzing also needs the nightly toolchain
+(`rustup toolchain install nightly`). Neither is part of the normal test gate.
+
 `scripts/publication-check.sh` scans tracked files and the history for
 credentials and local-only files; it is a good check before sharing a branch.
 
