@@ -212,8 +212,11 @@ read/write. The dispatcher compares the handle path with the subjects the
 pre-dispatch check saw; a path that changed in between is re-evaluated by the
 engine and refused unless the rules allow it. Write truncates only after this
 verification, and the actual path is also re-checked against the sandbox path
-policy. Directory-walk tools (`Grep`, `Glob`, `ListDir`) open the root as a
-`cap-std` directory capability, verify the capability's real path, and then
+policy. A Write that created a new file and then failed verification removes it
+through the same parent-directory capability that created it, so cleanup cannot
+delete a different file after a path swap. Directory-walk tools (`Grep`, `Glob`,
+`ListDir`) open the root as a `cap-std` directory capability, verify the
+capability's real path, and then
 enumerate and open entries through that open handle. A rename or symlink swap of
 the ambient root after the check therefore cannot redirect the walk. Symlinks
 below the root are reported but never followed (and are not read as files).
@@ -222,12 +225,12 @@ Bash rules are matched against each command **segment**, not the raw string.
 The splitter understands top-level quotes/escapes, `;`, `&&`, `||`, `|`, `|&`,
 `&`, newlines, comments, `$(...)`/backticks, a wrapping `( ... )`, `sh -c`/
 `eval` scripts, and leading `NAME=value` assignments. Common wrappers (`sudo`,
-`env`, `timeout`, `nohup`, `xargs`, `find -exec`, ...) have their inner command
-recovered as an additional segment, so a deny rule still sees what they will
-run. For **deny/ask**, matching any segment applies to the whole call. For
-**allow**, every segment must be covered by at least one allow rule (rules
-compose), so `cd repo && git diff` is not auto-approved by a rule that only
-covers `git diff`. `PowerShell(...)` and `pwsh(...)` use the same command
+`env`, `timeout`, `nohup`, `xargs`, `find -exec`, ...) and the `time`/`!`
+keywords have their inner command recovered as an additional segment, so a deny
+rule still sees what they will run. For **deny/ask**, matching any segment
+applies to the whole call. For **allow**, every segment must be covered by at
+least one allow rule (rules compose), so `cd repo && git diff` is not
+auto-approved by a rule that only covers `git diff`. `PowerShell(...)` and `pwsh(...)` use the same command
 semantics as `Bash(...)`: `:*` prefix matching, per-segment matching over `;`/
 `|`/`&&`, and the same opaque analysis. PowerShell-specific wrappers and
 cmdlets (`Start-Process`, `Invoke-Expression`/`iex`, `Invoke-Command`,

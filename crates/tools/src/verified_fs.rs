@@ -159,24 +159,68 @@ pub fn open_read(path: &Path, ctx: &ToolContext<'_>) -> Result<VerifiedFile, Too
 
 /// Open (or create) a file for writing, without truncating it yet.
 pub fn open_write(path: &Path, ctx: &ToolContext<'_>) -> Result<VerifiedFile, ToolError> {
-    // `create_new` tells us reliably whether this call created the file; the
-    // fallback opens an existing target (including through a final symlink).
-    match OpenOptions::new().write(true).create_new(true).open(path) {
-        Ok(file) => verified(file, path, ctx, true),
+    // The parent is opened as a capability first, so a rename or symlink swap
+    // between creating the file and verifying its handle cannot make cleanup
+    // delete a different file: removal goes through the same directory handle.
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let name = path.file_name().ok_or_else(|| ToolError::InvalidInput {
+        message: format!("not a file path: {}", path.display()),
+    })?;
+    let dir = cap_std::fs::Dir::open_ambient_dir(parent, cap_std::ambient_authority()).map_err(
+        |error| ToolError::InvalidInput {
+            message: format!("failed to access directory: {error}"),
+        },
+    )?;
+
+    let mut create = cap_std::fs::OpenOptions::new();
+    create.write(true).create_new(true);
+    match dir.open_with(name, &create) {
+        Ok(file) => verified_created(file.into_std(), path, ctx, &dir, name),
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            let file = OpenOptions::new()
-                .write(true)
-                .truncate(false)
-                .open(path)
+            let mut open = cap_std::fs::OpenOptions::new();
+            open.write(true).truncate(false);
+            let file = dir
+                .open_with(name, &open)
                 .map_err(|error| ToolError::InvalidInput {
                     message: format!("failed to write file: {error}"),
                 })?;
-            verified(file, path, ctx, false)
+            verified(file.into_std(), path, ctx, false)
         }
         Err(error) => Err(ToolError::InvalidInput {
             message: format!("failed to write file: {error}"),
         }),
     }
+}
+
+/// Verify a newly created file, removing it through the parent capability if
+/// the verification fails. The removal is relative to the same open directory
+/// handle that created the file, so it cannot race with a path swap.
+fn verified_created(
+    file: File,
+    original: &Path,
+    ctx: &ToolContext<'_>,
+    dir: &cap_std::fs::Dir,
+    name: &std::ffi::OsStr,
+) -> Result<VerifiedFile, ToolError> {
+    let resolved = real_path(&file, original);
+    if let Err(error) = ctx.verify_paths(std::slice::from_ref(&resolved)) {
+        if let Err(cleanup) = dir.remove_file(name) {
+            tracing::warn!(
+                path = %resolved.display(),
+                %cleanup,
+                "could not remove a newly created file after verification failed"
+            );
+        }
+        return Err(error);
+    }
+    Ok(VerifiedFile {
+        file,
+        path: resolved,
+        created: true,
+    })
 }
 
 /// Open an existing file for reading and writing.
@@ -272,9 +316,48 @@ fn fd_path(_file: &File) -> Option<PathBuf> {
 mod tests {
     use super::*;
     use crate::context::ExecutionContext;
+    use std::sync::Arc;
 
     fn ctx(path: &Path) -> ToolContext<'_> {
         ToolContext::new(ExecutionContext::Normal, path)
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_macos_handle_path_is_the_symlink_target_not_the_link() {
+        let root = tempfile::tempdir().unwrap();
+        let real = root.path().join("real.txt");
+        std::fs::write(&real, "content").unwrap();
+        let link = root.path().join("link.txt");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<PathBuf>::new()));
+        let recorder = Arc::clone(&seen);
+        let ctx = ToolContext::new(ExecutionContext::Normal, root.path()).with_path_verifier(
+            Arc::new(move |paths| {
+                recorder.lock().unwrap().extend_from_slice(paths);
+                Ok(())
+            }),
+        );
+
+        let verified = open_read(&link, &ctx).unwrap();
+        assert_eq!(verified.path, std::fs::canonicalize(&real).unwrap());
+        assert_eq!(
+            seen.lock().unwrap().first().map(PathBuf::as_path),
+            Some(verified.path.as_path())
+        );
+    }
+
+    #[test]
+    fn a_rejected_new_file_is_removed_through_the_parent_capability() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("new.txt");
+        let ctx = ToolContext::new(ExecutionContext::Normal, root.path())
+            .with_path_verifier(Arc::new(|_paths| Err("denied by test".to_string())));
+
+        let error = open_write(&target, &ctx).expect_err("the verifier must reject the file");
+        assert!(matches!(error, ToolError::Io(_)), "{error:?}");
+        assert!(!target.exists(), "the rejected file was left behind");
     }
 
     #[test]
