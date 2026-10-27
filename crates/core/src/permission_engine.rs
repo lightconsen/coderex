@@ -820,9 +820,33 @@ mod tests {
         store.add(req);
         assert_eq!(store.pending_count(), 1);
         assert!(store.is_pending("test_1"));
+        assert!(!store.is_pending("another_request"));
 
         store.resolve("test_1", PermissionResponse::Approved);
         assert_eq!(store.pending_count(), 0);
+        assert!(!store.is_pending("test_1"));
+    }
+
+    #[test]
+    fn clearing_the_confirmation_bus_removes_it() {
+        let mut engine = PermissionEngine::new(PermissionChecker::new(PermissionMode::Default));
+        assert!(engine.confirmation_bus().is_none());
+        engine.set_confirmation_bus(ConfirmationBus::new(1));
+        assert!(engine.confirmation_bus().is_some());
+        engine.clear_confirmation_bus();
+        assert!(engine.confirmation_bus().is_none());
+    }
+
+    #[test]
+    fn pending_lists_only_unresolved_requests() {
+        let mut store = PendingPermissionStore::new(None);
+        assert!(store.pending().is_empty());
+        store.add(make_request("bash"));
+        let pending = store.pending();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, "test_1");
+        store.resolve("test_1", PermissionResponse::Approved);
+        assert!(store.pending().is_empty());
     }
 
     #[test]
@@ -857,14 +881,30 @@ mod tests {
     async fn permission_engine_hook_short_circuits() {
         let checker = PermissionChecker::new(PermissionMode::Default);
         let mut engine = PermissionEngine::new(checker);
-        engine.add_hook(Arc::new(AutoApproveHook::for_tools(vec!["read".into()])));
+        // `bash` normally asks in Default mode, so this only passes if the
+        // hook is actually installed and consulted.
+        engine.add_hook(Arc::new(AutoApproveHook::for_tools(vec!["bash".into()])));
 
         let (request, result) = engine
-            .evaluate("read", "{}".into(), None, HashMap::new())
+            .evaluate("bash", "{}".into(), None, HashMap::new())
             .await
             .unwrap();
-        assert_eq!(request.tool_name, "read");
+        assert_eq!(request.tool_name, "bash");
         assert!(matches!(result, PermissionResult::Allow));
+    }
+
+    #[tokio::test]
+    async fn each_evaluation_gets_a_distinct_request_id() {
+        let mut engine = PermissionEngine::new(PermissionChecker::new(PermissionMode::Default));
+        let (first, _) = engine
+            .evaluate("bash", "{}".into(), None, HashMap::new())
+            .await
+            .unwrap();
+        let (second, _) = engine
+            .evaluate("bash", "{}".into(), None, HashMap::new())
+            .await
+            .unwrap();
+        assert_ne!(first.id, second.id);
     }
 
     #[tokio::test]

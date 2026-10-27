@@ -1,0 +1,12 @@
+# First-pass mutation scope: the safety-critical permission, sandbox, hook and
+# compaction modules. Run scripts/mutation.sh rather than invoking cargo-mutants
+# by hand so the scope, timeout and output directory stay consistent.
+exclude_globs = [
+    "crates/*/tests/**",
+    "crates/*/benches/**",
+    "crates/*/examples/**",
+    "fuzz/**",
+]
+output = "target/mutants"
+timeout_multiplier = 2.0
+minimum_test_timeout = 10

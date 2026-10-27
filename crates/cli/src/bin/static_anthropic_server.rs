@@ -190,6 +190,10 @@ fn handle_connection(mut stream: TcpStream, responses: &std::sync::Arc<StaticRes
             build_sequence_tool_response(turn_number)
         } else if has_json_schema {
             build_json_sse_response(r#"{"greeting": "Hello!"}"#)
+        } else if has_tool_result && body_str.contains("soak turn") {
+            // One unique marker per tool round, so the soak driver can wait
+            // for the turn to finish instead of sleeping.
+            sse_text_block(&format!("soak-turn-ok-{}", count_tool_results(&body_str)))
         } else if has_tool_result || should_stream_text_response(&prompt) {
             build_text_response(&prompt, responses)
         } else {
@@ -427,6 +431,9 @@ fn resolve_text_response(prompt: &str, responses: &StaticResponses) -> String {
         responses.resolve("read_lib", "The file defines an add function.")
     } else if p.contains("grep") || p.contains("search for") || p.contains("search pattern") {
         responses.resolve("grep_search", "Found the matching functions.")
+    } else if p.contains("soak turn") {
+        // The long-session soak driver waits for one marker per turn.
+        "soak-turn-ok".into()
     } else if p.contains("hello") || p.contains("hi") {
         responses.resolve("hello", "Hello! I'm ready to help.")
     } else {
