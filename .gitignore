@@ -22,3 +22,7 @@ export_env.*.sh
 # Agent and session worktrees
 .claude/worktrees/
 screenshot/
+
+# LLVM coverage profile fragments from child processes
+*.profraw
+*.profdata

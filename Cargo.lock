@@ -1404,7 +1404,6 @@ dependencies = [
  "globset",
  "home",
  "html2text",
- "ignore",
  "libc",
  "lsp-types",
  "mockall",
@@ -1424,7 +1423,6 @@ dependencies = [
  "tracing",
  "url",
  "uuid",
- "walkdir",
  "windows-sys 0.59.0",
 ]
 

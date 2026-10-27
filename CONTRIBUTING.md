@@ -19,7 +19,7 @@ request against it from a topic branch.
 
 ```bash
 cargo build --workspace
-cargo test --workspace          # full suite, roughly 3.9k tests
+cargo test --workspace          # full suite, roughly 4.3k tests
 cargo fmt --all --check
 cargo clippy --workspace        # warnings are reported, not denied (see below)
 ```
@@ -47,6 +47,14 @@ Some suites need extra setup:
 `cargo clippy --workspace` currently prints a backlog of pre-existing lints and
 is **not** run with `-D warnings`; do not introduce new warnings in files you
 touch. `cargo fmt --all --check` is required.
+
+`scripts/coverage.sh` runs the workspace suite under `cargo llvm-cov` and writes
+`target/coverage/lcov.info` plus a per-crate line-coverage table
+(`target/coverage/summary.md`). Test files under `crates/*/tests`, benches and
+examples are excluded from the denominator. The advisory targets are 80% lines
+for `core`, `cli` and `tools`, and 65% for the other crates; the script reports
+them but does not fail the build. See [`docs/coverage.md`](docs/coverage.md) for
+the current baseline and the lowest-coverage modules.
 
 `scripts/publication-check.sh` scans tracked files and the history for
 credentials and local-only files; it is a good check before sharing a branch.
