@@ -178,6 +178,30 @@ impl BashAst {
 
 // ─── Tokenization ──────────────────────────────────────────────────────────
 
+/// What static analysis could learn about a shell command.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CommandAnalysis {
+    /// The commands the command will run, at every nesting level the splitter
+    /// understands.
+    pub segments: Vec<String>,
+    /// Why the command cannot be fully modelled, if it cannot.
+    ///
+    /// A command with a reason must never be auto-approved by a specifier allow
+    /// rule: aliases, functions, wrappers, interpreters and dynamic constructs
+    /// can execute something the segments do not name. Callers fail closed
+    /// (ask, or deny when no prompt is available).
+    pub opaque: Option<String>,
+}
+
+/// Analyze a shell command for rule matching.
+#[must_use]
+pub fn analyze_command(command: &str) -> CommandAnalysis {
+    let mut segments = Vec::new();
+    collect_segments(command, &mut segments);
+    let opaque = opaque_reason(command, &segments);
+    CommandAnalysis { segments, opaque }
+}
+
 /// The individual commands a shell command will run.
 ///
 /// Permission rules are evaluated per segment. A compound command such as
@@ -193,9 +217,154 @@ impl BashAst {
 /// deny/ask and the fail-closed direction for allow.
 #[must_use]
 pub fn command_segments(command: &str) -> Vec<String> {
-    let mut segments = Vec::new();
-    collect_segments(command, &mut segments);
-    segments
+    analyze_command(command).segments
+}
+
+/// Constructs the segment splitter cannot model well enough to auto-approve.
+fn opaque_reason(command: &str, segments: &[String]) -> Option<String> {
+    const WRAPPERS: &[&str] = &[
+        "sudo", "doas", "pkexec", "su", "env", "command", "builtin", "exec", "nohup", "timeout",
+        "nice", "ionice", "stdbuf", "xargs", "parallel", "watch", "script", "eval", "source",
+        "alias", "unalias", "enable", "trap", "hash", ".",
+    ];
+    const CONTROL: &[&str] = &[
+        "if", "then", "elif", "else", "fi", "for", "while", "until", "do", "done", "case", "esac",
+        "select", "function", "coproc", "time", "!", "[[", "((",
+    ];
+    const INTERPRETERS: &[&str] = &[
+        "python",
+        "python3",
+        "perl",
+        "ruby",
+        "node",
+        "php",
+        "lua",
+        "osascript",
+        "pwsh",
+        "powershell",
+        "cmd",
+        "wmic",
+        "mshta",
+        "ssh",
+        "docker",
+        "podman",
+        "kubectl",
+        "nsenter",
+        "chroot",
+        "unshare",
+        "strace",
+        "ltrace",
+        "gdb",
+    ];
+    const SHELLS: &[&str] = &["sh", "bash", "zsh", "dash", "ksh", "fish", "csh", "tcsh"];
+
+    let trimmed = command.trim();
+    if trimmed.contains("$(")
+        || trimmed.contains('`')
+        || trimmed.contains("<(")
+        || trimmed.contains(">(")
+        || trimmed.contains("<<")
+    {
+        return Some(
+            "command substitution, process substitution or a here-document cannot be fully analyzed"
+                .to_string(),
+        );
+    }
+
+    for segment in segments {
+        // An assignment to a variable that changes command resolution or
+        // startup behavior is as dangerous as a wrapper.
+        let mut assignments = segment.trim_start();
+        loop {
+            let (token, rest) = assignments
+                .split_once(char::is_whitespace)
+                .unwrap_or((assignments, ""));
+            let Some((name, _value)) = token.split_once('=') else {
+                break;
+            };
+            if matches!(
+                name,
+                "PATH"
+                    | "IFS"
+                    | "ENV"
+                    | "BASH_ENV"
+                    | "LD_PRELOAD"
+                    | "LD_LIBRARY_PATH"
+                    | "DYLD_INSERT_LIBRARIES"
+                    | "DYLD_LIBRARY_PATH"
+                    | "SHELLOPTS"
+                    | "BASHOPTS"
+                    | "CDPATH"
+                    | "GLOBIGNORE"
+                    | "PROMPT_COMMAND"
+                    | "PS4"
+            ) {
+                return Some(format!(
+                    "assignment to {name} can change which command runs"
+                ));
+            }
+            if rest.is_empty() {
+                break;
+            }
+            assignments = rest.trim_start();
+        }
+        let segment = strip_leading_env_assignments(segment);
+        let program = segment
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .rsplit('/')
+            .next()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if program.is_empty() {
+            continue;
+        }
+        if program.starts_with('$') || program.starts_with('{') {
+            return Some(format!(
+                "the command name '{program}' is dynamic and cannot be fully analyzed"
+            ));
+        }
+        if CONTROL.contains(&program.as_str()) {
+            return Some(format!(
+                "shell control-flow/keyword '{program}' cannot be fully analyzed"
+            ));
+        }
+        if WRAPPERS.contains(&program.as_str()) {
+            return Some(format!(
+                "shell wrapper or builtin '{program}' can execute another command"
+            ));
+        }
+        if segment.contains("()") || segment.starts_with("function ") {
+            return Some("shell function definitions cannot be fully analyzed".to_string());
+        }
+        if SHELLS.contains(&program.as_str()) {
+            return Some(format!(
+                "nested shell '{program}' can execute arbitrary commands"
+            ));
+        }
+        if INTERPRETERS.contains(&program.as_str()) {
+            return Some(format!(
+                "interpreter '{program}' can execute arbitrary commands"
+            ));
+        }
+        if [
+            ".sh", ".bash", ".zsh", ".py", ".pl", ".rb", ".js", ".ts", ".ps1",
+        ]
+        .iter()
+        .any(|extension| program.ends_with(extension))
+        {
+            return Some(format!("script '{program}' can execute arbitrary commands"));
+        }
+        if program == "find"
+            && ["-exec", "-execdir", "-ok", "-okdir"]
+                .iter()
+                .any(|flag| segment.split_whitespace().any(|token| token == *flag))
+        {
+            return Some("find's -exec family can execute arbitrary commands".to_string());
+        }
+    }
+    None
 }
 
 fn collect_segments(command: &str, out: &mut Vec<String>) {
@@ -210,10 +379,110 @@ fn collect_segments(command: &str, out: &mut Vec<String>) {
         if let Some(script) = shell_c_script(stage) {
             collect_segments(&script, out);
         }
+        if let Some(command) = find_exec_command(stage) {
+            collect_segments(&command, out);
+        }
+        if let Some(command) = wrapper_script(stage) {
+            collect_segments(&command, out);
+        }
         for nested in nested_scripts(stage) {
             collect_segments(&nested, out);
         }
     }
+}
+
+/// The command after `find ... -exec` / `-ok`.
+fn find_exec_command(stage: &str) -> Option<String> {
+    let tokens = tokenize(stage);
+    let program = tokens.first()?.rsplit('/').next()?;
+    if program != "find" {
+        return None;
+    }
+    let index = tokens
+        .iter()
+        .position(|token| matches!(token.as_str(), "-exec" | "-execdir" | "-ok" | "-okdir"))?;
+    let command: Vec<String> = tokens[index + 1..]
+        .iter()
+        .take_while(|token| !matches!(token.as_str(), ";" | "+" | r"\;"))
+        .map(|token| unquote(token))
+        .collect();
+    (!command.is_empty()).then(|| command.join(" "))
+}
+
+/// The command executed by a wrapper (`sudo rm`, `env FOO=1 rm`, ...).
+fn wrapper_script(stage: &str) -> Option<String> {
+    let stage = strip_leading_env_assignments(stage);
+    let tokens = tokenize(stage);
+    let program = tokens.first()?.rsplit('/').next()?.to_ascii_lowercase();
+    let args = tokens.get(1..).unwrap_or_default();
+
+    let command = match program.as_str() {
+        "sudo" | "doas" | "pkexec" => after_options(
+            args,
+            &["-u", "-g", "-p", "-C", "-h", "-r", "-t", "-U", "-D", "-R"],
+        ),
+        "su" => {
+            if let Some(index) = args.iter().position(|token| token == "-c") {
+                return args.get(index + 1).map(|token| unquote(token));
+            }
+            after_options(args, &["-s", "-g", "-G", "-u", "-c"])
+        }
+        "env" => after_assignments(after_options(args, &[])),
+        "timeout" => {
+            let rest = after_options(args, &["-s", "-k"]);
+            rest.get(1..).unwrap_or_default()
+        }
+        "nice" | "ionice" | "nohup" | "command" | "builtin" | "exec" | "stdbuf" | "xargs"
+        | "parallel" => after_options(args, &["-n", "-P", "-I", "-L", "-s", "-a", "-d", "-E"]),
+        "watch" => after_options(args, &["-n", "-d", "-q", "-t"]),
+        "script" => {
+            if let Some(index) = args.iter().position(|token| token == "-c") {
+                return args.get(index + 1).map(|token| unquote(token));
+            }
+            return None;
+        }
+        _ => return None,
+    };
+
+    let command: Vec<String> = command.iter().map(|token| unquote(token)).collect();
+    (!command.is_empty()).then(|| command.join(" "))
+}
+
+/// Skip leading options, consuming a value for options in `value_options`.
+fn after_options<'a>(args: &'a [String], value_options: &[&str]) -> &'a [String] {
+    let mut index = 0;
+    while index < args.len() {
+        let token = &args[index];
+        if token == "--" {
+            return args.get(index + 1..).unwrap_or_default();
+        }
+        if token.starts_with('-') && token.len() > 1 {
+            index += if value_options.contains(&token.as_str()) && index + 1 < args.len() {
+                2
+            } else {
+                1
+            };
+            continue;
+        }
+        break;
+    }
+    args.get(index..).unwrap_or_default()
+}
+
+/// Skip `NAME=value` assignment tokens (used by `env` and `sudo`).
+fn after_assignments(args: &[String]) -> &[String] {
+    let mut index = 0;
+    while index < args.len() {
+        let token = &args[index];
+        let Some((name, _value)) = token.split_once('=') else {
+            break;
+        };
+        if name.is_empty() || !name.chars().all(|c| c == '_' || c.is_ascii_alphanumeric()) {
+            break;
+        }
+        index += 1;
+    }
+    args.get(index..).unwrap_or_default()
 }
 
 /// Skip `NAME=value` assignments at the start of a command.
@@ -976,5 +1245,83 @@ mod command_segment_tests {
     fn a_single_command_stays_one_segment() {
         assert_eq!(command_segments("git diff --stat"), vec!["git diff --stat"]);
         assert!(command_segments("   ").is_empty());
+    }
+}
+
+#[cfg(test)]
+mod command_analysis_tests {
+    use super::*;
+
+    #[test]
+    fn plain_and_chained_commands_are_fully_modeled() {
+        for command in [
+            "echo hi",
+            "cd repo && git diff",
+            "a; b || c | d",
+            "echo ok 2>&1",
+            "echo 'a && b'",
+        ] {
+            assert!(
+                analyze_command(command).opaque.is_none(),
+                "{command}: {:?}",
+                analyze_command(command)
+            );
+        }
+    }
+
+    #[test]
+    fn wrapper_commands_are_recovered_for_deny_matching() {
+        for (command, expected) in [
+            ("sudo rm -rf /tmp/x", "rm -rf /tmp/x"),
+            ("sudo -u root rm -rf /tmp/x", "rm -rf /tmp/x"),
+            ("env FOO=1 rm -rf /tmp/x", "rm -rf /tmp/x"),
+            ("timeout 5 rm -rf /tmp/x", "rm -rf /tmp/x"),
+            ("nohup rm -rf /tmp/x", "rm -rf /tmp/x"),
+            ("xargs rm -rf", "rm -rf"),
+            ("su -c 'rm -rf /tmp/x'", "rm -rf /tmp/x"),
+            ("find . -exec rm -rf {} ;", "rm -rf {}"),
+        ] {
+            let analysis = analyze_command(command);
+            assert!(
+                analysis.segments.iter().any(|segment| segment == expected),
+                "{command}: {:?}",
+                analysis.segments
+            );
+            assert!(analysis.opaque.is_some(), "{command} should stay opaque");
+        }
+    }
+
+    #[test]
+    fn wrappers_and_dynamic_constructs_are_opaque() {
+        for command in [
+            "sudo rm -rf /tmp/x",
+            "xargs rm",
+            "find . -name x -exec rm {} ;",
+            "eval 'rm -rf /tmp/x'",
+            ". ./script.sh",
+            "source ./script.sh",
+            "alias ls='rm -rf /'",
+            "f() { rm -rf /tmp/x; }",
+            "function f { rm; }",
+            "sh -c 'rm -rf /tmp/x'",
+            "python3 -c 'import os; os.system(\"rm -rf /\")'",
+            "if true; then rm -rf /tmp/x; fi",
+            "$CMD -rf /tmp/x",
+            "echo $(rm -rf /tmp/x)",
+            "echo `rm -rf /tmp/x`",
+            "PATH=/tmp/evil rm -rf /tmp/x",
+            "PATH=/tmp/evil",
+            "IFS=, rm -rf /tmp/x",
+            "hash -p /tmp/evil rm",
+            "./deploy.sh",
+            "cat <<EOF\nrm -rf /tmp/x\nEOF",
+            "cat <(rm -rf /tmp/x)",
+        ] {
+            let analysis = analyze_command(command);
+            assert!(
+                analysis.opaque.is_some(),
+                "{command:?} should be opaque: {analysis:?}"
+            );
+        }
     }
 }

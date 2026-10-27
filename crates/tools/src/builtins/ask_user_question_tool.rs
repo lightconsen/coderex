@@ -111,6 +111,7 @@ mod tests {
     fn test_ctx() -> ToolContext<'static> {
         ToolContext {
             elicit_tx: None,
+            path_verifier: None,
             execution_context: ExecutionContext::Normal,
             cwd: Path::new("/tmp"),
             extra: Arc::new(HashMap::new()),
@@ -146,6 +147,7 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         let ctx = ToolContext {
             elicit_tx: Some(tx),
+            path_verifier: None,
             execution_context: ExecutionContext::Normal,
             cwd: Path::new("/tmp"),
             extra: Arc::new(HashMap::new()),

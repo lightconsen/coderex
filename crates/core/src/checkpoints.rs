@@ -102,6 +102,24 @@ impl CheckpointStore {
         }
     }
 
+    /// Record that `path` did not exist before the write named by `call_id`.
+    ///
+    /// A write tool opens the target before verifying its real path, so the
+    /// file may exist (empty) by the time the snapshot is taken. This records
+    /// the pre-write fact explicitly: restore removes the file instead of
+    /// restoring an empty one.
+    pub fn snapshot_absent(&self, call_id: &str, path: &Path) {
+        if let Ok(mut entries) = self.entries.lock() {
+            entries.push(Entry {
+                call_id: call_id.to_string(),
+                path: path.to_path_buf(),
+                snapshot: Snapshot::Absent,
+            });
+        } else {
+            tracing::warn!("file checkpoint: entries lock poisoned; snapshot lost");
+        }
+    }
+
     /// Undo the file effects of the tool calls named by `call_ids`.
     ///
     /// Entries are applied earliest-first and the first entry wins per path:

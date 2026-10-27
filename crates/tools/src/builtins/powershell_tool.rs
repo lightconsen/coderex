@@ -74,14 +74,18 @@ impl Tool for PowerShellTool {
         // The helper also refuses a `pwsh` that resolves inside the working
         // directory: a checkout that ships one would otherwise choose what
         // "run PowerShell" means.
-        let (mut cmd, sandbox_handle) =
-            crate::sandbox_shell::sandboxed_shell(&ctx, "pwsh", &["-Command", &command])?;
+        let (mut cmd, sandbox_handle) = crate::sandbox_shell::sandboxed_shell(
+            &ctx,
+            "pwsh",
+            &["-NoProfile", "-NonInteractive", "-Command", &command],
+        )?;
 
         // The shell is not a provider client, so it is given no way to read
         // this session's credentials out of the environment it inherits.
         for key in coderex_core::sandbox::credential_scrub_keys() {
             cmd.env_remove(key);
         }
+        crate::sandbox_shell::sanitize_shell_env(&mut cmd, ctx.cwd);
 
         // Spawned rather than `output()`ed because Windows has to place the
         // child in its Job Object after it exists.

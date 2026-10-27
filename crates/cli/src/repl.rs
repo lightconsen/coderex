@@ -2360,6 +2360,22 @@ impl coderex_core::tool_executor::ToolExecutor for ArcToolExecutor {
     ) -> Vec<coderex_core::permissions::RuleSubject> {
         self.0.rule_subjects(tool_name, input)
     }
+
+    fn set_path_verifier(&self, verifier: Option<coderex_core::tool_executor::PathVerifier>) {
+        self.0.set_path_verifier(verifier);
+    }
+
+    fn note_permission_subjects(
+        &self,
+        call_id: &str,
+        subjects: &[coderex_core::permissions::RuleSubject],
+    ) {
+        self.0.note_permission_subjects(call_id, subjects);
+    }
+
+    fn clear_permission_subjects(&self) {
+        self.0.clear_permission_subjects();
+    }
 }
 
 /// Tool executor that falls back to plugin tools when the primary reports "not found".
@@ -2401,6 +2417,22 @@ impl coderex_core::tool_executor::ToolExecutor for PluginToolFallbackExecutor {
         } else {
             primary
         }
+    }
+
+    fn set_path_verifier(&self, verifier: Option<coderex_core::tool_executor::PathVerifier>) {
+        self.primary.set_path_verifier(verifier);
+    }
+
+    fn note_permission_subjects(
+        &self,
+        call_id: &str,
+        subjects: &[coderex_core::permissions::RuleSubject],
+    ) {
+        self.primary.note_permission_subjects(call_id, subjects);
+    }
+
+    fn clear_permission_subjects(&self) {
+        self.primary.clear_permission_subjects();
     }
 }
 

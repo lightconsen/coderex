@@ -149,6 +149,7 @@ mod tests {
         extra.insert(TASK_STORE_KEY.to_string(), Box::new(store));
         ToolContext {
             elicit_tx: None,
+            path_verifier: None,
             execution_context: ExecutionContext::Normal,
             cwd: Path::new("/tmp"),
             extra: Arc::new(extra),
@@ -163,6 +164,7 @@ mod tests {
         extra.insert(TASK_STORE_KEY.to_string(), Box::new(store));
         let ctx = ToolContext {
             elicit_tx: None,
+            path_verifier: None,
             execution_context: ExecutionContext::Normal,
             cwd: Path::new("/tmp"),
             extra: Arc::new(extra),

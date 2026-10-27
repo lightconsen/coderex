@@ -123,6 +123,7 @@ mod tests {
         extra.insert(TODO_STORE_KEY.to_string(), Box::new(Arc::new(store)));
         ToolContext {
             elicit_tx: None,
+            path_verifier: None,
             execution_context: ExecutionContext::Normal,
             cwd: Path::new("/tmp"),
             extra: Arc::new(extra),

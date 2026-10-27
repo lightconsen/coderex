@@ -15,6 +15,7 @@ mod task_store;
 mod todo_store;
 mod tool;
 mod tool_cache;
+mod verified_fs;
 
 pub use builtins::{
     AgentTool, AskUserQuestionTool, BashTool, BriefTool, ChromeClient, ConfigTool, CronCreateTool,

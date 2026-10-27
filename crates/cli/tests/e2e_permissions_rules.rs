@@ -424,3 +424,21 @@ fn a_symlinked_path_cannot_bypass_a_path_deny() {
         "the denied file content reached the transcript:\n{stdout}"
     );
 }
+
+#[test]
+fn an_opaque_wrapped_command_is_not_auto_approved_by_an_allow_rule() {
+    let dir = workspace();
+    write_json(
+        &dir.path().join(".coderex/settings.json"),
+        serde_json::json!({"permissions": {"allow": ["Bash(sudo:*)"]}}),
+    );
+    let home = config_home(None);
+    let (mut provider, base_url) = start_static_provider();
+
+    let (stdout, asked) = run_denying(dir.path(), home.path(), &base_url, "run a wrapped command");
+
+    let _ = provider.kill();
+    let _ = provider.wait();
+    assert!(asked, "an opaque command was auto-approved:\n{stdout}");
+    assert!(stdout.contains("denied"), "{stdout}");
+}

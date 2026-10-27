@@ -98,6 +98,70 @@ pub fn sandboxed_shell(
     Ok((Command::from(std_cmd), Some(handle)))
 }
 
+/// Remove shell startup/code-injection hooks and sanitize `PATH`.
+///
+/// Aliases and exported functions are runtime state a static rule matcher
+/// cannot see. Non-interactive `sh` does not read profiles, but inherited
+/// `BASH_ENV`/`ENV`, exported functions (`BASH_FUNC_*`) and a repository-
+/// controlled `PATH` entry can still change what a command means.
+pub fn sanitize_shell_env(cmd: &mut Command, cwd: &std::path::Path) {
+    for key in [
+        "BASH_ENV",
+        "ENV",
+        "CDPATH",
+        "GLOBIGNORE",
+        "SHELLOPTS",
+        "BASHOPTS",
+        "PROMPT_COMMAND",
+        "PS4",
+        "BASH_XTRACEFD",
+        "IFS",
+        "LD_PRELOAD",
+        "LD_LIBRARY_PATH",
+        "DYLD_INSERT_LIBRARIES",
+        "DYLD_LIBRARY_PATH",
+    ] {
+        cmd.env_remove(key);
+    }
+    let mut exported_functions: Vec<String> = std::env::vars()
+        .map(|(key, _)| key)
+        .filter(|key| key.starts_with("BASH_FUNC_"))
+        .collect();
+    exported_functions.extend(
+        cmd.as_std()
+            .get_envs()
+            .map(|(key, _)| key.to_string_lossy().into_owned())
+            .filter(|key| key.starts_with("BASH_FUNC_")),
+    );
+    for key in exported_functions {
+        cmd.env_remove(key);
+    }
+
+    // Keep absolute system/toolchain entries. Drop relative entries and
+    // entries inside the workspace, unless the workspace *is* (or contains)
+    // the home directory — `PATH=~/.cargo/bin` must keep working when the
+    // session runs from home.
+    let home = home::home_dir();
+    let safe_path: Vec<std::path::PathBuf> = std::env::var_os("PATH")
+        .map(|path| {
+            std::env::split_paths(&path)
+                .filter(|entry| {
+                    entry.is_absolute()
+                        && (!entry.starts_with(cwd)
+                            || home.as_ref().is_some_and(|home| entry.starts_with(home)))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let fallback = if cfg!(windows) {
+        std::ffi::OsString::from(r"C:\Windows\System32;C:\Windows")
+    } else {
+        std::ffi::OsString::from("/usr/local/bin:/usr/bin:/bin")
+    };
+    let path = std::env::join_paths(&safe_path).unwrap_or(fallback.clone());
+    cmd.env("PATH", if safe_path.is_empty() { fallback } else { path });
+}
+
 /// Finish sandbox setup for a child that has just spawned.
 ///
 /// On Windows the child was created suspended by `prepare`. This attaches the
@@ -289,5 +353,48 @@ mod tests {
             "./sh",
             dir.path()
         ));
+    }
+}
+
+#[cfg(test)]
+mod sanitize_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn shell_startup_hooks_and_relative_path_entries_are_removed() {
+        let cwd = std::path::Path::new("/work/repo");
+        let mut cmd = Command::new("sh");
+        cmd.env("BASH_ENV", "/tmp/hook.sh")
+            .env("ENV", "/tmp/hook.sh")
+            .env("LD_PRELOAD", "/tmp/x.so")
+            .env("BASH_FUNC_evil%%", "() { rm -rf /; }")
+            .env("PATH", "/usr/bin:.:/work/repo/bin:/bin");
+        sanitize_shell_env(&mut cmd, cwd);
+
+        let envs: std::collections::HashMap<_, _> = cmd
+            .as_std()
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        for key in ["BASH_ENV", "ENV", "LD_PRELOAD", "BASH_FUNC_evil%%"] {
+            assert_eq!(envs.get(key), Some(&None), "{key}");
+        }
+        let path = envs
+            .get("PATH")
+            .and_then(|value| value.as_deref())
+            .expect("PATH is set");
+        assert!(
+            !path
+                .split(':')
+                .any(|entry| entry == "." || entry.is_empty()),
+            "{path}"
+        );
+        assert!(!path.contains("/work/repo"), "{path}");
+        assert!(path.contains("/usr/bin"), "{path}");
     }
 }

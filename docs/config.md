@@ -203,20 +203,44 @@ spelling such as `link/../secret` cannot widen an allow rule. If the path
 cannot be canonicalized at all, a lexical absolute form is used. Rule patterns
 resolve the longest existing glob-free prefix the same way, so
 `Read(./link/**)` matches files reached through a symlinked `link`.
-Canonicalization is a point-in-time check: a symlink retargeted between the
-check and the tool call is a TOCTOU risk that can only be closed inside the
-tool's own path handling.
+The canonical path is not just a check-time spelling. `Read`, `Write`, `Edit`
+and `NotebookEdit` open the file first, ask the OS for the **handle's** real
+path (`/proc/self/fd` on Linux, `fcntl(F_GETPATH)` on macOS,
+`GetFinalPathNameByHandle` on Windows), and use that same handle for the
+read/write. The dispatcher compares the handle path with the subjects the
+pre-dispatch check saw; a path that changed in between is re-evaluated by the
+engine and refused unless the rules allow it. Write truncates only after this
+verification, and the actual path is also re-checked against the sandbox path
+policy. Directory-walk tools (`Grep`, `Glob`, `ListDir`) use `walkdir` without
+following symlinks and do not read file contents through symlinks; their root
+path is still opened by the walker, so a rename/symlink race on the root is
+covered by the OS sandbox rather than an fd-bound check.
 
 Bash rules are matched against each command **segment**, not the raw string.
 The splitter understands top-level quotes/escapes, `;`, `&&`, `||`, `|`, `|&`,
-`&`, newlines, `$(...)`/backticks, a wrapping `( ... )`, `sh -c`/`eval`
-scripts, and leading `NAME=value` assignments. For **deny/ask**, matching any
-segment applies to the whole call. For **allow**, every segment must be covered
-by at least one allow rule (rules compose), so `cd repo && git diff` is not
-auto-approved by a rule that only covers `git diff`. This is intentionally
-shallower than a POSIX parser: constructs it cannot split stay in the enclosing
-segment (conservative for deny/ask, fail-closed for allow). Bash rules are not a
-sandbox — aliases, `xargs`, and other shell indirection are not inspected.
+`&`, newlines, comments, `$(...)`/backticks, a wrapping `( ... )`, `sh -c`/
+`eval` scripts, and leading `NAME=value` assignments. Common wrappers (`sudo`,
+`env`, `timeout`, `nohup`, `xargs`, `find -exec`, ...) have their inner command
+recovered as an additional segment, so a deny rule still sees what they will
+run. For **deny/ask**, matching any segment applies to the whole call. For
+**allow**, every segment must be covered by at least one allow rule (rules
+compose), so `cd repo && git diff` is not auto-approved by a rule that only
+covers `git diff`.
+
+A construct the analysis cannot fully model — shell functions/aliases, `source`,
+`eval`, control flow, directly executed scripts (`./deploy.sh`), nested
+interpreters (`python -c`, `sh -c`, ...), here-documents, process substitution,
+dynamic command names, assignments to `PATH`/`IFS`/`BASH_ENV`/loader variables,
+etc. — is marked **opaque**. Opaque calls are never auto-approved by an allow rule, including a
+whole-tool `Bash` allow and the auto-classifier hook; without an approval
+channel they are denied. The shell is also started with `--noprofile`/
+`--norc` semantics (`sh` is non-interactive), `BASH_ENV`/`ENV`/exported
+functions/`LD_PRELOAD`-style variables removed, and `PATH` stripped of relative
+and workspace entries (home toolchain entries still work). This is not a full
+POSIX parser, but security no longer depends on parsing every construct:
+anything outside the modelled subset asks. Bash rules are not a sandbox;
+`bypass-permissions` explicitly opts out of the guard, and a command that runs
+another interpreter can still do anything that interpreter allows.
 
 Precedence inside the rule set is **deny > ask > allow**. A configured deny is
 evaluated before the plan/accept-edits shortcuts; `bypass-permissions` and

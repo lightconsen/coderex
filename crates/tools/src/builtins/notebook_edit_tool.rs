@@ -4,6 +4,7 @@ use crate::context::{ToolError, ToolOutput};
 use crate::tool::{Tool, ToolContext, ToolDescriptor, ToolInput, ToolTier};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use std::io::{Read as _, Seek, SeekFrom, Write as _};
 
 /// Edit a cell in a Jupyter notebook (.ipynb file).
 #[derive(Debug)]
@@ -65,7 +66,7 @@ impl Tool for NotebookEditTool {
     async fn execute(
         &self,
         input: ToolInput,
-        _ctx: ToolContext<'_>,
+        ctx: ToolContext<'_>,
     ) -> Result<ToolOutput, ToolError> {
         let notebook_path = extract_string(&input.arguments, "notebook_path")?;
         let new_source = extract_string(&input.arguments, "new_source")?;
@@ -75,9 +76,21 @@ impl Tool for NotebookEditTool {
         let edit_mode =
             extract_string_opt(&input.arguments, "edit_mode").unwrap_or_else(|| "replace".into());
 
-        let content =
-            std::fs::read_to_string(&notebook_path).map_err(|e| ToolError::InvalidInput {
+        let mut verified =
+            crate::verified_fs::open_read_write(std::path::Path::new(&notebook_path), &ctx)?;
+        let actual = verified.path.clone();
+        let mut content = String::new();
+        verified
+            .file
+            .read_to_string(&mut content)
+            .map_err(|e| ToolError::InvalidInput {
                 message: format!("failed to read notebook: {e}"),
+            })?;
+        verified
+            .file
+            .seek(SeekFrom::Start(0))
+            .map_err(|e| ToolError::InvalidInput {
+                message: format!("failed to seek notebook: {e}"),
             })?;
 
         let mut notebook: Notebook =
@@ -151,13 +164,18 @@ impl Tool for NotebookEditTool {
             })?;
 
         // Snapshot the current notebook so `/rewind` can undo this edit.
-        if let Some(store) = crate::tool::checkpoint_store_from(&_ctx) {
-            store.snapshot(&input.call_id, std::path::Path::new(&notebook_path));
+        if let Some(store) = crate::tool::checkpoint_store_from(&ctx) {
+            store.snapshot(&input.call_id, &actual);
         }
 
-        std::fs::write(&notebook_path, new_content).map_err(|e| ToolError::InvalidInput {
-            message: format!("failed to write notebook: {e}"),
-        })?;
+        verified
+            .file
+            .set_len(0)
+            .and_then(|()| verified.file.seek(SeekFrom::Start(0)).map(|_| ()))
+            .and_then(|()| verified.file.write_all(new_content.as_bytes()))
+            .map_err(|e| ToolError::InvalidInput {
+                message: format!("failed to write notebook: {e}"),
+            })?;
 
         Ok(ToolOutput {
             output: "true".to_string(),
@@ -205,6 +223,7 @@ mod tests {
     fn test_ctx() -> ToolContext<'static> {
         ToolContext {
             elicit_tx: None,
+            path_verifier: None,
             execution_context: ExecutionContext::Normal,
             cwd: Path::new("/tmp"),
             extra: Arc::new(HashMap::new()),

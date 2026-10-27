@@ -135,6 +135,7 @@ pub async fn run_tool_calls<S: std::hash::BuildHasher + Sync>(
 
         // 4. Permission check
         let subjects = tools.rule_subjects(&call.name, &call.input);
+        tools.note_permission_subjects(&call.id, &subjects);
         let (_request, perm_result) = permission_engine
             .evaluate_with_subjects(
                 &call.name,
@@ -323,6 +324,7 @@ pub async fn run_tool_calls<S: std::hash::BuildHasher + Sync>(
 
     // Unwrap all results (every slot should be filled)
     let results: Vec<ToolResult> = results.into_iter().flatten().collect();
+    tools.clear_permission_subjects();
 
     Ok(SchedulerOutcome {
         results,

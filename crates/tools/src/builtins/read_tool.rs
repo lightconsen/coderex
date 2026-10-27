@@ -98,12 +98,18 @@ impl Tool for ReadTool {
 
         // Image handling
         if IMAGE_EXTENSIONS.contains(&ext.as_str()) {
-            return read_image(&path_buf, &ext);
+            return read_image(&path_buf, &ext, &ctx);
         }
 
-        // Text file handling
-        let content = std::fs::read_to_string(&path_buf).map_err(|e| ToolError::InvalidInput {
-            message: format!("failed to read file: {e}"),
+        // Text file handling. The handle's real path is verified before it is
+        // read, so a symlink retargeted after the permission check cannot make
+        // this read a different file.
+        let mut verified = crate::verified_fs::open_read(&path_buf, &ctx)?;
+        let mut content = String::new();
+        std::io::Read::read_to_string(&mut verified.file, &mut content).map_err(|e| {
+            ToolError::InvalidInput {
+                message: format!("failed to read file: {e}"),
+            }
         })?;
 
         let lines: Vec<&str> = content.lines().collect();
@@ -164,9 +170,13 @@ fn resolve_path(file_path: &str, cwd: &std::path::Path) -> String {
     }
 }
 
-fn read_image(path: &PathBuf, ext: &str) -> Result<ToolOutput, ToolError> {
-    let bytes = std::fs::read(path).map_err(|e| ToolError::InvalidInput {
-        message: format!("failed to read image: {e}"),
+fn read_image(path: &PathBuf, ext: &str, ctx: &ToolContext<'_>) -> Result<ToolOutput, ToolError> {
+    let mut verified = crate::verified_fs::open_read(path, ctx)?;
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(&mut verified.file, &mut bytes).map_err(|e| {
+        ToolError::InvalidInput {
+            message: format!("failed to read image: {e}"),
+        }
     })?;
 
     let mime = match ext {
@@ -325,5 +335,70 @@ mod tests {
             .unwrap();
         assert!(output.output.contains("truncated"));
         assert!(output.output.len() < content.len() + 100); // some overhead for truncation message
+    }
+}
+
+#[cfg(test)]
+mod verified_read_tests {
+    use super::*;
+    use crate::context::ExecutionContext;
+    use std::sync::Arc;
+
+    fn ctx(cwd: &std::path::Path) -> ToolContext<'_> {
+        ToolContext::new(ExecutionContext::Normal, cwd)
+    }
+
+    fn input(file_path: &str) -> ToolInput {
+        ToolInput {
+            call_id: "1".into(),
+            name: "Read".into(),
+            arguments: serde_json::json!({ "file_path": file_path }),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_read_is_refused_when_the_verifier_rejects_the_handle() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "content").unwrap();
+        let ctx = ctx(dir.path()).with_path_verifier(Arc::new(|_paths| {
+            Err("the opened path is not allowed".to_string())
+        }));
+        let error = ReadTool
+            .execute(input("a.txt"), ctx)
+            .await
+            .expect_err("the verifier refusal must fail the read");
+        assert!(error.to_string().contains("not allowed"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_symlink_retargeted_after_open_does_not_change_the_read_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first.txt");
+        let second = dir.path().join("second.txt");
+        let link = dir.path().join("link.txt");
+        std::fs::write(&first, "first").unwrap();
+        std::fs::write(&second, "second").unwrap();
+        std::os::unix::fs::symlink(&first, &link).unwrap();
+
+        let link_for_hook = link.clone();
+        let second_for_hook = second.clone();
+        let ctx = ctx(dir.path()).with_path_verifier(Arc::new(move |paths| {
+            assert!(
+                paths[0].ends_with("first.txt"),
+                "the handle path is the real target: {:?}",
+                paths
+            );
+            // Retarget after the handle was opened and its path reported.
+            let _ = std::fs::remove_file(&link_for_hook);
+            std::os::unix::fs::symlink(&second_for_hook, &link_for_hook).unwrap();
+            Ok(())
+        }));
+
+        let output = ReadTool
+            .execute(input(link.to_str().unwrap()), ctx)
+            .await
+            .unwrap();
+        assert_eq!(output.output, "first");
     }
 }

@@ -209,6 +209,12 @@ pub enum RuleMatcher {
 pub struct RuleSubject {
     /// Candidate spellings of this subject.
     pub forms: Vec<String>,
+    /// Why this call cannot be fully modelled, if it cannot.
+    ///
+    /// An opaque call is never auto-approved by an allow rule; it asks (or is
+    /// denied when no prompt is available). Deny and ask rules still match the
+    /// segments that were recovered.
+    pub opaque: Option<String>,
 }
 
 impl From<&str> for RuleSubject {
@@ -229,6 +235,7 @@ impl RuleSubject {
     pub fn new(forms: impl IntoIterator<Item = String>) -> Self {
         Self {
             forms: forms.into_iter().collect(),
+            opaque: None,
         }
     }
 
@@ -237,7 +244,15 @@ impl RuleSubject {
     pub fn single(value: impl Into<String>) -> Self {
         Self {
             forms: vec![value.into()],
+            opaque: None,
         }
+    }
+
+    /// Mark the call as not fully analysable, with the reason.
+    #[must_use]
+    pub fn with_opaque(mut self, reason: impl Into<String>) -> Self {
+        self.opaque = Some(reason.into());
+        self
     }
 }
 
@@ -893,6 +908,7 @@ impl PermissionChecker {
         }
 
         let exemptions = exemptions.unwrap_or_else(|| self.tool_exemptions(tool_name));
+        let opaque_reason = subjects.iter().find_map(|subject| subject.opaque.clone());
 
         // Deny rules first: deny always wins over ask and allow.
         for rule in &self.rules {
@@ -945,6 +961,7 @@ impl PermissionChecker {
             if rule.action == PermissionAction::Allow
                 && name_matches
                 && matches!(rule.matcher, CompiledMatcher::WholeTool)
+                && opaque_reason.is_none()
                 && !exemptions.ignores_whole_tool_allow_rule
             {
                 return PermissionResult::Allow;
@@ -954,7 +971,7 @@ impl PermissionChecker {
         // Specifier allows compose: a compound command or a multi-file write
         // is auto-approved only when *every* subject is covered by at least
         // one allow rule. A rule covering one part is not enough.
-        if !subjects.is_empty() {
+        if !subjects.is_empty() && opaque_reason.is_none() {
             let mut path_patterns: Vec<String> = Vec::new();
             let mut all_covered = true;
             for subject in subjects {
@@ -990,6 +1007,16 @@ impl PermissionChecker {
                     }
                 };
             }
+        }
+
+        // A command the static analysis cannot fully model is never
+        // auto-approved; it asks even when the tool would otherwise be safe.
+        if let Some(reason) = opaque_reason {
+            return PermissionResult::Ask {
+                reason: format!(
+                    "command requires approval because it cannot be fully analyzed: {reason}"
+                ),
+            };
         }
 
         // Default: dangerous tools require approval, safe tools allowed.
@@ -2004,6 +2031,35 @@ mod rule_spec_tests {
                 .is_allowed(),
             "an allow for one tool approved another"
         );
+    }
+
+    #[test]
+    fn an_opaque_command_is_never_auto_approved() {
+        let context = ctx(Path::new("/proj"), None);
+        let opaque = RuleSubject::single("sudo rm -rf /tmp/x").with_opaque("sudo wrapper");
+
+        let whole = checker_with(&[parsed("Bash", PermissionAction::Allow)], &context);
+        assert!(
+            matches!(
+                whole.check_with_subjects("Bash", std::slice::from_ref(&opaque), None),
+                PermissionResult::Ask { .. }
+            ),
+            "a whole-tool allow approved an opaque command"
+        );
+
+        let specifier = checker_with(&[parsed("Bash(sudo:*)", PermissionAction::Allow)], &context);
+        match specifier.check_with_subjects("Bash", std::slice::from_ref(&opaque), None) {
+            PermissionResult::Ask { reason } => {
+                assert!(reason.contains("cannot be fully analyzed"), "{reason}");
+            }
+            other => panic!("an opaque command was auto-approved: {other:?}"),
+        }
+
+        let deny = checker_with(&[parsed("Bash(sudo:*)", PermissionAction::Deny)], &context);
+        assert!(matches!(
+            deny.check_with_subjects("Bash", std::slice::from_ref(&opaque), None),
+            PermissionResult::Deny { .. }
+        ));
     }
 
     #[test]

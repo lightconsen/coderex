@@ -3,6 +3,7 @@
 use crate::context::{ToolError, ToolOutput};
 use crate::tool::{Tool, ToolContext, ToolDescriptor, ToolInput, ToolTier};
 use async_trait::async_trait;
+use std::io::{Seek, SeekFrom, Write as _};
 
 /// Write file contents, creating parent directories if needed.
 #[derive(Debug)]
@@ -74,15 +75,40 @@ impl Tool for WriteTool {
             })?;
         }
 
+        // Open first, then verify the handle's real path. Truncation happens
+        // only after the path the OS resolved has passed the permission check,
+        // so a retargeted symlink cannot redirect this write.
+        let mut verified = crate::verified_fs::open_write(&path_buf, &ctx)?;
+        let actual = verified.path.clone();
+        if let Some(config) = ctx
+            .extra
+            .get("sandbox_config")
+            .and_then(|value| value.downcast_ref::<coderex_core::sandbox::SandboxConfig>())
+            && !crate::sandbox_policy::is_path_allowed(&actual, &config.allowed_write_paths)
+        {
+            return Err(ToolError::PermissionDenied {
+                name: "Write".into(),
+            });
+        }
+
         // Snapshot what is about to be overwritten so `/rewind` can undo this
         // write along with the conversation truncation.
         if let Some(store) = crate::tool::checkpoint_store_from(&ctx) {
-            store.snapshot(&input.call_id, &path_buf);
+            if verified.created {
+                store.snapshot_absent(&input.call_id, &actual);
+            } else {
+                store.snapshot(&input.call_id, &actual);
+            }
         }
 
-        std::fs::write(&path_buf, &content).map_err(|e| ToolError::InvalidInput {
-            message: format!("failed to write file: {e}"),
-        })?;
+        verified
+            .file
+            .set_len(0)
+            .and_then(|()| verified.file.seek(SeekFrom::Start(0)).map(|_| ()))
+            .and_then(|()| verified.file.write_all(content.as_bytes()))
+            .map_err(|e| ToolError::InvalidInput {
+                message: format!("failed to write file: {e}"),
+            })?;
 
         let bytes = content.len();
         Ok(ToolOutput {
@@ -149,7 +175,10 @@ mod tests {
 
         let undone: std::collections::HashSet<String> = ["1".to_string()].into_iter().collect();
         let report = store.restore(&undone);
-        assert_eq!(report.restored, vec![target.clone()]);
+        assert_eq!(
+            report.restored,
+            vec![std::fs::canonicalize(&target).unwrap()]
+        );
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "v1");
     }
 
@@ -217,5 +246,40 @@ mod tests {
             std::fs::read_to_string(tmp.path().join("empty.txt")).unwrap(),
             ""
         );
+    }
+}
+
+#[cfg(test)]
+mod verified_write_tests {
+    use super::*;
+    use crate::context::ExecutionContext;
+    use std::sync::Arc;
+
+    fn ctx(cwd: &std::path::Path) -> ToolContext<'_> {
+        ToolContext::new(ExecutionContext::Normal, cwd)
+    }
+
+    fn input(file_path: &str, content: &str) -> ToolInput {
+        ToolInput {
+            call_id: "1".into(),
+            name: "Write".into(),
+            arguments: serde_json::json!({ "file_path": file_path, "content": content }),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_denied_handle_is_not_truncated_or_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.txt");
+        std::fs::write(&path, "original").unwrap();
+        let ctx = ctx(dir.path()).with_path_verifier(Arc::new(|_paths| {
+            Err("the opened path is not allowed".to_string())
+        }));
+        let error = WriteTool
+            .execute(input("a.txt", "replacement"), ctx)
+            .await
+            .expect_err("the verifier refusal must fail the write");
+        assert!(error.to_string().contains("not allowed"), "{error}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "original");
     }
 }

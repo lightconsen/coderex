@@ -1368,6 +1368,7 @@ dependencies = [
  "home",
  "html2text",
  "ignore",
+ "libc",
  "lsp-types",
  "mockall",
  "moka",
@@ -1387,6 +1388,7 @@ dependencies = [
  "url",
  "uuid",
  "walkdir",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

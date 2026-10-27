@@ -12,6 +12,16 @@
 use crate::permissions::RuleSubject;
 use crate::types::ToolResult;
 use serde_json::Value;
+use std::path::PathBuf;
+use std::sync::Arc;
+
+/// Re-check a file path after the tool has opened it.
+///
+/// The callback receives the tool name and the actual paths of the opened
+/// handles. It must return `Err` unless the open target is allowed: the
+/// pre-dispatch check saw a path string, and a symlink can be retargeted
+/// between that check and the open.
+pub type PathVerifier = Arc<dyn Fn(&str, &[PathBuf]) -> Result<(), String> + Send + Sync>;
 
 /// Outcome of dispatching a single tool call through a `ToolExecutor`.
 #[derive(Debug, Clone)]
@@ -60,6 +70,18 @@ pub trait ToolExecutor: Send + Sync {
     fn rule_subjects(&self, _tool_name: &str, _input: &Value) -> Vec<RuleSubject> {
         Vec::new()
     }
+
+    /// Install the callback file tools use to verify opened paths.
+    fn set_path_verifier(&self, _verifier: Option<PathVerifier>) {}
+
+    /// Record the subjects the pre-dispatch permission check saw for `call_id`.
+    ///
+    /// File tools compare their opened paths against this set; a path that was
+    /// not checked is re-evaluated by the verifier before the tool uses it.
+    fn note_permission_subjects(&self, _call_id: &str, _subjects: &[RuleSubject]) {}
+
+    /// Forget any per-call subjects the dispatcher still holds.
+    fn clear_permission_subjects(&self) {}
 }
 
 /// No-op tool executor — used when no concrete tool registry is wired.

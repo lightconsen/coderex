@@ -3,6 +3,7 @@
 use crate::context::{ToolError, ToolOutput};
 use crate::tool::{Tool, ToolContext, ToolDescriptor, ToolInput, ToolTier};
 use async_trait::async_trait;
+use std::io::{Read as _, Seek, SeekFrom, Write as _};
 
 /// Edit file contents with exact string replacement.
 #[derive(Debug)]
@@ -75,9 +76,34 @@ impl Tool for EditTool {
             }
         }
 
-        let content = std::fs::read_to_string(&path_buf).map_err(|e| ToolError::InvalidInput {
-            message: format!("failed to read file: {e}"),
-        })?;
+        let mut verified = crate::verified_fs::open_read_write(&path_buf, &ctx)?;
+        let actual = verified.path.clone();
+        if let Some(config) = ctx
+            .extra
+            .get("sandbox_config")
+            .and_then(|value| value.downcast_ref::<coderex_core::sandbox::SandboxConfig>())
+        {
+            if !crate::sandbox_policy::is_path_allowed(&actual, &config.allowed_read_paths)
+                || !crate::sandbox_policy::is_path_allowed(&actual, &config.allowed_write_paths)
+            {
+                return Err(ToolError::PermissionDenied {
+                    name: "Edit".into(),
+                });
+            }
+        }
+        let mut content = String::new();
+        verified
+            .file
+            .read_to_string(&mut content)
+            .map_err(|e| ToolError::InvalidInput {
+                message: format!("failed to read file: {e}"),
+            })?;
+        verified
+            .file
+            .seek(SeekFrom::Start(0))
+            .map_err(|e| ToolError::InvalidInput {
+                message: format!("failed to seek file: {e}"),
+            })?;
 
         let count = content.matches(&old_string).count();
         if count == 0 {
@@ -101,12 +127,17 @@ impl Tool for EditTool {
 
         // Snapshot the current content so `/rewind` can undo this edit.
         if let Some(store) = crate::tool::checkpoint_store_from(&ctx) {
-            store.snapshot(&input.call_id, &path_buf);
+            store.snapshot(&input.call_id, &actual);
         }
 
-        std::fs::write(&path_buf, &new_content).map_err(|e| ToolError::InvalidInput {
-            message: format!("failed to write file: {e}"),
-        })?;
+        verified
+            .file
+            .set_len(0)
+            .and_then(|()| verified.file.seek(SeekFrom::Start(0)).map(|_| ()))
+            .and_then(|()| verified.file.write_all(new_content.as_bytes()))
+            .map_err(|e| ToolError::InvalidInput {
+                message: format!("failed to write file: {e}"),
+            })?;
 
         Ok(ToolOutput {
             output: format!("Replaced {count} occurrence(s) of old_string in {path}"),

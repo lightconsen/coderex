@@ -1931,6 +1931,27 @@ impl QueryEngine {
     /// Set the tool executor for tool call dispatch.
     pub fn set_tool_executor(&mut self, tools: Box<dyn ToolExecutor + Send + Sync>) {
         self.tools = tools;
+        // File tools open a handle and hand its real path back here before
+        // using it. If that path is not the one the pre-dispatch check saw, it
+        // is checked again; the pre-dispatch path alone is a TOCTOU snapshot.
+        let checker = self.permission_engine.checker();
+        let verifier: crate::tool_executor::PathVerifier = Arc::new(move |tool, paths| {
+            let subjects: Vec<crate::permissions::RuleSubject> = paths
+                .iter()
+                .map(|path| {
+                    crate::permissions::RuleSubject::single(path.to_string_lossy().to_string())
+                })
+                .collect();
+            let checker = checker.lock().unwrap();
+            match checker.check_with_subjects(tool, &subjects, None) {
+                crate::permissions::PermissionResult::Allow
+                | crate::permissions::PermissionResult::AllowForPath { .. } => Ok(()),
+                other => Err(format!(
+                    "the opened path differs from the permission-checked path and is not                      allowed: {other:?}"
+                )),
+            }
+        });
+        self.tools.set_path_verifier(Some(verifier));
     }
 
     /// Set the loop detector for detecting repetitive tool call patterns.
@@ -4856,6 +4877,7 @@ impl QueryEngine {
 
         // 3. Permission check
         let subjects = self.tools.rule_subjects(&call.name, &call.input);
+        self.tools.note_permission_subjects(&call.id, &subjects);
         let (_request, perm_result) = self
             .permission_engine
             .evaluate_with_subjects(
@@ -5085,6 +5107,7 @@ impl QueryEngine {
             }
         }
         turn.pending_tool_calls.clear();
+        self.tools.clear_permission_subjects();
         Ok(results)
     }
 
@@ -5227,6 +5250,8 @@ impl QueryEngine {
         let subjects = self
             .tools
             .rule_subjects(&elevation.tool_name, &elevation.input);
+        self.tools
+            .note_permission_subjects(&elevation.tool_call_id, &subjects);
         let permission_result = self
             .permission_engine
             .evaluate_with_subjects(
@@ -10112,5 +10137,70 @@ mod tests {
             summary,
             ToolCall::summarize_activity("bash", &serde_json::json!({"command": "true"}))
         );
+    }
+
+    /// The engine installs a verifier that re-checks a path after a tool has
+    /// opened it; an unexpected path must not inherit the pre-check verdict.
+    #[tokio::test]
+    async fn the_engine_verifier_rechecks_an_opened_path() {
+        use crate::permissions::{PermissionRuleSpec, RuleCompileContext};
+        use std::sync::Mutex;
+
+        #[derive(Clone, Default)]
+        struct Capture(std::sync::Arc<Mutex<Option<crate::tool_executor::PathVerifier>>>);
+
+        #[async_trait::async_trait]
+        impl ToolExecutor for Capture {
+            async fn execute(
+                &self,
+                _tool_call_id: &str,
+                _tool_name: &str,
+                _input: &serde_json::Value,
+            ) -> crate::tool_executor::ToolDispatchOutcome {
+                crate::tool_executor::ToolDispatchOutcome {
+                    result: ToolResult {
+                        tool_call_id: "x".into(),
+                        output: String::new(),
+                        is_error: false,
+                        images: Vec::new(),
+                    },
+                }
+            }
+
+            fn set_path_verifier(&self, verifier: Option<crate::tool_executor::PathVerifier>) {
+                *self.0.lock().unwrap() = verifier;
+            }
+        }
+
+        let (mut engine, _rx, _session) = make_test_engine();
+        let checker = engine.permission_checker();
+        {
+            let mut checker = checker.lock().unwrap();
+            checker.set_mode(PermissionMode::Default);
+            checker
+                .add_specs(
+                    &[PermissionRuleSpec::parse(
+                        "Read(./secret/**)",
+                        crate::permissions::PermissionAction::Deny,
+                    )
+                    .unwrap()],
+                    &RuleCompileContext {
+                        cwd: std::path::Path::new("/tmp"),
+                        home: None,
+                    },
+                )
+                .unwrap();
+        }
+        let capture = Capture::default();
+        engine.set_tool_executor(Box::new(capture.clone()));
+        let verifier = capture
+            .0
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("verifier installed");
+
+        assert!(verifier("Read", &[std::path::PathBuf::from("/tmp/secret/x")]).is_err());
+        assert!(verifier("Read", &[std::path::PathBuf::from("/tmp/public/x")]).is_ok());
     }
 }

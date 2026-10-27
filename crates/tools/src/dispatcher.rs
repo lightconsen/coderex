@@ -22,7 +22,10 @@ use crate::tool::{
 };
 use coderex_config::FeatureFlags;
 use coderex_core::hook_executor::HookExecutor;
-use coderex_core::tool_executor::{ToolDispatchOutcome, ToolExecutor as CoreToolExecutor};
+use coderex_core::permissions::RuleSubject;
+use coderex_core::tool_executor::{
+    PathVerifier, ToolDispatchOutcome, ToolExecutor as CoreToolExecutor,
+};
 use coderex_core::types::ToolResult;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -84,6 +87,10 @@ pub struct RegistryToolDispatcher {
     /// can undo the file half of a truncated turn.
     checkpoint_store:
         Arc<parking_lot::RwLock<Option<Arc<coderex_core::checkpoints::CheckpointStore>>>>,
+    /// Re-check a path after a tool has opened it.
+    path_verifier: Arc<parking_lot::RwLock<Option<PathVerifier>>>,
+    /// Subject forms the pre-dispatch permission check saw, by call id.
+    expected_subjects: Arc<parking_lot::Mutex<HashMap<String, Vec<String>>>>,
 }
 
 impl RegistryToolDispatcher {
@@ -223,6 +230,8 @@ impl RegistryToolDispatcher {
             session_id: None,
             hooks: Arc::new(parking_lot::RwLock::new(None)),
             checkpoint_store: Arc::new(parking_lot::RwLock::new(None)),
+            path_verifier: Arc::new(parking_lot::RwLock::new(None)),
+            expected_subjects: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         }
     }
 
@@ -304,6 +313,17 @@ impl RegistryToolDispatcher {
         if let Ok(mut guard) = self.elicit_tx.lock() {
             *guard = tx;
         }
+    }
+}
+
+/// Stable comparison key for a path or subject form.
+fn subject_key(value: &str) -> String {
+    let normalized = value.replace('\\', "/");
+    let trimmed = normalized.trim_end_matches('/');
+    if cfg!(windows) {
+        trimmed.to_lowercase()
+    } else {
+        trimmed.to_string()
     }
 }
 
@@ -399,6 +419,25 @@ impl CoreToolExecutor for RegistryToolDispatcher {
         subjects
     }
 
+    fn set_path_verifier(&self, verifier: Option<PathVerifier>) {
+        *self.path_verifier.write() = verifier;
+    }
+
+    fn note_permission_subjects(&self, call_id: &str, subjects: &[RuleSubject]) {
+        let forms = subjects
+            .iter()
+            .flat_map(|subject| subject.forms.iter())
+            .map(|form| subject_key(form))
+            .collect();
+        self.expected_subjects
+            .lock()
+            .insert(call_id.to_string(), forms);
+    }
+
+    fn clear_permission_subjects(&self) {
+        self.expected_subjects.lock().clear();
+    }
+
     async fn execute(
         &self,
         tool_call_id: &str,
@@ -492,6 +531,29 @@ impl CoreToolExecutor for RegistryToolDispatcher {
         // not `Send`, and this runs inside spawned tasks.
         let cwd = self.cwd.read().clone();
         let mut ctx = ToolContext::new(self.context, &cwd);
+
+        // The pre-dispatch permission check saw path strings. A file tool
+        // hands back the path of the handle it actually opened; a path that
+        // is not the one that was checked is re-evaluated before use.
+        let expected = self
+            .expected_subjects
+            .lock()
+            .remove(tool_call_id)
+            .unwrap_or_default();
+        if let Some(verifier) = self.path_verifier.read().clone() {
+            let expected = Arc::new(expected);
+            let tool_name = tool_name.to_string();
+            ctx = ctx.with_path_verifier(Arc::new(move |paths: &[std::path::PathBuf]| {
+                if !expected.is_empty()
+                    && paths
+                        .iter()
+                        .all(|path| expected.contains(&subject_key(&path.to_string_lossy())))
+                {
+                    return Ok(());
+                }
+                verifier(&tool_name, paths)
+            }));
+        }
 
         // Inject elicitation channel if available
         if let Ok(guard) = self.elicit_tx.lock() {
@@ -726,14 +788,23 @@ pub fn rule_content_subjects(
             return Vec::new();
         };
         let command = command.to_string_lossy().to_string();
-        let segments = coderex_core::shell_security::command_segments(&command);
-        if segments.is_empty() {
-            return vec![coderex_core::permissions::RuleSubject::single(command)];
+        let analysis = coderex_core::shell_security::analyze_command(&command);
+        let mut subjects: Vec<coderex_core::permissions::RuleSubject> =
+            if analysis.segments.is_empty() {
+                vec![coderex_core::permissions::RuleSubject::single(command)]
+            } else {
+                analysis
+                    .segments
+                    .into_iter()
+                    .map(coderex_core::permissions::RuleSubject::single)
+                    .collect()
+            };
+        if let Some(reason) = analysis.opaque {
+            for subject in &mut subjects {
+                subject.opaque = Some(reason.clone());
+            }
         }
-        return segments
-            .into_iter()
-            .map(coderex_core::permissions::RuleSubject::single)
-            .collect();
+        return subjects;
     }
 
     // Each file is its own subject; a multi-file allow must cover every one.
@@ -1941,6 +2012,32 @@ mod subject_tests {
     }
 
     #[test]
+    fn a_wrapped_command_is_marked_opaque() {
+        let subjects = rule_content_subjects(
+            Some(RuleContentField::Scalar("command")),
+            &json!({"command": "sudo rm -rf /tmp/x"}),
+            std::path::Path::new("/proj"),
+        );
+        assert!(
+            subjects.iter().all(|subject| subject.opaque.is_some()),
+            "{subjects:?}"
+        );
+    }
+
+    #[test]
+    fn a_plain_chained_command_is_not_opaque() {
+        let subjects = rule_content_subjects(
+            Some(RuleContentField::Scalar("command")),
+            &json!({"command": "cd repo && git diff"}),
+            std::path::Path::new("/proj"),
+        );
+        assert!(
+            subjects.iter().all(|subject| subject.opaque.is_none()),
+            "{subjects:?}"
+        );
+    }
+
+    #[test]
     fn a_declared_path_field_yields_raw_and_absolute_forms() {
         let subjects = rule_content_subjects(
             Some(RuleContentField::Scalar("file_path")),
@@ -2115,5 +2212,87 @@ mod subject_tests {
                 .any(|form| *form == real_form),
             "the canonical form is missing: {subjects:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod toctou_dispatch_tests {
+    use super::*;
+    use crate::builtins::ReadTool;
+    use crate::context::ExecutionContext;
+    use crate::executor::{ExecutionConfig, ToolExecutor as InnerExecutor};
+    use crate::registry::ToolRegistry;
+    use coderex_core::permissions::{RuleSubject, RuleSubject as Subject};
+
+    fn dispatcher(cwd: &std::path::Path) -> RegistryToolDispatcher {
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(ReadTool));
+        RegistryToolDispatcher::new(
+            Arc::new(registry),
+            Arc::new(InnerExecutor::new(ExecutionConfig::default())),
+            ExecutionContext::Normal,
+            cwd.to_path_buf(),
+        )
+    }
+
+    #[tokio::test]
+    async fn an_unexpected_opened_path_is_rechecked_and_can_be_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "content").unwrap();
+        let dispatcher = dispatcher(dir.path());
+        dispatcher.set_path_verifier(Some(Arc::new(|_tool, _paths| {
+            Err("re-check refused".to_string())
+        })));
+        // The pre-dispatch check saw a different path, so the opened path is
+        // not trusted and the verifier runs.
+        CoreToolExecutor::note_permission_subjects(
+            &dispatcher,
+            "call_1",
+            &[Subject::single("/somewhere/else")],
+        );
+
+        let outcome = CoreToolExecutor::execute(
+            &dispatcher,
+            "call_1",
+            "Read",
+            &serde_json::json!({"file_path": "a.txt"}),
+        )
+        .await;
+        assert!(outcome.result.is_error, "{:?}", outcome.result);
+        assert!(
+            outcome.result.output.contains("re-check refused"),
+            "{}",
+            outcome.result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn the_checked_path_does_not_pay_for_a_second_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.txt");
+        std::fs::write(&path, "content").unwrap();
+        let canonical = std::fs::canonicalize(&path).unwrap();
+        let dispatcher = dispatcher(dir.path());
+        dispatcher.set_path_verifier(Some(Arc::new(|_tool, _paths| {
+            Err("must not be called for the checked path".to_string())
+        })));
+        CoreToolExecutor::note_permission_subjects(
+            &dispatcher,
+            "call_2",
+            &[RuleSubject::new(vec![
+                "a.txt".to_string(),
+                canonical.to_string_lossy().to_string(),
+            ])],
+        );
+
+        let outcome = CoreToolExecutor::execute(
+            &dispatcher,
+            "call_2",
+            "Read",
+            &serde_json::json!({"file_path": "a.txt"}),
+        )
+        .await;
+        assert!(!outcome.result.is_error, "{:?}", outcome.result);
+        assert_eq!(outcome.result.output, "content");
     }
 }

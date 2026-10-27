@@ -365,6 +365,12 @@ pub struct ToolContext<'a> {
     pub extra: Arc<HashMap<String, SharedState>>,
     /// Optional channel for asking the user questions mid-execution.
     pub elicit_tx: Option<tokio::sync::mpsc::Sender<ElicitRequest>>,
+    /// Verify the actual paths of files a tool has opened.
+    ///
+    /// The dispatcher installs this for a call; a tool that reads or writes a
+    /// file passes the handle's real path here before using the handle.
+    pub path_verifier:
+        Option<Arc<dyn Fn(&[std::path::PathBuf]) -> Result<(), String> + Send + Sync>>,
 }
 
 impl fmt::Debug for ToolContext<'_> {
@@ -373,6 +379,7 @@ impl fmt::Debug for ToolContext<'_> {
             .field("execution_context", &self.execution_context)
             .field("cwd", &self.cwd)
             .field("has_elicit_tx", &self.elicit_tx.is_some())
+            .field("has_path_verifier", &self.path_verifier.is_some())
             .finish()
     }
 }
@@ -386,6 +393,7 @@ impl<'a> ToolContext<'a> {
             cwd,
             extra: Arc::new(HashMap::new()),
             elicit_tx: None,
+            path_verifier: None,
         }
     }
 
@@ -401,6 +409,30 @@ impl<'a> ToolContext<'a> {
     pub fn with_elicit_tx(mut self, tx: tokio::sync::mpsc::Sender<ElicitRequest>) -> Self {
         self.elicit_tx = Some(tx);
         self
+    }
+
+    /// Attach the verifier for paths a tool has opened.
+    #[must_use]
+    pub fn with_path_verifier(
+        mut self,
+        verifier: Arc<dyn Fn(&[std::path::PathBuf]) -> Result<(), String> + Send + Sync>,
+    ) -> Self {
+        self.path_verifier = Some(verifier);
+        self
+    }
+
+    /// Verify opened paths, or allow them when no verifier is installed
+    /// (direct tool use in tests and library calls).
+    pub fn verify_paths(&self, paths: &[std::path::PathBuf]) -> Result<(), ToolError> {
+        let Some(verifier) = self.path_verifier.as_ref() else {
+            return Ok(());
+        };
+        verifier(paths).map_err(|message| {
+            ToolError::Io(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                message,
+            ))
+        })
     }
 }
 

@@ -281,6 +281,7 @@ impl Tool for BashTool {
         for key in coderex_core::sandbox::credential_scrub_keys() {
             cmd.env_remove(key);
         }
+        crate::sandbox_shell::sanitize_shell_env(&mut cmd, ctx.cwd);
 
         if run_in_background {
             return Self::spawn_background(&ctx, &command, timeout_secs, cmd, sandbox_handle);

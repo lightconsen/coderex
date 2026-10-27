@@ -780,6 +780,10 @@ fn select_tools(prompt: &str) -> Vec<Tool> {
         vec![Tool::Bash {
             command: "sudo -n true".into(),
         }]
+    } else if p.contains("run a wrapped command") {
+        vec![Tool::Bash {
+            command: "sudo -n true".into(),
+        }]
     } else if p.contains("run a chained command") {
         vec![Tool::Bash {
             command: "cd /tmp && echo chained-ok".into(),

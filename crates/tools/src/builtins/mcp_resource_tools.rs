@@ -170,6 +170,7 @@ mod tests {
         extra.insert(MCP_RESOURCE_HANDLE_KEY.into(), Box::new(handle));
         ToolContext {
             elicit_tx: None,
+            path_verifier: None,
             execution_context: ExecutionContext::Normal,
             cwd: Path::new("/tmp"),
             extra: Arc::new(extra),

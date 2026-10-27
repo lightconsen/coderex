@@ -65,7 +65,11 @@ async fn write_over_an_existing_file_is_reversible() {
     );
 
     let report = checkpoints.restore(&ids(&["call_write"]));
-    assert_eq!(report.restored, vec![file.clone()], "{report:?}");
+    assert_eq!(
+        report.restored,
+        vec![std::fs::canonicalize(&file).unwrap()],
+        "{report:?}"
+    );
     assert_eq!(
         std::fs::read_to_string(&file).unwrap(),
         "fn original() {}\n"
@@ -88,9 +92,10 @@ async fn a_file_created_by_write_is_removed_on_restore() {
     assert!(!outcome.result.is_error, "{:?}", outcome.result);
     let file = tmp.path().join("new.rs");
     assert!(file.exists());
+    let canonical = std::fs::canonicalize(&file).unwrap();
 
     let report = checkpoints.restore(&ids(&["call_new"]));
-    assert_eq!(report.removed, vec![file.clone()], "{report:?}");
+    assert_eq!(report.removed, vec![canonical], "{report:?}");
     assert!(!file.exists());
 }
 
@@ -117,7 +122,11 @@ async fn edit_snapshots_before_it_changes_the_file() {
     assert!(std::fs::read_to_string(&file).unwrap().contains("new();"));
 
     let report = checkpoints.restore(&ids(&["call_edit"]));
-    assert_eq!(report.restored, vec![file.clone()], "{report:?}");
+    assert_eq!(
+        report.restored,
+        vec![std::fs::canonicalize(&file).unwrap()],
+        "{report:?}"
+    );
     assert_eq!(
         std::fs::read_to_string(&file).unwrap(),
         "fn main() {\n    old();\n}\n"

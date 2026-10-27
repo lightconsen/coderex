@@ -285,6 +285,7 @@ impl PermissionEngine {
             let checker = self.checker.lock().unwrap();
             checker.mode()
         };
+        let opaque = subjects.iter().any(|subject| subject.opaque.is_some());
 
         self.request_counter += 1;
         let id = format!("perm_{}", self.request_counter);
@@ -299,8 +300,15 @@ impl PermissionEngine {
         };
 
         // Phase 1: Hook short-circuit
+        //
+        // A hook may still deny an opaque call; it may not auto-approve one.
+        // That keeps the auto-classifier and auto-approve hooks from waving
+        // through a command the static analysis could not model.
         for hook in &self.hooks {
             if let Some(result) = hook.evaluate(&request, mode).await? {
+                if opaque && result.is_allowed() {
+                    continue;
+                }
                 return Ok((request, result));
             }
         }
@@ -1642,6 +1650,31 @@ mod tests {
         assert!(
             result.is_none(),
             "the substring 'safe' must not be a verdict"
+        );
+    }
+
+    /// An auto-approve hook must not wave through a call the static analysis
+    /// could not model; a deny hook still may.
+    #[tokio::test]
+    async fn an_auto_approve_hook_cannot_allow_an_opaque_call() {
+        let mut engine = PermissionEngine::new(PermissionChecker::new(PermissionMode::Default));
+        engine.add_hook(Arc::new(AutoApproveHook::for_tools(vec!["Bash".into()])));
+        let (_request, result) = engine
+            .evaluate_with_subjects(
+                "Bash",
+                serde_json::json!({"command": "sudo true"}).to_string(),
+                None,
+                HashMap::new(),
+                vec![
+                    crate::permissions::RuleSubject::single("sudo true")
+                        .with_opaque("sudo wrapper"),
+                ],
+            )
+            .await
+            .unwrap();
+        assert!(
+            !result.is_allowed(),
+            "auto-approve bypassed the opaque check: {result:?}"
         );
     }
 }
