@@ -61,7 +61,7 @@ Manages plugin lifecycle (discovery, loading, execution, unloading), marketplace
 - **Environment injection**: `userConfig` values and static `env` are resolved and substituted before the child is spawned.
 - **Trust on first use**: archive SHA-256 / git commit recorded in `.coderex-pins.json` and checked on later installs.
 - **Dependency resolution**: Kahn's topological sort with cycle detection for plugin load ordering.
-- **Error recovery**: Exponential-backoff retry for Error-state plugins (re-reads manifest, re-validates). A successful retry reports `RestartRequired` (or invokes a registered restart handler); the CLI acts on that signal by calling `spawn_plugin` again, so recovery restores a runtime instead of only clearing the error state.
+- **Error recovery**: Exponential-backoff retry for Error-state plugins (re-reads manifest, re-validates). A successful retry reports `RestartRequired` (or invokes a registered restart handler); the CLI acts on that signal by calling `spawn_plugin` again, so recovery restores a runtime instead of only clearing the error state. Process exits are detected by `reap_dead_plugins()` — called before each retry pass and after a failed command/skill — so a plugin that dies while idle is moved to `Error` and retried rather than staying `Active` with a dead child.
 - **MCP skills bridge**: Discovered MCP tools converted to `SkillMetadata` and stored in `SessionContext.mcp_skills`.
 - **Hybrid execution model**: Default tier = external process (JSON-RPC over stdio). Fast tier = WASM (compiled in-process, sandboxed, and loaded by `spawn_plugin`).
 - **Plugin command registration**: Dynamic `SlashCommand` registration via `Box::leak` for `&'static str` names/descriptions.

@@ -1845,6 +1845,9 @@ impl StartupOrchestrator {
                 let Some(manager) = manager.upgrade() else {
                     break;
                 };
+                // A process can die while no command is in flight; move it to
+                // Error first so the retry pass can see it.
+                let _ = manager.reap_dead_plugins();
                 for outcome in manager.retry_failed_plugins() {
                     if let coderex_plugins::plugins::RetryOutcome::RestartRequired(name) = outcome {
                         match manager.spawn_plugin(&name).await {

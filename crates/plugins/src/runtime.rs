@@ -349,9 +349,14 @@ impl PluginProcess {
     }
 
     /// Check if the process is still running.
-    #[must_use]
-    pub const fn is_running(&self) -> bool {
-        self.process.is_some()
+    ///
+    /// `try_wait` also reaps an exited child. A plugin that died between
+    /// requests must not keep reporting `Active`.
+    pub fn is_running(&mut self) -> bool {
+        match self.process.as_mut() {
+            Some(process) => matches!(process.try_wait(), Ok(None)),
+            None => false,
+        }
     }
 
     /// Get the discovered commands.
@@ -392,7 +397,7 @@ mod tests {
 
     #[tokio::test]
     async fn new_process_not_initialized() {
-        let process = PluginProcess::new(
+        let mut process = PluginProcess::new(
             "echo",
             vec![],
             HashMap::new(),
@@ -467,5 +472,22 @@ mod tests {
         let err = response.error.unwrap();
         assert_eq!(err.code, -32601);
         assert_eq!(err.message, "Method not found");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_process_that_exited_is_not_running() {
+        let mut process = PluginProcess::new(
+            "sh",
+            vec!["-c".into(), "exit 7".into()],
+            std::collections::HashMap::new(),
+            std::env::temp_dir(),
+        );
+        process.spawn().expect("spawn");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while process.is_running() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(!process.is_running(), "the exited child still looked alive");
     }
 }

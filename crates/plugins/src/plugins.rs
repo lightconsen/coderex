@@ -2920,7 +2920,17 @@ impl PluginManager {
         args: &[String],
     ) -> Result<String, String> {
         if let Some(mut entry) = self.active_processes.get_mut(plugin_name) {
-            return entry.execute_command(command_name, args).await;
+            let result = entry.execute_command(command_name, args).await;
+            let alive = entry.is_running();
+            drop(entry);
+            if !alive {
+                self.active_processes.remove(plugin_name);
+                self.set_plugin_state(
+                    plugin_name,
+                    PluginState::Error("plugin process exited unexpectedly".into()),
+                );
+            }
+            return result;
         }
         if let Some(mut entry) = self.active_wasm_instances.get_mut(plugin_name) {
             return entry.execute_command(command_name, args);
@@ -2938,7 +2948,17 @@ impl PluginManager {
         context: &Value,
     ) -> Result<String, String> {
         if let Some(mut entry) = self.active_processes.get_mut(plugin_name) {
-            return entry.execute_skill(skill_name, context).await;
+            let result = entry.execute_skill(skill_name, context).await;
+            let alive = entry.is_running();
+            drop(entry);
+            if !alive {
+                self.active_processes.remove(plugin_name);
+                self.set_plugin_state(
+                    plugin_name,
+                    PluginState::Error("plugin process exited unexpectedly".into()),
+                );
+            }
+            return result;
         }
         if let Some(mut entry) = self.active_wasm_instances.get_mut(plugin_name) {
             return entry.execute_skill(skill_name, context);
@@ -5251,6 +5271,34 @@ impl PluginManager {
     /// and the plugin becomes `Active` only when it returns `Ok`. Without a
     /// handler the plugin becomes `Loading` and the outcome is
     /// [`RetryOutcome::RestartRequired`], so the caller knows to spawn it.
+    /// Move plugins whose child process exited into `Error`.
+    ///
+    /// A process plugin can die while idle, not only while a command is
+    /// running. Without this pass the entry would stay `Active` with a dead
+    /// runtime and the retry loop would never see it. Must be called from a
+    /// Tokio runtime: the child handle is a `tokio::process::Child`.
+    pub fn reap_dead_plugins(&self) -> Vec<String> {
+        let dead: Vec<String> = self
+            .active_processes
+            .iter_mut()
+            .filter_map(|mut entry| (!entry.value_mut().is_running()).then(|| entry.key().clone()))
+            .collect();
+        for name in &dead {
+            self.active_processes.remove(name);
+            self.set_plugin_state(
+                name,
+                PluginState::Error("plugin process exited unexpectedly".into()),
+            );
+            tracing::warn!(plugin = %name, "plugin process exited; scheduling a retry");
+        }
+        dead
+    }
+
+    /// Retry plugins in the `Error` state.
+    ///
+    /// A plugin whose runtime crashed is reaped into `Error` by
+    /// [`Self::reap_dead_plugins`]; this pass re-reads its manifest and either
+    /// marks it for a caller-driven restart or reports the failure.
     pub fn retry_failed_plugins(&self) -> Vec<RetryOutcome> {
         let mut outcomes = Vec::new();
 
@@ -5768,6 +5816,51 @@ fn retry_backoff(retry_count: u32) -> std::time::Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reaping_a_dead_process_moves_the_plugin_to_error() {
+        use crate::runtime::PluginProcess;
+
+        let dir = tempfile::tempdir().unwrap();
+        let manager = PluginManager::new();
+        let manifest = PluginManifest {
+            name: "dead-process".into(),
+            version: "1.0.0".into(),
+            ..PluginManifest::default()
+        };
+        manager.load_plugin(manifest, dir.path().to_path_buf());
+        let mut process = PluginProcess::new(
+            "sh",
+            vec!["-c".into(), "exit 0".into()],
+            std::collections::HashMap::new(),
+            dir.path().to_path_buf(),
+        );
+        process.spawn().expect("spawn");
+        manager
+            .active_processes
+            .insert("dead-process".to_string(), process);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let reaped = manager.reap_dead_plugins();
+            if reaped == vec!["dead-process".to_string()] {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the exited plugin was never reaped"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let plugin = manager.get_plugin("dead-process").expect("plugin");
+        assert!(
+            matches!(plugin.state, PluginState::Error(ref message) if message.contains("exited")),
+            "{:?}",
+            plugin.state
+        );
+        assert!(!manager.active_processes.contains_key("dead-process"));
+    }
 
     #[test]
     fn new_manager_is_empty() {
