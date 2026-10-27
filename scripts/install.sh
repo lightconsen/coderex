@@ -9,6 +9,8 @@ set -e
 
 REPO="lightconsen/coderex"
 BINARY="coderex"
+RELEASE_BASE_URL="${CODEREX_RELEASE_BASE_URL:-https://github.com/$REPO/releases/download}"
+API_URL="${CODEREX_API_BASE_URL:-https://api.github.com/repos/$REPO}"
 
 # Determine version
 if [ -n "$1" ]; then
@@ -46,7 +48,7 @@ esac
 
 # Resolve latest version from GitHub API
 if [ "$VERSION" = "latest" ]; then
-    VERSION=$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" | \
+    VERSION=$(curl -fsSL "$API_URL/releases/latest" | \
         grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
     if [ -z "$VERSION" ]; then
         echo "Failed to determine latest version"
@@ -57,7 +59,7 @@ fi
 echo "Installing $BINARY $VERSION for $TARGET..."
 
 # Download URL
-URL="https://github.com/$REPO/releases/download/$VERSION/${BINARY}-${TARGET}.tar.gz"
+URL="$RELEASE_BASE_URL/$VERSION/${BINARY}-${TARGET}.tar.gz"
 TMPDIR=$(mktemp -d)
 trap 'rm -rf "$TMPDIR"' EXIT
 
@@ -82,4 +84,12 @@ cp "$TMPDIR/${BINARY}-${TARGET}" "$INSTALL_DIR/$BINARY"
 chmod +x "$INSTALL_DIR/$BINARY"
 
 echo "Installed $BINARY to $INSTALL_DIR/$BINARY"
+case ":$PATH:" in
+    *":$INSTALL_DIR:"*) ;;
+    *)
+        echo "Note: $INSTALL_DIR is not on your PATH."
+        echo "Add it with: export PATH=\"$INSTALL_DIR:\$PATH\""
+        ;;
+esac
 echo "Run '$BINARY --help' to get started"
+echo "To uninstall, remove $INSTALL_DIR/$BINARY"
