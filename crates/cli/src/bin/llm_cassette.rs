@@ -37,6 +37,39 @@ struct CassetteFile {
     responses: Vec<RecordedResponse>,
     /// The (canonicalized) request, for debugging what a recording answers.
     request: serde_json::Value,
+    /// How and when this recording was produced. Older recordings predate the
+    /// field, so it defaults to empty and `scripts/record-cassettes.sh
+    /// --backfill` can fill it in.
+    #[serde(default)]
+    metadata: CassetteMetadata,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct CassetteMetadata {
+    /// UTC recording time, RFC 3339.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    recorded_at: Option<String>,
+    /// The cassette suite (`e2e_code_agent`, `live`, ...).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    suite: Option<String>,
+    /// The test that issued the request, when the harness reported one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    test: Option<String>,
+    /// Upstream host only; credentials and paths are deliberately absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    endpoint_host: Option<String>,
+    /// The model sent upstream while recording.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
+    /// True when the values came from an older recording, not from the
+    /// recorder itself. `endpoint_host` and `test` may be absent in that case.
+    #[serde(default, skip_serializing_if = "is_false")]
+    backfilled: bool,
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+const fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,6 +85,7 @@ struct Args {
     upstream: String,
     api_key: String,
     model: String,
+    suite: String,
     exit_on_stdin_eof: bool,
 }
 
@@ -63,6 +97,7 @@ impl Args {
         let mut upstream = String::new();
         let mut api_key = String::new();
         let mut model = String::new();
+        let mut suite = String::new();
         let mut exit_on_stdin_eof = false;
         let mut args = std::env::args().skip(1);
         while let Some(arg) = args.next() {
@@ -87,6 +122,7 @@ impl Args {
                 }
                 "--api-key" => api_key = args.next().ok_or("--api-key needs a value")?,
                 "--model" => model = args.next().ok_or("--model needs a value")?,
+                "--suite" => suite = args.next().ok_or("--suite needs a value")?,
                 "--exit-on-stdin-eof" => exit_on_stdin_eof = true,
                 "-h" | "--help" => {
                     println!(
@@ -114,6 +150,7 @@ impl Args {
             upstream,
             api_key,
             model,
+            suite,
             exit_on_stdin_eof,
         })
     }
@@ -171,9 +208,12 @@ async fn run() -> Result<(), String> {
         let dir = args.dir.clone();
         let mode = args.mode;
         let model = args.model.clone();
+        let suite = args.suite.clone();
         tokio::spawn(async move {
-            if let Err(error) =
-                handle(socket, mode, &dir, &cassettes, &upstream, &api_key, &model).await
+            if let Err(error) = handle(
+                socket, mode, &dir, &cassettes, &upstream, &api_key, &model, &suite,
+            )
+            .await
             {
                 eprintln!("llm-cassette: connection error: {error}");
             }
@@ -209,6 +249,7 @@ async fn handle(
     upstream: &str,
     api_key: &str,
     model: &str,
+    suite: &str,
 ) -> Result<(), String> {
     let Some((method, path, headers, body)) = read_request(&mut socket).await? else {
         return Ok(());
@@ -221,7 +262,14 @@ async fn handle(
         .iter()
         .find(|(name, _)| name.eq_ignore_ascii_case("x-cassette-cwd"))
         .map(|(_, value)| value.as_str());
-    trace(&format!("{mode:?} {method} {path} key={key} cwd={cwd:?}"));
+    let test = headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("x-cassette-test"))
+        .map(|(_, value)| value.trim())
+        .filter(|value| !value.is_empty());
+    trace(&format!(
+        "{mode:?} {method} {path} key={key} test={test:?} cwd={cwd:?}"
+    ));
 
     let recorded = if mode == Mode::Replay {
         let guard = cassettes.lock().await;
@@ -243,13 +291,16 @@ async fn handle(
              Run the suites with CODEREX_CASSETTE_MODE=record against a real endpoint first."
         );
         eprintln!("{message}");
-        // Leave the unmatched request behind so the difference from a
-        // recording can be inspected.
-        let missing = dir.join(format!("_missing_{key}.json"));
-        let _ = std::fs::write(
-            missing,
-            serde_json::to_string_pretty(&canonical).unwrap_or_default(),
-        );
+        // Leave the unmatched request behind for inspection when tracing is
+        // explicitly enabled. A normal replay run must not litter the tree
+        // with `_missing_*.json`; optional follow-up requests are common.
+        if std::env::var_os("CODEREX_CASSETTE_TRACE").is_some() {
+            let missing = dir.join(format!("_missing_{key}.json"));
+            let _ = std::fs::write(
+                missing,
+                serde_json::to_string_pretty(&canonical).unwrap_or_default(),
+            );
+        }
         let body = serde_json::json!({
             "type": "error",
             "error": {"type": "cassette_missing", "message": message},
@@ -349,11 +400,17 @@ async fn handle(
         body: String::from_utf8_lossy(&body_bytes).into_owned(),
     };
     let mut guard = cassettes.lock().await;
+    let metadata = recording_metadata(suite, test, upstream, model);
     let entry = guard.entry(key.clone()).or_insert_with(|| CassetteFile {
         key: key.clone(),
         responses: Vec::new(),
         request: canonical,
+        metadata: metadata.clone(),
     });
+    let filled_metadata = entry.metadata.recorded_at.is_none();
+    if filled_metadata {
+        entry.metadata = metadata;
+    }
     if !entry
         .responses
         .iter()
@@ -361,10 +418,30 @@ async fn handle(
     {
         entry.responses.push(recorded.clone());
         persist(dir, entry)?;
+    } else if filled_metadata {
+        persist(dir, entry)?;
     }
     drop(guard);
     let _ = client_gone;
     Ok(())
+}
+
+fn recording_metadata(
+    suite: &str,
+    test: Option<&str>,
+    upstream: &str,
+    model: &str,
+) -> CassetteMetadata {
+    CassetteMetadata {
+        recorded_at: Some(chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
+        suite: (!suite.trim().is_empty()).then(|| suite.trim().to_string()),
+        test: test.map(str::to_string),
+        endpoint_host: reqwest::Url::parse(upstream)
+            .ok()
+            .and_then(|url| url.host_str().map(str::to_string)),
+        model: (!model.trim().is_empty()).then(|| model.trim().to_string()),
+        backfilled: false,
+    }
 }
 
 fn persist(dir: &Path, cassette: &CassetteFile) -> Result<(), String> {
@@ -961,5 +1038,30 @@ data: {"type":"content_block_stop","index":1}
             rebound.body
         );
         assert!(!rebound.body.contains(".tmpAbC"));
+    }
+
+    #[test]
+    fn an_old_cassette_without_metadata_still_loads() {
+        let cassette: CassetteFile =
+            serde_json::from_str(r#"{"key":"abc","responses":[],"request":{"model":"<model>"}}"#)
+                .expect("old cassette");
+        assert!(cassette.metadata.recorded_at.is_none());
+        assert!(!cassette.metadata.backfilled);
+    }
+
+    #[test]
+    fn recording_metadata_keeps_only_the_upstream_host() {
+        let metadata = recording_metadata(
+            "live",
+            Some("basic_chat_responds"),
+            "https://user:secret@example.test:8443/v1?token=hidden",
+            "test-model",
+        );
+        assert_eq!(metadata.endpoint_host.as_deref(), Some("example.test"));
+        assert_eq!(metadata.model.as_deref(), Some("test-model"));
+        assert_eq!(metadata.test.as_deref(), Some("basic_chat_responds"));
+        let serialized = serde_json::to_string(&metadata).expect("serialize");
+        assert!(!serialized.contains("secret"));
+        assert!(!serialized.contains("hidden"));
     }
 }

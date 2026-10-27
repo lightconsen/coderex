@@ -9,6 +9,14 @@
 # Usage:
 #   scripts/record-cassettes.sh            # add missing recordings
 #   scripts/record-cassettes.sh --fresh    # discard old recordings first
+#   scripts/record-cassettes.sh --check    # metadata, age, size, secrets
+#   scripts/record-cassettes.sh --backfill # add metadata to older recordings
+#   scripts/record-cassettes.sh --prune    # replay and delete unused cassettes
+#
+# --check exits non-zero for malformed files, unmatched-request markers or
+# credential-like strings. Staleness and size are warnings unless
+# CASSETTE_STRICT=1. --prune replays every suite with tracing; a suite whose
+# replay fails is left untouched.
 #
 # The endpoint and key are read from $CODEREX_SETTINGS, defaulting to
 # ~/.coderex/settings.json and falling back to ~/.claude/settings.ds.json when
@@ -19,6 +27,21 @@ set -euo pipefail
 
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$root"
+
+case "${1:-}" in
+  --check)
+    shift
+    exec python3 scripts/cassette_tool.py check "$@"
+    ;;
+  --backfill)
+    shift
+    exec python3 scripts/cassette_tool.py backfill "$@"
+    ;;
+  --prune)
+    shift
+    exec python3 scripts/cassette_tool.py prune "$@"
+    ;;
+esac
 
 # Prefer an explicit file, then CodeRex's own settings, then the Claude Code
 # settings that commonly hold a proxy provider (ANTHROPIC_* in `env`).

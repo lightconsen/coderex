@@ -2434,7 +2434,7 @@ fn launch_with_cassette(dir: &Path) -> PtySession {
         ("ANTHROPIC_AUTH_TOKEN".to_string(), "cassette".to_string()),
         (
             "CODEREX_CUSTOM_HEADERS".to_string(),
-            format!("X-Cassette-Cwd: {}", dir.display()),
+            common::cassette_headers(dir),
         ),
     ];
     PtySession::launch(dir, &envs, common::MODEL)

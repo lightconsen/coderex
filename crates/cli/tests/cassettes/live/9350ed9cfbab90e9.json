@@ -1154,5 +1154,10 @@
         }
       }
     ]
+  },
+  "metadata": {
+    "recorded_at": "2026-10-26T00:00:00Z",
+    "suite": "live",
+    "backfilled": true
   }
 }

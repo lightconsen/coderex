@@ -69,8 +69,61 @@ The script reads the endpoint and key from `$CODEREX_SETTINGS`
 `crates/cli/tests/cassettes/` files.
 
 If a replay cannot find a recording, the cassette returns HTTP 404 with a
-`cassette_missing` error and writes the unmatched canonical request to
-`crates/cli/tests/cassettes/<suite>/_missing_<key>.json` for inspection.
+`cassette_missing` error. When `CODEREX_CASSETTE_TRACE` is set, the unmatched
+canonical request is also written to
+`crates/cli/tests/cassettes/<suite>/_missing_<key>.json` for inspection; normal
+runs do not create these files.
+
+### Cassette metadata and maintenance
+
+Every recording carries a `metadata` object:
+
+```json
+"metadata": {
+  "recorded_at": "2026-10-27T08:00:00Z",
+  "suite": "e2e_equivalence",
+  "test": "tool_write_new_file",
+  "endpoint_host": "api.example.com",
+  "model": "deepseek-flash"
+}
+```
+
+`endpoint_host` is the host only — never the base URL, query or key. `test`
+comes from the Rust test thread name; older or in-process test harnesses may
+leave it empty. Recordings made before the field existed can be backfilled:
+
+```bash
+scripts/record-cassettes.sh --backfill
+```
+
+`--backfill` takes `recorded_at` from the file's most recent git commit date
+(falling back to mtime), `suite` from the directory and `model` from the
+request. It marks such files `"backfilled": true` and cannot invent
+`endpoint_host` or `test`.
+
+`--check` validates the tree without modifying it:
+
+```bash
+scripts/record-cassettes.sh --check
+CASSETTE_MAX_AGE_DAYS=180 CASSETTE_MAX_MB=30 CASSETTE_STRICT=1 \
+  scripts/record-cassettes.sh --check
+```
+
+It reports malformed JSON, credential-like strings, missing metadata, stale
+recordings, unmatched-request markers and suite/tree sizes. Malformed files and
+credential-like strings always fail; the other findings are warnings, and
+`CASSETTE_STRICT=1` turns them into failures (for CI).
+
+`--prune` replays every suite with `CODEREX_CASSETTE_TRACE` set, collects the
+keys each suite actually requested, and deletes `.json` files those suites did
+not use, plus `_missing_*.json` markers. It refuses to prune a suite whose
+replay failed. Use `--dry-run` to list the deletions first. Prune on the
+platform that runs the full suite; a platform-gated test may use recordings a
+different platform never requests.
+
+The tree budget is 30 MiB by default (`CASSETTE_MAX_MB`). Large responses
+should keep only the fields replay needs; the request side already stores the
+canonical form.
 
 ### What the E2E suites cover
 

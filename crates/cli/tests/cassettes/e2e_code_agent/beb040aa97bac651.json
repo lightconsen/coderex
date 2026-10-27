@@ -1454,5 +1454,10 @@
         }
       }
     ]
+  },
+  "metadata": {
+    "recorded_at": "2026-10-26T00:00:00Z",
+    "suite": "e2e_code_agent",
+    "backfilled": true
   }
 }

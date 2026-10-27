@@ -165,10 +165,7 @@ fn run_live_agent(cwd: &Path, prompt: &str, extra_args: &[&str]) -> AgentOutput 
         ("ANTHROPIC_API_KEY", "cassette".to_string()),
         ("ANTHROPIC_BASE_URL", cassette.base_url().to_string()),
         ("ANTHROPIC_MODEL", common::MODEL.to_string()),
-        (
-            "CODEREX_CUSTOM_HEADERS",
-            format!("X-Cassette-Cwd: {}", cwd.display()),
-        ),
+        ("CODEREX_CUSTOM_HEADERS", common::cassette_headers(cwd)),
     ];
     run_agent_with_env(cwd, prompt, extra_args, live_timeout(), &envs)
 }

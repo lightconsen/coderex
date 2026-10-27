@@ -68,6 +68,9 @@ pub fn live_api_client() -> AnthropicApiClient {
     let mut config = ApiConfig::new(key);
     config.base_url = base;
     config.request_timeout_secs = 180; // longer timeout for live tests
+    config
+        .custom_headers
+        .insert("X-Cassette-Test".to_string(), common::cassette_test_name());
     AnthropicApiClient::new(config)
 }
 

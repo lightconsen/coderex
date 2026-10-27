@@ -56,6 +56,7 @@ impl Cassette {
         cmd.env("ANTHROPIC_AUTH_TOKEN", "cassette");
         cmd.env("ANTHROPIC_MODEL", MODEL);
         cmd.env("CLAUDE_CONFIG_DIR", self.config_home.path());
+        cmd.env("CODEREX_CUSTOM_HEADERS", test_header());
         for key in [
             "OPENAI_API_KEY",
             "OPENAI_BASE_URL",
@@ -73,11 +74,28 @@ impl Cassette {
     /// cargo test` must point at this run's fixture, not the recording's).
     pub fn configure_for(&self, cmd: &mut Command, cwd: &Path) {
         self.configure(cmd);
-        cmd.env(
-            "CODEREX_CUSTOM_HEADERS",
-            format!("X-Cassette-Cwd: {}", cwd.display()),
-        );
+        cmd.env("CODEREX_CUSTOM_HEADERS", cassette_headers(cwd));
     }
+}
+
+/// The current Rust test's name, used to label a recording.
+#[must_use]
+pub fn cassette_test_name() -> String {
+    std::thread::current()
+        .name()
+        .unwrap_or("unknown")
+        .to_string()
+}
+
+fn test_header() -> String {
+    format!("X-Cassette-Test: {}", cassette_test_name())
+}
+
+/// Headers for a child that runs in `cwd`: the path rebinding and the test
+/// name that should be recorded with the cassette.
+#[must_use]
+pub fn cassette_headers(cwd: &Path) -> String {
+    format!("X-Cassette-Cwd: {}\n{}", cwd.display(), test_header())
 }
 
 static SERVERS: OnceLock<Mutex<HashMap<String, Arc<Cassette>>>> = OnceLock::new();
@@ -121,6 +139,8 @@ fn start(suite: &str) -> Cassette {
         .arg("0")
         .arg("--model")
         .arg(MODEL)
+        .arg("--suite")
+        .arg(suite)
         .arg("--exit-on-stdin-eof")
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
