@@ -50,12 +50,23 @@ fn start_static_provider() -> (Child, String) {
 
 struct Outcome {
     saw_request: bool,
+    control_requests: usize,
     tool: String,
     tool_result: String,
+    tool_results: Vec<String>,
     frames: Vec<serde_json::Value>,
 }
 
 fn run_with_control(cwd: &Path, base_url: &str, prompt: &str, behavior: &str) -> Outcome {
+    run_with_control_responses(cwd, base_url, prompt, &[behavior])
+}
+
+fn run_with_control_responses(
+    cwd: &Path,
+    base_url: &str,
+    prompt: &str,
+    behaviors: &[&str],
+) -> Outcome {
     let config_home = tempfile::tempdir().expect("config home");
     std::fs::write(
         config_home.path().join("settings.json"),
@@ -101,8 +112,10 @@ fn run_with_control(cwd: &Path, base_url: &str, prompt: &str, behavior: &str) ->
 
     let mut outcome = Outcome {
         saw_request: false,
+        control_requests: 0,
         tool: String::new(),
         tool_result: String::new(),
+        tool_results: Vec::new(),
         frames: Vec::new(),
     };
     loop {
@@ -114,23 +127,26 @@ fn run_with_control(cwd: &Path, base_url: &str, prompt: &str, behavior: &str) ->
         match frame["type"].as_str().unwrap_or_default() {
             "control_request" => {
                 outcome.saw_request = true;
+                outcome.control_requests += 1;
                 outcome.tool = frame["request"]["tool_name"]
                     .as_str()
                     .unwrap_or_default()
                     .to_string();
                 let request_id = frame["request_id"].as_str().expect("request id");
-                let response = serde_json::json!({
-                    "type": "control_response",
-                    "response": {
-                        "subtype": "success",
-                        "request_id": request_id,
-                        "response": {"behavior": behavior, "message": "test decision"}
-                    }
-                });
-                let pipe = stdin.as_mut().expect("stdin");
-                pipe.write_all(format!("{response}\n").as_bytes())
-                    .expect("write control response");
-                pipe.flush().expect("flush control response");
+                for behavior in behaviors {
+                    let response = serde_json::json!({
+                        "type": "control_response",
+                        "response": {
+                            "subtype": "success",
+                            "request_id": request_id,
+                            "response": {"behavior": behavior, "message": "test decision"}
+                        }
+                    });
+                    let pipe = stdin.as_mut().expect("stdin");
+                    pipe.write_all(format!("{response}\n").as_bytes())
+                        .expect("write control response");
+                    pipe.flush().expect("flush control response");
+                }
                 // The host is done answering: closing stdin is the signal that
                 // lets the headless session exit (and the control reader
                 // finish).
@@ -140,8 +156,9 @@ fn run_with_control(cwd: &Path, base_url: &str, prompt: &str, behavior: &str) ->
                 if let Some(content) = frame["message"]["content"].as_array() {
                     for block in content {
                         if block["type"] == "tool_result" {
-                            outcome.tool_result =
-                                block["content"].as_str().unwrap_or_default().to_string();
+                            let text = block["content"].as_str().unwrap_or_default().to_string();
+                            outcome.tool_result = text.clone();
+                            outcome.tool_results.push(text);
                         }
                     }
                 }
@@ -250,5 +267,45 @@ fn an_elevation_request_can_be_approved_or_denied() {
         denied.tool_result.contains("elevation denied"),
         "a denied elevation reported something else: {:?}",
         denied.tool_result
+    );
+}
+
+/// Two answers for the same pending approval must still produce one tool
+/// result: the second response has nothing left to resolve.
+#[test]
+fn a_duplicate_control_response_produces_one_result() {
+    let dir = tempfile::tempdir().expect("workspace");
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(
+        dir.path().join("src/lib.rs"),
+        "pub fn add(a: i32, b: i32) -> i32 { a + b }\n",
+    )
+    .unwrap();
+    let (mut provider, base_url) = start_static_provider();
+
+    let outcome = run_with_control_responses(
+        dir.path(),
+        &base_url,
+        "add a recursive fibonacci function to src/lib.rs with unit tests",
+        &["deny", "allow"],
+    );
+
+    let _ = provider.kill();
+    let _ = provider.wait();
+    assert_eq!(
+        outcome.control_requests, 1,
+        "one approval should be emitted"
+    );
+    assert_eq!(
+        outcome.tool_results.len(),
+        1,
+        "a duplicate approval produced more than one tool result: {:?}",
+        outcome.tool_results
+    );
+    assert!(
+        !std::fs::read_to_string(dir.path().join("src/lib.rs"))
+            .unwrap()
+            .contains("fibonacci"),
+        "the duplicate allow overrode the deny"
     );
 }

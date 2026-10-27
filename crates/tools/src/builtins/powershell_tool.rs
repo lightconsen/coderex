@@ -50,6 +50,14 @@ impl Tool for PowerShellTool {
         }
     }
 
+    fn capabilities(&self) -> crate::tool::ToolCapabilities {
+        crate::tool::ToolCapabilities {
+            // Permission rules match the command, exactly as for Bash.
+            rule_content_field: Some(crate::tool::RuleContentField::Scalar("command")),
+            ..crate::tool::ToolCapabilities::default()
+        }
+    }
+
     async fn execute(
         &self,
         input: ToolInput,

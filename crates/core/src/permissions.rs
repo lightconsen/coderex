@@ -335,9 +335,7 @@ impl PermissionRuleSpec {
             Some(specifier) if specifier.is_empty() => {
                 return Err(PermissionRuleParseError::EmptySpecifier(raw.to_string()));
             }
-            Some(specifier) if tool_name.eq_ignore_ascii_case("bash") => {
-                parse_bash_matcher(&specifier, raw)?
-            }
+            Some(specifier) if is_shell_tool(tool_name) => parse_shell_matcher(&specifier, raw)?,
             Some(specifier) => {
                 validate_path_glob(&specifier, raw)?;
                 RuleMatcher::Glob {
@@ -355,7 +353,18 @@ impl PermissionRuleSpec {
     }
 }
 
-fn parse_bash_matcher(specifier: &str, raw: &str) -> Result<RuleMatcher, PermissionRuleParseError> {
+/// A tool whose specifier is a command, not a path.
+fn is_shell_tool(tool_name: &str) -> bool {
+    matches!(
+        tool_name.to_ascii_lowercase().as_str(),
+        "bash" | "powershell" | "pwsh" | "sh" | "zsh" | "shell"
+    )
+}
+
+fn parse_shell_matcher(
+    specifier: &str,
+    raw: &str,
+) -> Result<RuleMatcher, PermissionRuleParseError> {
     if let Some(prefix) = specifier.strip_suffix(":*") {
         let prefix = prefix.trim_end();
         if prefix.is_empty() {
@@ -1838,6 +1847,39 @@ mod rule_spec_tests {
                 .description,
             "Bash(git diff:*)"
         );
+    }
+
+    #[test]
+    fn powershell_rules_use_command_semantics() {
+        assert_eq!(
+            parsed("PowerShell(Get-ChildItem:*)", PermissionAction::Allow).matcher,
+            RuleMatcher::BashPrefix {
+                prefix: "Get-ChildItem".into()
+            }
+        );
+        let context = ctx(Path::new("/proj"), None);
+        let checker = checker_with(
+            &[parsed(
+                "PowerShell(Get-ChildItem:*)",
+                PermissionAction::Allow,
+            )],
+            &context,
+        );
+        assert!(matches!(
+            checker.check_with_subjects(
+                "PowerShell",
+                &[RuleSubject::single("Get-ChildItem C:\\work")],
+                None
+            ),
+            PermissionResult::Allow
+        ));
+
+        let opaque = RuleSubject::single("Invoke-Expression $payload")
+            .with_opaque("PowerShell cmdlet can execute arbitrary commands");
+        assert!(matches!(
+            checker.check_with_subjects("PowerShell", std::slice::from_ref(&opaque), None),
+            PermissionResult::Ask { .. }
+        ));
     }
 
     #[test]

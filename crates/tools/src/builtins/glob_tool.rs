@@ -69,28 +69,20 @@ impl Tool for GlobTool {
         let matcher = glob.compile_matcher();
 
         let mut matches = Vec::new();
-        let walker = walkdir::WalkDir::new(&root).into_iter().filter_entry(|e| {
-            if e.file_type().is_dir() {
-                let name = e.file_name().to_string_lossy();
-                name != ".git"
-            } else {
-                true
-            }
-        });
-
-        for entry in walker {
-            let entry = entry.map_err(|e| ToolError::InvalidInput {
-                message: format!("directory walk error: {e}"),
+        let verified_root = crate::verified_fs::open_dir(&root, &ctx)?;
+        let entries = verified_root
+            .walk(100_000)
+            .map_err(|error| ToolError::InvalidInput {
+                message: format!("directory walk error: {error}"),
             })?;
 
-            if entry.file_type().is_file() {
-                let relative = entry
-                    .path()
-                    .strip_prefix(&root)
-                    .unwrap_or_else(|_| entry.path());
-                if matcher.is_match(relative) {
-                    matches.push(relative.to_string_lossy().to_string());
-                }
+        for entry in entries {
+            if entry.kind != crate::verified_fs::EntryKind::File {
+                continue;
+            }
+            let relative = entry.relative.as_path();
+            if matcher.is_match(relative) {
+                matches.push(relative.to_string_lossy().to_string());
             }
 
             if matches.len() >= MAX_RESULTS {

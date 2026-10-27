@@ -2678,3 +2678,232 @@ fn resume_finds_a_session_by_a_fragment() {
     drop(session);
     assert!(screen.contains("Resumed session:"), "{screen}");
 }
+
+/// Interrupts a slow turn before its tool call is emitted, then runs a new
+/// prompt. The old turn's tool must not run, and no unanswered `tool_use` may
+/// stay in the transcript.
+struct InterruptToolProvider {
+    url: String,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl InterruptToolProvider {
+    fn start(marker: &Path) -> Self {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let marker = marker.to_string_lossy().to_string();
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind interrupt provider");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let url = format!("http://{}", listener.local_addr().expect("addr"));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_thread = Arc::clone(&stop);
+        let handle = thread::spawn(move || {
+            while !stop_thread.load(std::sync::atomic::Ordering::SeqCst) {
+                let mut socket = match listener.accept() {
+                    Ok((socket, _)) => socket,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(20));
+                        continue;
+                    }
+                    Err(_) => break,
+                };
+                let _ = socket.set_read_timeout(Some(Duration::from_secs(5)));
+                let mut buffer = Vec::new();
+                let mut chunk = [0_u8; 4096];
+                let header_end = loop {
+                    match socket.read(&mut chunk) {
+                        Ok(0) | Err(_) => break None,
+                        Ok(read) => {
+                            buffer.extend_from_slice(&chunk[..read]);
+                            if let Some(position) =
+                                buffer.windows(4).position(|window| window == b"\r\n\r\n")
+                            {
+                                break Some(position + 4);
+                            }
+                        }
+                    }
+                };
+                let Some(header_end) = header_end else {
+                    continue;
+                };
+                let headers = String::from_utf8_lossy(&buffer[..header_end]).to_string();
+                let length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                    .unwrap_or(0);
+                while buffer.len() < header_end + length {
+                    match socket.read(&mut chunk) {
+                        Ok(0) | Err(_) => break,
+                        Ok(read) => buffer.extend_from_slice(&chunk[..read]),
+                    }
+                }
+                let request = String::from_utf8_lossy(&buffer[header_end..]).to_string();
+                let last_prompt = serde_json::from_str::<serde_json::Value>(&request)
+                    .ok()
+                    .and_then(|body| {
+                        body["messages"]
+                            .as_array()?
+                            .iter()
+                            .rev()
+                            .find_map(|message| {
+                                (message["role"] == "user").then(|| {
+                                    message["content"].as_str().map(str::to_string).or_else(|| {
+                                        message["content"].as_array().and_then(|parts| {
+                                            parts.iter().find_map(|part| {
+                                                part["text"].as_str().map(str::to_string)
+                                            })
+                                        })
+                                    })
+                                })?
+                            })
+                    });
+                if socket
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n",
+                    )
+                    .is_err()
+                {
+                    continue;
+                }
+                if last_prompt.as_deref() == Some("interrupt-before-tool") {
+                    let _ = socket.write_all(
+                        b"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+                    );
+                    for tick in 0..20 {
+                        if stop_thread.load(std::sync::atomic::Ordering::SeqCst) {
+                            break;
+                        }
+                        if tick == 12 {
+                            let input = serde_json::json!({
+                                "command": format!("echo ran > {marker}")
+                            })
+                            .to_string();
+                            let delta = serde_json::json!({
+                                "type": "input_json_delta",
+                                "partial_json": input,
+                            });
+                            let _ = socket.write_all(
+                                format!(
+                                    "event: content_block_start\ndata: {{\"type\":\"content_block_start\",\"index\":1,\"content_block\":{{\"type\":\"tool_use\",\"id\":\"tc_interrupt\",\"name\":\"Bash\",\"input\":{{}}}}}}\n\n\
+                                     event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":1,\"delta\":{}}}\n\n\
+                                     event: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":1}}\n\n",
+                                    serde_json::to_string(&delta).expect("delta")
+                                )
+                                .as_bytes(),
+                            );
+                            let _ = socket.flush();
+                            break;
+                        }
+                        let delta = b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"tick \"}}\n\n";
+                        if socket.write_all(delta).is_err() {
+                            break;
+                        }
+                        let _ = socket.flush();
+                        thread::sleep(Duration::from_millis(150));
+                    }
+                    let _ = socket.write_all(
+                        b"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+                    );
+                } else {
+                    let event = |name: &str, value: serde_json::Value| {
+                        format!(
+                            "event: {name}\ndata: {}\n\n",
+                            serde_json::to_string(&value).unwrap()
+                        )
+                    };
+                    let body = [
+                        event(
+                            "content_block_start",
+                            serde_json::json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
+                        ),
+                        event(
+                            "content_block_delta",
+                            serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"after-cancel-ok"}}),
+                        ),
+                        event(
+                            "content_block_stop",
+                            serde_json::json!({"type":"content_block_stop","index":0}),
+                        ),
+                        event(
+                            "message_delta",
+                            serde_json::json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":1,"output_tokens":1}}),
+                        ),
+                        event("message_stop", serde_json::json!({"type":"message_stop"})),
+                    ]
+                    .concat();
+                    let _ = socket.write_all(body.as_bytes());
+                }
+            }
+        });
+        Self {
+            url,
+            stop,
+            handle: Some(handle),
+        }
+    }
+}
+
+impl Drop for InterruptToolProvider {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+#[test]
+fn interrupting_before_the_tool_call_leaves_no_tool_or_history() {
+    let dir = setup_project_dir();
+    let marker = dir.path().join("interrupted-tool-ran");
+    let provider = InterruptToolProvider::start(&marker);
+    let envs = vec![
+        ("ANTHROPIC_BASE_URL".to_string(), provider.url.clone()),
+        ("ANTHROPIC_API_KEY".to_string(), "mock".to_string()),
+        (
+            "ANTHROPIC_MODEL".to_string(),
+            "claude-sonnet-4-6".to_string(),
+        ),
+    ];
+    let mut session =
+        PtySession::launch_with_persistence(dir.path(), &envs, "claude-sonnet-4-6", true);
+    session.wait_for_text("CodeRex v", SCREEN_TIMEOUT);
+    session.send_line("interrupt-before-tool");
+    session.wait_for_text("tick", SCREEN_TIMEOUT);
+
+    session.ctrl_c();
+    session.wait_for_text("(interrupted)", SCREEN_TIMEOUT);
+    // Let the cancelled turn finish unwinding before typing the next prompt.
+    thread::sleep(Duration::from_millis(500));
+
+    // A fresh turn must work normally after the cancellation.
+    session.send_line("hello");
+    session.wait_for_text("after-cancel-ok", SCREEN_TIMEOUT);
+    session.send_line("/exit");
+    session.wait_for_exit(Duration::from_secs(10));
+
+    assert!(
+        !marker.exists(),
+        "the interrupted turn still executed its Bash tool"
+    );
+    let transcripts = dir.path().join(".coderex/transcripts");
+    let mut history = String::new();
+    if let Ok(entries) = std::fs::read_dir(&transcripts) {
+        for entry in entries.flatten() {
+            if entry.path().extension().is_some_and(|ext| ext == "jsonl") {
+                history.push_str(&std::fs::read_to_string(entry.path()).unwrap_or_default());
+            }
+        }
+    }
+    assert!(
+        !history.contains("tc_interrupt"),
+        "an unanswered tool_use was left in the transcript:\n{history}"
+    );
+}

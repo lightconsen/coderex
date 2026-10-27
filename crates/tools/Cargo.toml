@@ -46,6 +46,7 @@ moka.workspace = true
 lsp-types.workspace = true
 tokio-tungstenite.workspace = true
 futures-util.workspace = true
+cap-std = "3.4"
 
 [dev-dependencies]
 mockall.workspace = true

@@ -50,30 +50,23 @@ impl Tool for ListDirTool {
             .and_then(serde_json::Value::as_str)
             .map_or_else(|| ctx.cwd.to_path_buf(), |path| resolve_path(path, ctx.cwd));
 
-        let metadata = std::fs::metadata(&dir).map_err(|e| ToolError::InvalidInput {
-            message: format!("failed to access directory: {e}"),
-        })?;
-        if !metadata.is_dir() {
-            return Err(ToolError::InvalidInput {
-                message: format!("not a directory: {}", dir.display()),
-            });
-        }
-
-        let mut entries = std::fs::read_dir(&dir)
-            .map_err(|e| ToolError::InvalidInput {
-                message: format!("failed to list directory: {e}"),
+        let verified = crate::verified_fs::open_dir(&dir, &ctx)?;
+        let mut entries = verified
+            .entries()
+            .map_err(|error| ToolError::InvalidInput {
+                message: format!("failed to list directory: {error}"),
             })?
-            .filter_map(Result::ok)
+            .into_iter()
             .filter_map(|entry| {
-                let name = entry.file_name().to_string_lossy().to_string();
+                let name = entry.relative.to_string_lossy().to_string();
                 if matches!(name.as_str(), "." | "..") {
                     return None;
                 }
-                let suffix = entry
-                    .metadata()
-                    .ok()
-                    .filter(std::fs::Metadata::is_dir)
-                    .map_or("", |_| "/");
+                let suffix = if entry.kind == crate::verified_fs::EntryKind::Dir {
+                    "/"
+                } else {
+                    ""
+                };
                 Some(format!("{name}{suffix}"))
             })
             .collect::<Vec<_>>();

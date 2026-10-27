@@ -2038,6 +2038,40 @@ mod subject_tests {
     }
 
     #[test]
+    fn powershell_commands_are_segmented_and_opaque_when_needed() {
+        let subjects = rule_content_subjects(
+            Some(RuleContentField::Scalar("command")),
+            &json!({"command": "Get-ChildItem | Where-Object { $_.Name -eq 'x' }"}),
+            std::path::Path::new("/proj"),
+        );
+        assert_eq!(subjects.len(), 2, "{subjects:?}");
+        assert!(
+            subjects.iter().all(|subject| subject.opaque.is_none()),
+            "{subjects:?}"
+        );
+
+        let opaque = rule_content_subjects(
+            Some(RuleContentField::Scalar("command")),
+            &json!({"command": "Invoke-Expression $payload"}),
+            std::path::Path::new("/proj"),
+        );
+        assert!(
+            opaque.iter().all(|subject| subject.opaque.is_some()),
+            "{opaque:?}"
+        );
+    }
+
+    #[test]
+    fn the_powershell_tool_declares_its_rule_content_field() {
+        use crate::tool::Tool;
+        let capabilities = crate::builtins::PowerShellTool.capabilities();
+        assert_eq!(
+            capabilities.rule_content_field,
+            Some(RuleContentField::Scalar("command"))
+        );
+    }
+
+    #[test]
     fn a_declared_path_field_yields_raw_and_absolute_forms() {
         let subjects = rule_content_subjects(
             Some(RuleContentField::Scalar("file_path")),

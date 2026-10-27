@@ -95,36 +95,34 @@ impl Tool for GrepTool {
             .transpose()?;
 
         let mut results = Vec::new();
+        let verified_root = crate::verified_fs::open_dir(&root, &ctx)?;
+        let entries = verified_root
+            .walk(100_000)
+            .map_err(|error| ToolError::InvalidInput {
+                message: format!("directory walk error: {error}"),
+            })?;
 
-        let walker = walkdir::WalkDir::new(&root).into_iter().filter_entry(|e| {
-            if e.file_type().is_dir() {
-                let name = e.file_name().to_string_lossy();
-                name != ".git"
-            } else {
-                true
-            }
-        });
-
-        for entry in walker {
-            let Ok(entry) = entry else {
-                continue;
-            };
-
-            if !entry.file_type().is_file() {
+        for entry in entries {
+            if entry.kind != crate::verified_fs::EntryKind::File {
                 continue;
             }
+            let logical = root.join(&entry.relative);
 
             // Apply glob filter if specified
-            if let Some(ref gm) = glob_matcher {
-                if !gm.is_match(entry.path()) {
-                    continue;
-                }
+            if let Some(ref gm) = glob_matcher
+                && !gm.is_match(&logical)
+            {
+                continue;
             }
 
             // Skip binary files.
-            let Ok(content) = std::fs::read_to_string(entry.path()) else {
+            let Ok(mut file) = verified_root.open(&entry.relative) else {
                 continue;
             };
+            let mut content = String::new();
+            if std::io::Read::read_to_string(&mut file, &mut content).is_err() {
+                continue;
+            }
 
             let lines: Vec<&str> = content.lines().collect();
             let mut file_matched = false;
@@ -137,10 +135,7 @@ impl Tool for GrepTool {
                         let start = i.saturating_sub(before);
                         let end = (i + 1 + after).min(lines.len());
 
-                        let rel = entry
-                            .path()
-                            .strip_prefix(&root)
-                            .unwrap_or_else(|_| entry.path());
+                        let rel = entry.relative.as_path();
 
                         for (j, line) in lines.iter().enumerate().take(end).skip(start) {
                             let prefix = if j == i { ">" } else { " " };
@@ -155,20 +150,12 @@ impl Tool for GrepTool {
             }
 
             if file_matched && matches!(output_mode.as_str(), "files_with_matches") {
-                let rel = entry
-                    .path()
-                    .strip_prefix(&root)
-                    .unwrap_or_else(|_| entry.path());
-                results.push(rel.display().to_string());
+                results.push(entry.relative.display().to_string());
             }
 
             if file_matched && matches!(output_mode.as_str(), "count") {
-                let rel = entry
-                    .path()
-                    .strip_prefix(&root)
-                    .unwrap_or_else(|_| entry.path());
                 let count = regex.find_iter(&content).count();
-                results.push(format!("{}:{count}", rel.display()));
+                results.push(format!("{}:{count}", entry.relative.display()));
             }
 
             if results.len() >= head_limit && !matches!(output_mode.as_str(), "content") {

@@ -191,6 +191,7 @@ Supported syntax:
 | `Bash(command)` | exact command match. |
 | `Bash(prefix:*)` | the command starts with `prefix` at a word boundary (`git diff:*` matches `git diff --stat`, not `git differences`). |
 | `Bash(glob)` | a glob over the whole command (`Bash(*)`, `Bash(ls *.rs)`). |
+| `PowerShell(...)` | the same forms with PowerShell command semantics (segments split on `;`, `|`, `&&`; `:*` prefix matching). |
 
 Path patterns follow Claude's spellings: `./x` and bare `src/**` are relative to
 the session cwd, `~/x` to the home directory, `//tmp/x` and `/etc/**` are
@@ -211,10 +212,11 @@ read/write. The dispatcher compares the handle path with the subjects the
 pre-dispatch check saw; a path that changed in between is re-evaluated by the
 engine and refused unless the rules allow it. Write truncates only after this
 verification, and the actual path is also re-checked against the sandbox path
-policy. Directory-walk tools (`Grep`, `Glob`, `ListDir`) use `walkdir` without
-following symlinks and do not read file contents through symlinks; their root
-path is still opened by the walker, so a rename/symlink race on the root is
-covered by the OS sandbox rather than an fd-bound check.
+policy. Directory-walk tools (`Grep`, `Glob`, `ListDir`) open the root as a
+`cap-std` directory capability, verify the capability's real path, and then
+enumerate and open entries through that open handle. A rename or symlink swap of
+the ambient root after the check therefore cannot redirect the walk. Symlinks
+below the root are reported but never followed (and are not read as files).
 
 Bash rules are matched against each command **segment**, not the raw string.
 The splitter understands top-level quotes/escapes, `;`, `&&`, `||`, `|`, `|&`,
@@ -225,7 +227,13 @@ recovered as an additional segment, so a deny rule still sees what they will
 run. For **deny/ask**, matching any segment applies to the whole call. For
 **allow**, every segment must be covered by at least one allow rule (rules
 compose), so `cd repo && git diff` is not auto-approved by a rule that only
-covers `git diff`.
+covers `git diff`. `PowerShell(...)` and `pwsh(...)` use the same command
+semantics as `Bash(...)`: `:*` prefix matching, per-segment matching over `;`/
+`|`/`&&`, and the same opaque analysis. PowerShell-specific wrappers and
+cmdlets (`Start-Process`, `Invoke-Expression`/`iex`, `Invoke-Command`,
+`Start-Job`, `cmd`, ...) are treated as opaque rather than modelled. The
+`PowerShell` tool runs `pwsh -NoProfile -NonInteractive -Command ...` with the
+same sanitized environment as Bash.
 
 A construct the analysis cannot fully model — shell functions/aliases, `source`,
 `eval`, control flow, directly executed scripts (`./deploy.sh`), nested

@@ -154,9 +154,12 @@ Sub-agent system for spawning autonomous worker agents, dream agents (background
 
 ## Permission inheritance
 
-A sub-agent inherits the parent's **permission mode only**. The child builds a fresh
-`PermissionChecker` with that mode; the parent's rules, hooks, and rule exemptions are
-not carried over. The background-denial hook is added to every child, and only a child
+A sub-agent inherits the parent's **permission mode and compiled rule specs**. The
+child builds a fresh `PermissionChecker` with that mode and recompiles the parent's
+`PermissionRuleSpec`s against its own working directory (so `./`-relative patterns
+follow a worktree move); `add_specs` is all-or-nothing, and a failure is logged with
+`tracing::error!`. Parent hooks and session-wide approvals are not
+carried over. The background-denial hook is added to every child, and only a child
 spawned with `run_in_background` carries an `agent_id` (so the hook is a no-op for
 foreground agents).
 

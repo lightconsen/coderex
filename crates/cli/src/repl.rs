@@ -8659,7 +8659,12 @@ impl ReplLoop {
         }
         *thinking = false;
         phase.reset();
-        *query_done_rx = None;
+        // The engine is inside the spawned turn task. Dropping the receiver
+        // here would drop the engine with it, so the next prompt would find
+        // "No engine configured". Keep the receiver: the normal completion
+        // branch restores the engine; a prompt typed meanwhile is queued and
+        // starts once it is back.
+        let _ = query_done_rx;
         *elicit_rx = None;
         *tui_elicit_rx = None;
         self.pending_elicitation = None;

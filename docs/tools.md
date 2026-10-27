@@ -131,6 +131,14 @@ it is not the shell.
 `sandbox_policy::default_sandbox_config` keeps its entry for both names, because
 on Windows the `PowerShell` entry is the live one.
 
+`PowerShell` declares `command` as its rule-content field, so
+`PowerShell(...)` rules use the same command-segment analysis as `Bash(...)`:
+`:*` prefix matching, per-segment deny/ask, and opaque fail-closed handling for
+cmdlets such as `Invoke-Expression`, `Start-Process` and `Invoke-Command`. It
+runs `pwsh -NoProfile -NonInteractive -Command <command>` and passes the same
+`sanitize_shell_env` filter as Bash, so profile scripts and loader variables
+cannot run before the analysed command.
+
 ## Current Status
 
 ### What Works
