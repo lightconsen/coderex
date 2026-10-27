@@ -8,9 +8,11 @@
 #   RUN_CASSETTES=1     run scripts/record-cassettes.sh --check
 #   RUN_FUZZ=1          run scripts/fuzz.sh
 #   RUN_SOAK=1          run a 200-turn soak
+#   RUN_RACE_SOAK=1     run the symlink/rename adversarial soak
 #   RUN_MUTATION=0      run scripts/mutation.sh (expensive; off by default)
 #   FUZZ_SECONDS=600    seconds per fuzz target
 #   SOAK_TURNS=200
+#   RACE_SOAK_ITERATIONS=20000
 #   MUTATION_SCOPE=permission-engine
 #   MUTATION_STRICT=0   fail the run when cargo-mutants reports missed mutants
 #   NIGHTLY_OUTPUT=target/nightly/<UTC timestamp>
@@ -27,9 +29,11 @@ run_coverage="${RUN_COVERAGE:-1}"
 run_cassettes="${RUN_CASSETTES:-1}"
 run_fuzz="${RUN_FUZZ:-1}"
 run_soak="${RUN_SOAK:-1}"
+run_race_soak="${RUN_RACE_SOAK:-1}"
 run_mutation="${RUN_MUTATION:-0}"
 fuzz_seconds="${FUZZ_SECONDS:-600}"
 soak_turns="${SOAK_TURNS:-200}"
+race_iterations="${RACE_SOAK_ITERATIONS:-20000}"
 mutation_scope="${MUTATION_SCOPE:-permission-engine}"
 mutation_strict="${MUTATION_STRICT:-0}"
 out="${NIGHTLY_OUTPUT:-target/nightly/$(date -u +%Y%m%dT%H%M%SZ)}"
@@ -65,6 +69,9 @@ if [[ "$run_fuzz" != "0" ]]; then
 fi
 if [[ "$run_soak" != "0" ]]; then
     step soak env SOAK_TURNS="$soak_turns" SOAK_OUTPUT_DIR="$out/soak" python3 scripts/soak.py
+fi
+if [[ "$run_race_soak" != "0" ]]; then
+    step race-soak ./scripts/race-soak.sh "$race_iterations"
 fi
 if [[ "$run_mutation" != "0" ]]; then
     echo "== mutation ($mutation_scope)"

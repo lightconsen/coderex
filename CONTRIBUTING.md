@@ -67,6 +67,7 @@ scripts/mutation.sh permission-engine   # cargo-mutants, bounded scope
 MUTATION_TEST_FILTER=permission_engine::tests scripts/mutation.sh permission-engine
 scripts/fuzz.sh 60                      # cargo-fuzz, 60s per target
 python3 scripts/soak.py                 # 200-turn PTY soak
+scripts/race-soak.sh                    # symlink/rename adversarial soak
 scripts/install-smoke.sh                # real install.sh against a fake release
 scripts/nightly.sh                      # orchestrate the checks above
 ```

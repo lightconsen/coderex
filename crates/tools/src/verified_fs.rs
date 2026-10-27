@@ -360,6 +360,93 @@ mod tests {
         assert!(!target.exists(), "the rejected file was left behind");
     }
 
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "race soak; run scripts/race-soak.sh"]
+    fn symlink_and_rename_churn_never_reads_outside_the_verified_root() {
+        use std::io::Read as _;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let base = tempfile::tempdir().unwrap();
+        let inside = base.path().join("inside");
+        let outside = base.path().join("outside");
+        std::fs::create_dir(&inside).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(inside.join("file.txt"), "inside").unwrap();
+        std::fs::write(outside.join("file.txt"), "outside-secret").unwrap();
+
+        let gate = base.path().join("current");
+        std::os::unix::fs::symlink(&inside, &gate).unwrap();
+        let canonical_inside = std::fs::canonicalize(&inside).unwrap();
+        let reject_outside = canonical_inside.clone();
+        let ctx = ToolContext::new(ExecutionContext::Normal, base.path()).with_path_verifier(
+            Arc::new(move |paths| {
+                for path in paths {
+                    if !path.starts_with(&reject_outside) {
+                        return Err(format!("outside root: {}", path.display()));
+                    }
+                }
+                Ok(())
+            }),
+        );
+
+        let iterations: usize = std::env::var("RACE_SOAK_ITERATIONS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(2_000);
+        let stop = Arc::new(AtomicBool::new(false));
+        let attacker_stop = Arc::clone(&stop);
+        let attacker_base = base.path().to_path_buf();
+        let attacker_gate = gate.clone();
+        let attacker = std::thread::spawn(move || {
+            let mut index = 0_u64;
+            while !attacker_stop.load(Ordering::Relaxed) {
+                let target = if index % 2 == 0 {
+                    attacker_base.join("outside")
+                } else {
+                    attacker_base.join("inside")
+                };
+                let temporary = attacker_base.join(format!("link-{index}"));
+                let _ = std::fs::remove_file(&temporary);
+                if std::os::unix::fs::symlink(&target, &temporary).is_ok() {
+                    let _ = std::fs::rename(&temporary, &attacker_gate);
+                }
+                index += 1;
+            }
+        });
+
+        let mut successes = 0_usize;
+        for _ in 0..iterations {
+            let file = gate.join("file.txt");
+            if let Ok(mut handle) = open_read(&file, &ctx) {
+                let mut content = String::new();
+                handle.file.read_to_string(&mut content).unwrap();
+                assert!(
+                    !content.contains("secret"),
+                    "read outside content through the gate: {content}"
+                );
+                successes += 1;
+            }
+            if let Ok(directory) = open_dir(&gate, &ctx) {
+                for entry in directory.walk(100).unwrap() {
+                    if entry.relative != Path::new("file.txt") {
+                        continue;
+                    }
+                    let mut handle = directory.open(&entry.relative).unwrap();
+                    let mut content = String::new();
+                    handle.read_to_string(&mut content).unwrap();
+                    assert!(
+                        !content.contains("secret"),
+                        "walked outside content through the gate: {content}"
+                    );
+                }
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        attacker.join().unwrap();
+        assert!(successes > 0, "the gate was never observed pointing inside");
+    }
+
     #[test]
     fn the_capability_keeps_walking_after_the_root_is_renamed() {
         let parent = tempfile::tempdir().unwrap();
