@@ -79,6 +79,8 @@ leaves mutation off (`RUN_MUTATION=1` enables it); every step logs under
 Mutation testing and fuzzing need `cargo install cargo-mutants --locked` and
 `cargo install cargo-fuzz --locked`; fuzzing also needs the nightly toolchain
 (`rustup toolchain install nightly`). Neither is part of the normal test gate.
+Mutation scopes, the current kill rates and the surviving-mutant triage are in
+[`docs/mutation.md`](docs/mutation.md).
 
 `scripts/publication-check.sh` scans tracked files and the history for
 credentials and local-only files; it is a good check before sharing a branch.
