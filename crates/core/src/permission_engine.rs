@@ -2,7 +2,7 @@
 //! pending request persistence, and orphaned recovery.
 
 use crate::confirmation_bus::{ConfirmationBus, ConfirmationRequest, ConfirmationResponse};
-use crate::permissions::{PermissionChecker, PermissionResult, ToolRuleExemptions};
+use crate::permissions::{PermissionChecker, PermissionResult, RuleSubject, ToolRuleExemptions};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -279,7 +279,7 @@ impl PermissionEngine {
         arguments: String,
         path: Option<PathBuf>,
         context: HashMap<String, String>,
-        mut subjects: Vec<String>,
+        mut subjects: Vec<RuleSubject>,
     ) -> Result<(PermissionRequest, PermissionResult), PermissionRequestError> {
         let mode = {
             let checker = self.checker.lock().unwrap();
@@ -319,8 +319,11 @@ impl PermissionEngine {
         // programmatic callers keep their path rules working.
         if let Some(path) = request.path.as_ref() {
             let raw = path.to_string_lossy().to_string();
-            if !subjects.contains(&raw) {
-                subjects.push(raw);
+            let present = subjects
+                .iter()
+                .any(|subject| subject.forms.iter().any(|form| form == &raw));
+            if !present {
+                subjects.push(RuleSubject::single(raw));
             }
         }
         let result = {

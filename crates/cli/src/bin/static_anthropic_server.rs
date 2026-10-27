@@ -759,6 +759,10 @@ fn select_tools(prompt: &str) -> Vec<Tool> {
             name: "memory_write".into(),
             input_json: r#"{"store":"project","key":"e2e-memory","content":"memo-value"}"#.into(),
         }]
+    } else if p.contains("read the symlinked file") {
+        vec![Tool::Read {
+            file: "link/secret.txt".into(),
+        }]
     } else if p.contains("read the large file") {
         vec![Tool::Read {
             file: "large.txt".into(),
@@ -775,6 +779,10 @@ fn select_tools(prompt: &str) -> Vec<Tool> {
     } else if p.contains("run a command with sudo") {
         vec![Tool::Bash {
             command: "sudo -n true".into(),
+        }]
+    } else if p.contains("run a chained command") {
+        vec![Tool::Bash {
+            command: "cd /tmp && echo chained-ok".into(),
         }]
     } else if p.contains("run a safe echo") {
         vec![Tool::Bash {

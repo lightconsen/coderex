@@ -178,48 +178,338 @@ impl BashAst {
 
 // ─── Tokenization ──────────────────────────────────────────────────────────
 
+/// The individual commands a shell command will run.
+///
+/// Permission rules are evaluated per segment. A compound command such as
+/// `cd repo && git diff` yields `cd repo` and `git diff`, so a prefix rule
+/// covers both or neither; a deny/ask rule matching any segment applies to the
+/// whole call.
+///
+/// The splitter is deliberately shallow: it understands top-level quotes,
+/// escapes, `;`, `&&`, `||`, `|`, `|&`, `&`, newlines, `$(...)`/backtick
+/// command substitutions, a wrapping `( ... )`, and `sh -c`/`eval` scripts.
+/// It does not implement full POSIX grammar; a construct it cannot parse stays
+/// part of the enclosing segment, which is the conservative direction for
+/// deny/ask and the fail-closed direction for allow.
+#[must_use]
+pub fn command_segments(command: &str) -> Vec<String> {
+    let mut segments = Vec::new();
+    collect_segments(command, &mut segments);
+    segments
+}
+
+fn collect_segments(command: &str, out: &mut Vec<String>) {
+    for stage in split_stages(command) {
+        let stage = stage.trim();
+        if stage.is_empty() {
+            continue;
+        }
+        if !out.iter().any(|existing| existing == stage) {
+            out.push(stage.to_string());
+        }
+        if let Some(script) = shell_c_script(stage) {
+            collect_segments(&script, out);
+        }
+        for nested in nested_scripts(stage) {
+            collect_segments(&nested, out);
+        }
+    }
+}
+
+/// Skip `NAME=value` assignments at the start of a command.
+///
+/// Quote-aware, so `FOO="a b" cmd` strips the whole assignment. Used by Bash
+/// rule matching and by the `sh -c`/`eval` script finder.
+#[must_use]
+pub fn strip_leading_env_assignments(command: &str) -> &str {
+    let mut rest = command.trim_start();
+    loop {
+        let Some(end) = assignment_end(rest) else {
+            return rest;
+        };
+        rest = rest[end..].trim_start();
+    }
+}
+
+fn assignment_end(input: &str) -> Option<usize> {
+    let mut chars = input.char_indices().peekable();
+    let (_, first) = *chars.peek()?;
+    if !(first == '_' || first.is_ascii_alphabetic()) {
+        return None;
+    }
+    let mut index = 0;
+    while let Some(&(offset, ch)) = chars.peek() {
+        if ch == '=' {
+            index = offset + 1;
+            chars.next();
+            break;
+        }
+        if ch == '_' || ch.is_ascii_alphanumeric() {
+            chars.next();
+            continue;
+        }
+        return None;
+    }
+    if index == 0 {
+        return None;
+    }
+
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    while let Some(&(offset, ch)) = chars.peek() {
+        if escaped {
+            escaped = false;
+            chars.next();
+            continue;
+        }
+        match ch {
+            '\\' if quote != Some('\'') => {
+                escaped = true;
+                chars.next();
+            }
+            '\'' | '"' if quote == Some(ch) => {
+                quote = None;
+                chars.next();
+            }
+            '\'' | '"' if quote.is_none() => {
+                quote = Some(ch);
+                chars.next();
+            }
+            ch if quote.is_none() && ch.is_whitespace() => return Some(offset),
+            _ => {
+                chars.next();
+            }
+        }
+    }
+    Some(input.len())
+}
+
+/// `sh -c '...'` / `bash -c "..."` / `eval ...`: the script is a command too.
+fn shell_c_script(stage: &str) -> Option<String> {
+    let rest = strip_leading_env_assignments(stage);
+    let tokens = tokenize(rest);
+    let program = tokens.first()?.rsplit('/').next().unwrap_or_default();
+    if program == "eval" {
+        let script = tokens[1..]
+            .iter()
+            .map(|t| unquote(t))
+            .collect::<Vec<_>>()
+            .join(" ");
+        return (!script.trim().is_empty()).then_some(script);
+    }
+    if !matches!(program, "sh" | "bash" | "zsh" | "dash" | "ksh" | "fish") {
+        return None;
+    }
+    let index = tokens.iter().position(|token| token == "-c")?;
+    let script = tokens.get(index + 1)?;
+    let script = unquote(script);
+    (!script.trim().is_empty()).then_some(script)
+}
+
+fn unquote(token: &str) -> String {
+    let bytes = token.as_bytes();
+    if bytes.len() >= 2 {
+        let first = bytes[0];
+        let last = bytes[bytes.len() - 1];
+        if (first == b'"' || first == b'\'') && first == last {
+            return token[1..token.len() - 1].to_string();
+        }
+    }
+    token.to_string()
+}
+
+/// Command substitutions inside one stage.
+fn nested_scripts(stage: &str) -> Vec<String> {
+    let mut scripts = Vec::new();
+    let chars: Vec<char> = stage.chars().collect();
+    let mut index = 0;
+    let mut quote: Option<char> = None;
+    while index < chars.len() {
+        let ch = chars[index];
+        if ch == '\\' && quote != Some('\'') {
+            index += 2;
+            continue;
+        }
+        if let Some(active) = quote {
+            if ch == active {
+                quote = None;
+            }
+            if active == '"'
+                && ch == '$'
+                && chars.get(index + 1) == Some(&'(')
+                && let Some((inner, next)) = parenthesized(&chars, index + 2)
+            {
+                scripts.push(inner);
+                index = next;
+                continue;
+            }
+            index += 1;
+            continue;
+        }
+        if ch == '\'' || ch == '"' {
+            quote = Some(ch);
+            index += 1;
+            continue;
+        }
+        if ch == '$'
+            && chars.get(index + 1) == Some(&'(')
+            && let Some((inner, next)) = parenthesized(&chars, index + 2)
+        {
+            scripts.push(inner);
+            index = next;
+            continue;
+        }
+        if ch == '`' {
+            let mut inner = String::new();
+            let mut cursor = index + 1;
+            while cursor < chars.len() {
+                match chars[cursor] {
+                    '\\' => {
+                        if let Some(next) = chars.get(cursor + 1) {
+                            inner.push(*next);
+                        }
+                        cursor += 2;
+                    }
+                    '`' => break,
+                    other => {
+                        inner.push(other);
+                        cursor += 1;
+                    }
+                }
+            }
+            if cursor < chars.len() {
+                scripts.push(inner);
+                index = cursor + 1;
+                continue;
+            }
+        }
+        index += 1;
+    }
+
+    // A wrapping subshell is another command list.
+    let trimmed = stage.trim();
+    if trimmed.starts_with('(') && trimmed.ends_with(')') && !trimmed.starts_with("$(") {
+        scripts.push(trimmed[1..trimmed.len() - 1].to_string());
+    }
+    scripts
+}
+
+/// Body of a `$(...)`, starting after the opening parenthesis.
+fn parenthesized(chars: &[char], start: usize) -> Option<(String, usize)> {
+    let mut depth = 1usize;
+    let mut index = start;
+    let mut quote: Option<char> = None;
+    while index < chars.len() {
+        let ch = chars[index];
+        if ch == '\\' && quote != Some('\'') {
+            index += 2;
+            continue;
+        }
+        match quote {
+            Some(active) if ch == active => quote = None,
+            None if ch == '\'' || ch == '"' => quote = Some(ch),
+            None if ch == '(' => depth += 1,
+            None if ch == ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some((chars[start..index].iter().collect(), index + 1));
+                }
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    None
+}
+
 fn split_stages(command: &str) -> Vec<String> {
     let mut stages = Vec::new();
     let mut current = String::new();
     let mut in_quote: Option<char> = None;
-    let mut chars = command.chars().peekable();
+    let mut escaped = false;
+    let mut paren_depth = 0usize;
+    let chars: Vec<char> = command.chars().collect();
+    let mut index = 0;
 
-    while let Some(ch) = chars.next() {
+    while index < chars.len() {
+        let ch = chars[index];
+        if escaped {
+            current.push(ch);
+            escaped = false;
+            index += 1;
+            continue;
+        }
         match ch {
-            '\'' | '"' if in_quote == Some(ch) => {
+            '\\' if in_quote != Some('\'') => {
+                current.push(ch);
+                escaped = true;
+            }
+            '\'' | '"' | '`' if in_quote == Some(ch) => {
                 in_quote = None;
                 current.push(ch);
             }
-            '\'' | '"' if in_quote.is_none() => {
+            '\'' | '"' | '`' if in_quote.is_none() => {
                 in_quote = Some(ch);
                 current.push(ch);
             }
-            '|' if in_quote.is_none() => {
-                // A single pipe is a pipeline; `||` is a sequence separator.
-                // Both boundaries must be checked for destructive commands.
-                if chars.peek() == Some(&'|') {
-                    chars.next();
+            '(' if in_quote.is_none() => {
+                paren_depth += 1;
+                current.push(ch);
+            }
+            ')' if in_quote.is_none() => {
+                paren_depth = paren_depth.saturating_sub(1);
+                current.push(ch);
+            }
+            '#' if in_quote.is_none()
+                && paren_depth == 0
+                && (current.trim().is_empty()
+                    || current.ends_with(|c: char| c.is_whitespace())) =>
+            {
+                // A shell comment: the rest is not a command.
+                break;
+            }
+            ';' | '\n' if in_quote.is_none() && paren_depth == 0 => {
+                stages.push(current.trim().to_string());
+                current.clear();
+            }
+            '|' if in_quote.is_none() && paren_depth == 0 => {
+                if chars
+                    .get(index + 1)
+                    .is_some_and(|next| *next == '|' || *next == '&')
+                {
+                    index += 1;
                 }
                 stages.push(current.trim().to_string());
                 current.clear();
             }
-            '&' if in_quote.is_none() && chars.peek() == Some(&'&') => {
-                chars.next();
-                stages.push(current.trim().to_string());
-                current.clear();
-            }
-            ';' if in_quote.is_none() => {
+            '&' if in_quote.is_none() && paren_depth == 0 => {
+                if chars.get(index + 1) == Some(&'&') {
+                    index += 1;
+                } else if chars.get(index + 1) == Some(&'>') {
+                    // `&> file`
+                    current.push(ch);
+                    index += 1;
+                    continue;
+                } else if chars
+                    .get(index.wrapping_sub(1))
+                    .is_some_and(|previous| *previous == '>' || *previous == '<')
+                {
+                    // `2>&1` is a file-descriptor merge, not a separator.
+                    current.push(ch);
+                    index += 1;
+                    continue;
+                }
                 stages.push(current.trim().to_string());
                 current.clear();
             }
             _ => current.push(ch),
         }
+        index += 1;
     }
 
     if !current.trim().is_empty() {
         stages.push(current.trim().to_string());
     }
-
     stages
 }
 
@@ -607,5 +897,84 @@ mod tests {
     fn fd_merge_is_not_split_as_and() {
         let ast = BashAst::parse("echo ok 2>&1");
         assert_eq!(ast.commands.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod command_segment_tests {
+    use super::*;
+
+    #[test]
+    fn splits_chained_commands() {
+        assert_eq!(
+            command_segments("cd repo && git diff"),
+            vec!["cd repo", "git diff"]
+        );
+        assert_eq!(
+            command_segments("a; b || c | d & e"),
+            vec!["a", "b", "c", "d", "e"]
+        );
+        assert_eq!(command_segments("first\nsecond"), vec!["first", "second"]);
+    }
+
+    #[test]
+    fn quotes_and_escapes_hide_separators() {
+        assert_eq!(
+            command_segments(r#"echo "a && b" 'c; d'"#),
+            vec![r#"echo "a && b" 'c; d'"#]
+        );
+        assert_eq!(command_segments(r"echo a\;b"), vec![r"echo a\;b"]);
+        assert_eq!(command_segments("echo hi # && rm -rf /"), vec!["echo hi"]);
+        assert_eq!(command_segments("echo a#b"), vec!["echo a#b"]);
+    }
+
+    #[test]
+    fn command_substitution_scripts_are_segments_too() {
+        let segments = command_segments("echo $(rm -rf /tmp/x)");
+        assert_eq!(segments[0], "echo $(rm -rf /tmp/x)");
+        assert!(
+            segments.iter().any(|segment| segment == "rm -rf /tmp/x"),
+            "{segments:?}"
+        );
+
+        let backtick = command_segments("echo `git status`");
+        assert!(
+            backtick.iter().any(|segment| segment == "git status"),
+            "{backtick:?}"
+        );
+    }
+
+    #[test]
+    fn shell_c_and_eval_scripts_are_segments_too() {
+        for command in [
+            "sh -c 'rm -rf /tmp/x'",
+            "bash -c \"rm -rf /tmp/x\"",
+            "eval 'rm -rf /tmp/x'",
+        ] {
+            let segments = command_segments(command);
+            assert!(
+                segments.iter().any(|segment| segment == "rm -rf /tmp/x"),
+                "{command}: {segments:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_wrapping_subshell_is_unwrapped() {
+        let segments = command_segments("(cd repo; rm -rf /tmp/x)");
+        assert!(
+            segments.iter().any(|segment| segment == "cd repo"),
+            "{segments:?}"
+        );
+        assert!(
+            segments.iter().any(|segment| segment == "rm -rf /tmp/x"),
+            "{segments:?}"
+        );
+    }
+
+    #[test]
+    fn a_single_command_stays_one_segment() {
+        assert_eq!(command_segments("git diff --stat"), vec!["git diff --stat"]);
+        assert!(command_segments("   ").is_empty());
     }
 }

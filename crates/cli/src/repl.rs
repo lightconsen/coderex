@@ -2353,7 +2353,11 @@ impl coderex_core::tool_executor::ToolExecutor for ArcToolExecutor {
         self.0.execute(tool_call_id, tool_name, input).await
     }
 
-    fn rule_subjects(&self, tool_name: &str, input: &serde_json::Value) -> Vec<String> {
+    fn rule_subjects(
+        &self,
+        tool_name: &str,
+        input: &serde_json::Value,
+    ) -> Vec<coderex_core::permissions::RuleSubject> {
         self.0.rule_subjects(tool_name, input)
     }
 }
@@ -2386,7 +2390,11 @@ impl coderex_core::tool_executor::ToolExecutor for PluginToolFallbackExecutor {
         }
     }
 
-    fn rule_subjects(&self, tool_name: &str, input: &serde_json::Value) -> Vec<String> {
+    fn rule_subjects(
+        &self,
+        tool_name: &str,
+        input: &serde_json::Value,
+    ) -> Vec<coderex_core::permissions::RuleSubject> {
         let primary = self.primary.rule_subjects(tool_name, input);
         if primary.is_empty() {
             self.plugin.rule_subjects(tool_name, input)

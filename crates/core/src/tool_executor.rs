@@ -9,6 +9,7 @@
 //! simple in-memory executor and production code can wire the full
 //! registry from `coderex-tools`.
 
+use crate::permissions::RuleSubject;
 use crate::types::ToolResult;
 use serde_json::Value;
 
@@ -56,7 +57,7 @@ pub trait ToolExecutor: Send + Sync {
     /// `file_path`, a file list, ...); the executor is the layer that can
     /// read it because it owns the registry. An executor that exposes no
     /// content returns nothing, and only whole-tool rules apply.
-    fn rule_subjects(&self, _tool_name: &str, _input: &Value) -> Vec<String> {
+    fn rule_subjects(&self, _tool_name: &str, _input: &Value) -> Vec<RuleSubject> {
         Vec::new()
     }
 }

@@ -197,6 +197,50 @@ pub enum RuleMatcher {
     },
 }
 
+/// One thing a permission rule is judged against for a call.
+///
+/// A call has one subject per command segment or file. Each subject carries the
+/// candidate spellings of that same thing (the argument as typed, its absolute
+/// form, its canonical form). Deny/ask rules match when **any** subject
+/// matches; an allow rule must cover **every** subject, so a compound command
+/// or a multi-file write is never auto-approved by a rule that only covers one
+/// of its parts.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RuleSubject {
+    /// Candidate spellings of this subject.
+    pub forms: Vec<String>,
+}
+
+impl From<&str> for RuleSubject {
+    fn from(value: &str) -> Self {
+        Self::single(value)
+    }
+}
+
+impl From<String> for RuleSubject {
+    fn from(value: String) -> Self {
+        Self::single(value)
+    }
+}
+
+impl RuleSubject {
+    /// Build a subject from its candidate spellings.
+    #[must_use]
+    pub fn new(forms: impl IntoIterator<Item = String>) -> Self {
+        Self {
+            forms: forms.into_iter().collect(),
+        }
+    }
+
+    /// A subject with exactly one spelling.
+    #[must_use]
+    pub fn single(value: impl Into<String>) -> Self {
+        Self {
+            forms: vec![value.into()],
+        }
+    }
+}
+
 /// Errors from parsing a Claude-style permission rule.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum PermissionRuleParseError {
@@ -509,23 +553,118 @@ fn path_pattern_variants(pattern: &str, ctx: &RuleCompileContext<'_>) -> Vec<Str
         }
     };
 
-    if let Some(absolute) = absolute
-        && !variants.contains(&absolute)
-    {
-        variants.push(absolute);
+    if let Some(absolute) = absolute {
+        if let Some(canonical) = canonical_pattern_variant(&absolute)
+            && !variants.contains(&canonical)
+        {
+            variants.push(canonical);
+        }
+        if !variants.contains(&absolute) {
+            variants.push(absolute);
+        }
     }
     variants
 }
 
+/// Resolve the longest existing, glob-free prefix of a pattern.
+///
+/// A rule such as `Read(./link/**)` must match a file reached through a
+/// symlink by its real location. The literal directory before the first glob
+/// is canonicalized; the glob suffix is appended unchanged. A path that is a
+/// symlink but whose target changes between the check and the tool call is a
+/// residual TOCTOU risk no userspace matcher can remove.
+fn canonical_pattern_variant(pattern: &str) -> Option<String> {
+    let glob_at = pattern.find(['*', '?', '[', '{']);
+    if glob_at.is_none() {
+        let path = std::path::Path::new(pattern);
+        let canonical = canonicalize_lenient(path)?;
+        return Some(globset::escape(&normalize_separators(
+            &canonical.to_string_lossy(),
+        )));
+    }
+
+    let glob_at = glob_at.unwrap_or(pattern.len());
+    let literal = &pattern[..glob_at];
+    let rest = &pattern[glob_at..];
+    let directory_end = literal.rfind('/').map_or(0, |index| index + 1);
+    if directory_end == 0 {
+        return None;
+    }
+    let directory = &literal[..directory_end];
+    let partial = &literal[directory_end..];
+    let canonical = canonicalize_lenient(std::path::Path::new(directory))?;
+    let mut out = globset::escape(&normalize_separators(&canonical.to_string_lossy()));
+    if !out.ends_with('/') {
+        out.push('/');
+    }
+    out.push_str(partial);
+    out.push_str(rest);
+    Some(out)
+}
+
+/// Resolve symlinks when possible; keep the path otherwise.
+fn canonicalize_lenient(path: &Path) -> Option<std::path::PathBuf> {
+    if let Ok(canonical) = std::fs::canonicalize(path) {
+        return Some(strip_verbatim_prefix(canonical));
+    }
+
+    // A not-yet-created target: find the nearest existing ancestor, then
+    // re-attach the missing components.
+    let mut suffix: Vec<std::ffi::OsString> = Vec::new();
+    let mut current = path;
+    loop {
+        let name = current.file_name()?;
+        suffix.push(name.to_os_string());
+        let parent = current.parent()?;
+        if parent.as_os_str().is_empty() {
+            return None;
+        }
+        if let Ok(mut base) = std::fs::canonicalize(parent) {
+            for component in suffix.iter().rev() {
+                base.push(component);
+            }
+            return Some(strip_verbatim_prefix(base));
+        }
+        current = parent;
+    }
+}
+
+/// Windows canonical paths carry a `\\?\` prefix; rules do not.
+fn strip_verbatim_prefix(path: std::path::PathBuf) -> std::path::PathBuf {
+    let text = path.to_string_lossy().into_owned();
+    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        return std::path::PathBuf::from(format!(r"\\{rest}"));
+    }
+    text.strip_prefix(r"\\?\")
+        .map_or(path, |rest| std::path::PathBuf::from(rest))
+}
+
 /// Whether a command is the configured prefix at a word boundary.
+///
+/// Leading `NAME=value` environment assignments are skipped for matching, so a
+/// `Bash(rm:*)` rule still covers `FOO=1 rm -rf /`. The rule text itself may
+/// still include assignments if the caller wants them.
 fn bash_prefix_matches(command: &str, prefix: &str) -> bool {
     let command = command.trim_start();
+    let stripped = crate::shell_security::strip_leading_env_assignments(command);
+    [command, stripped]
+        .into_iter()
+        .any(|candidate| command_starts_with_prefix(candidate, prefix))
+}
+
+fn command_starts_with_prefix(command: &str, prefix: &str) -> bool {
     command.strip_prefix(prefix).is_some_and(|rest| {
         rest.is_empty()
             || rest.starts_with(|c: char| {
                 c.is_whitespace() || matches!(c, ';' | '&' | '|' | '<' | '>' | '(' | ')')
             })
     })
+}
+
+/// A Bash glob also matches once leading environment assignments are removed.
+fn bash_glob_matches(matcher: &GlobMatcher, form: &str) -> bool {
+    matcher.is_match(form)
+        || matcher.is_match(crate::shell_security::strip_leading_env_assignments(form))
 }
 
 /// Checks permissions based on mode and configured rules.
@@ -721,8 +860,8 @@ impl PermissionChecker {
         path: Option<&Path>,
         exemptions: Option<ToolRuleExemptions>,
     ) -> PermissionResult {
-        let subjects: Vec<String> = path
-            .map(|path| vec![path.to_string_lossy().to_string()])
+        let subjects: Vec<RuleSubject> = path
+            .map(|path| vec![RuleSubject::single(path.to_string_lossy().to_string())])
             .unwrap_or_default();
         self.check_with_subjects(tool_name, &subjects, exemptions)
     }
@@ -738,7 +877,7 @@ impl PermissionChecker {
     pub fn check_with_subjects(
         &self,
         tool_name: &str,
-        subjects: &[String],
+        subjects: &[RuleSubject],
         exemptions: Option<ToolRuleExemptions>,
     ) -> PermissionResult {
         // Mode-level shortcuts. Bypass and dont-ask are the deliberate hard
@@ -758,7 +897,7 @@ impl PermissionChecker {
         // Deny rules first: deny always wins over ask and allow.
         for rule in &self.rules {
             if rule.action == PermissionAction::Deny
-                && Self::rule_matches(rule, tool_name, subjects)
+                && Self::rule_matches_any(rule, tool_name, subjects)
             {
                 return PermissionResult::Deny {
                     reason: Self::rule_reason(rule, tool_name),
@@ -789,7 +928,8 @@ impl PermissionChecker {
 
         // Ask before allow: an explicit ask must not be defeated by an allow.
         for rule in &self.rules {
-            if rule.action == PermissionAction::Ask && Self::rule_matches(rule, tool_name, subjects)
+            if rule.action == PermissionAction::Ask
+                && Self::rule_matches_any(rule, tool_name, subjects)
             {
                 return PermissionResult::Ask {
                     reason: Self::rule_reason(rule, tool_name),
@@ -797,36 +937,58 @@ impl PermissionChecker {
             }
         }
 
-        // Explicit allow rules.
+        // Explicit whole-tool allows. A runner that refuses the shortcut
+        // does not get it; the specifier rules below, or the default, decide.
         for rule in &self.rules {
+            let name_matches =
+                rule.tool_name.is_empty() || rule.tool_name.eq_ignore_ascii_case(tool_name);
             if rule.action == PermissionAction::Allow
-                && Self::rule_matches(rule, tool_name, subjects)
+                && name_matches
+                && matches!(rule.matcher, CompiledMatcher::WholeTool)
+                && !exemptions.ignores_whole_tool_allow_rule
             {
-                match &rule.matcher {
-                    CompiledMatcher::WholeTool => {
-                        // A whole-tool allow. A runner that refuses the
-                        // shortcut does not get it, and the next rule — or the
-                        // default below — decides instead.
-                        if exemptions.ignores_whole_tool_allow_rule {
-                            continue;
+                return PermissionResult::Allow;
+            }
+        }
+
+        // Specifier allows compose: a compound command or a multi-file write
+        // is auto-approved only when *every* subject is covered by at least
+        // one allow rule. A rule covering one part is not enough.
+        if !subjects.is_empty() {
+            let mut path_patterns: Vec<String> = Vec::new();
+            let mut all_covered = true;
+            for subject in subjects {
+                let mut covered = false;
+                for rule in &self.rules {
+                    if rule.action != PermissionAction::Allow
+                        || matches!(rule.matcher, CompiledMatcher::WholeTool)
+                    {
+                        continue;
+                    }
+                    if Self::rule_matches_segment(rule, tool_name, subject) {
+                        covered = true;
+                        if let RuleMatcher::Glob { patterns } = &rule.spec.matcher {
+                            for pattern in patterns {
+                                if !path_patterns.contains(pattern) {
+                                    path_patterns.push(pattern.clone());
+                                }
+                            }
                         }
-                        return PermissionResult::Allow;
-                    }
-                    CompiledMatcher::Path(_) => {
-                        return PermissionResult::AllowForPath {
-                            patterns: match &rule.spec.matcher {
-                                RuleMatcher::Glob { patterns } => patterns.clone(),
-                                _ => Vec::new(),
-                            },
-                        };
-                    }
-                    // A command/content allow is not a path allow: the subject
-                    // already proved the call matches, so the call is allowed
-                    // outright.
-                    CompiledMatcher::BashPrefix { .. } | CompiledMatcher::BashGlob(_) => {
-                        return PermissionResult::Allow;
                     }
                 }
+                if !covered {
+                    all_covered = false;
+                    break;
+                }
+            }
+            if all_covered {
+                return if path_patterns.is_empty() {
+                    PermissionResult::Allow
+                } else {
+                    PermissionResult::AllowForPath {
+                        patterns: path_patterns,
+                    }
+                };
             }
         }
 
@@ -919,8 +1081,8 @@ impl PermissionChecker {
         )
     }
 
-    /// Check if a rule matches the given tool and rule subjects.
-    fn rule_matches(rule: &CompiledRule, tool_name: &str, subjects: &[String]) -> bool {
+    /// Whether a rule matches one subject of a call.
+    fn rule_matches_segment(rule: &CompiledRule, tool_name: &str, subject: &RuleSubject) -> bool {
         let name_matches =
             rule.tool_name.is_empty() || rule.tool_name.eq_ignore_ascii_case(tool_name);
         if !name_matches {
@@ -929,16 +1091,34 @@ impl PermissionChecker {
 
         match &rule.matcher {
             CompiledMatcher::WholeTool => true,
-            CompiledMatcher::BashPrefix { prefix } => subjects
+            CompiledMatcher::BashPrefix { prefix } => subject
+                .forms
                 .iter()
-                .any(|subject| bash_prefix_matches(subject, prefix)),
-            CompiledMatcher::BashGlob(matcher) => {
-                subjects.iter().any(|subject| matcher.is_match(subject))
-            }
-            CompiledMatcher::Path(matchers) => subjects
+                .any(|form| bash_prefix_matches(form, prefix)),
+            CompiledMatcher::BashGlob(matcher) => subject
+                .forms
                 .iter()
-                .any(|subject| matchers.iter().any(|matcher| matcher.is_match(subject))),
+                .any(|form| bash_glob_matches(matcher, form)),
+            CompiledMatcher::Path(matchers) => subject
+                .forms
+                .iter()
+                .any(|form| matchers.iter().any(|matcher| matcher.is_match(form))),
         }
+    }
+
+    /// Whether a rule matches any subject of a call (deny/ask semantics).
+    fn rule_matches_any(rule: &CompiledRule, tool_name: &str, subjects: &[RuleSubject]) -> bool {
+        let name_matches =
+            rule.tool_name.is_empty() || rule.tool_name.eq_ignore_ascii_case(tool_name);
+        if !name_matches {
+            return false;
+        }
+        if matches!(rule.matcher, CompiledMatcher::WholeTool) {
+            return true;
+        }
+        subjects
+            .iter()
+            .any(|subject| Self::rule_matches_segment(rule, tool_name, subject))
     }
 
     /// Generate a human-readable reason from a rule.
@@ -1812,6 +1992,183 @@ mod rule_spec_tests {
             edits.check_with_subjects("Write", &["./secret.txt".into()], None),
             PermissionResult::Deny { .. }
         ));
+    }
+
+    #[test]
+    fn a_whole_tool_allow_only_matches_its_tool() {
+        let context = ctx(Path::new("/proj"), None);
+        let checker = checker_with(&[parsed("Artifact", PermissionAction::Allow)], &context);
+        assert!(
+            !checker
+                .check_with_subjects("Write", &[RuleSubject::single("x")], None)
+                .is_allowed(),
+            "an allow for one tool approved another"
+        );
+    }
+
+    #[test]
+    fn a_whole_tool_deny_applies_even_without_subjects() {
+        let context = ctx(Path::new("/proj"), None);
+        let checker = checker_with(&[parsed("Bash", PermissionAction::Deny)], &context);
+        assert!(matches!(
+            checker.check("Bash", None),
+            PermissionResult::Deny { .. }
+        ));
+        let ask = checker_with(&[parsed("Bash", PermissionAction::Ask)], &context);
+        assert!(matches!(
+            ask.check("Bash", None),
+            PermissionResult::Ask { .. }
+        ));
+    }
+
+    #[test]
+    fn an_allow_rule_must_cover_every_command_segment() {
+        let context = ctx(Path::new("/proj"), None);
+        let checker = checker_with(&[parsed("Bash(git:*)", PermissionAction::Allow)], &context);
+
+        let both_git = [
+            RuleSubject::single("git status"),
+            RuleSubject::single("git diff"),
+        ];
+        assert!(matches!(
+            checker.check_with_subjects("Bash", &both_git, None),
+            PermissionResult::Allow
+        ));
+
+        let mixed = [
+            RuleSubject::single("git status"),
+            RuleSubject::single("rm -rf /tmp/x"),
+        ];
+        assert!(
+            !checker
+                .check_with_subjects("Bash", &mixed, None)
+                .is_allowed(),
+            "a rule covering only one segment approved the whole compound command"
+        );
+    }
+
+    #[test]
+    fn leading_environment_assignments_do_not_hide_the_command() {
+        let context = ctx(Path::new("/proj"), None);
+        let prefix = checker_with(&[parsed("Bash(rm:*)", PermissionAction::Deny)], &context);
+        assert!(matches!(
+            prefix.check_with_subjects("Bash", &["FOO=1 rm -rf /tmp/x".into()], None),
+            PermissionResult::Deny { .. }
+        ));
+
+        let exact = checker_with(
+            &[parsed("Bash(rm -rf /tmp/x)", PermissionAction::Deny)],
+            &context,
+        );
+        assert!(matches!(
+            exact.check_with_subjects("Bash", &["FOO=1 rm -rf /tmp/x".into()], None),
+            PermissionResult::Deny { .. }
+        ));
+
+        assert!(matches!(
+            prefix.check_with_subjects("Bash", &[r#"FOO="a b" rm -rf /tmp/x"#.into()], None),
+            PermissionResult::Deny { .. }
+        ));
+    }
+
+    #[test]
+    fn separate_allow_rules_can_cover_a_compound_command() {
+        let context = ctx(Path::new("/proj"), None);
+        let checker = checker_with(
+            &[
+                parsed("Bash(cd:*)", PermissionAction::Allow),
+                parsed("Bash(echo:*)", PermissionAction::Allow),
+            ],
+            &context,
+        );
+        let subjects = [
+            RuleSubject::single("cd /tmp"),
+            RuleSubject::single("echo chained-ok"),
+        ];
+        assert!(matches!(
+            checker.check_with_subjects("Bash", &subjects, None),
+            PermissionResult::Allow
+        ));
+    }
+
+    #[test]
+    fn a_deny_or_ask_rule_matches_any_segment() {
+        let context = ctx(Path::new("/proj"), None);
+        let deny = checker_with(&[parsed("Bash(rm:*)", PermissionAction::Deny)], &context);
+        let subjects = [
+            RuleSubject::single("git status"),
+            RuleSubject::single("rm -rf /tmp/x"),
+        ];
+        assert!(matches!(
+            deny.check_with_subjects("Bash", &subjects, None),
+            PermissionResult::Deny { .. }
+        ));
+
+        let ask = checker_with(&[parsed("Bash(rm:*)", PermissionAction::Ask)], &context);
+        assert!(matches!(
+            ask.check_with_subjects("Bash", &subjects, None),
+            PermissionResult::Ask { .. }
+        ));
+    }
+
+    #[test]
+    fn a_path_allow_must_cover_every_file() {
+        let context = ctx(Path::new("/proj"), None);
+        let checker = checker_with(
+            &[parsed("Write(./src/**)", PermissionAction::Allow)],
+            &context,
+        );
+
+        assert!(matches!(
+            checker.check_with_subjects("Write", &[RuleSubject::single("/proj/src/a.rs")], None,),
+            PermissionResult::AllowForPath { .. }
+        ));
+        assert!(
+            !checker
+                .check_with_subjects(
+                    "Write",
+                    &[
+                        RuleSubject::single("/proj/src/a.rs"),
+                        RuleSubject::single("/etc/passwd"),
+                    ],
+                    None,
+                )
+                .is_allowed(),
+            "a rule covering one file approved writing another"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_path_is_matched_by_its_real_location() {
+        let root = tempfile::tempdir().unwrap();
+        let real = root.path().join("real");
+        let link = root.path().join("link");
+        std::fs::create_dir(&real).unwrap();
+        std::fs::write(real.join("secret.txt"), "hidden").unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let context = ctx(root.path(), None);
+        let checker = checker_with(
+            &[parsed("Read(./real/**)", PermissionAction::Deny)],
+            &context,
+        );
+        let canonical = std::fs::canonicalize(&real)
+            .unwrap()
+            .join("secret.txt")
+            .to_string_lossy()
+            .to_string();
+        let subject = RuleSubject::new(vec![
+            link.join("secret.txt").to_string_lossy().to_string(),
+            canonical,
+        ]);
+        assert!(
+            matches!(
+                checker.check_with_subjects("Read", &[subject], None),
+                PermissionResult::Deny { .. }
+            ),
+            "a symlinked path bypassed the deny rule"
+        );
     }
 
     #[test]

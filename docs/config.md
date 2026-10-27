@@ -194,10 +194,29 @@ Supported syntax:
 
 Path patterns follow Claude's spellings: `./x` and bare `src/**` are relative to
 the session cwd, `~/x` to the home directory, `//tmp/x` and `/etc/**` are
-absolute. `*` does not cross `/`; `**` does. Matching is lexical (no symlink
-canonicalization) and happens against both the argument as written and a
-cwd/home-resolved absolute form. Bash rules are matched against the command
-(`RuleContentField`), never against the command's slash-containing arguments.
+absolute. `*` does not cross `/`; `**` does. Matching happens against the
+argument as written and a canonical form that the OS will actually open:
+symlinks are followed **before** lexical `..` folding, and a not-yet-created
+target resolves its nearest existing ancestor then re-attaches the missing
+components. The canonical form is authoritative when it exists, so a lexical
+spelling such as `link/../secret` cannot widen an allow rule. If the path
+cannot be canonicalized at all, a lexical absolute form is used. Rule patterns
+resolve the longest existing glob-free prefix the same way, so
+`Read(./link/**)` matches files reached through a symlinked `link`.
+Canonicalization is a point-in-time check: a symlink retargeted between the
+check and the tool call is a TOCTOU risk that can only be closed inside the
+tool's own path handling.
+
+Bash rules are matched against each command **segment**, not the raw string.
+The splitter understands top-level quotes/escapes, `;`, `&&`, `||`, `|`, `|&`,
+`&`, newlines, `$(...)`/backticks, a wrapping `( ... )`, `sh -c`/`eval`
+scripts, and leading `NAME=value` assignments. For **deny/ask**, matching any
+segment applies to the whole call. For **allow**, every segment must be covered
+by at least one allow rule (rules compose), so `cd repo && git diff` is not
+auto-approved by a rule that only covers `git diff`. This is intentionally
+shallower than a POSIX parser: constructs it cannot split stay in the enclosing
+segment (conservative for deny/ask, fail-closed for allow). Bash rules are not a
+sandbox — aliases, `xargs`, and other shell indirection are not inspected.
 
 Precedence inside the rule set is **deny > ask > allow**. A configured deny is
 evaluated before the plan/accept-edits shortcuts; `bypass-permissions` and

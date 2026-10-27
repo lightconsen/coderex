@@ -378,7 +378,11 @@ impl CoreToolExecutor for RegistryToolDispatcher {
             .collect()
     }
 
-    fn rule_subjects(&self, tool_name: &str, input: &Value) -> Vec<String> {
+    fn rule_subjects(
+        &self,
+        tool_name: &str,
+        input: &Value,
+    ) -> Vec<coderex_core::permissions::RuleSubject> {
         let Some(tool) = self.registry.get_tool_arc(tool_name) else {
             tracing::debug!(tool = %tool_name, "rule_subjects: no such tool");
             return Vec::new();
@@ -716,22 +720,27 @@ pub fn rule_content_subjects(
     field: Option<RuleContentField>,
     input: &Value,
     cwd: &std::path::Path,
-) -> Vec<String> {
+) -> Vec<coderex_core::permissions::RuleSubject> {
     if matches!(field, Some(RuleContentField::Scalar("command"))) {
-        return scalar_argument(input, "command")
-            .map(|command| vec![command.to_string_lossy().to_string()])
-            .unwrap_or_default();
+        let Some(command) = scalar_argument(input, "command") else {
+            return Vec::new();
+        };
+        let command = command.to_string_lossy().to_string();
+        let segments = coderex_core::shell_security::command_segments(&command);
+        if segments.is_empty() {
+            return vec![coderex_core::permissions::RuleSubject::single(command)];
+        }
+        return segments
+            .into_iter()
+            .map(coderex_core::permissions::RuleSubject::single)
+            .collect();
     }
 
-    let mut subjects = Vec::new();
-    for path in rule_content_arguments(field, input) {
-        for subject in subject_forms(&path, cwd) {
-            if !subjects.contains(&subject) {
-                subjects.push(subject);
-            }
-        }
-    }
-    subjects
+    // Each file is its own subject; a multi-file allow must cover every one.
+    rule_content_arguments(field, input)
+        .into_iter()
+        .map(|path| coderex_core::permissions::RuleSubject::new(subject_forms(&path, cwd)))
+        .collect()
 }
 
 /// The raw and absolute forms of one path argument.
@@ -753,12 +762,59 @@ fn subject_forms(path: &std::path::Path, cwd: &std::path::Path) -> Vec<String> {
     };
 
     if let Some(expanded) = expanded {
-        let absolute = normalize_separators(&lexical_absolute(&expanded));
-        if !forms.contains(&absolute) {
-            forms.push(absolute);
+        // Canonicalize the path as the OS will resolve it, before any lexical
+        // `..` folding: `link/../x` follows the symlink first. When a
+        // canonical form exists it is the authoritative one; adding the
+        // lexical form beside it would let an allow rule for the lexical
+        // spelling approve a different real file.
+        let resolved = canonicalize_lenient(&expanded)
+            .unwrap_or_else(|| std::path::PathBuf::from(lexical_absolute(&expanded)));
+        let resolved = normalize_separators(&resolved.to_string_lossy());
+        if !forms.contains(&resolved) {
+            forms.push(resolved);
         }
     }
     forms
+}
+
+/// Resolve symlinks when the path exists; for a not-yet-created file, resolve
+/// its parent and keep the file name.
+fn canonicalize_lenient(path: &std::path::Path) -> Option<std::path::PathBuf> {
+    if let Ok(canonical) = std::fs::canonicalize(path) {
+        return Some(strip_verbatim_prefix(canonical));
+    }
+
+    // A not-yet-created target: find the nearest existing ancestor, then
+    // re-attach the missing components.
+    let mut suffix: Vec<std::ffi::OsString> = Vec::new();
+    let mut current = path;
+    loop {
+        let name = current.file_name()?;
+        suffix.push(name.to_os_string());
+        let parent = current.parent()?;
+        if parent.as_os_str().is_empty() {
+            return None;
+        }
+        if let Ok(mut base) = std::fs::canonicalize(parent) {
+            for component in suffix.iter().rev() {
+                base.push(component);
+            }
+            return Some(strip_verbatim_prefix(base));
+        }
+        current = parent;
+    }
+}
+
+/// Windows canonical paths carry a `\\?\` prefix; rules do not.
+fn strip_verbatim_prefix(path: std::path::PathBuf) -> std::path::PathBuf {
+    let text = path.to_string_lossy();
+    match text.strip_prefix(r"\\?\UNC\") {
+        Some(rest) => std::path::PathBuf::from(format!(r"\\{rest}")),
+        None => match text.strip_prefix(r"\\?\") {
+            Some(rest) => std::path::PathBuf::from(rest),
+            None => path,
+        },
+    }
 }
 
 fn normalize_separators(value: &str) -> String {
@@ -1867,14 +1923,21 @@ mod subject_tests {
     use crate::tool::RuleContentField;
     use serde_json::json;
 
+    fn forms(subjects: &[coderex_core::permissions::RuleSubject]) -> Vec<Vec<String>> {
+        subjects
+            .iter()
+            .map(|subject| subject.forms.clone())
+            .collect()
+    }
+
     #[test]
-    fn a_command_field_yields_the_command_only() {
+    fn a_command_field_yields_one_subject_per_command_segment() {
         let subjects = rule_content_subjects(
             Some(RuleContentField::Scalar("command")),
-            &json!({"command": "cat /etc/passwd"}),
+            &json!({"command": "cd repo && git diff"}),
             std::path::Path::new("/proj"),
         );
-        assert_eq!(subjects, vec!["cat /etc/passwd"]);
+        assert_eq!(forms(&subjects), vec![vec!["cd repo"], vec!["git diff"]]);
     }
 
     #[test]
@@ -1884,7 +1947,10 @@ mod subject_tests {
             &json!({"file_path": "src/lib.rs"}),
             std::path::Path::new("/proj"),
         );
-        assert_eq!(subjects, vec!["src/lib.rs", "/proj/src/lib.rs"]);
+        assert_eq!(
+            forms(&subjects),
+            vec![vec!["src/lib.rs", "/proj/src/lib.rs"]]
+        );
     }
 
     #[test]
@@ -1894,21 +1960,33 @@ mod subject_tests {
             &json!({"file_path": "src/lib.rs", "content": "text"}),
             std::path::Path::new("/proj"),
         );
-        assert_eq!(subjects, vec!["src/lib.rs", "/proj/src/lib.rs"]);
+        assert_eq!(
+            forms(&subjects),
+            vec![vec!["src/lib.rs", "/proj/src/lib.rs"]]
+        );
         assert!(
-            !subjects.iter().any(|subject| subject.contains("text")),
+            !subjects
+                .iter()
+                .flat_map(|subject| &subject.forms)
+                .any(|form| form.contains("text")),
             "file content must not be a subject: {subjects:?}"
         );
     }
 
     #[test]
-    fn a_list_field_offers_every_entry() {
+    fn a_list_field_offers_every_entry_as_its_own_subject() {
         let subjects = rule_content_subjects(
             Some(RuleContentField::List("files")),
             &json!({"files": ["a.txt", {"path": "/tmp/b.txt"}]}),
             std::path::Path::new("/proj"),
         );
-        assert_eq!(subjects, vec!["a.txt", "/proj/a.txt", "/tmp/b.txt"]);
+        let forms = forms(&subjects);
+        assert_eq!(forms[0], vec!["a.txt", "/proj/a.txt"]);
+        assert_eq!(forms[1][0], "/tmp/b.txt");
+        assert!(
+            forms[1].iter().any(|form| form.ends_with("/b.txt")),
+            "{forms:?}"
+        );
     }
 
     #[test]
@@ -1918,6 +1996,124 @@ mod subject_tests {
             &json!({"file_path": "../x"}),
             std::path::Path::new("/proj/sub"),
         );
-        assert_eq!(subjects, vec!["../x", "/proj/x"]);
+        assert_eq!(forms(&subjects), vec![vec!["../x", "/proj/x"]]);
+    }
+
+    #[test]
+    fn a_not_yet_created_nested_path_gains_a_canonical_form() {
+        let root = tempfile::tempdir().unwrap();
+        let subjects = rule_content_subjects(
+            Some(RuleContentField::Scalar("file_path")),
+            &json!({"file_path": "new/dir/file.txt"}),
+            root.path(),
+        );
+        let expected = std::fs::canonicalize(root.path())
+            .unwrap()
+            .join("new/dir/file.txt")
+            .to_string_lossy()
+            .to_string();
+        assert!(
+            subjects
+                .iter()
+                .flat_map(|subject| &subject.forms)
+                .any(|form| *form == expected),
+            "the canonical form is missing: {subjects:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dotdot_after_a_symlink_is_resolved_like_the_kernel() {
+        let root = tempfile::tempdir().unwrap();
+        let a = root.path().join("a");
+        let b = a.join("b");
+        std::fs::create_dir_all(&b).unwrap();
+        std::fs::write(a.join("secret.txt"), "hidden").unwrap();
+        std::os::unix::fs::symlink(&b, root.path().join("link")).unwrap();
+
+        let subjects = rule_content_subjects(
+            Some(RuleContentField::Scalar("file_path")),
+            &json!({"file_path": "link/../secret.txt"}),
+            root.path(),
+        );
+        let expected = std::fs::canonicalize(a.join("secret.txt"))
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        assert!(
+            subjects
+                .iter()
+                .flat_map(|subject| &subject.forms)
+                .any(|form| *form == expected),
+            "the kernel-resolved form is missing: {subjects:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_dotdot_symlink_cannot_widen_an_allow_rule() {
+        let root = tempfile::tempdir().unwrap();
+        let a = root.path().join("a");
+        let b = a.join("b");
+        std::fs::create_dir_all(&b).unwrap();
+        std::fs::write(a.join("secret.txt"), "hidden").unwrap();
+        std::os::unix::fs::symlink(&b, root.path().join("link")).unwrap();
+
+        let subjects = rule_content_subjects(
+            Some(RuleContentField::Scalar("file_path")),
+            &json!({"file_path": "link/../secret.txt"}),
+            root.path(),
+        );
+        let mut checker = coderex_core::permissions::PermissionChecker::new(
+            coderex_core::permissions::PermissionMode::Default,
+        );
+        let spec = coderex_core::permissions::PermissionRuleSpec::parse(
+            "Write(./secret/**)",
+            coderex_core::permissions::PermissionAction::Allow,
+        )
+        .unwrap();
+        checker
+            .add_spec(
+                &spec,
+                &coderex_core::permissions::RuleCompileContext {
+                    cwd: root.path(),
+                    home: None,
+                },
+            )
+            .unwrap();
+        assert!(
+            !checker
+                .check_with_subjects("Write", &subjects, None)
+                .is_allowed(),
+            "the lexical spelling widened the allow rule: {subjects:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_path_gains_its_real_form() {
+        let root = tempfile::tempdir().unwrap();
+        let real = root.path().join("real");
+        let link = root.path().join("link");
+        std::fs::create_dir(&real).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let subjects = rule_content_subjects(
+            Some(RuleContentField::Scalar("file_path")),
+            &json!({"file_path": link.join("note.txt").to_string_lossy()}),
+            root.path(),
+        );
+        let real_form = std::fs::canonicalize(&real)
+            .unwrap()
+            .join("note.txt")
+            .to_string_lossy()
+            .to_string();
+        assert!(
+            subjects
+                .iter()
+                .flat_map(|subject| &subject.forms)
+                .any(|form| *form == real_form),
+            "the canonical form is missing: {subjects:?}"
+        );
     }
 }

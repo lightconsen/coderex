@@ -3811,8 +3811,15 @@ mod tests {
             }
         }
 
-        fn rule_subjects(&self, _tool_name: &str, _input: &serde_json::Value) -> Vec<String> {
-            vec!["note.txt".into(), "/tmp/note.txt".into()]
+        fn rule_subjects(
+            &self,
+            _tool_name: &str,
+            _input: &serde_json::Value,
+        ) -> Vec<coderex_core::permissions::RuleSubject> {
+            vec![coderex_core::permissions::RuleSubject::new(vec![
+                "note.txt".into(),
+                "/tmp/note.txt".into(),
+            ])]
         }
     }
 

@@ -351,3 +351,76 @@ fn a_path_deny_rule_blocks_a_read() {
         "the path deny did not reach the transcript:\n{stdout}"
     );
 }
+
+#[test]
+fn a_compound_command_needs_an_allow_rule_for_every_segment() {
+    let dir = workspace();
+    write_json(
+        &dir.path().join(".coderex/settings.json"),
+        serde_json::json!({"permissions": {"allow": ["Bash(cd:*)"]}}),
+    );
+    let home = config_home(None);
+    let (mut provider, base_url) = start_static_provider();
+    let (stdout, asked) = run_denying(dir.path(), home.path(), &base_url, "run a chained command");
+    let _ = provider.kill();
+    let _ = provider.wait();
+    assert!(asked, "the uncovered segment did not ask:\n{stdout}");
+    assert!(stdout.contains("denied by user"), "{stdout}");
+
+    // Covering both segments lets the compound command run.
+    let covered = workspace();
+    write_json(
+        &covered.path().join(".coderex/settings.json"),
+        serde_json::json!({
+            "permissions": {"allow": ["Bash(cd:*)", "Bash(echo:*)"]}
+        }),
+    );
+    let home = config_home(None);
+    let (mut provider, base_url) = start_static_provider();
+    let stdout = run(
+        covered.path(),
+        home.path(),
+        &base_url,
+        "run a chained command",
+    );
+    let _ = provider.kill();
+    let _ = provider.wait();
+    assert!(
+        stdout.contains("chained-ok"),
+        "a fully covered compound command did not run:\n{stdout}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_symlinked_path_cannot_bypass_a_path_deny() {
+    let dir = workspace();
+    let protected = dir.path().join("protected");
+    std::fs::create_dir(&protected).unwrap();
+    std::fs::write(protected.join("secret.txt"), "hidden-secret").unwrap();
+    std::os::unix::fs::symlink(&protected, dir.path().join("link")).unwrap();
+    write_json(
+        &dir.path().join(".coderex/settings.json"),
+        serde_json::json!({"permissions": {"deny": ["Read(./protected/**)"]}}),
+    );
+    let home = config_home(None);
+    let (mut provider, base_url) = start_static_provider();
+
+    let stdout = run(
+        dir.path(),
+        home.path(),
+        &base_url,
+        "read the symlinked file",
+    );
+
+    let _ = provider.kill();
+    let _ = provider.wait();
+    assert!(
+        stdout.contains("denied") && stdout.contains("Read(./protected/**)"),
+        "a symlinked path bypassed the deny:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("hidden-secret"),
+        "the denied file content reached the transcript:\n{stdout}"
+    );
+}
