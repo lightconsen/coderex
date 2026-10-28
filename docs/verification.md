@@ -7,7 +7,7 @@ machine, cron, a Linux runner or CI issue the same commands.
 ```bash
 scripts/verify.sh                 # audit, deny, licenses, clippy, rustdoc
 scripts/verify.sh audit deny      # one or more named checks
-scripts/verify.sh --strict        # clippy/rustdoc warnings become failures
+scripts/verify.sh --lenient       # report clippy/rustdoc counts without failing
 ```
 
 | Check | Command | Current state |
@@ -15,8 +15,8 @@ scripts/verify.sh --strict        # clippy/rustdoc warnings become failures
 | `audit` | `cargo audit` with `.cargo/audit.toml` | **0** unignored advisories |
 | `deny` | `cargo deny check` | advisories, bans, licences, sources all pass |
 | `licenses` | `cargo deny check licenses` | passes; reports `nucleo-matcher` (MPL-2.0, accepted) |
-| `clippy` | `cargo clippy --workspace --all-targets` | **830** warnings, 0 errors |
-| `rustdoc` | `cargo doc --workspace --no-deps` | **62** warnings, 0 errors |
+| `clippy` | `cargo clippy --workspace --all-targets` | **0** warnings, 0 errors |
+| `rustdoc` | `cargo doc --workspace --no-deps` | **0** warnings, 0 errors |
 
 Logs and a summary go to `target/verify/`. `scripts/nightly.sh` runs
 `verify` by default (`RUN_VERIFY=0` disables it).
@@ -52,16 +52,26 @@ used as a normal Cargo dependency. GPL/AGPL remain denied.
 allow entry cannot silently widen to another crate; adding a second MPL
 dependency is a policy decision, not a config edit.
 
-## Clippy and rustdoc backlogs
+## Clippy and rustdoc
 
-Neither is enforced yet: `cargo clippy --workspace` and `cargo doc` run in CI
-without `-D warnings`. `scripts/verify.sh` prints the counts (830 and 62 on
-2026-10-28) and only fails with `--strict`. To restore the strict gates:
+Both are clean, and `scripts/verify.sh` now fails on any warning. The
+workspace lints in `Cargo.toml` allow a small, documented set of lints whose
+suggested rewrite is worse than the code (`assert_is_empty`,
+`significant_drop_tightening`, `await_holding_lock`, `option_if_let_else`,
+`cast_possible_truncation`, `type_complexity`, `needless_pass_by_value`).
 
-1. clear the warnings (or pin the toolchain so a new stable release does not
-   silently add lints);
-2. then add `-- -D warnings` to clippy and `RUSTDOCFLAGS="-D warnings"` to the
-   docs job, and pass `--strict` to `scripts/verify.sh`.
+## Keeping it clean
+
+`scripts/verify.sh` fails on a clippy or rustdoc warning, so a new one is a
+regression rather than a number nobody reads. Two things are deliberate:
+
+- A small set of lints is allowed at the workspace level for a recorded
+  reason (see the comment in `Cargo.toml`). Each is a lint whose suggested
+  rewrite is worse than the code it replaces, not a warnings count being
+  hidden.
+- A site-specific `#[allow]` carries a comment saying why the lint does not
+  apply there (a `#[non_exhaustive]` struct, a shell string that looks like a
+  format argument, a lock held across an await in a test).
 
 Do not add `#[allow]` at module scope to make the count smaller; fix the lint
 or record a reviewed exception next to it.

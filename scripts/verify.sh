@@ -12,10 +12,10 @@
 #   rustdoc   cargo doc --workspace --no-deps, warning count
 #   all       every check above (default)
 #
-# Each check prints its current count and the actionable findings. The script
-# exits non-zero when a check fails; `clippy` and `rustdoc` report their warning
-# counts and only fail when --strict is set (or STRICT=1), because the backlog
-# is still being paid down. Audit and deny are always strict.
+# Each check prints its current count and the actionable findings. Every check
+# fails on a finding: the clippy and rustdoc backlogs are empty, so a new
+# warning is a regression. `--lenient` (or STRICT=0) reports the counts without
+# failing, for a machine that is mid-upgrade.
 #
 # Output: target/verify/<check>.log, and target/verify/summary.md.
 
@@ -23,9 +23,13 @@ set -uo pipefail
 
 cd "$(dirname "$0")/.."
 
-strict="${STRICT:-0}"
+strict="${STRICT:-1}"
 if [[ "${1:-}" == "--strict" ]]; then
     strict=1
+    shift
+fi
+if [[ "${1:-}" == "--lenient" ]]; then
+    strict=0
     shift
 fi
 
@@ -149,10 +153,12 @@ run_clippy() {
         results+=("fail clippy (exit $code)")
         status=1
     elif [[ "$warnings" -gt 0 && "$strict" == "1" ]]; then
-        results+=("fail clippy ($warnings warnings, strict)")
+        results+=("fail clippy ($warnings warnings)")
         status=1
+    elif [[ "$warnings" -gt 0 ]]; then
+        results+=("warn clippy ($warnings warnings, lenient)")
     else
-        results+=("warn clippy ($warnings warnings)")
+        results+=("ok clippy (0 warnings)")
     fi
 }
 
@@ -167,10 +173,12 @@ run_rustdoc() {
         results+=("fail rustdoc (exit $code)")
         status=1
     elif [[ "$warnings" -gt 0 && "$strict" == "1" ]]; then
-        results+=("fail rustdoc ($warnings warnings, strict)")
+        results+=("fail rustdoc ($warnings warnings)")
         status=1
+    elif [[ "$warnings" -gt 0 ]]; then
+        results+=("warn rustdoc ($warnings warnings, lenient)")
     else
-        results+=("warn rustdoc ($warnings warnings)")
+        results+=("ok rustdoc (0 warnings)")
     fi
 }
 
@@ -215,8 +223,7 @@ done
     echo
     printf -- '- %s\n' "${results[@]}"
     echo
-    echo "Warning counts (clippy / rustdoc) are informational until the backlog"
-    echo "is cleared; \`--strict\` turns them into failures."
+    echo "clippy and rustdoc fail on any warning; \`--lenient\` only reports them."
 } | tee "$out/summary.md"
 
 exit "$status"
