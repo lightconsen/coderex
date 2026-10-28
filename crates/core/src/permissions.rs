@@ -1484,7 +1484,7 @@ mod tests {
     fn strip_dangerous_tools_removes_blocked() {
         let checker = PermissionChecker::new(PermissionMode::Plan);
         let tools = ["read", "grep", "bash", "write"];
-        let (allowed, denied) = checker.strip_dangerous_tools(tools.iter().map(|s| *s));
+        let (allowed, denied) = checker.strip_dangerous_tools(tools.iter().copied());
 
         assert_eq!(allowed, vec!["read", "grep"]);
         assert_eq!(denied.len(), 2);

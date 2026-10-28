@@ -157,7 +157,7 @@ fn run_with_control_responses(
                     for block in content {
                         if block["type"] == "tool_result" {
                             let text = block["content"].as_str().unwrap_or_default().to_string();
-                            outcome.tool_result = text.clone();
+                            outcome.tool_result.clone_from(&text);
                             outcome.tool_results.push(text);
                         }
                     }

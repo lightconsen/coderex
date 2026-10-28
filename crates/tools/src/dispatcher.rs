@@ -555,7 +555,8 @@ impl CoreToolExecutor for RegistryToolDispatcher {
             .lock()
             .remove(tool_call_id)
             .unwrap_or_default();
-        if let Some(verifier) = self.path_verifier.read().clone() {
+        let verifier = self.path_verifier.read().clone();
+        if let Some(verifier) = verifier {
             let expected = Arc::new(expected);
             let tool_name = tool_name.to_string();
             ctx = ctx.with_path_verifier(Arc::new(move |paths: &[std::path::PathBuf]| {

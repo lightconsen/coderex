@@ -746,16 +746,13 @@ fn sed_script_command(args: &[String]) -> Option<String> {
             "-e" | "--expression" => {
                 scripts.push(args.get(index + 1).cloned().unwrap_or_default());
                 index += 2;
-                continue;
             }
             token if token.starts_with("--expression=") => {
                 scripts.push(token["--expression=".len()..].to_string());
                 index += 1;
-                continue;
             }
             token if token.starts_with('-') => {
                 index += 1;
-                continue;
             }
             _ => {
                 scripts.push(args[index].clone());
@@ -776,10 +773,7 @@ fn sed_exec_in(script: &str) -> Option<String> {
     for part in script.split([';', '\n']) {
         let mut rest = part.trim();
         // Strip a simple address (`1`, `$`, `/regex/`, `1,5`, `!`).
-        loop {
-            let Some(ch) = rest.chars().next() else {
-                break;
-            };
+        while let Some(ch) = rest.chars().next() {
             if ch.is_ascii_digit() || ch == '$' || ch == '!' || ch.is_whitespace() {
                 rest = &rest[ch.len_utf8()..];
                 continue;

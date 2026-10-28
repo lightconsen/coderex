@@ -345,6 +345,53 @@ fn parse_fallback_providers_env() -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// The cloud deployment the environment asks for, if any.
+#[must_use]
+pub fn cloud_endpoint_from_env() -> Option<CloudEndpoint> {
+    let kind = select(&SelectionInputs::from_env());
+    if kind == ProviderKind::FirstParty {
+        return None;
+    }
+
+    let region = std::env::var("AWS_REGION")
+        .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
+        .or_else(|_| std::env::var("CLOUD_ML_REGION"))
+        .unwrap_or_else(|_| "us-east-1".to_string());
+
+    let endpoint = CloudEndpoint::new(kind, region);
+    match kind {
+        ProviderKind::Vertex => {
+            let project = std::env::var("ANTHROPIC_VERTEX_PROJECT_ID")
+                .or_else(|_| std::env::var("GOOGLE_CLOUD_PROJECT"))
+                .unwrap_or_default();
+            Some(endpoint.with_project(project))
+        }
+        _ => Some(endpoint),
+    }
+}
+
+/// The base URL a cloud deployment talks to.
+#[must_use]
+pub fn cloud_base_url(endpoint: &CloudEndpoint) -> String {
+    match endpoint.kind {
+        ProviderKind::Vertex => std::env::var("ANTHROPIC_VERTEX_BASE_URL")
+            .unwrap_or_else(|_| vertex_base_url(&endpoint.region)),
+        ProviderKind::Bedrock => std::env::var("ANTHROPIC_BEDROCK_BASE_URL")
+            .unwrap_or_else(|_| default_base_url(endpoint.kind, &endpoint.region)),
+        ProviderKind::Mantle => std::env::var("ANTHROPIC_BEDROCK_MANTLE_BASE_URL")
+            .unwrap_or_else(|_| default_base_url(endpoint.kind, &endpoint.region)),
+        ProviderKind::AnthropicAws => std::env::var("ANTHROPIC_AWS_BASE_URL")
+            .unwrap_or_else(|_| default_base_url(endpoint.kind, &endpoint.region)),
+        ProviderKind::Foundry => std::env::var("ANTHROPIC_FOUNDRY_BASE_URL").unwrap_or_else(|_| {
+            foundry_base_url(&std::env::var("ANTHROPIC_FOUNDRY_RESOURCE").unwrap_or_default())
+        }),
+        ProviderKind::Gateway => std::env::var("CODEREX_GATEWAY_URL").unwrap_or_default(),
+        ProviderKind::AnthropicGoogleCloud => std::env::var("ANTHROPIC_GOOGLE_CLOUD_BASE_URL")
+            .unwrap_or_else(|_| default_base_url(endpoint.kind, &endpoint.region)),
+        ProviderKind::FirstParty => default_base_url(endpoint.kind, &endpoint.region),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -465,52 +512,5 @@ mod tests {
         ];
 
         assert_eq!(ProviderConfig::from_env().request_timeout_secs, Some(3000));
-    }
-}
-
-/// The cloud deployment the environment asks for, if any.
-#[must_use]
-pub fn cloud_endpoint_from_env() -> Option<CloudEndpoint> {
-    let kind = select(&SelectionInputs::from_env());
-    if kind == ProviderKind::FirstParty {
-        return None;
-    }
-
-    let region = std::env::var("AWS_REGION")
-        .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
-        .or_else(|_| std::env::var("CLOUD_ML_REGION"))
-        .unwrap_or_else(|_| "us-east-1".to_string());
-
-    let endpoint = CloudEndpoint::new(kind, region);
-    match kind {
-        ProviderKind::Vertex => {
-            let project = std::env::var("ANTHROPIC_VERTEX_PROJECT_ID")
-                .or_else(|_| std::env::var("GOOGLE_CLOUD_PROJECT"))
-                .unwrap_or_default();
-            Some(endpoint.with_project(project))
-        }
-        _ => Some(endpoint),
-    }
-}
-
-/// The base URL a cloud deployment talks to.
-#[must_use]
-pub fn cloud_base_url(endpoint: &CloudEndpoint) -> String {
-    match endpoint.kind {
-        ProviderKind::Vertex => std::env::var("ANTHROPIC_VERTEX_BASE_URL")
-            .unwrap_or_else(|_| vertex_base_url(&endpoint.region)),
-        ProviderKind::Bedrock => std::env::var("ANTHROPIC_BEDROCK_BASE_URL")
-            .unwrap_or_else(|_| default_base_url(endpoint.kind, &endpoint.region)),
-        ProviderKind::Mantle => std::env::var("ANTHROPIC_BEDROCK_MANTLE_BASE_URL")
-            .unwrap_or_else(|_| default_base_url(endpoint.kind, &endpoint.region)),
-        ProviderKind::AnthropicAws => std::env::var("ANTHROPIC_AWS_BASE_URL")
-            .unwrap_or_else(|_| default_base_url(endpoint.kind, &endpoint.region)),
-        ProviderKind::Foundry => std::env::var("ANTHROPIC_FOUNDRY_BASE_URL").unwrap_or_else(|_| {
-            foundry_base_url(&std::env::var("ANTHROPIC_FOUNDRY_RESOURCE").unwrap_or_default())
-        }),
-        ProviderKind::Gateway => std::env::var("CODEREX_GATEWAY_URL").unwrap_or_default(),
-        ProviderKind::AnthropicGoogleCloud => std::env::var("ANTHROPIC_GOOGLE_CLOUD_BASE_URL")
-            .unwrap_or_else(|_| default_base_url(endpoint.kind, &endpoint.region)),
-        ProviderKind::FirstParty => default_base_url(endpoint.kind, &endpoint.region),
     }
 }

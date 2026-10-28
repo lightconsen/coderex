@@ -8701,6 +8701,10 @@ impl ReplLoop {
     /// the word appended to the streaming message. Esc in the *default*
     /// (non-Vim) mode never reached either of them, so "Esc stops the run" was
     /// only true with Vim mode on.
+    // `query_done_rx` is taken by reference only to keep the receiver alive;
+    // the caller needs the same binding mutably for the next turn, so the
+    // signature stays `&mut`.
+    #[allow(clippy::needless_pass_by_ref_mut)]
     fn stop_running_query(
         &mut self,
         ui_state: &mut coderex_ui::state::UiState,
@@ -13269,7 +13273,9 @@ mod tests {
                 assert!(text.contains("auto-turn limit"), "{text}");
                 assert!(text.contains("1 queued mod message(s) dropped"), "{text}");
             }
-            other => panic!("expected a notice, got {other:?}"),
+            unsupported @ ModDrainAction::Submit(_) => {
+                panic!("expected a notice, got {unsupported:?}");
+            }
         }
         assert!(queue.is_empty(), "the dropped backlog must not replay");
     }
@@ -13293,7 +13299,7 @@ mod tests {
             ModDrainAction::Notice(text) => {
                 assert!(text.contains("submission limit"), "{text}");
             }
-            other => panic!("expected a notice, got {other:?}"),
+            ModDrainAction::Submit(text) => panic!("expected a notice, got {text:?}"),
         }
         assert!(queue.is_empty());
     }

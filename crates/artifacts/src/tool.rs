@@ -939,7 +939,7 @@ mod tests {
         )
     }
 
-    fn ctx<'a>(cwd: &'a Path) -> ToolContext<'a> {
+    fn ctx(cwd: &Path) -> ToolContext<'_> {
         ToolContext::new(coderex_tools::ExecutionContext::Normal, cwd)
     }
 

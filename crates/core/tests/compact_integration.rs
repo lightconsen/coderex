@@ -194,10 +194,11 @@ fn micro_compact_empty_messages() {
 
 #[test]
 fn auto_compact_triggers_above_threshold() {
-    let mut messages = Vec::new();
-    messages.push(make_user("start"));
-    messages.push(make_assistant(&"x".repeat(5000)));
-    messages.push(make_assistant(&"y".repeat(5000)));
+    let mut messages = vec![
+        make_user("start"),
+        make_assistant(&"x".repeat(5000)),
+        make_assistant(&"y".repeat(5000)),
+    ];
     messages.push(make_user("end"));
 
     let result = auto_compact(&messages, 100);
@@ -269,11 +270,12 @@ fn reactive_compact_preserves_first_user_and_recent_turns() {
 
 #[test]
 fn reactive_compact_boundary_inserted_when_gap_exists() {
-    let mut messages = Vec::new();
-    messages.push(make_user("first"));
-    messages.push(make_assistant("a"));
-    messages.push(make_user("second"));
-    messages.push(make_assistant("b"));
+    let mut messages = vec![
+        make_user("first"),
+        make_assistant("a"),
+        make_user("second"),
+        make_assistant("b"),
+    ];
     messages.push(make_user("third"));
     messages.push(make_assistant("c"));
     messages.push(make_user("fourth"));
@@ -340,10 +342,11 @@ fn snip_compact_reduces_to_fit_target() {
 
 #[test]
 fn snip_compact_preserves_first_user_message() {
-    let mut messages = Vec::new();
-    messages.push(make_user("must preserve this"));
-    messages.push(make_assistant(&"x".repeat(1000)));
-    messages.push(make_user("also this"));
+    let messages = vec![
+        make_user("must preserve this"),
+        make_assistant(&"x".repeat(1000)),
+        make_user("also this"),
+    ];
 
     let result = snip_compact(&messages, 50);
 

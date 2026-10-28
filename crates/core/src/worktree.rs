@@ -372,9 +372,8 @@ mod tests {
     #[test]
     fn enter_worktree_returns_original_path() {
         // This is a unit test for the function structure, not git integration
-        let mgr = WorktreeManager::default();
+        let _mgr = WorktreeManager::default();
         // We can't test the actual git operations without a real git repo,
-        // but we can verify the function signatures are correct
-        let _mgr = mgr; // suppress unused warning
+        // but we can verify the function signatures are correct.
     }
 }

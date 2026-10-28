@@ -1759,7 +1759,7 @@ mod tests {
             assert!(
                 !plan
                     .iter()
-                    .any(|grant| grant.path == PathBuf::from(ancestor)),
+                    .any(|grant| grant.path == std::path::Path::new(ancestor)),
                 "{ancestor} is an ancestor of a search path and should not be granted"
             );
         }
@@ -1774,7 +1774,9 @@ mod tests {
         let grant = grant_for(&plan, "C:/work");
         assert_eq!(grant.access, AclAccess::Traverse);
         assert!(
-            !plan.iter().any(|grant| grant.path == PathBuf::from("C:/")),
+            !plan
+                .iter()
+                .any(|grant| grant.path == std::path::Path::new("C:/")),
             "a drive root must never be rewritten"
         );
     }

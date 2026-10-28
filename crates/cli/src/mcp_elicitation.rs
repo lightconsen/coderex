@@ -846,7 +846,11 @@ mod tests {
     /// The handler reads the variable while the request is awaited, so the
     /// lock is held for the whole test. Only these tests touch this name.
     #[allow(unsafe_code)] // SAFETY: the environment mutation is serialised by ENV_LOCK.
-    #[allow(clippy::await_holding_lock)] // ENV_LOCK must stay held until the answer is read.
+    #[allow(clippy::await_holding_lock)]
+    // ENV_LOCK must stay held until the answer is read.
+    // The guard is deliberately held across the await, which is what makes the
+    // future non-`Send`; this helper is awaited inline by the test.
+    #[allow(clippy::future_not_send)]
     async fn request_free_text(
         policy: HeadlessElicitation,
         answer: Option<&str>,

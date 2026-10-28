@@ -408,7 +408,7 @@ fn answer_log() -> PathBuf {
     log
 }
 
-fn answer_env(log: &PathBuf) -> HashMap<String, String> {
+fn answer_env(log: &std::path::Path) -> HashMap<String, String> {
     HashMap::from([(
         "CODEREX_MOCK_ANSWER_LOG".to_string(),
         log.to_string_lossy().into_owned(),
@@ -416,12 +416,14 @@ fn answer_env(log: &PathBuf) -> HashMap<String, String> {
 }
 
 /// The answer the mock server logged, as the client sent it.
-fn logged_answer(log: &PathBuf) -> serde_json::Value {
+fn logged_answer(log: &std::path::Path) -> serde_json::Value {
     let logged = std::fs::read_to_string(log).unwrap_or_default();
-    let line = logged
-        .lines()
-        .next()
-        .unwrap_or_else(|| panic!("the server never received an answer (log {log:?})"));
+    let line = logged.lines().next().unwrap_or_else(|| {
+        panic!(
+            "the server never received an answer (log {})",
+            log.display()
+        )
+    });
     let entry: serde_json::Value =
         serde_json::from_str(line).expect("the server logged valid JSON");
     entry
@@ -566,8 +568,8 @@ async fn discovered_tools_run_through_the_registry_dispatcher() {
 
     // Registering the discovered tools is all it takes: from here they are
     // ordinary registry tools with no MCP-specific execution path.
-    let mut registry = ToolRegistry::new();
-    mgr.register_tools_into(&mut registry);
+    let registry = ToolRegistry::new();
+    mgr.register_tools_into(&registry);
     assert!(registry.get_tool_arc("mcp__mock__mock_read_file").is_some());
 
     let dispatcher = RegistryToolDispatcher::new(

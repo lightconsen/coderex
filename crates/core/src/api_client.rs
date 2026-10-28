@@ -3159,17 +3159,22 @@ data: {"type":"message_stop"}
 
     #[tokio::test]
     async fn parse_sse_stream_stress_multiple_tool_calls() {
+        use std::fmt::Write as _;
+
         let mut sse = String::new();
         for i in 0..50 {
-            sse.push_str(&format!(
+            let _ = write!(
+                sse,
                 "event: content_block_start\ndata: {{\"type\":\"content_block_start\",\"index\":{i},\"content_block\":{{\"type\":\"tool_use\",\"id\":\"tool_{i}\",\"name\":\"read\",\"input\":{{}}}}}}\n\n"
-            ));
-            sse.push_str(&format!(
+            );
+            let _ = write!(
+                sse,
                 "event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":{i},\"delta\":{{\"type\":\"input_json_delta\",\"partial_json\":\"{{\\\"file\\\":\\\"f{i}.txt\\\"}}\"}}}}\n\n"
-            ));
-            sse.push_str(&format!(
+            );
+            let _ = write!(
+                sse,
                 "event: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":{i}}}\n\n"
-            ));
+            );
         }
         sse.push_str("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n");
 

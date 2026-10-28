@@ -2729,7 +2729,7 @@ mod tests {
 
     #[test]
     fn parse_hook_output_line_missing_fields_defaults() {
-        let line = r#"{}"#;
+        let line = r"{}";
         let result = parse_hook_output_line(line).unwrap();
         assert!(matches!(result.action, HookAction::Continue));
         assert!(!result.suppress_output);
@@ -2816,9 +2816,7 @@ mod tests {
             prompt: None,
             model: None,
             mcp: None,
-            env: [("MY_VAR".to_string(), "my_val".to_string())]
-                .into_iter()
-                .collect(),
+            env: std::iter::once(("MY_VAR".to_string(), "my_val".to_string())).collect(),
             cwd: None,
             internal: false,
             timeout_ms: 5000,

@@ -65,6 +65,9 @@ pub fn checkpoint_store_from(
 /// on entering a worktree, `TaskCompleted` on completing a task) calls this
 /// after the moment has happened. With no executor in the context — a bare
 /// test context — it is a no-op, so a tool keeps working without hooks.
+// The concrete hasher is fixed by `HookExecutor::fire_hook`, so a generic
+// parameter would only move the conversion to every caller.
+#[allow(clippy::implicit_hasher)]
 pub async fn fire_tool_hook(
     ctx: &ToolContext<'_>,
     event: &str,

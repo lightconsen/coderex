@@ -957,7 +957,7 @@ async fn an_expired_session_is_cleared_and_reinitialized_once() {
                 };
                 let body = format!(
                     r#"{{"jsonrpc":"2.0","id":{},"result":{{"protocolVersion":"2024-11-05"}}}}"#,
-                    if request.contains("\"id\":0") { 0 } else { 1 }
+                    i32::from(!request.contains("\"id\":0"))
                 );
                 let response = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nMcp-Session-Id: {session}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -1032,6 +1032,10 @@ async fn a_question_on_the_get_stream_is_answered_over_post() {
 
     std::thread::spawn(move || {
         // Keep GET streams alive while answers arrive on other connections.
+        // The vector is written and never read: dropping it closes them.
+        #[allow(clippy::collection_is_never_read)]
+        // Held open on purpose; see the note on the first server below.
+        #[allow(clippy::collection_is_never_read)]
         let mut open_streams: Vec<TcpStream> = Vec::new();
 
         for mut stream in listener.incoming().flatten() {
@@ -1054,9 +1058,9 @@ async fn a_question_on_the_get_stream_is_answered_over_post() {
                     body.len()
                 );
                 stream.write_all(response.as_bytes()).unwrap();
-            } else if request.contains("\"method\":\"initialized\"") {
-                write_response(&mut stream, "202 Accepted", "application/json", "");
-            } else if request.contains("\"id\":77") {
+            } else if request.contains("\"method\":\"initialized\"")
+                || request.contains("\"id\":77")
+            {
                 write_response(&mut stream, "202 Accepted", "application/json", "");
             } else {
                 write_response(&mut stream, "200 OK", "application/json", "{}");
@@ -1141,6 +1145,8 @@ async fn a_request_delivered_on_both_streams_is_answered_once() {
     let recorded = Arc::clone(&requests);
 
     std::thread::spawn(move || {
+        // Held open on purpose; see the note on the first server below.
+        #[allow(clippy::collection_is_never_read)]
         let mut open_streams: Vec<TcpStream> = Vec::new();
         for mut stream in listener.incoming().flatten() {
             let request = read_request(&mut stream);
@@ -1256,6 +1262,8 @@ async fn a_notification_delivered_on_both_streams_is_dispatched_once() {
     let recorded = Arc::clone(&requests);
 
     std::thread::spawn(move || {
+        // Held open on purpose; see the note on the first server below.
+        #[allow(clippy::collection_is_never_read)]
         let mut open_streams: Vec<TcpStream> = Vec::new();
         for mut stream in listener.incoming().flatten() {
             let request = read_request(&mut stream);
@@ -1335,6 +1343,8 @@ async fn a_replayed_server_request_after_reconnect_is_not_asked_again() {
     let recorded = Arc::clone(&requests);
 
     std::thread::spawn(move || {
+        // Held open on purpose: dropping a stream closes it.
+        #[allow(clippy::collection_is_never_read)]
         let mut held: Vec<TcpStream> = Vec::new();
         for mut stream in listener.incoming().flatten() {
             let request = read_request(&mut stream);
@@ -1480,6 +1490,8 @@ async fn a_degraded_stream_probes_and_recovers_to_active() {
     std::thread::spawn(move || {
         // Hold recovered streams open, or the client would see EOF and
         // treat the probe as another failure.
+        // Held open on purpose: dropping a stream closes it.
+        #[allow(clippy::collection_is_never_read)]
         let mut held: Vec<TcpStream> = Vec::new();
         for mut stream in listener.incoming().flatten() {
             let request = read_request(&mut stream);
@@ -1552,6 +1564,8 @@ async fn a_get_404_reinitializes_once_and_resumes() {
     let recorded = Arc::clone(&requests);
 
     std::thread::spawn(move || {
+        // Held open on purpose; see the note on the first server below.
+        #[allow(clippy::collection_is_never_read)]
         let mut open_streams: Vec<TcpStream> = Vec::new();
         let mut initializes = 0_usize;
         for mut stream in listener.incoming().flatten() {
@@ -1579,7 +1593,7 @@ async fn a_get_404_reinitializes_once_and_resumes() {
             } else if request.contains("\"method\":\"initialize\"") {
                 initializes += 1;
                 let session = format!("session-{initializes}");
-                let id = if request.contains("\"id\":0") { 0 } else { 1 };
+                let id = i32::from(!request.contains("\"id\":0"));
                 let body = format!(
                     r#"{{"jsonrpc":"2.0","id":{id},"result":{{"protocolVersion":"2024-11-05"}}}}"#
                 );
@@ -1614,13 +1628,12 @@ async fn a_get_404_reinitializes_once_and_resumes() {
     );
 
     let recorded = requests.lock().unwrap();
-    let initializes: Vec<&String> = recorded
+    let initializes = recorded
         .iter()
         .filter(|request| request.contains("\"method\":\"initialize\""))
-        .collect();
+        .count();
     assert_eq!(
-        initializes.len(),
-        2,
+        initializes, 2,
         "the session must be re-initialized exactly once"
     );
     let gets: Vec<&String> = recorded.iter().filter(|request| is_get(request)).collect();

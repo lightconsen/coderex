@@ -173,7 +173,7 @@ mod tests {
         assert!(output.output.contains("Wrote"));
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "v2");
 
-        let undone: std::collections::HashSet<String> = ["1".to_string()].into_iter().collect();
+        let undone: std::collections::HashSet<String> = std::iter::once("1".to_string()).collect();
         let report = store.restore(&undone);
         assert_eq!(
             report.restored,

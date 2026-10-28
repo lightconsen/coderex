@@ -763,6 +763,9 @@ fn encode_json(value: &serde_json::Value) -> Result<EncodedBody, TelemetryError>
 
 #[cfg(test)]
 mod tests {
+    use flate2::read::GzDecoder;
+    use std::io::Read;
+
     use super::*;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -1040,8 +1043,6 @@ mod tests {
         assert!(body.gzipped, "a large payload should be compressed");
 
         // The header the sender sets must match what the bytes actually are.
-        use flate2::read::GzDecoder;
-        use std::io::Read;
         let mut decoded = Vec::new();
         GzDecoder::new(&body.bytes[..])
             .read_to_end(&mut decoded)
@@ -1236,8 +1237,12 @@ mod tests {
             backtrace_symbols: frames
                 .as_ref()
                 .and_then(|symbols| serde_json::to_string(&symbols.frames).ok()),
-            backtrace_frame_count: frames.as_ref().map(|symbols| symbols.frame_count as i64),
-            backtrace_symbols_len: frames.as_ref().map(|symbols| symbols.symbols_len as i64),
+            backtrace_frame_count: frames
+                .as_ref()
+                .map(|symbols| i64::try_from(symbols.frame_count).unwrap_or(i64::MAX)),
+            backtrace_symbols_len: frames
+                .as_ref()
+                .map(|symbols| i64::try_from(symbols.symbols_len).unwrap_or(i64::MAX)),
             backtrace_symbols_sha256: frames.map(|symbols| symbols.symbols_sha256),
         }
     }

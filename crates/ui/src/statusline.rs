@@ -439,7 +439,7 @@ mod tests {
         let sl = Statusline {
             thinking: true,
             thinking_label: Some("Planning...".into()),
-            thinking_started: Some(Instant::now() - Duration::from_secs(65)),
+            thinking_started: Instant::now().checked_sub(Duration::from_secs(65)),
             spinner_frame: 0,
             ..Statusline::new()
         };

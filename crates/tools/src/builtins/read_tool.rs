@@ -170,7 +170,11 @@ fn resolve_path(file_path: &str, cwd: &std::path::Path) -> String {
     }
 }
 
-fn read_image(path: &PathBuf, ext: &str, ctx: &ToolContext<'_>) -> Result<ToolOutput, ToolError> {
+fn read_image(
+    path: &std::path::Path,
+    ext: &str,
+    ctx: &ToolContext<'_>,
+) -> Result<ToolOutput, ToolError> {
     let mut verified = crate::verified_fs::open_read(path, ctx)?;
     let mut bytes = Vec::new();
     std::io::Read::read_to_end(&mut verified.file, &mut bytes).map_err(|e| {

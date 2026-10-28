@@ -177,6 +177,31 @@ too_many_arguments = "allow"
 too_many_lines = "allow"
 struct_excessive_bools = "allow"
 doc_markdown = "allow"
+# The suggested rewrites below are worse than the code they replace, or the
+# lint needs a judgement the compiler cannot make. Each is allowed with the
+# reason it is not being chased.
+#
+# `assert!(x.is_empty())` is idiomatic; this lint's fix is `assert_eq!(x,
+# [] as [T; 0])`, which reads worse than the assertion it replaces.
+assert_is_empty = "allow"
+# A nursery heuristic about how long a guard lives. Where it fires here the
+# scope is deliberate (a lock held across a parse); shrinking it changes what
+# the code guarantees.
+significant_drop_tightening = "allow"
+# Every occurrence is in a test that serializes on a std mutex across `.await`
+# on purpose, so concurrent tests cannot interleave environment access.
+await_holding_lock = "allow"
+# `map_or_else` is not clearer than an `if let`/`else` when the else branch is
+# several lines; the call sites use it that way.
+option_if_let_else = "allow"
+# These conversions are display-only (theme colours, byte counts), where a
+# narrowing cast is intended and cannot overflow the rendered range.
+cast_possible_truncation = "allow"
+# Callback and trait-object types that a type alias would only rename.
+type_complexity = "allow"
+# Taking an owned value keeps the public signature stable for callers that
+# build it inline; the lint would push `&()`-style borrows into the API.
+needless_pass_by_value = "allow"
 
 # ─── Release Features ────────────────────────────────────────────────────────
 

@@ -336,12 +336,12 @@ mod tests {
             .await
             .unwrap();
         assert!(output.output.contains("truncated"));
-        let match_lines: Vec<_> = output
+        let match_lines = output
             .output
             .lines()
             .filter(|l| !l.is_empty() && !l.starts_with("..."))
-            .collect();
-        assert_eq!(match_lines.len(), 5);
+            .count();
+        assert_eq!(match_lines, 5);
     }
 
     #[tokio::test]

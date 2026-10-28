@@ -15,17 +15,23 @@
 /// can be pasted into a bug report or diffed between two captures.
 #[must_use]
 pub fn capture() -> String {
+    use std::fmt::Write as _;
+
     let mut out = String::new();
-    out.push_str("# CodeRex runtime snapshot (process facts, not a heap profile)\n");
-    out.push_str(&format!("version: {}\n", env!("CARGO_PKG_VERSION")));
-    out.push_str(&format!(
-        "os: {} {}\n",
+    let _ = writeln!(
+        out,
+        "# CodeRex runtime snapshot (process facts, not a heap profile)"
+    );
+    let _ = writeln!(out, "version: {}", env!("CARGO_PKG_VERSION"));
+    let _ = writeln!(
+        out,
+        "os: {} {}",
         std::env::consts::OS,
         std::env::consts::ARCH
-    ));
+    );
 
     let pid = std::process::id();
-    out.push_str(&format!("pid: {pid}\n"));
+    let _ = writeln!(out, "pid: {pid}");
     if let Some(facts) = linux_process_facts(pid) {
         out.push_str(&facts);
     } else {

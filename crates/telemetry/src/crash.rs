@@ -1703,9 +1703,11 @@ mod tests {
 
     #[test]
     fn symbolization_keeps_at_most_the_top_n_frames() {
+        use std::fmt::Write as _;
+
         let mut raw = String::new();
         for index in 0..(MAX_BACKTRACE_FRAMES + 6) {
-            raw.push_str(&format!("   {index}: crate_{index}::function_{index}\n"));
+            let _ = writeln!(raw, "   {index}: crate_{index}::function_{index}");
         }
         let symbols = symbolize_backtrace(&raw);
         assert_eq!(symbols.frames.len(), MAX_BACKTRACE_FRAMES);

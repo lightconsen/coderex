@@ -322,7 +322,7 @@ mod tests {
         // output: 500/1M * 15.0 = 0.0075
         // cache_read: 200/1M * 0.3 = 0.00006
         // cache_creation: 100/1M * 3.75 = 0.000375
-        let expected = 0.003 + 0.0075 + 0.00006 + 0.000375;
+        let expected = 0.003 + 0.0075 + 0.000_06 + 0.000_375;
         assert!((cost - expected).abs() < 1e-9);
     }
 
@@ -361,6 +361,9 @@ mod tests {
         assert_eq!(p.input_per_million, 3.0);
     }
 
+    // A `mul_add` rewrite of the tolerance check below would be harder to
+    // read for no measurable gain in a test.
+    #[allow(clippy::suboptimal_flops)]
     #[test]
     fn cost_tracker_accumulates_per_turn() {
         let mut tracker = CostTracker::new();
@@ -381,7 +384,7 @@ mod tests {
         let turn2_cost = tracker.get_turn_cost();
 
         assert!((turn1_cost - turn2_cost).abs() < 1e-9);
-        assert!((tracker.get_total_cost() - 2.0 * turn1_cost).abs() < 1e-9);
+        assert!((tracker.get_total_cost() - turn1_cost * 2.0).abs() < 1e-9);
     }
 
     #[test]

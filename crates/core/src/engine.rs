@@ -8633,8 +8633,7 @@ mod tests {
 
         // Verify content
         let content = std::fs::read_to_string(&path).unwrap();
-        let lines: Vec<&str> = content.lines().collect();
-        assert_eq!(lines.len(), 2);
+        assert_eq!(content.lines().count(), 2);
     }
 
     #[test]
@@ -8657,8 +8656,7 @@ mod tests {
         QueryEngine::write_transcript_replacement(&path, &[Message::user("new")]).unwrap();
 
         let content = std::fs::read_to_string(&path).unwrap();
-        let lines: Vec<&str> = content.lines().collect();
-        assert_eq!(lines.len(), 1);
+        assert_eq!(content.lines().count(), 1);
     }
 
     #[test]

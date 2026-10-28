@@ -154,11 +154,6 @@ impl MockProvider {
         }
     }
 
-    fn with_models(mut self, models: Vec<&str>) -> Self {
-        self.supported_models = models.into_iter().map(std::convert::Into::into).collect();
-        self
-    }
-
     fn with_response(mut self, response: &str) -> Self {
         self.response = Some(response.into());
         self
@@ -403,6 +398,8 @@ fn token_budget_reset_turn_clears() {
 //  10.4 CostTracker — accumulation, agent/task costs, turn history
 // ═══════════════════════════════════════════════════════════════════════════
 
+// `mul_add` would obscure the arithmetic this assertion is checking.
+#[allow(clippy::suboptimal_flops)]
 #[test]
 fn cost_tracker_accumulates_per_turn() {
     let mut tracker = CostTracker::new();
@@ -910,7 +907,7 @@ async fn openai_provider_sends_coderex_identity_headers_and_metadata() {
             turn_id: Some("7".into()),
             agent_id: Some("agent-openai".into()),
             request_id: None,
-            provider_hints: Default::default(),
+            provider_hints: std::collections::BTreeMap::default(),
         });
     let resp = provider
         .create_message("system", &[], &ModelId("gpt-4o".into()), 32, &[])
@@ -1111,7 +1108,7 @@ async fn openai_responses_provider_uses_responses_payload_shape() {
             turn_id: Some("11".into()),
             agent_id: Some("agent-responses".into()),
             request_id: None,
-            provider_hints: Default::default(),
+            provider_hints: std::collections::BTreeMap::default(),
         });
 
     let resp = provider
@@ -1157,7 +1154,7 @@ async fn provider_router_forwards_request_context_to_provider_headers() {
         turn_id: Some("3".into()),
         agent_id: Some("agent-router".into()),
         request_id: None,
-        provider_hints: Default::default(),
+        provider_hints: std::collections::BTreeMap::default(),
     });
 
     let resp = request_client

@@ -453,6 +453,31 @@ async fn structured_io_query_request_response() {
 /// assertion is about what the server actually sent, not about echoed text.
 #[tokio::test]
 async fn a_session_reuses_its_history_and_a_new_session_starts_clean() {
+    async fn ask(
+        ws: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+        id: &str,
+        content: &str,
+    ) -> String {
+        ws_send_json(
+            ws,
+            &serde_json::json!({"id": id, "type": "query", "content": content}),
+        )
+        .await;
+        let mut answer = String::new();
+        loop {
+            let text = ws_recv_text(ws).await;
+            let frame: serde_json::Value = serde_json::from_str(&text).unwrap();
+            match frame.get("type").and_then(|value| value.as_str()) {
+                Some("stream_chunk") => {
+                    answer.push_str(frame.get("chunk").and_then(|v| v.as_str()).unwrap_or(""));
+                }
+                Some("query_done") => break,
+                other => panic!("unexpected frame: {other:?} ({text})"),
+            }
+        }
+        answer
+    }
+
     struct HistoryEcho;
 
     #[async_trait::async_trait]
@@ -527,31 +552,6 @@ async fn a_session_reuses_its_history_and_a_new_session_starts_clean() {
         (engine, rx)
     });
     let addr = start_server_with_factory(config, factory).await;
-
-    async fn ask(
-        ws: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
-        id: &str,
-        content: &str,
-    ) -> String {
-        ws_send_json(
-            ws,
-            &serde_json::json!({"id": id, "type": "query", "content": content}),
-        )
-        .await;
-        let mut answer = String::new();
-        loop {
-            let text = ws_recv_text(ws).await;
-            let frame: serde_json::Value = serde_json::from_str(&text).unwrap();
-            match frame.get("type").and_then(|value| value.as_str()) {
-                Some("stream_chunk") => {
-                    answer.push_str(frame.get("chunk").and_then(|v| v.as_str()).unwrap_or(""));
-                }
-                Some("query_done") => break,
-                other => panic!("unexpected frame: {other:?} ({text})"),
-            }
-        }
-        answer
-    }
 
     let mut first = ws_connect(addr).await;
     let _sid = ws_auth(&mut first, "key").await;

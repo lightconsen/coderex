@@ -1043,9 +1043,8 @@ mod policy_tests {
             false,
             Err("bubblewrap (bwrap) is not installed".to_string()),
         );
-        let error = match enforce(plan, true) {
-            Ok(_) => panic!("a gating hook must be refused when confinement is unavailable"),
-            Err(error) => error,
+        let Err(error) = enforce(plan, true) else {
+            panic!("a gating hook must be refused when confinement is unavailable");
         };
         assert!(
             matches!(error, HookError::SandboxUnavailable(_)),

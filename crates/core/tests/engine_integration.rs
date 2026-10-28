@@ -68,7 +68,7 @@ fn tool_response(tool_calls: Vec<ToolCall>) -> ApiResponse {
 }
 
 /// Drain events from the receiver into a Vec.
-async fn drain_events(rx: &mut mpsc::UnboundedReceiver<EngineEvent>) -> Vec<EngineEvent> {
+fn drain_events(rx: &mut mpsc::UnboundedReceiver<EngineEvent>) -> Vec<EngineEvent> {
     let mut events = Vec::new();
     while let Ok(evt) = rx.try_recv() {
         events.push(evt);
@@ -366,12 +366,12 @@ async fn single_turn_no_tool_calls() {
     assert_eq!(result, TerminalReason::Completed);
 
     // No tool events should have been emitted
-    let events = drain_events(&mut rx).await;
-    let tool_starts: Vec<_> = events
+    let events = drain_events(&mut rx);
+    let tool_starts = events
         .iter()
         .filter(|e| matches!(e, EngineEvent::ToolCallStart { .. }))
-        .collect();
-    assert!(tool_starts.is_empty());
+        .count();
+    assert_eq!(tool_starts, 0);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -409,12 +409,12 @@ async fn multi_turn_tool_call_then_text() {
     assert_eq!(engine.session().messages.len(), 5);
 
     // Verify tool events were emitted
-    let events = drain_events(&mut rx).await;
-    let tool_ends: Vec<_> = events
+    let events = drain_events(&mut rx);
+    let tool_ends = events
         .iter()
         .filter(|e| matches!(e, EngineEvent::ToolCallEnd { .. }))
-        .collect();
-    assert_eq!(tool_ends.len(), 1);
+        .count();
+    assert_eq!(tool_ends, 1);
 }
 
 #[tokio::test]
@@ -535,7 +535,7 @@ async fn streaming_text_deltas_emitted() {
     assert_eq!(result, TerminalReason::Completed);
 
     // Collect text delta events
-    let events = drain_events(&mut rx).await;
+    let events = drain_events(&mut rx);
     let deltas: Vec<String> = events
         .iter()
         .filter_map(|e| match e {
@@ -567,12 +567,12 @@ async fn streaming_no_tool_calls_completes_cleanly() {
         .unwrap();
     assert_eq!(result, TerminalReason::Completed);
 
-    let events = drain_events(&mut rx).await;
-    let tool_starts: Vec<_> = events
+    let events = drain_events(&mut rx);
+    let tool_starts = events
         .iter()
         .filter(|e| matches!(e, EngineEvent::ToolCallStart { .. }))
-        .collect();
-    assert!(tool_starts.is_empty());
+        .count();
+    assert_eq!(tool_starts, 0);
 }
 
 /// A turn with no tool call is not a loop, however many of them arrive.
@@ -967,12 +967,12 @@ async fn tool_call_loop_multiple_tools_in_one_turn() {
     assert_eq!(tool_count, 2);
 
     // Two tool end events should be emitted
-    let events = drain_events(&mut rx).await;
-    let tool_ends: Vec<_> = events
+    let events = drain_events(&mut rx);
+    let tool_ends = events
         .iter()
         .filter(|e| matches!(e, EngineEvent::ToolCallEnd { .. }))
-        .collect();
-    assert_eq!(tool_ends.len(), 2);
+        .count();
+    assert_eq!(tool_ends, 2);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1122,9 +1122,11 @@ async fn termination_budget_exhausted() {
     let tools = Box::new(EchoToolExecutor);
     let (mut engine, _rx) = make_engine(Box::new(HighUsageMock), tools);
 
-    let mut options = SubmitOptions::default();
-    options.task_budget_tokens = 5; // tiny budget
-    options.handle_elicitation = false;
+    let options = SubmitOptions {
+        task_budget_tokens: 5, // tiny budget
+        handle_elicitation: false,
+        ..Default::default()
+    };
 
     let result = engine.submit("hello".into(), options).await.unwrap();
     assert_eq!(result, TerminalReason::BudgetExhausted);
@@ -1222,7 +1224,7 @@ async fn termination_user_interrupt() {
     engine.interrupt();
 
     // The event should be emitted
-    let events = drain_events(&mut rx).await;
+    let events = drain_events(&mut rx);
     assert!(events.iter().any(|e| matches!(e, EngineEvent::SessionEnd)));
 }
 
@@ -1330,16 +1332,15 @@ async fn engine_allowed_tools_override_blocks_unlisted() {
     assert_eq!(result, TerminalReason::Completed);
 
     // The write tool should have been blocked
-    let events = drain_events(&mut rx).await;
-    let blocked: Vec<_> = events
+    let events = drain_events(&mut rx);
+    let blocked = events
         .iter()
         .filter(|e| {
             matches!(e, EngineEvent::ToolCallEnd { result, .. } if result.is_error && result.output.contains("blocked"))
         })
-        .collect();
+        .count();
     assert_eq!(
-        blocked.len(),
-        1,
+        blocked, 1,
         "write tool should be blocked by allowed_tools_override"
     );
 }

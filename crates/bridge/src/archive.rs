@@ -438,7 +438,9 @@ mod tests {
     fn cleanup_terminates_a_tracked_process_tree() {
         let dir = tempfile::tempdir().unwrap();
         let mut mgr = BridgeCleanupManager::new(dir.path().to_path_buf(), dir.path().to_path_buf());
-        let tree = Arc::new(ProcessTree::create(Default::default()).unwrap());
+        let tree = Arc::new(
+            ProcessTree::create(coderex_core::process_tree::JobLimits::default()).unwrap(),
+        );
 
         #[cfg(unix)]
         let mut cmd = {

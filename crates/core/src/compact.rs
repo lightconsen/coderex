@@ -1962,9 +1962,9 @@ mod tests {
                 "CODEREX_CONTEXT_WINDOW_GATEWAY_ALIAS",
                 "64000",
             )]),
-            Default::default(),
-            Default::default(),
-            Default::default(),
+            crate::types::ContextWindowOverrides::default(),
+            crate::types::ContextWindowOverrides::default(),
+            crate::types::ContextWindowOverrides::default(),
         );
         let overridden = CompactThresholds::resolve_with(&model, &config, &resolver);
         assert_eq!(overridden.auto, config.resolve_auto_threshold(64_000));
@@ -2159,9 +2159,8 @@ mod tests {
         let boundary_idx = result.boundary_index.unwrap();
         assert!(boundary_idx > 0);
         let summary_msg = &result.messages[boundary_idx + 1];
-        let text = match &summary_msg.content {
-            MessageContent::Text(t) => t,
-            _ => panic!("summary must be text"),
+        let MessageContent::Text(text) = &summary_msg.content else {
+            panic!("summary must be text");
         };
         assert!(text.contains("<context_summary>"));
         assert!(text.contains("summary text"));
@@ -2187,7 +2186,7 @@ mod tests {
     fn truncate_middle_keeps_head_and_tail() {
         let long = "a".repeat(500) + "MIDDLE_MARKER" + &"z".repeat(500);
         let out = truncate_middle(&long, 100);
-        assert_eq!(out.contains("MIDDLE_MARKER"), false);
+        assert!(!out.contains("MIDDLE_MARKER"));
         assert!(out.starts_with('a'));
         assert!(out.ends_with('z'));
         assert!(out.contains("chars elided"));
@@ -2280,9 +2279,8 @@ mod tests {
     #[test]
     fn file_restore_message_lists_paths() {
         let msg = file_restore_message(&["a.rs".into(), "b.md".into()]).unwrap();
-        let text = match &msg.content {
-            MessageContent::Text(t) => t,
-            _ => panic!("must be text"),
+        let MessageContent::Text(text) = &msg.content else {
+            panic!("must be text");
         };
         assert!(text.contains("<post_compact_file_restore>"));
         assert!(text.contains("- a.rs"));

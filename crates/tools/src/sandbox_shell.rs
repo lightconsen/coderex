@@ -158,7 +158,7 @@ pub fn sanitize_shell_env(cmd: &mut Command, cwd: &std::path::Path) {
     } else {
         std::ffi::OsString::from("/usr/local/bin:/usr/bin:/bin")
     };
-    let path = std::env::join_paths(&safe_path).unwrap_or(fallback.clone());
+    let path = std::env::join_paths(&safe_path).unwrap_or_else(|_| fallback.clone());
     cmd.env("PATH", if safe_path.is_empty() { fallback } else { path });
 }
 

@@ -616,6 +616,9 @@ mod tests {
     /// A shell that can still read `PATH` and `HOME` but not the session's
     /// credentials. The variable is set in this process for the duration of
     /// the call; nothing else in the crate reads it.
+    // `"${ANTHROPIC_AUTH_TOKEN:-STRIPPED}"` reads like a format argument but
+    // is shell parameter expansion.
+    #[allow(clippy::literal_string_with_formatting_args)]
     #[tokio::test]
     #[allow(unsafe_code)]
     async fn child_does_not_inherit_provider_credentials() {
@@ -656,6 +659,8 @@ mod tests {
     }
 
     /// Stripping credentials must not become clearing the environment.
+    // `"${HOME:+HAS_HOME}"` reads like a format argument but is shell syntax.
+    #[allow(clippy::literal_string_with_formatting_args)]
     #[tokio::test]
     async fn child_keeps_ordinary_environment() {
         let output = BashTool::new()

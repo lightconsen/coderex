@@ -133,16 +133,16 @@ async fn authenticate_with(
     // dynamically registered) one is reused. Registration happens only when
     // neither exists.
     let stored_entry = load_token_entry(persistence, &server_url);
-    let mut client_id = requested_client_id
+    let stored_client_id = requested_client_id
         .clone()
         .or_else(|| stored_entry.as_ref().map(|entry| entry.client_id.clone()))
         .filter(|id| !id.trim().is_empty());
-    let mut client_secret = stored_entry
+    let stored_client_secret = stored_entry
         .as_ref()
         .and_then(|entry| entry.client_secret.clone());
 
-    if requested_client_id.is_none()
-        && client_id.is_none()
+    let (client_id, client_secret) = if requested_client_id.is_none()
+        && stored_client_id.is_none()
         && let Some(registration_endpoint) = discovery.registration_endpoint.as_deref()
     {
         let registration = register_client(
@@ -153,9 +153,10 @@ async fn authenticate_with(
             &server_url,
         )
         .await?;
-        client_id = Some(registration.client_id);
-        client_secret = registration.client_secret;
-    }
+        (Some(registration.client_id), registration.client_secret)
+    } else {
+        (stored_client_id, stored_client_secret)
+    };
     let client_id = client_id.unwrap_or_else(|| "coderex-cli".into());
     let auth_method = select_client_auth_method(
         &discovery.token_endpoint_auth_methods_supported,
@@ -2569,8 +2570,11 @@ mod tests {
         assert_eq!(body["code_challenge_method"], "S256");
 
         // The secret travels in the header, not the body.
-        use base64::Engine;
-        let credentials = base64::engine::general_purpose::STANDARD.encode("dyn-client:dyn-secret");
+        let credentials =
+            <base64::engine::general_purpose::GeneralPurpose as base64::Engine>::encode(
+                &base64::engine::general_purpose::STANDARD,
+                "dyn-client:dyn-secret",
+            );
         assert!(
             exchange.to_ascii_lowercase().contains(&format!(
                 "\r\nauthorization: basic {}",

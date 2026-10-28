@@ -323,15 +323,6 @@ impl MessageDedup {
             inner.order.retain(|entry| entry != key);
         }
     }
-
-    #[cfg(test)]
-    fn len(&self) -> usize {
-        self.inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .entries
-            .len()
-    }
 }
 
 /// Supplies the credential for a remote request.

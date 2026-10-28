@@ -820,7 +820,7 @@ mod tests {
         // Create 5 sessions
         for i in 0..5 {
             store
-                .append(&format!("sess_{i}"), &Message::user(&format!("msg-{i}")))
+                .append(&format!("sess_{i}"), &Message::user(format!("msg-{i}")))
                 .unwrap();
             // Space out modification times so ordering is deterministic
             std::thread::sleep(std::time::Duration::from_millis(10));

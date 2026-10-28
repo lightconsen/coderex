@@ -489,8 +489,8 @@ mod tests {
     #[test]
     fn test_match_specific_minute() {
         // This test checks the logic — the actual result depends on current time
-        let parts: Vec<&str> = "30 * * * *".split_whitespace().collect();
-        assert_eq!(parts.len(), 5);
+        let parts = "30 * * * *".split_whitespace().count();
+        assert_eq!(parts, 5);
         // Field parsing works; actual match depends on current minute
         assert!(match_field("30", 30, 0, 59));
         assert!(!match_field("30", 15, 0, 59));

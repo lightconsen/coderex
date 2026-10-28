@@ -239,14 +239,13 @@ mod tests {
         setup_tree(&base);
 
         let config = TraversalConfig::new(&base).include_hidden();
-        let files: Vec<_> = traverse(&config).unwrap().map(|r| r.unwrap()).collect();
-
-        let names: Vec<_> = files
-            .iter()
-            .map(|p| p.file_name().unwrap().to_str().unwrap())
+        let names: Vec<_> = traverse(&config)
+            .unwrap()
+            .map(|r| r.unwrap())
+            .map(|p| p.file_name().unwrap().to_str().unwrap().to_string())
             .collect();
 
-        assert!(names.contains(&".hidden"));
+        assert!(names.iter().any(|name| name == ".hidden"));
     }
 
     #[test]
@@ -257,15 +256,14 @@ mod tests {
         let config = TraversalConfig::new(&base)
             .ignore_gitignore()
             .include_hidden();
-        let files: Vec<_> = traverse(&config).unwrap().map(|r| r.unwrap()).collect();
-
-        let names: Vec<_> = files
-            .iter()
-            .map(|p| p.file_name().unwrap().to_str().unwrap())
+        let names: Vec<_> = traverse(&config)
+            .unwrap()
+            .map(|r| r.unwrap())
+            .map(|p| p.file_name().unwrap().to_str().unwrap().to_string())
             .collect();
 
         // .log file should appear when gitignore is disabled
-        assert!(names.contains(&"debug.log"));
+        assert!(names.iter().any(|name| name == "debug.log"));
     }
 
     #[test]

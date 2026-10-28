@@ -623,7 +623,7 @@ mod tests {
                         let mut h = hb.lock().unwrap();
                         h.record_success();
                     }
-                    _ = stop.notified() => {
+                    () = stop.notified() => {
                         running.store(false, Ordering::SeqCst);
                         break;
                     }

@@ -1201,9 +1201,9 @@ mod context_window_tests {
         ]);
         let resolver = ContextWindowResolver::new(
             env,
-            Default::default(),
-            Default::default(),
-            Default::default(),
+            ContextWindowOverrides::default(),
+            ContextWindowOverrides::default(),
+            ContextWindowOverrides::default(),
         );
 
         assert_eq!(resolver.resolve("my-gateway"), 128_000);
@@ -1218,9 +1218,9 @@ mod context_window_tests {
         )]);
         let resolver = ContextWindowResolver::new(
             env,
-            Default::default(),
-            Default::default(),
-            Default::default(),
+            ContextWindowOverrides::default(),
+            ContextWindowOverrides::default(),
+            ContextWindowOverrides::default(),
         );
 
         for name in [
@@ -1248,7 +1248,7 @@ mod context_window_tests {
         assert_eq!(resolver.resolve(model), 110_000, "env wins");
 
         let resolver = ContextWindowResolver::new(
-            Default::default(),
+            ContextWindowOverrides::default(),
             overrides(Some(200_000), &[(model, 210_000)]),
             overrides(Some(300_000), &[(model, 310_000)]),
             overrides(Some(400_000), &[(model, 410_000)]),
@@ -1256,17 +1256,17 @@ mod context_window_tests {
         assert_eq!(resolver.resolve(model), 210_000, "settings wins");
 
         let resolver = ContextWindowResolver::new(
-            Default::default(),
-            Default::default(),
+            ContextWindowOverrides::default(),
+            ContextWindowOverrides::default(),
             overrides(Some(300_000), &[(model, 310_000)]),
             overrides(Some(400_000), &[(model, 410_000)]),
         );
         assert_eq!(resolver.resolve(model), 310_000, "client data wins");
 
         let resolver = ContextWindowResolver::new(
-            Default::default(),
-            Default::default(),
-            Default::default(),
+            ContextWindowOverrides::default(),
+            ContextWindowOverrides::default(),
+            ContextWindowOverrides::default(),
             overrides(Some(400_000), &[(model, 410_000)]),
         );
         assert_eq!(resolver.resolve(model), 410_000, "experiment wins");
@@ -1289,8 +1289,8 @@ mod context_window_tests {
         let resolver = ContextWindowResolver::new(
             overrides(Some(90_000), &[]),
             overrides(None, &[("gateway-alias", 210_000)]),
-            Default::default(),
-            Default::default(),
+            ContextWindowOverrides::default(),
+            ContextWindowOverrides::default(),
         );
         assert_eq!(
             resolver.resolve("gateway-alias"),
@@ -1318,7 +1318,7 @@ mod context_window_tests {
         let resolver = ContextWindowResolver::new(
             env,
             overrides(Some(0), &[("gateway-alias", 0)]),
-            Default::default(),
+            ContextWindowOverrides::default(),
             overrides(Some(123_000), &[]),
         );
         assert_eq!(

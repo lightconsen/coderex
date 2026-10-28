@@ -741,7 +741,9 @@ async fn a_relayed_call_is_authorized_over_the_websocket_protocol() {
                 "the forwarding policy let a foreign header through: {headers:?}"
             );
         }
-        other => panic!("the confirmed call should have been forwarded, got {other:?}"),
+        other @ RelayDecision::Refuse { .. } => {
+            panic!("the confirmed call should have been forwarded, got {other:?}");
+        }
     }
 
     // One confirmation authorises one call.
@@ -752,7 +754,9 @@ async fn a_relayed_call_is_authorized_over_the_websocket_protocol() {
             assert_eq!(status, 403);
             assert_eq!(code, "write_relay_unapproved");
         }
-        other => panic!("a replayed header pair must be refused, got {other:?}"),
+        other @ RelayDecision::Forward { .. } => {
+            panic!("a replayed header pair must be refused, got {other:?}");
+        }
     }
 
     // A call whose pair headers were smuggled under names the relay does not
@@ -808,7 +812,9 @@ async fn a_relayed_call_is_refused_when_the_person_denied_it() {
             assert_eq!(status, 403);
             assert_eq!(code, "write_relay_unapproved");
         }
-        other => panic!("a denied call must not be forwarded, got {other:?}"),
+        other @ RelayDecision::Forward { .. } => {
+            panic!("a denied call must not be forwarded, got {other:?}");
+        }
     }
 
     serving.abort();
@@ -1068,7 +1074,10 @@ fn cleanup_of_a_tracked_tree_kills_the_grandchild() {
         dir.path().join("sessions"),
     );
 
-    let tree = coderex_core::process_tree::ProcessTree::create(Default::default()).unwrap();
+    let tree = coderex_core::process_tree::ProcessTree::create(
+        coderex_core::process_tree::JobLimits::default(),
+    )
+    .unwrap();
     let mut command = std::process::Command::new("sh");
     command
         .arg("-c")

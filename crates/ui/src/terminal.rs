@@ -191,7 +191,7 @@ impl TerminalUi {
     /// The buffer is cloned only when a copy is requested, not on every draw.
     #[must_use]
     pub fn selected_text(&self, selection: &TextSelection) -> String {
-        selection_text(self.frame_area, &self.frame_rows, selection)
+        selection_text(self.frame_area, &self.frame_rows, *selection)
     }
 }
 
@@ -222,7 +222,7 @@ fn capture_rows(buffer: &ratatui::buffer::Buffer) -> Vec<Vec<char>> {
 /// at the selected columns. Trailing blanks on each row and trailing blank
 /// rows are dropped, so choosing a rectangle of screen does not copy a block
 /// of spaces or the interface below the text.
-pub(crate) fn selection_text(area: Rect, rows: &[Vec<char>], selection: &TextSelection) -> String {
+pub(crate) fn selection_text(area: Rect, rows: &[Vec<char>], selection: TextSelection) -> String {
     let ((start_col, start_row), (end_col, end_row)) = selection.normalized();
     let last_col = area.right().saturating_sub(1);
     let mut lines = Vec::new();
@@ -1589,13 +1589,11 @@ fn welcome_hint_spans(theme: &Theme, inner: usize) -> Vec<Span<'static>> {
         spans.push(Span::styled(" to exit", dim));
     } else if inner >= 42 {
         spans.push(Span::styled(" for commands · ", dim));
-        spans.push(Span::styled("Ctrl+D", key(theme.assistant)));
-        spans.push(Span::styled(" to exit", dim));
     } else {
         spans.push(Span::styled(" · ", dim));
-        spans.push(Span::styled("Ctrl+D", key(theme.assistant)));
-        spans.push(Span::styled(" to exit", dim));
     }
+    spans.push(Span::styled("Ctrl+D", key(theme.assistant)));
+    spans.push(Span::styled(" to exit", dim));
     spans
 }
 
@@ -2747,7 +2745,7 @@ mod layout_tests {
             cursor: (delta_col, gamma_row),
         };
         assert_eq!(
-            selection_text(buffer.area, &rows, &selection),
+            selection_text(buffer.area, &rows, selection),
             // The second line keeps the indent the transcript drew.
             "alpha beta\n  gamma delta"
         );
@@ -2757,11 +2755,13 @@ mod layout_tests {
     /// outside the rectangle changes.
     #[test]
     fn a_selection_is_highlighted() {
-        let mut state = UiState::default();
-        state.selection = Some(TextSelection {
-            anchor: (1, 1),
-            cursor: (5, 2),
-        });
+        let mut state = UiState {
+            selection: Some(TextSelection {
+                anchor: (1, 1),
+                cursor: (5, 2),
+            }),
+            ..UiState::default()
+        };
         let buffer = render_to_buffer(80, 20, &mut state);
         let selected = crate::themes::Theme::dark().selection_bg;
 
