@@ -21,8 +21,9 @@ allow = [
     # `webpki-roots` certificate bundle.
     "CC0-1.0",
     "CDLA-Permissive-2.0",
-    # `nucleo-matcher` is MPL-2.0 (file-level copyleft). It is used
-    # unmodified; revisit if the dependency is replaced.
+    # `nucleo-matcher` is MPL-2.0 (file-level weak copyleft), used
+    # unmodified. Accepted by decision on 2026-10-28; the obligation is to
+    # publish modifications to MPL-covered files, and there are none.
     "MPL-2.0",
 ]
 confidence-threshold = 0.93
@@ -34,7 +35,8 @@ wildcards = "deny"
 # dependency as a wildcard. They are not registry wildcards.
 allow-wildcard-paths = true
 deny = [
-    # No GPL/AGPL. MPL-2.0 is allowed above for nucleo-matcher only.
+    # No GPL/AGPL. MPL-2.0 is allowed above for nucleo-matcher only; it is a
+    # file-level copyleft and the dependency is unmodified.
 ]
 
 [sources]

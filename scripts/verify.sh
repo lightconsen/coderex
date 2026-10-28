@@ -7,7 +7,7 @@
 # Checks:
 #   audit     cargo audit with .cargo/audit.toml (reviewed ignores)
 #   deny      cargo deny check (advisories, bans, licenses, sources)
-#   licenses  list dependencies whose licence policy needs a decision (MPL-2.0)
+#   licenses  licence policy, including the accepted MPL-2.0 dependency
 #   clippy    cargo clippy --workspace --all-targets, warning count
 #   rustdoc   cargo doc --workspace --no-deps, warning count
 #   all       every check above (default)
@@ -116,14 +116,17 @@ run_deny() {
 run_licenses() {
     cargo deny check licenses > "$out/licenses.log" 2>&1
     local code=$?
-    # `MPL-2.0` is allowed in deny.toml only for nucleo-matcher (a file-level
-    # weak copyleft). Print every crate that resolves to it so the policy
-    # decision is visible instead of buried in a config file.
+    # MPL-2.0 is accepted for nucleo-matcher only (file-level weak copyleft,
+    # unmodified). Print it every run so the allow entry cannot silently widen
+    # to a second crate without a policy decision.
     local mpl
-    mpl=$(grep -c "MPL-2.0" "$out/licenses.log" 2>/dev/null || true)
+    mpl=$(awk '/MPL-2.0/ {print}' "$out/licenses.log" 2>/dev/null | grep -oE "[A-Za-z0-9_-]+ v[0-9][^ ]*" | sort -u | tr '\n' ' ')
     echo "   licence check exit $code"
     if cargo tree --workspace 2>/dev/null | grep -q "nucleo-matcher"; then
-        echo "   MPL-2.0 dependency: nucleo-matcher (see deny.toml)"
+        echo "   MPL-2.0 dependency: nucleo-matcher (accepted; see deny.toml)"
+    fi
+    if [[ -n "${mpl// /}" ]]; then
+        echo "   MPL-2.0 crates in the licence report: $mpl"
     fi
     if [[ $code -eq 0 ]]; then
         results+=("ok   licenses")

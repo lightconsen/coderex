@@ -14,7 +14,7 @@ scripts/verify.sh --strict        # clippy/rustdoc warnings become failures
 |---|---|---|
 | `audit` | `cargo audit` with `.cargo/audit.toml` | **0** unignored advisories |
 | `deny` | `cargo deny check` | advisories, bans, licences, sources all pass |
-| `licenses` | `cargo deny check licenses` | passes; reports the one MPL-2.0 dependency |
+| `licenses` | `cargo deny check licenses` | passes; reports `nucleo-matcher` (MPL-2.0, accepted) |
 | `clippy` | `cargo clippy --workspace --all-targets` | **830** warnings, 0 errors |
 | `rustdoc` | `cargo doc --workspace --no-deps` | **62** warnings, 0 errors |
 
@@ -41,12 +41,16 @@ dependency was unnecessary.
 Both checks fall back to the cached advisory database when GitHub is
 unreachable, and say so in the log; a *finding* still fails the run.
 
-## Licence decision still open
+## Licence policy
 
 `deny.toml` allows `MPL-2.0` for `nucleo-matcher` (file-level weak copyleft,
-used unmodified). `scripts/verify.sh licenses` prints the dependency each run
-so the decision stays visible. If the policy does not accept MPL-2.0, the
-dependency has to be replaced rather than the allow entry widened.
+used unmodified). **Accepted by decision on 2026-10-28.** The obligation is to
+publish modifications to MPL-covered files; there are none, and the crate is
+used as a normal Cargo dependency. GPL/AGPL remain denied.
+
+`scripts/verify.sh licenses` prints the MPL-2.0 dependency each run so the
+allow entry cannot silently widen to another crate; adding a second MPL
+dependency is a policy decision, not a config edit.
 
 ## Clippy and rustdoc backlogs
 
