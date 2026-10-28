@@ -4365,7 +4365,7 @@ mod tests {
         );
         assert!(
             matches!(
-                manager.get_plugin("recovering").map(|p| p.state.clone()),
+                manager.get_plugin("recovering").map(|p| p.state),
                 Some(coderex_plugins::plugins::PluginState::Error(_))
             ),
             "the failed spawn did not leave the plugin in Error"
@@ -4410,7 +4410,7 @@ mod tests {
         // The retry pass and the spawn it triggers are both async: poll.
         let mut state = None;
         for _ in 0..200 {
-            state = manager.get_plugin("recovering").map(|p| p.state.clone());
+            state = manager.get_plugin("recovering").map(|p| p.state);
             if matches!(state, Some(coderex_plugins::plugins::PluginState::Active)) {
                 break;
             }

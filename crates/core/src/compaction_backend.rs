@@ -65,7 +65,7 @@ mod tests {
             CompactionKind::Remote
         }
 
-        fn name(&self) -> &str {
+        fn name(&self) -> &'static str {
             "stub-remote"
         }
 

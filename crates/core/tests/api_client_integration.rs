@@ -227,7 +227,7 @@ impl Provider for MockProvider {
         }
         let content = self.response.clone().unwrap_or_default();
         Box::pin(futures::stream::iter(vec![
-            StreamEvent::TextDelta(content.clone()),
+            StreamEvent::TextDelta(content),
             StreamEvent::StreamEnd,
         ]))
     }

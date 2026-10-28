@@ -558,7 +558,7 @@ fn managed_settings_checksum_verifies() {
         "model": "claude-sonnet-4-6",
         "permission_mode": "default"
     });
-    let managed = ManagedSettings::new(settings.clone());
+    let managed = ManagedSettings::new(settings);
     assert!(managed.verify_checksum());
 }
 

@@ -31,7 +31,7 @@ fn restoring_the_earliest_snapshot_undoes_every_later_edit() {
         std::fs::read_to_string(&file).unwrap(),
         "fn original() {}\n"
     );
-    assert_eq!(report.restored, vec![file.clone()], "one path, once");
+    assert_eq!(report.restored, vec![file], "one path, once");
     assert!(report.failed.is_empty(), "{report:?}");
     assert!(report.removed.is_empty(), "{report:?}");
 }

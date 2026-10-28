@@ -378,7 +378,7 @@ mod tests {
         let gate = base.path().join("current");
         std::os::unix::fs::symlink(&inside, &gate).unwrap();
         let canonical_inside = std::fs::canonicalize(&inside).unwrap();
-        let reject_outside = canonical_inside.clone();
+        let reject_outside = canonical_inside;
         let ctx = ToolContext::new(ExecutionContext::Normal, base.path()).with_path_verifier(
             Arc::new(move |paths| {
                 for path in paths {

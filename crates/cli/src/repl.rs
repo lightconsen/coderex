@@ -8074,7 +8074,7 @@ impl ReplLoop {
             if let Some(ref mut engine) = self.engine {
                 let mut session = engine.session().clone();
                 if session.title.is_none() {
-                    session.title = Some(title.clone());
+                    session.title = Some(title);
                     engine.set_session(session);
                 }
             }

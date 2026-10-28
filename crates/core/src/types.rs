@@ -969,7 +969,7 @@ mod tests {
             is_error: false,
             images: Vec::new(),
         };
-        let msg = Message::tool(result.clone());
+        let msg = Message::tool(result);
         let json = serde_json::to_string(&msg).unwrap();
         let decoded: Message = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded.role, Role::Tool);

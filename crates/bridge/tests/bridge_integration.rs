@@ -346,7 +346,7 @@ fn worktree_spawner_creates_worktree() {
     std::fs::create_dir_all(&wt).unwrap();
     std::fs::create_dir_all(&sess).unwrap();
 
-    let spawner = BridgeSessionSpawner::new(repo.clone(), wt.clone(), sess.clone());
+    let spawner = BridgeSessionSpawner::new(repo, wt.clone(), sess);
     let rt = tokio::runtime::Runtime::new().unwrap();
 
     let config = SpawnConfig {

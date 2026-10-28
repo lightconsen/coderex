@@ -2711,8 +2711,8 @@ mod tests {
     fn static_watch_is_collected_only_from_file_changed_hooks() {
         let path = absolute("coderex-static-watch-scope");
         let settings = serde_json::json!([
-            {"event": "SessionStart", "command": "echo {}", "watch": path.clone()},
-            {"event": "FileChanged", "command": "echo {}", "watch": path.clone()},
+            {"event": "SessionStart", "command": "echo {}", "watch": path},
+            {"event": "FileChanged", "command": "echo {}", "watch": path},
         ]);
         let registry = HookRegistry::load_from_settings(&settings).unwrap();
         assert_eq!(registry.watch_paths(), vec![path]);

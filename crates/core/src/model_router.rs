@@ -470,7 +470,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Provider for SuccessProvider {
-        fn name(&self) -> &str {
+        fn name(&self) -> &'static str {
             "success"
         }
         fn capabilities(&self) -> ProviderCapabilities {

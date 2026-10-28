@@ -983,7 +983,7 @@ mod tests {
         store.add(req);
         store.persist().unwrap();
 
-        let mut store2 = PendingPermissionStore::new(Some(path.clone()));
+        let mut store2 = PendingPermissionStore::new(Some(path));
         store2.load().unwrap();
         assert!(store2.is_pending("test_1"));
 
@@ -1061,7 +1061,7 @@ mod tests {
         // Create new engine, recover orphaned
         let checker = PermissionChecker::new(PermissionMode::Default);
         let mut engine = PermissionEngine::new(checker);
-        engine.set_persist_path(path.clone());
+        engine.set_persist_path(path);
         engine.recover_orphaned().unwrap();
         assert_eq!(engine.pending_count(), 1);
 

@@ -170,7 +170,7 @@ mod tests {
     fn parse_title_truncates_long_text() {
         let long = "a".repeat(100);
         let result = QueryResult {
-            content: long.clone(),
+            content: long,
             input_tokens: 50,
             output_tokens: 10,
             cache_read_tokens: 0,

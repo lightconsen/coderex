@@ -408,7 +408,7 @@ mod tests {
 
         // Same length, different bytes: only the digest catches this one.
         let original = std::fs::read(&path).unwrap();
-        let mut tampered = original.clone();
+        let mut tampered = original;
         tampered[0] = b'X';
         std::fs::write(&path, &tampered).unwrap();
 

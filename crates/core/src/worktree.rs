@@ -338,7 +338,7 @@ mod tests {
         std::fs::File::create(&existing_file).unwrap();
 
         let mut mgr = WorktreeManager::new(WorktreeConfig {
-            base_dir: existing_file.clone(), // Use the existing file as base_dir
+            base_dir: existing_file, // Use the existing file as base_dir
             branch_prefix: "test".into(),
             auto_cleanup: true,
         });

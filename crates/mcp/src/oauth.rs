@@ -2753,7 +2753,7 @@ mod tests {
                 (404, String::new()),
                 (200, body.clone()),
                 (404, String::new()),
-                (200, body.clone()),
+                (200, body),
             ]
         });
         let mut mgr = OAuthManager::with_path(tempfile::tempdir().unwrap().path().join("t.json"));

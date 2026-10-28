@@ -433,7 +433,7 @@ fn adoption_of_a_written_running_record_marks_it_interrupted() {
 
     let adopted = coderex_core::job_record::adopt_for_session(&store, NOW, "sess_a")
         .expect("adoption succeeds");
-    assert_eq!(adopted.outcome.interrupted, vec![running.clone()]);
+    assert_eq!(adopted.outcome.interrupted, vec![running]);
     assert_eq!(adopted.notifications.len(), 1);
 
     let reconciled = store.load("shell-2").unwrap().unwrap();
