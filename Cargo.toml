@@ -74,7 +74,7 @@ tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 metrics = "0.24"
 
 # Database
-rusqlite = { version = "0.34", features = ["bundled"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
 
 # JSON Schema
 jsonschema = "0.28"
