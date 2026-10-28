@@ -1006,20 +1006,19 @@ impl AgentManager {
         if let AgentType::Custom {
             prompt: ref custom_name,
         } = agent_type
+            && let Some(def) = self.custom_agents.get(custom_name)
         {
-            if let Some(def) = self.custom_agents.get(custom_name) {
-                if !def.allowed_tools.is_empty() && options.allowed_tools.is_none() {
-                    options.allowed_tools = Some(def.allowed_tools.clone());
-                }
-                if options.model_override.is_none() {
-                    options.model_override = def.model.clone();
-                }
-                if options.max_tokens.is_none() {
-                    options.max_tokens = def.max_tokens;
-                }
-                if options.output_schema.is_none() {
-                    options.output_schema = def.output_schema.clone();
-                }
+            if !def.allowed_tools.is_empty() && options.allowed_tools.is_none() {
+                options.allowed_tools = Some(def.allowed_tools.clone());
+            }
+            if options.model_override.is_none() {
+                options.model_override = def.model.clone();
+            }
+            if options.max_tokens.is_none() {
+                options.max_tokens = def.max_tokens;
+            }
+            if options.output_schema.is_none() {
+                options.output_schema = def.output_schema.clone();
             }
         }
 
@@ -1326,21 +1325,21 @@ impl AgentManager {
         let _ = instance.status_tx.send(AgentStatus::Stopped);
         // Cancellation is a lifecycle end: the record must not stay
         // `Running`, or a later session would report work nobody is doing.
-        if let Some((store, id)) = &instance.job_record {
-            if let Err(error) = store.settle(
+        if let Some((store, id)) = &instance.job_record
+            && let Err(error) = store.settle(
                 id,
                 JobState::Interrupted,
                 now_ms(),
                 None,
                 Some("agent stopped before completion".to_string()),
-            ) {
-                tracing::warn!(
-                    job = %id,
-                    path = %store.root().display(),
-                    error = %error,
-                    "could not settle the cancelled agent job record"
-                );
-            }
+            )
+        {
+            tracing::warn!(
+                job = %id,
+                path = %store.root().display(),
+                error = %error,
+                "could not settle the cancelled agent job record"
+            );
         }
         // Drop the actual task as well as its status. A stopped background
         // agent must not keep running invisibly.
@@ -1610,14 +1609,14 @@ pub fn read_agent_log_at(path: &Path) -> Result<Vec<WireEvent>, AgentError> {
 /// into the parent and every other agent, the exact opposite of the
 /// isolation the caller asked for. So the request is refused, not faked.
 fn validate_spawn_options(options: &SpawnOptions) -> Result<(), AgentError> {
-    if let Some(ref mode) = options.isolation {
-        if !mode.eq_ignore_ascii_case(ISOLATION_WORKTREE) {
-            return Err(AgentError::Configuration(format!(
-                "unsupported isolation mode {mode:?}: this build can only isolate an agent in a \
+    if let Some(ref mode) = options.isolation
+        && !mode.eq_ignore_ascii_case(ISOLATION_WORKTREE)
+    {
+        return Err(AgentError::Configuration(format!(
+            "unsupported isolation mode {mode:?}: this build can only isolate an agent in a \
                  git worktree (isolation = \"worktree\"); refusing the spawn instead of running \
                  it without the isolation the caller asked for"
-            )));
-        }
+        )));
     }
 
     if !options.extra_env.is_empty() {
@@ -1863,18 +1862,18 @@ async fn run_agent_task(
             engine.set_tool_executor(executor);
         }
 
-        if let Some(ref fork) = forked_context {
-            if fork.reuses_parent_prefix() {
-                let safe = fork.is_cache_safe(&model.0, &system_prompt, &advertised_tool_names);
-                cache_safe = Some(safe);
-                tracing::debug!(
-                    agent_id = %agent_id,
-                    prefix_messages = seeded_prefix_messages,
-                    prefix_fingerprint = %fork.prefix_fingerprint(),
-                    cache_safe = safe,
-                    "seeded the child session from the parent prefix"
-                );
-            }
+        if let Some(ref fork) = forked_context
+            && fork.reuses_parent_prefix()
+        {
+            let safe = fork.is_cache_safe(&model.0, &system_prompt, &advertised_tool_names);
+            cache_safe = Some(safe);
+            tracing::debug!(
+                agent_id = %agent_id,
+                prefix_messages = seeded_prefix_messages,
+                prefix_fingerprint = %fork.prefix_fingerprint(),
+                cache_safe = safe,
+                "seeded the child session from the parent prefix"
+            );
         }
 
         // Only an agent the person is not watching is a background run. A
@@ -1952,22 +1951,22 @@ async fn run_agent_task(
             }
 
             // Append to NDJSON log file
-            if let Some(wire_event) = engine_event_to_wire(&event) {
-                if let Ok(json) = serde_json::to_string(&wire_event) {
-                    let _ = async {
-                        let _ = tokio::fs::create_dir_all(&log_dir).await;
+            if let Some(wire_event) = engine_event_to_wire(&event)
+                && let Ok(json) = serde_json::to_string(&wire_event)
+            {
+                let _ = async {
+                    let _ = tokio::fs::create_dir_all(&log_dir).await;
 
-                        let mut file = tokio::fs::OpenOptions::new()
-                            .create(true)
-                            .append(true)
-                            .open(&log_path)
-                            .await?;
-                        file.write_all(json.as_bytes()).await?;
-                        file.write_all(b"\n").await?;
-                        Ok::<(), std::io::Error>(())
-                    }
-                    .await;
+                    let mut file = tokio::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&log_path)
+                        .await?;
+                    file.write_all(json.as_bytes()).await?;
+                    file.write_all(b"\n").await?;
+                    Ok::<(), std::io::Error>(())
                 }
+                .await;
             }
         }
 
@@ -3526,10 +3525,10 @@ mod tests {
 
         let mut denial = None;
         while let Ok(observed) = events.try_recv() {
-            if let EngineEvent::ToolCallEnd { result, .. } = observed.event {
-                if result.is_error {
-                    denial = Some(result.output);
-                }
+            if let EngineEvent::ToolCallEnd { result, .. } = observed.event
+                && result.is_error
+            {
+                denial = Some(result.output);
             }
         }
 
@@ -3875,10 +3874,10 @@ mod tests {
 
         let mut denial = None;
         while let Ok(observed) = events.try_recv() {
-            if let EngineEvent::ToolCallEnd { result, .. } = observed.event {
-                if result.is_error {
-                    denial = Some(result.output);
-                }
+            if let EngineEvent::ToolCallEnd { result, .. } = observed.event
+                && result.is_error
+            {
+                denial = Some(result.output);
             }
         }
         let denial = denial.expect("the child tool call was never reported");

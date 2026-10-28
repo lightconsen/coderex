@@ -48,10 +48,10 @@ pub async fn generate_session_title_from_messages(
 /// taking the first 60 characters.
 #[must_use]
 pub fn parse_title(result: &QueryResult) -> String {
-    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&result.content) {
-        if let Some(title) = value.get("title").and_then(|v| v.as_str()) {
-            return title.to_string();
-        }
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&result.content)
+        && let Some(title) = value.get("title").and_then(|v| v.as_str())
+    {
+        return title.to_string();
     }
     // Fallback: take first line or first 60 chars
     result

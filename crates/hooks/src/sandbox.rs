@@ -271,10 +271,8 @@ pub fn sandbox_config(hook: &HookConfig) -> SandboxConfig {
         let is_bin_dir = dir
             .file_name()
             .is_some_and(|name| name == "bin" || name == "sbin");
-        if is_bin_dir {
-            if let Some(prefix) = dir.parent() {
-                push_unique(&mut read, canonicalize_lenient(prefix));
-            }
+        if is_bin_dir && let Some(prefix) = dir.parent() {
+            push_unique(&mut read, canonicalize_lenient(prefix));
         }
         push_unique(&mut read, dir.clone());
         push_unique(&mut exec, dir);

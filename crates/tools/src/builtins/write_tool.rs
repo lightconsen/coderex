@@ -60,12 +60,12 @@ impl Tool for WriteTool {
                     name: "Write".into(),
                 });
             }
-            if let Some(parent) = path_buf.parent() {
-                if !crate::sandbox_policy::is_path_allowed(parent, allowed_write) {
-                    return Err(ToolError::PermissionDenied {
-                        name: "Write".into(),
-                    });
-                }
+            if let Some(parent) = path_buf.parent()
+                && !crate::sandbox_policy::is_path_allowed(parent, allowed_write)
+            {
+                return Err(ToolError::PermissionDenied {
+                    name: "Write".into(),
+                });
             }
         }
 

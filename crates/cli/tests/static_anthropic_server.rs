@@ -75,16 +75,15 @@ fn read_bound_port(stderr: std::process::ChildStderr) -> u16 {
     let mut line = String::new();
 
     while reader.read_line(&mut line).unwrap_or(0) > 0 {
-        if let Some(rest) = line.split("listening on ").nth(1) {
-            if let Some(found) = rest
+        if let Some(rest) = line.split("listening on ").nth(1)
+            && let Some(found) = rest
                 .trim()
                 .rsplit(':')
                 .next()
                 .and_then(|value| value.parse::<u16>().ok())
-            {
-                port = Some(found);
-                break;
-            }
+        {
+            port = Some(found);
+            break;
         }
         line.clear();
     }
@@ -327,14 +326,13 @@ fn extract_text_from_sse(sse: &str) -> String {
     for line in sse.lines() {
         if line.starts_with("data: ") {
             let json_str = line.trim_start_matches("data: ");
-            if let Ok(value) = serde_json::from_str::<serde_json::Value>(json_str) {
-                if let Some(text) = value
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(json_str)
+                && let Some(text) = value
                     .get("delta")
                     .and_then(|d| d.get("text"))
                     .and_then(|t| t.as_str())
-                {
-                    result.push_str(text);
-                }
+            {
+                result.push_str(text);
             }
         }
     }

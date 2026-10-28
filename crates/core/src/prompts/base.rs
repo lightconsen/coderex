@@ -343,13 +343,13 @@ impl PromptCompiler {
 
         while let Some(dir) = current {
             let claude_md = dir.join("CLAUDE.md");
-            if claude_md.is_file() {
-                if let Ok(text) = std::fs::read_to_string(&claude_md) {
-                    if !content.is_empty() {
-                        content.push_str("\n\n---\n\n");
-                    }
-                    content.push_str(&text);
+            if claude_md.is_file()
+                && let Ok(text) = std::fs::read_to_string(&claude_md)
+            {
+                if !content.is_empty() {
+                    content.push_str("\n\n---\n\n");
                 }
+                content.push_str(&text);
             }
             current = dir.parent();
         }
@@ -380,12 +380,11 @@ impl PromptCompiler {
             .args(["branch", "--show-current"])
             .current_dir(cwd)
             .output()
+            && output.status.success()
         {
-            if output.status.success() {
-                let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                if !branch.is_empty() {
-                    let _ = writeln!(out, "Current branch: `{branch}`");
-                }
+            let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !branch.is_empty() {
+                let _ = writeln!(out, "Current branch: `{branch}`");
             }
         }
 
@@ -394,15 +393,14 @@ impl PromptCompiler {
             .args(["status", "--short"])
             .current_dir(cwd)
             .output()
+            && output.status.success()
         {
-            if output.status.success() {
-                let status = String::from_utf8_lossy(&output.stdout);
-                let status = status.trim();
-                if !status.is_empty() {
-                    out.push_str("\nGit status:\n```\n");
-                    out.push_str(status);
-                    out.push_str("\n```\n");
-                }
+            let status = String::from_utf8_lossy(&output.stdout);
+            let status = status.trim();
+            if !status.is_empty() {
+                out.push_str("\nGit status:\n```\n");
+                out.push_str(status);
+                out.push_str("\n```\n");
             }
         }
 

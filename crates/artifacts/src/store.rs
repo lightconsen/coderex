@@ -267,10 +267,10 @@ impl ArtifactStore {
                 continue;
             }
             let name = entry.file_name().to_string_lossy().to_string();
-            if let Some(slug) = Slug::parse(&name) {
-                if let Ok(manifest) = self.manifest(&slug) {
-                    manifests.push(manifest);
-                }
+            if let Some(slug) = Slug::parse(&name)
+                && let Ok(manifest) = self.manifest(&slug)
+            {
+                manifests.push(manifest);
             }
         }
         manifests.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));

@@ -620,10 +620,10 @@ impl FormSpec {
     /// Fill every absent field that declares a `default`.
     pub fn apply_defaults(&self, values: &mut Map<String, Value>) {
         for field in &self.fields {
-            if !values.contains_key(&field.name) {
-                if let Some(default) = &field.default {
-                    values.insert(field.name.clone(), default.clone());
-                }
+            if !values.contains_key(&field.name)
+                && let Some(default) = &field.default
+            {
+                values.insert(field.name.clone(), default.clone());
             }
         }
     }
@@ -817,15 +817,15 @@ impl FormField {
         match (&self.field_type, value) {
             (FormFieldType::String, Value::String(text)) => {
                 let length = text.chars().count();
-                if let Some(minimum) = self.min_length {
-                    if length < minimum {
-                        return Err(format!("must be at least {minimum} characters"));
-                    }
+                if let Some(minimum) = self.min_length
+                    && length < minimum
+                {
+                    return Err(format!("must be at least {minimum} characters"));
                 }
-                if let Some(maximum) = self.max_length {
-                    if length > maximum {
-                        return Err(format!("must be at most {maximum} characters"));
-                    }
+                if let Some(maximum) = self.max_length
+                    && length > maximum
+                {
+                    return Err(format!("must be at most {maximum} characters"));
                 }
                 if let Some(pattern) = &self.pattern {
                     let regex = regex::Regex::new(pattern)
@@ -860,15 +860,15 @@ impl FormField {
     }
 
     fn check_range(&self, value: f64) -> Result<(), String> {
-        if let Some(minimum) = self.minimum {
-            if value < minimum {
-                return Err(format!("must be at least {minimum}"));
-            }
+        if let Some(minimum) = self.minimum
+            && value < minimum
+        {
+            return Err(format!("must be at least {minimum}"));
         }
-        if let Some(maximum) = self.maximum {
-            if value > maximum {
-                return Err(format!("must be at most {maximum}"));
-            }
+        if let Some(maximum) = self.maximum
+            && value > maximum
+        {
+            return Err(format!("must be at most {maximum}"));
         }
         Ok(())
     }

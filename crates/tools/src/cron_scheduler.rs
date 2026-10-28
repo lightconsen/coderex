@@ -210,10 +210,10 @@ impl CronScheduler {
         };
 
         // Check expiry
-        if let Some(ref expires) = job.expires_at {
-            if Local::now().format("%Y-%m-%dT%H:%M:%S").to_string() >= *expires {
-                return false;
-            }
+        if let Some(ref expires) = job.expires_at
+            && Local::now().format("%Y-%m-%dT%H:%M:%S").to_string() >= *expires
+        {
+            return false;
         }
 
         match_cron_expr(&job.cron)
@@ -330,11 +330,11 @@ impl CronScheduler {
         };
         let now = now_ms();
         if recurring {
-            if let Ok(Some(mut record)) = store.load(id) {
-                if record.state == JobState::Running {
-                    record.touch(now);
-                    let _ = store.write(&record);
-                }
+            if let Ok(Some(mut record)) = store.load(id)
+                && record.state == JobState::Running
+            {
+                record.touch(now);
+                let _ = store.write(&record);
             }
         } else {
             let _ = store.settle(id, JobState::Done, now, Some(0), None);
@@ -358,10 +358,10 @@ impl CronScheduler {
 
                 let jobs = self.list();
                 for job in jobs {
-                    if self.should_fire(&job.id) {
-                        if let Some(prompt) = self.get_prompt(&job.id) {
-                            let _ = tx.send((job.id.clone(), prompt));
-                        }
+                    if self.should_fire(&job.id)
+                        && let Some(prompt) = self.get_prompt(&job.id)
+                    {
+                        let _ = tx.send((job.id.clone(), prompt));
                     }
                 }
             }

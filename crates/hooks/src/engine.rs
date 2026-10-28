@@ -316,16 +316,17 @@ impl HookCondition {
     #[must_use]
     pub fn parse(raw: &str) -> Self {
         let trimmed = raw.trim();
-        if let Some(open) = trimmed.find('(') {
-            if trimmed.ends_with(')') && trimmed.len() > open + 2 {
-                let tool = trimmed[..open].trim();
-                if !tool.is_empty() {
-                    return Self {
-                        raw: trimmed.to_string(),
-                        tool: Some(tool.to_string()),
-                        pattern: Some(trimmed[open + 1..trimmed.len() - 1].to_string()),
-                    };
-                }
+        if let Some(open) = trimmed.find('(')
+            && trimmed.ends_with(')')
+            && trimmed.len() > open + 2
+        {
+            let tool = trimmed[..open].trim();
+            if !tool.is_empty() {
+                return Self {
+                    raw: trimmed.to_string(),
+                    tool: Some(tool.to_string()),
+                    pattern: Some(trimmed[open + 1..trimmed.len() - 1].to_string()),
+                };
             }
         }
         Self {
@@ -1621,14 +1622,14 @@ async fn execute_hook_with_timeout(
     }
 
     // In dry-run mode, suppress stop actions so they don't affect execution.
-    if hook.dry_run {
-        if let Ok(mut exec_result) = result {
-            if matches!(exec_result.hook_result.action, HookAction::Stop) {
-                exec_result.hook_result.action = HookAction::Continue;
-                exec_result.hook_result.suppress_output = false;
-            }
-            return Ok(exec_result);
+    if hook.dry_run
+        && let Ok(mut exec_result) = result
+    {
+        if matches!(exec_result.hook_result.action, HookAction::Stop) {
+            exec_result.hook_result.action = HookAction::Continue;
+            exec_result.hook_result.suppress_output = false;
         }
+        return Ok(exec_result);
     }
 
     result
@@ -1723,18 +1724,18 @@ async fn execute_hook(
     // non-gating hook has nowhere to deny, so it is warned about and runs with
     // the resource limits installed above — the same policy `enforce` applies
     // when no backend exists at all.
-    if let Some(handle) = &sandbox_handle {
-        if let Err(error) = handle.prepare(command.as_std_mut()) {
-            if gating {
-                return Err(HookError::SandboxUnavailable(format!(
-                    "could not install the hook sandbox: {error}"
-                )));
-            }
-            tracing::warn!(
-                %error,
-                "could not install the hook sandbox; the hook runs with resource limits only"
-            );
+    if let Some(handle) = &sandbox_handle
+        && let Err(error) = handle.prepare(command.as_std_mut())
+    {
+        if gating {
+            return Err(HookError::SandboxUnavailable(format!(
+                "could not install the hook sandbox: {error}"
+            )));
         }
+        tracing::warn!(
+            %error,
+            "could not install the hook sandbox; the hook runs with resource limits only"
+        );
     }
 
     // A Linux memory limit is also a cgroup: created before spawn, attached
@@ -1837,14 +1838,14 @@ async fn execute_hook(
             Ok(())
         }
         .await;
-        if let Err(e) = &write {
-            if e.kind() == std::io::ErrorKind::BrokenPipe {
-                tracing::debug!(
-                    hook = hook.label(),
-                    event = input.event,
-                    "hook closed stdin without reading its input"
-                );
-            }
+        if let Err(e) = &write
+            && e.kind() == std::io::ErrorKind::BrokenPipe
+        {
+            tracing::debug!(
+                hook = hook.label(),
+                event = input.event,
+                "hook closed stdin without reading its input"
+            );
         }
         classify_input_write(write)?;
     }

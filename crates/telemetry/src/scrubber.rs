@@ -95,10 +95,10 @@ pub fn is_model_key(key: &str) -> bool {
 /// confidential, and only the placeholders (which name no model) are left in
 /// the clear. See `docs/telemetry.md`.
 fn redacted_model_value(current: &serde_json::Value) -> serde_json::Value {
-    if let serde_json::Value::String(s) = current {
-        if MODEL_PLACEHOLDERS.contains(&s.as_str()) {
-            return current.clone();
-        }
+    if let serde_json::Value::String(s) = current
+        && MODEL_PLACEHOLDERS.contains(&s.as_str())
+    {
+        return current.clone();
     }
     serde_json::Value::String(CONFIDENTIAL_MODEL.to_string())
 }

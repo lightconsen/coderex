@@ -197,10 +197,10 @@ fn variant_order(name: &str) -> (u8, u32, String) {
     if name == "baseline" {
         return (0, 0, String::new());
     }
-    if let Some(number) = name.strip_prefix('v') {
-        if let Ok(number) = number.parse::<u32>() {
-            return (1, number, String::new());
-        }
+    if let Some(number) = name.strip_prefix('v')
+        && let Ok(number) = number.parse::<u32>()
+    {
+        return (1, number, String::new());
     }
     (2, 0, name.to_string())
 }

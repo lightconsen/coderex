@@ -97,12 +97,11 @@ impl AutoDream {
 
     /// Load or initialize dream state.
     fn load_state(&self) -> DreamState {
-        if self.state_path.exists() {
-            if let Ok(content) = std::fs::read_to_string(&self.state_path) {
-                if let Ok(state) = serde_json::from_str::<DreamState>(&content) {
-                    return state;
-                }
-            }
+        if self.state_path.exists()
+            && let Ok(content) = std::fs::read_to_string(&self.state_path)
+            && let Ok(state) = serde_json::from_str::<DreamState>(&content)
+        {
+            return state;
         }
         DreamState::default()
     }

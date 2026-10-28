@@ -711,10 +711,10 @@ mod tests {
 
     async fn wait_for_terminal(store: &JobStore, id: &str) -> coderex_core::job_record::JobRecord {
         for _ in 0..200 {
-            if let Ok(Some(record)) = store.load(id) {
-                if record.state != JobState::Running {
-                    return record;
-                }
+            if let Ok(Some(record)) = store.load(id)
+                && record.state != JobState::Running
+            {
+                return record;
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }

@@ -311,10 +311,10 @@ impl TokenPersistence {
     /// that cannot be reached is logged rather than returned: the file is the
     /// last-resort copy and its removal is the part that matters here.
     pub fn delete(&self) -> io::Result<()> {
-        if let Backend::Secret(backend) = &self.backend {
-            if let Err(error) = backend.delete(&self.account) {
-                tracing::debug!("keychain delete failed: {error}");
-            }
+        if let Backend::Secret(backend) = &self.backend
+            && let Err(error) = backend.delete(&self.account)
+        {
+            tracing::debug!("keychain delete failed: {error}");
         }
         match std::fs::remove_file(&self.path) {
             Ok(()) => Ok(()),

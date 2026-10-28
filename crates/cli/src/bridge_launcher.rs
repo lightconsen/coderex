@@ -369,15 +369,15 @@ fn spawn_registered_child(
     let mut child = command
         .spawn()
         .map_err(|err| format!("failed to start the session process: {err}"))?;
-    if let Some(pid) = child.id() {
-        if let Err(err) = tree.attach_pid(pid) {
-            // The child is not in the tree it was promised; it must not run
-            // outside the job that would have owned it.
-            let _ = child.start_kill();
-            return Err(format!(
-                "cannot attach the session process to its tree: {err}"
-            ));
-        }
+    if let Some(pid) = child.id()
+        && let Err(err) = tree.attach_pid(pid)
+    {
+        // The child is not in the tree it was promised; it must not run
+        // outside the job that would have owned it.
+        let _ = child.start_kill();
+        return Err(format!(
+            "cannot attach the session process to its tree: {err}"
+        ));
     }
     registry.track_tree(session_id, Arc::clone(&tree));
     Ok((child, Some(tree)))
@@ -945,14 +945,12 @@ impl PermissionTracker {
                     *count += 1;
                     *count == 1
                 };
-                if first {
-                    if let Err(error) = bridge.begin_awaiting_permission(&request.session_id) {
-                        tracing::warn!(
-                            session_id = %request.session_id,
-                            error = %error,
-                            "could not record the session as awaiting permission"
-                        );
-                    }
+                if first && let Err(error) = bridge.begin_awaiting_permission(&request.session_id) {
+                    tracing::warn!(
+                        session_id = %request.session_id,
+                        error = %error,
+                        "could not record the session as awaiting permission"
+                    );
                 }
 
                 // Route the answer before the frame is flushed: the person
@@ -1489,8 +1487,8 @@ async fn run_worker(
                 }
             }
             line = output_rx.recv() => {
-                if let Some(line) = line {
-                    if let Err(err) = bridge
+                if let Some(line) = line
+                    && let Err(err) = bridge
                         .forward_session_output(&line.session_id, line.stream, &line.line)
                         .await
                     {
@@ -1500,7 +1498,6 @@ async fn run_worker(
                             "could not forward session output"
                         );
                     }
-                }
             }
             request = permission_request_rx.recv() => {
                 if let Some(request) = request {

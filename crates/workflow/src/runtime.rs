@@ -360,10 +360,11 @@ fn drive(
         .run_jobs()
         .map_err(|error| WorkflowError::Failed(readable(&error)))?;
 
-    if let Some(failure) = read_string(&mut context, "__workflow_failure") {
-        if !failure.is_empty() && failure != "null" {
-            return Err(WorkflowError::Failed(failure));
-        }
+    if let Some(failure) = read_string(&mut context, "__workflow_failure")
+        && !failure.is_empty()
+        && failure != "null"
+    {
+        return Err(WorkflowError::Failed(failure));
     }
 
     state.progress.phases = read_strings(&mut context, "__phases");
@@ -516,13 +517,13 @@ async fn run_agents(
         }
     }
 
-    if let Some(budget) = state.limits.token_budget {
-        if state.tokens_used > budget {
-            return Err(WorkflowError::Limit(format!(
-                "the workflow used {} output tokens, past its budget of {budget}",
-                state.tokens_used
-            )));
-        }
+    if let Some(budget) = state.limits.token_budget
+        && state.tokens_used > budget
+    {
+        return Err(WorkflowError::Limit(format!(
+            "the workflow used {} output tokens, past its budget of {budget}",
+            state.tokens_used
+        )));
     }
 
     Ok(results)

@@ -720,10 +720,10 @@ impl StartupOrchestrator {
         // Resolve the name before any startup phase runs. A typo must fail
         // loudly with the configured names, not start a default session that
         // silently ignores the flag.
-        if let Some(ref name) = self.ctx.agent {
-            if let Err(error) = crate::agent_selection::resolve_agent(name) {
-                bail!("{error}");
-            }
+        if let Some(ref name) = self.ctx.agent
+            && let Err(error) = crate::agent_selection::resolve_agent(name)
+        {
+            bail!("{error}");
         }
         self.ctx.worktree = args.worktree;
         self.ctx.fork_session.clone_from(&args.fork_session);
@@ -1038,17 +1038,18 @@ impl StartupOrchestrator {
         // `None` until the user decides (the built-in defaults no longer force
         // it on), so this gate is reachable. It fires on first run — no user
         // settings file yet and no decision recorded anywhere.
-        if !user_path.exists() && settings.telemetry_enabled.is_none() {
-            if let Some(choice) = Self::prompt_telemetry_consent() {
-                settings.telemetry_enabled = Some(choice);
-                // Persist the decision on its own. Writing the resolved
-                // settings back would copy everything that went into resolving
-                // them — including whatever a project's `.coderex/settings.json`
-                // contributed, which the repository controls — into the
-                // person's permanent settings as a side effect of answering a
-                // question about telemetry.
-                let _ = Self::write_telemetry_consent(&user_path, choice);
-            }
+        if !user_path.exists()
+            && settings.telemetry_enabled.is_none()
+            && let Some(choice) = Self::prompt_telemetry_consent()
+        {
+            settings.telemetry_enabled = Some(choice);
+            // Persist the decision on its own. Writing the resolved
+            // settings back would copy everything that went into resolving
+            // them — including whatever a project's `.coderex/settings.json`
+            // contributed, which the repository controls — into the
+            // person's permanent settings as a side effect of answering a
+            // question about telemetry.
+            let _ = Self::write_telemetry_consent(&user_path, choice);
         }
 
         // Apply CLI runtime overrides
@@ -1084,10 +1085,10 @@ impl StartupOrchestrator {
         if let Some(fallback_model) = session.fallback_model {
             self.ctx.fallback_model = Some(ModelId(fallback_model));
         }
-        if let Some(allowed_tools) = session.allowed_tools {
-            if !allowed_tools.is_empty() {
-                self.ctx.allowed_tools = allowed_tools;
-            }
+        if let Some(allowed_tools) = session.allowed_tools
+            && !allowed_tools.is_empty()
+        {
+            self.ctx.allowed_tools = allowed_tools;
         }
         Self::validate_effort(session.effort.as_deref())?;
         self.ctx.effort = session.effort;
@@ -1455,15 +1456,13 @@ impl StartupOrchestrator {
             if let Ok(entries) = std::fs::read_dir(&commands_dir) {
                 for entry in entries.flatten() {
                     let path = entry.path();
-                    if path.extension().is_some_and(|e| e == "json") {
-                        if let Ok(content) = std::fs::read_to_string(&path) {
-                            if let Ok(cmd) = serde_json::from_str::<serde_json::Value>(&content) {
-                                if let Some(name) = cmd.get("name").and_then(|n| n.as_str()) {
-                                    tracing::debug!("discovered custom command: {name}");
-                                    count += 1;
-                                }
-                            }
-                        }
+                    if path.extension().is_some_and(|e| e == "json")
+                        && let Ok(content) = std::fs::read_to_string(&path)
+                        && let Ok(cmd) = serde_json::from_str::<serde_json::Value>(&content)
+                        && let Some(name) = cmd.get("name").and_then(|n| n.as_str())
+                    {
+                        tracing::debug!("discovered custom command: {name}");
+                        count += 1;
                     }
                 }
             }
@@ -2143,16 +2142,16 @@ impl StartupOrchestrator {
     #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
     async fn phase_init_remote_services(&mut self) -> Result<()> {
         // Bridge transport initialization — best-effort, failures don't block startup
-        if let Ok(bridge_url) = std::env::var("CODEREX_BRIDGE_URL") {
-            if !bridge_url.is_empty() {
-                let factory = coderex_bridge::transport::default_factory();
-                tracing::info!(
-                    "bridge transport initialized: url={bridge_url}, transports={:?}",
-                    factory.registered_types()
-                );
-                self.ctx.remote_services_ready = true;
-                return Ok(());
-            }
+        if let Ok(bridge_url) = std::env::var("CODEREX_BRIDGE_URL")
+            && !bridge_url.is_empty()
+        {
+            let factory = coderex_bridge::transport::default_factory();
+            tracing::info!(
+                "bridge transport initialized: url={bridge_url}, transports={:?}",
+                factory.registered_types()
+            );
+            self.ctx.remote_services_ready = true;
+            return Ok(());
         }
 
         tracing::debug!("no remote services configured");
@@ -2206,10 +2205,10 @@ impl StartupOrchestrator {
     /// reasoning-effort control omits it and warns, so this checks the spelling
     /// of the request rather than promising that every provider honours it.
     fn validate_effort(effort: Option<&str>) -> Result<()> {
-        if let Some(level) = effort {
-            if ReasoningEffort::parse(level).is_none() {
-                bail!("invalid --effort '{level}': expected one of low, medium, high");
-            }
+        if let Some(level) = effort
+            && ReasoningEffort::parse(level).is_none()
+        {
+            bail!("invalid --effort '{level}': expected one of low, medium, high");
         }
         Ok(())
     }
@@ -3033,10 +3032,9 @@ impl StartupOrchestrator {
             return Ok(coderex_mcp::config::McpConfig::new());
         }
         if let Ok(config) = serde_json::from_value::<coderex_mcp::config::McpConfig>(value.clone())
+            && !config.is_empty()
         {
-            if !config.is_empty() {
-                return Ok(config);
-            }
+            return Ok(config);
         }
         let wrapped = serde_json::json!({ "mcpServers": value });
         serde_json::from_value::<coderex_mcp::config::McpConfig>(wrapped)

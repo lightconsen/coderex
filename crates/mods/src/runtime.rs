@@ -764,12 +764,12 @@ impl ModRuntime {
             // A gating event is already denied; do not run the downstream
             // hooks behind a closed gate. For anything else, behave as if the
             // mods were not installed: run the inner executor unchanged.
-            if !result.stop {
-                if let Some(inner) = inner {
-                    let inner_result =
-                        run_inner_without_worker(&self.downstream, &inner, event, input, context);
-                    result = merge_with_inner(result, inner_result);
-                }
+            if !result.stop
+                && let Some(inner) = inner
+            {
+                let inner_result =
+                    run_inner_without_worker(&self.downstream, &inner, event, input, context);
+                result = merge_with_inner(result, inner_result);
             }
             result
         } else {

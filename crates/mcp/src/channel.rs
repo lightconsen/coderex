@@ -619,13 +619,13 @@ impl JsonRpcChannel {
         // the POST endpoint. Wait for the connection here so a non-SSE
         // endpoint is rejected immediately rather than after a request
         // timeout.
-        if let Some(ref http) = self.http {
-            if http.is_legacy_sse() {
-                if http.event_stream_state() == crate::http::EventStreamState::Stopped {
-                    http.start_event_stream();
-                }
-                http.await_legacy_stream().await?;
+        if let Some(ref http) = self.http
+            && http.is_legacy_sse()
+        {
+            if http.event_stream_state() == crate::http::EventStreamState::Stopped {
+                http.start_event_stream();
             }
+            http.await_legacy_stream().await?;
         }
 
         let result = self.send_request("initialize", Some(init_params)).await?;
@@ -640,10 +640,10 @@ impl JsonRpcChannel {
         // the stream task stops quietly. Legacy SSE already started its
         // mandatory stream before initialize; restarting it here would drop
         // the session that just answered the handshake.
-        if let Some(ref http) = self.http {
-            if !http.is_legacy_sse() {
-                http.start_event_stream();
-            }
+        if let Some(ref http) = self.http
+            && !http.is_legacy_sse()
+        {
+            http.start_event_stream();
         }
 
         Ok(result)

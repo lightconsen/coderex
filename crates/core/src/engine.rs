@@ -113,45 +113,42 @@ impl StructuredOutputValidator {
         };
 
         // Type check
-        if let Some(expected_type) = schema_obj.get("type") {
-            if let Some(type_str) = expected_type.as_str() {
-                Self::check_type(value, type_str)?;
-            }
+        if let Some(expected_type) = schema_obj.get("type")
+            && let Some(type_str) = expected_type.as_str()
+        {
+            Self::check_type(value, type_str)?;
         }
 
         // Enum check
-        if let Some(enum_values) = schema_obj.get("enum") {
-            if let Some(arr) = enum_values.as_array() {
-                if !arr.contains(value) {
-                    return Err(format!("value not in enum: {value}"));
-                }
-            }
+        if let Some(enum_values) = schema_obj.get("enum")
+            && let Some(arr) = enum_values.as_array()
+            && !arr.contains(value)
+        {
+            return Err(format!("value not in enum: {value}"));
         }
 
         // Object required fields
-        if let Some(properties) = schema_obj.get("properties") {
-            if let Some(props) = properties.as_object() {
-                if let Some(obj) = value.as_object() {
-                    for (key, prop_schema) in props {
-                        if let Some(val) = obj.get(key) {
-                            Self::validate_value(val, prop_schema)?;
-                        }
-                    }
+        if let Some(properties) = schema_obj.get("properties")
+            && let Some(props) = properties.as_object()
+            && let Some(obj) = value.as_object()
+        {
+            for (key, prop_schema) in props {
+                if let Some(val) = obj.get(key) {
+                    Self::validate_value(val, prop_schema)?;
                 }
             }
         }
 
         // Required fields check
-        if let Some(required) = schema_obj.get("required") {
-            if let Some(arr) = required.as_array() {
-                if let Some(obj) = value.as_object() {
-                    for field in arr {
-                        if let Some(field_str) = field.as_str() {
-                            if !obj.contains_key(field_str) {
-                                return Err(format!("missing required field: {field_str}"));
-                            }
-                        }
-                    }
+        if let Some(required) = schema_obj.get("required")
+            && let Some(arr) = required.as_array()
+            && let Some(obj) = value.as_object()
+        {
+            for field in arr {
+                if let Some(field_str) = field.as_str()
+                    && !obj.contains_key(field_str)
+                {
+                    return Err(format!("missing required field: {field_str}"));
                 }
             }
         }
@@ -1601,13 +1598,13 @@ fn prepend_thinking_block(block: &ThinkingBlock, content: serde_json::Value) -> 
 /// call), but a provider turn is a single assistant message whose content is
 /// `[thinking, text, tool_use, ...]`.
 fn push_assistant_content(out: &mut Vec<(String, serde_json::Value)>, content: serde_json::Value) {
-    if let Some((role, existing)) = out.last_mut() {
-        if role == "assistant" {
-            let mut blocks = content_blocks(std::mem::take(existing));
-            blocks.extend(content_blocks(content));
-            *existing = serde_json::Value::Array(blocks);
-            return;
-        }
+    if let Some((role, existing)) = out.last_mut()
+        && role == "assistant"
+    {
+        let mut blocks = content_blocks(std::mem::take(existing));
+        blocks.extend(content_blocks(content));
+        *existing = serde_json::Value::Array(blocks);
+        return;
     }
     out.push(("assistant".to_string(), content));
 }
@@ -1713,15 +1710,14 @@ impl QueryEngine {
                     push_assistant_content(&mut out, content);
                 }
             } else if matches!(m.role, crate::types::Role::Tool) {
-                if last_user_is_tool_results {
-                    if let Some((role, existing)) = out.last_mut() {
-                        if role == "user" {
-                            let mut blocks = content_blocks(std::mem::take(existing));
-                            blocks.extend(content_blocks(content));
-                            *existing = serde_json::Value::Array(blocks);
-                            continue;
-                        }
-                    }
+                if last_user_is_tool_results
+                    && let Some((role, existing)) = out.last_mut()
+                    && role == "user"
+                {
+                    let mut blocks = content_blocks(std::mem::take(existing));
+                    blocks.extend(content_blocks(content));
+                    *existing = serde_json::Value::Array(blocks);
+                    continue;
                 }
                 pending_thinking = None;
                 out.push((role_str.to_string(), content));
@@ -2362,14 +2358,13 @@ impl QueryEngine {
             }
             .to_string(),
         );
-        if let ElicitationResult::Responded(resp) = &result {
-            if let Some(answer) = resp
+        if let ElicitationResult::Responded(resp) = &result
+            && let Some(answer) = resp
                 .other_text
                 .clone()
                 .or_else(|| resp.selected.first().cloned())
-            {
-                ctx.insert("response".to_string(), answer);
-            }
+        {
+            ctx.insert("response".to_string(), answer);
         }
         let hook_result = self
             .fire_hook(hook_events::ELICITATION_RESULT, &request_id, &ctx)
@@ -2664,10 +2659,10 @@ impl QueryEngine {
                 }
             }
 
-            if turn.state.is_terminal() {
-                if let Some(reason) = turn.terminal_reason.take() {
-                    return Ok(reason);
-                }
+            if turn.state.is_terminal()
+                && let Some(reason) = turn.terminal_reason.take()
+            {
+                return Ok(reason);
             }
         }
 
@@ -2793,10 +2788,10 @@ impl QueryEngine {
                 }
             }
 
-            if turn.state.is_terminal() {
-                if let Some(reason) = turn.terminal_reason.take() {
-                    return Ok(reason);
-                }
+            if turn.state.is_terminal()
+                && let Some(reason) = turn.terminal_reason.take()
+            {
+                return Ok(reason);
             }
         }
 
@@ -2929,22 +2924,21 @@ impl QueryEngine {
             let result = self
                 .handle_elicitation(turn, format!("elic_{turn_number}"), content.clone())
                 .await;
-            if let ElicitationResult::Responded(resp) = result {
-                if let Some(user_text) = resp.other_text.or_else(|| resp.selected.first().cloned())
-                {
-                    let user_msg = Message::user(user_text);
-                    turn.messages.push(user_msg.clone());
-                    self.session.messages.push(user_msg);
-                    // Re-send request with clarified context
-                    api_response = self.send_request(turn, options).await?;
-                    turn.budget.record_tokens(&api_response.usage);
-                    self.cost_tracker
-                        .record_usage(&api_response.usage, &self.model);
-                    self.last_usage = Some(api_response.usage);
-                    let new_content = self.validate_structured_output(api_response.content.clone());
-                    self.push_thinking_message(turn, api_response.thinking.clone());
-                    self.push_visible_assistant_message(turn, new_content);
-                }
+            if let ElicitationResult::Responded(resp) = result
+                && let Some(user_text) = resp.other_text.or_else(|| resp.selected.first().cloned())
+            {
+                let user_msg = Message::user(user_text);
+                turn.messages.push(user_msg.clone());
+                self.session.messages.push(user_msg);
+                // Re-send request with clarified context
+                api_response = self.send_request(turn, options).await?;
+                turn.budget.record_tokens(&api_response.usage);
+                self.cost_tracker
+                    .record_usage(&api_response.usage, &self.model);
+                self.last_usage = Some(api_response.usage);
+                let new_content = self.validate_structured_output(api_response.content.clone());
+                self.push_thinking_message(turn, api_response.thinking.clone());
+                self.push_visible_assistant_message(turn, new_content);
             }
         }
 
@@ -3254,27 +3248,26 @@ impl QueryEngine {
             let result = self
                 .handle_elicitation(turn, format!("elic_{turn_number}"), content.clone())
                 .await;
-            if let ElicitationResult::Responded(resp) = result {
-                if let Some(user_text) = resp.other_text.or_else(|| resp.selected.first().cloned())
-                {
-                    let user_msg = Message::user(user_text);
-                    turn.messages.push(user_msg.clone());
-                    self.session.messages.push(user_msg);
-                    // Re-send request with clarified context
-                    let answered = self.send_request_streaming(turn, options).await?;
-                    turn.budget.record_tokens(&answered.usage);
-                    self.cost_tracker.record_usage(&answered.usage, &self.model);
-                    self.last_usage = Some(answered.usage);
-                    content = answered.content;
-                    tool_calls = answered.tool_calls;
-                    early_calls = answered.early_calls;
-                    early_results = answered.early_results;
-                    usage = answered.usage;
-                    stop_reason = answered.stop_reason;
-                    self.push_thinking_message(turn, answered.thinking);
-                    turn.last_stop_reason = Some(stop_reason.clone());
-                    self.push_visible_assistant_message(turn, content.clone());
-                }
+            if let ElicitationResult::Responded(resp) = result
+                && let Some(user_text) = resp.other_text.or_else(|| resp.selected.first().cloned())
+            {
+                let user_msg = Message::user(user_text);
+                turn.messages.push(user_msg.clone());
+                self.session.messages.push(user_msg);
+                // Re-send request with clarified context
+                let answered = self.send_request_streaming(turn, options).await?;
+                turn.budget.record_tokens(&answered.usage);
+                self.cost_tracker.record_usage(&answered.usage, &self.model);
+                self.last_usage = Some(answered.usage);
+                content = answered.content;
+                tool_calls = answered.tool_calls;
+                early_calls = answered.early_calls;
+                early_results = answered.early_results;
+                usage = answered.usage;
+                stop_reason = answered.stop_reason;
+                self.push_thinking_message(turn, answered.thinking);
+                turn.last_stop_reason = Some(stop_reason.clone());
+                self.push_visible_assistant_message(turn, content.clone());
             }
         }
 
@@ -4078,10 +4071,10 @@ impl QueryEngine {
             }
 
             // Append boundary marker if one was inserted
-            if result.boundary_inserted {
-                if let Err(e) = Self::append_transcript_boundary(&transcript_file) {
-                    tracing::warn!("Failed to write compact boundary to transcript: {e}");
-                }
+            if result.boundary_inserted
+                && let Err(e) = Self::append_transcript_boundary(&transcript_file)
+            {
+                tracing::warn!("Failed to write compact boundary to transcript: {e}");
             }
         }
 
@@ -4608,17 +4601,17 @@ impl QueryEngine {
                         // the fallback model, independent of the transient
                         // retry budget below. Switching the engine's model
                         // makes a second fallback attempt impossible.
-                        if early_calls.is_empty() {
-                            if let Some(fallback) = self.fallback_for_api_error(e) {
-                                self.switch_to_fallback_model(fallback);
-                                let _ = self.event_tx.send(EngineEvent::StreamInterrupted {
-                                    reason: "error".into(),
-                                    partial_len: stream_text.delivered().len(),
-                                    will_retry: true,
-                                });
-                                retry_requested = true;
-                                break;
-                            }
+                        if early_calls.is_empty()
+                            && let Some(fallback) = self.fallback_for_api_error(e)
+                        {
+                            self.switch_to_fallback_model(fallback);
+                            let _ = self.event_tx.send(EngineEvent::StreamInterrupted {
+                                reason: "error".into(),
+                                partial_len: stream_text.delivered().len(),
+                                will_retry: true,
+                            });
+                            retry_requested = true;
+                            break;
                         }
                         if early_calls.is_empty()
                             && attempt < MAX_STREAM_ATTEMPTS
@@ -4844,27 +4837,27 @@ impl QueryEngine {
         options: &SubmitOptions,
     ) -> Result<Option<ToolResult>, String> {
         // 1. allowed_tools_override
-        if let Some(ref allowed) = options.allowed_tools_override {
-            if !allowed.iter().any(|t| t.eq_ignore_ascii_case(&call.name)) {
-                self.denied_tools.push(DeniedToolCall {
-                    name: call.name.clone(),
-                    reason: "tool is not in the allowed tools override".to_string(),
-                });
-                let result = ToolResult {
-                    tool_call_id: call.id.clone(),
-                    output: format!(
-                        "tool '{}' blocked: not in allowed tools override",
-                        call.name
-                    ),
-                    is_error: true,
-                    images: Vec::new(),
-                };
-                let _ = self.event_tx.send(EngineEvent::ToolCallEnd {
-                    id: call.id.clone(),
-                    result: result.clone(),
-                });
-                return Ok(Some(result));
-            }
+        if let Some(ref allowed) = options.allowed_tools_override
+            && !allowed.iter().any(|t| t.eq_ignore_ascii_case(&call.name))
+        {
+            self.denied_tools.push(DeniedToolCall {
+                name: call.name.clone(),
+                reason: "tool is not in the allowed tools override".to_string(),
+            });
+            let result = ToolResult {
+                tool_call_id: call.id.clone(),
+                output: format!(
+                    "tool '{}' blocked: not in allowed tools override",
+                    call.name
+                ),
+                is_error: true,
+                images: Vec::new(),
+            };
+            let _ = self.event_tx.send(EngineEvent::ToolCallEnd {
+                id: call.id.clone(),
+                result: result.clone(),
+            });
+            return Ok(Some(result));
         }
 
         // 2. PreToolUse hook
@@ -5131,13 +5124,12 @@ impl QueryEngine {
         for elevation in outcome.pending_elevations {
             let tool_call_id = elevation.tool_call_id.clone();
             turn.pending_elevation = Some(elevation);
-            if let Some(result) = self.resolve_pending_elevation(turn).await? {
-                if let Some(slot) = results
+            if let Some(result) = self.resolve_pending_elevation(turn).await?
+                && let Some(slot) = results
                     .iter_mut()
                     .find(|result| result.tool_call_id == tool_call_id)
-                {
-                    *slot = result;
-                }
+            {
+                *slot = result;
             }
         }
         turn.pending_tool_calls.clear();

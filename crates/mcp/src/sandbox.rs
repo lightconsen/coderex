@@ -82,30 +82,29 @@ fn stdio_sandbox_config_with(
     // that a `npx`/`uvx` launcher reads on every start.
     let mut read = vec![workspace.clone()];
     let mut exec = Vec::new();
-    if let Some(program) = resolve_program(command, &workspace) {
-        if let Some(parent) = program.parent() {
-            // On Windows the sandbox's own plan already grants the system
-            // roots and `PATH` directories — best-effort. Repeating them here
-            // would make the grant required, and a directory like
-            // `C:\Program Files\nodejs` cannot be rewritten by an ordinary
-            // user, which would turn "cannot tighten this DACL" into "the
-            // server does not start".
-            if !platform_covers(parent) {
-                // Canonicalized because the wrapper matches on the resolved
-                // path: on macOS `/var` is a symlink to `/private/var`, so a
-                // raw path grants a `subpath` rule the kernel never sees.
-                exec.push(canonical(parent));
-                read.push(canonical(parent));
-            }
-            // A toolchain usually lives at `<prefix>/bin`; the interpreter
-            // needs its standard library under the prefix as well.
-            if parent.file_name().is_some_and(|name| name == "bin") {
-                if let Some(prefix) = parent.parent() {
-                    if !platform_covers(prefix) {
-                        read.push(canonical(prefix));
-                    }
-                }
-            }
+    if let Some(program) = resolve_program(command, &workspace)
+        && let Some(parent) = program.parent()
+    {
+        // On Windows the sandbox's own plan already grants the system
+        // roots and `PATH` directories — best-effort. Repeating them here
+        // would make the grant required, and a directory like
+        // `C:\Program Files\nodejs` cannot be rewritten by an ordinary
+        // user, which would turn "cannot tighten this DACL" into "the
+        // server does not start".
+        if !platform_covers(parent) {
+            // Canonicalized because the wrapper matches on the resolved
+            // path: on macOS `/var` is a symlink to `/private/var`, so a
+            // raw path grants a `subpath` rule the kernel never sees.
+            exec.push(canonical(parent));
+            read.push(canonical(parent));
+        }
+        // A toolchain usually lives at `<prefix>/bin`; the interpreter
+        // needs its standard library under the prefix as well.
+        if parent.file_name().is_some_and(|name| name == "bin")
+            && let Some(prefix) = parent.parent()
+            && !platform_covers(prefix)
+        {
+            read.push(canonical(prefix));
         }
     }
     if let Some(home) = home_dir() {
@@ -138,10 +137,9 @@ fn stdio_sandbox_config_with(
         if dir
             .file_name()
             .is_some_and(|name| name == "bin" || name == "sbin")
+            && let Some(prefix) = dir.parent()
         {
-            if let Some(prefix) = dir.parent() {
-                push_unique(&mut read, prefix.to_path_buf());
-            }
+            push_unique(&mut read, prefix.to_path_buf());
         }
         push_unique(&mut read, dir.clone());
         push_unique(&mut exec, dir);

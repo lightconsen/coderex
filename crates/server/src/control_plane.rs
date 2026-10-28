@@ -154,12 +154,12 @@ impl ControlPlaneState {
 
     /// Claim an assignment for an environment.
     pub fn claim_assignment(&mut self, assignment_id: &str, env_id: &str) -> bool {
-        if let Some(entry) = self.assignments.get_mut(assignment_id) {
-            if !entry.claimed {
-                entry.claimed = true;
-                entry.assigned_to = Some(env_id.to_string());
-                return true;
-            }
+        if let Some(entry) = self.assignments.get_mut(assignment_id)
+            && !entry.claimed
+        {
+            entry.claimed = true;
+            entry.assigned_to = Some(env_id.to_string());
+            return true;
         }
         false
     }
@@ -306,35 +306,32 @@ async fn route(
     }
 
     // GET /api/environments/{env_id}/assignments
-    if method == "GET" {
-        if let Some(env_id) = path
+    if method == "GET"
+        && let Some(env_id) = path
             .strip_prefix("/api/environments/")
             .and_then(|p| p.strip_suffix("/assignments"))
-        {
-            return handle_get_assignments(env_id, state).await;
-        }
+    {
+        return handle_get_assignments(env_id, state).await;
     }
 
     // POST /api/environments/{env_id}/assignments/{id}/claim
-    if method == "POST" {
-        if let Some(rest) = path.strip_prefix("/api/environments/") {
-            if let Some(idx) = rest.find("/assignments/") {
-                let env_id = &rest[..idx];
-                if let Some(after) = rest[idx + "/assignments/".len()..].strip_suffix("/claim") {
-                    return handle_claim(env_id, after, state).await;
-                }
-            }
+    if method == "POST"
+        && let Some(rest) = path.strip_prefix("/api/environments/")
+        && let Some(idx) = rest.find("/assignments/")
+    {
+        let env_id = &rest[..idx];
+        if let Some(after) = rest[idx + "/assignments/".len()..].strip_suffix("/claim") {
+            return handle_claim(env_id, after, state).await;
         }
     }
 
     // POST /api/environments/{env_id}/capacity
-    if method == "POST" {
-        if let Some(env_id) = path
+    if method == "POST"
+        && let Some(env_id) = path
             .strip_prefix("/api/environments/")
             .and_then(|p| p.strip_suffix("/capacity"))
-        {
-            return handle_capacity(env_id, body, state).await;
-        }
+    {
+        return handle_capacity(env_id, body, state).await;
     }
 
     // GET /api/environments

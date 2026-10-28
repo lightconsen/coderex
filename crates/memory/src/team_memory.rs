@@ -368,10 +368,10 @@ impl TeamMemorySyncService {
                 continue;
             }
             let content = std::fs::read_to_string(&path)?;
-            if let Ok(mem) = serde_json::from_str::<TeamMemoryEntry>(&content) {
-                if !mem.tombstoned {
-                    entries.push(mem);
-                }
+            if let Ok(mem) = serde_json::from_str::<TeamMemoryEntry>(&content)
+                && !mem.tombstoned
+            {
+                entries.push(mem);
             }
         }
         Ok(entries)
@@ -469,10 +469,10 @@ impl TeamMemorySyncService {
             // exactly where another topic's encoded name is (a legacy
             // `backend_auth.json` is the current path for `backend_auth`). The
             // topic recorded inside the entry decides whether it is ours.
-            if let Some(entry) = Self::read_entry_file(&path)? {
-                if entry.topic == topic {
-                    return Ok(Some(entry));
-                }
+            if let Some(entry) = Self::read_entry_file(&path)?
+                && entry.topic == topic
+            {
+                return Ok(Some(entry));
             }
         }
 
@@ -482,12 +482,12 @@ impl TeamMemorySyncService {
         // exactly the one asked for: `backend_auth.json` may belong to
         // `backend_auth`, and must not be served as `backend/auth`.
         let legacy = self.legacy_entry_path(topic);
-        if legacy != path && legacy.exists() {
-            if let Some(entry) = Self::read_entry_file(&legacy)? {
-                if entry.topic == topic {
-                    return Ok(Some(entry));
-                }
-            }
+        if legacy != path
+            && legacy.exists()
+            && let Some(entry) = Self::read_entry_file(&legacy)?
+            && entry.topic == topic
+        {
+            return Ok(Some(entry));
         }
         Ok(None)
     }
@@ -510,12 +510,12 @@ impl TeamMemorySyncService {
         // is a stale duplicate. Remove it only when its recorded topic matches
         // — a legacy file belonging to a formerly-colliding topic is not ours.
         let legacy = self.legacy_entry_path(&entry.topic);
-        if legacy != path && legacy.exists() {
-            if let Ok(Some(old)) = Self::read_entry_file(&legacy) {
-                if old.topic == entry.topic {
-                    let _ = std::fs::remove_file(&legacy);
-                }
-            }
+        if legacy != path
+            && legacy.exists()
+            && let Ok(Some(old)) = Self::read_entry_file(&legacy)
+            && old.topic == entry.topic
+        {
+            let _ = std::fs::remove_file(&legacy);
         }
         Ok(())
     }

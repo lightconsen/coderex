@@ -377,12 +377,11 @@ impl LongTermStore {
             let path = entry.path();
             if path.is_dir() {
                 Self::scan_dir(&path, callback)?;
-            } else if path.extension().and_then(|e| e.to_str()) == Some("json") {
-                if let Ok(content) = std::fs::read_to_string(&path) {
-                    if let Ok(memory) = serde_json::from_str::<MemoryEntry>(&content) {
-                        callback(memory);
-                    }
-                }
+            } else if path.extension().and_then(|e| e.to_str()) == Some("json")
+                && let Ok(content) = std::fs::read_to_string(&path)
+                && let Ok(memory) = serde_json::from_str::<MemoryEntry>(&content)
+            {
+                callback(memory);
             }
         }
         Ok(())

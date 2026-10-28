@@ -114,11 +114,9 @@ impl StaticServer {
         thread::spawn(move || {
             let mut announced = false;
             for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-                if !announced {
-                    if let Some(address) = line.split("listening on ").nth(1) {
-                        let _ = tx.send(address.trim().to_string());
-                        announced = true;
-                    }
+                if !announced && let Some(address) = line.split("listening on ").nth(1) {
+                    let _ = tx.send(address.trim().to_string());
+                    announced = true;
                 }
             }
         });
@@ -1298,7 +1296,7 @@ fn the_statusline_shows_model_tokens_cost_and_branch() {
     let branch = branch.trim().to_string();
     assert!(!branch.is_empty(), "the fixture has no branch");
 
-    let (_server, mut session) = session_with_static_server(dir.path());
+    let (_server, session) = session_with_static_server(dir.path());
     session.wait_for_text("CodeRex v", SCREEN_TIMEOUT);
     let screen = session.wait_for_text("tok:0,", SCREEN_TIMEOUT);
     assert!(screen.contains("K2.6"), "model segment missing:\n{screen}");
@@ -1315,7 +1313,7 @@ fn the_statusline_shows_model_tokens_cost_and_branch() {
 #[test]
 fn the_statusline_and_permission_bar_keep_their_own_rows() {
     let dir = setup_git_project_dir();
-    let (_server, mut session) = session_with_static_server(dir.path());
+    let (_server, session) = session_with_static_server(dir.path());
     session.wait_for_text("CodeRex v", SCREEN_TIMEOUT);
     let screen = session.wait_for_text("Permissions:", SCREEN_TIMEOUT);
     let statusline_row = screen
@@ -1377,7 +1375,7 @@ fn an_unsupported_terminal_is_not_asked_for_the_keyboard_protocol() {
 #[test]
 fn the_keyboard_protocol_opt_out_pushes_nothing() {
     let dir = setup_project_dir();
-    let (_server, mut session) = session_with_static_server_envs(
+    let (_server, session) = session_with_static_server_envs(
         dir.path(),
         &[
             ("TERM_PROGRAM", "ghostty"),

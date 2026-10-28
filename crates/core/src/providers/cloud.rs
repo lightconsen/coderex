@@ -179,10 +179,10 @@ impl SelectionInputs {
     pub fn from_env() -> Self {
         let mut flags = BTreeMap::new();
         for kind in ProviderKind::ALL {
-            if let Some(name) = kind.enable_var() {
-                if let Ok(value) = std::env::var(name) {
-                    flags.insert(name.to_string(), value);
-                }
+            if let Some(name) = kind.enable_var()
+                && let Ok(value) = std::env::var(name)
+            {
+                flags.insert(name.to_string(), value);
             }
         }
         Self {
@@ -219,10 +219,10 @@ pub fn select(inputs: &SelectionInputs) -> ProviderKind {
         ProviderKind::Mantle,
         ProviderKind::Vertex,
     ] {
-        if let Some(name) = kind.enable_var() {
-            if inputs.enabled(name) {
-                return kind;
-            }
+        if let Some(name) = kind.enable_var()
+            && inputs.enabled(name)
+        {
+            return kind;
         }
     }
 

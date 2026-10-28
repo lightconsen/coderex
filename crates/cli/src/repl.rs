@@ -3290,20 +3290,19 @@ impl ReplLoop {
         );
 
         // If we have a primary tool executor and an engine, layer plugin fallback
-        if let Some(ref dispatcher) = self.dispatcher {
-            if let Some(ref mut engine) = self.engine {
-                let primary: Arc<dyn coderex_core::tool_executor::ToolExecutor + Send + Sync> =
-                    dispatcher.clone();
-                let plugin_exec =
-                    Arc::new(coderex_plugins::tool_executor::PluginToolExecutor::new(
-                        Arc::clone(&plugin_manager),
-                    ));
-                let fallback = PluginToolFallbackExecutor {
-                    primary: ArcToolExecutor(primary),
-                    plugin: plugin_exec,
-                };
-                engine.set_tool_executor(Box::new(fallback));
-            }
+        if let Some(ref dispatcher) = self.dispatcher
+            && let Some(ref mut engine) = self.engine
+        {
+            let primary: Arc<dyn coderex_core::tool_executor::ToolExecutor + Send + Sync> =
+                dispatcher.clone();
+            let plugin_exec = Arc::new(coderex_plugins::tool_executor::PluginToolExecutor::new(
+                Arc::clone(&plugin_manager),
+            ));
+            let fallback = PluginToolFallbackExecutor {
+                primary: ArcToolExecutor(primary),
+                plugin: plugin_exec,
+            };
+            engine.set_tool_executor(Box::new(fallback));
         }
 
         self.plugin_manager = Some(plugin_manager);
@@ -3657,12 +3656,12 @@ impl ReplLoop {
                 let mut c = checker.lock().unwrap();
                 c.set_mode(PermissionMode::BypassPermissions);
             }
-        } else if let Some(mode) = self.permission_mode {
-            if let Some(ref mut engine) = self.engine {
-                let checker = engine.permission_checker();
-                let mut c = checker.lock().unwrap();
-                c.set_mode(mode);
-            }
+        } else if let Some(mode) = self.permission_mode
+            && let Some(ref mut engine) = self.engine
+        {
+            let checker = engine.permission_checker();
+            let mut c = checker.lock().unwrap();
+            c.set_mode(mode);
         }
 
         // 1b. Settings-defined permission rules. Installed once, after the
@@ -3722,12 +3721,12 @@ impl ReplLoop {
         }
 
         // 4. Session name / title
-        if let Some(ref name) = self.session_name {
-            if let Some(ref mut engine) = self.engine {
-                let mut session = engine.session().clone();
-                session.title = Some(name.clone());
-                engine.set_session(session);
-            }
+        if let Some(ref name) = self.session_name
+            && let Some(ref mut engine) = self.engine
+        {
+            let mut session = engine.session().clone();
+            session.title = Some(name.clone());
+            engine.set_session(session);
         }
 
         // 5. Worktree mode
@@ -3754,27 +3753,25 @@ impl ReplLoop {
             if let Err(err) = self.load_session_state(&session_id, true) {
                 tracing::warn!("Failed to restore resumed session {session_id}: {err}");
             }
-        } else if let Some(fork_id) = self.fork_session.clone() {
-            if let Err(err) = self.load_session_state(&fork_id, false) {
-                tracing::warn!("Failed to load fork session {fork_id}: {err}");
-            }
+        } else if let Some(fork_id) = self.fork_session.clone()
+            && let Err(err) = self.load_session_state(&fork_id, false)
+        {
+            tracing::warn!("Failed to load fork session {fork_id}: {err}");
         }
 
         // 7. Replay user messages from most recent session
-        if self.replay_user_messages {
-            if let Some(ref mut engine) = self.engine {
-                if let Some(session_id) = session_resume::latest_session_id(&self.cwd) {
-                    if let Ok(msgs) = session_resume::load_resume_messages(&self.cwd, &session_id) {
-                        let user_msgs: Vec<_> = msgs
-                            .into_iter()
-                            .filter(|m| matches!(m.role, coderex_core::types::Role::User))
-                            .collect();
-                        let mut session = engine.session().clone();
-                        session.messages.extend(user_msgs);
-                        engine.set_session(session);
-                    }
-                }
-            }
+        if self.replay_user_messages
+            && let Some(ref mut engine) = self.engine
+            && let Some(session_id) = session_resume::latest_session_id(&self.cwd)
+            && let Ok(msgs) = session_resume::load_resume_messages(&self.cwd, &session_id)
+        {
+            let user_msgs: Vec<_> = msgs
+                .into_iter()
+                .filter(|m| matches!(m.role, coderex_core::types::Role::User))
+                .collect();
+            let mut session = engine.session().clone();
+            session.messages.extend(user_msgs);
+            engine.set_session(session);
         }
 
         // 8. Add directory contents to extra context
@@ -3873,16 +3870,16 @@ impl ReplLoop {
         // REPL exists; the fallback here keeps a direct `with_from_pr` caller
         // honest, and a fetch failure stops startup rather than continuing
         // without the context the flag promised.
-        if self.pr_context.is_none() {
-            if let Some(ref url) = self.from_pr {
-                match crate::from_pr::fetch(url) {
-                    Ok(context) => self.pr_context = Some(context.block),
-                    Err(error) => {
-                        let message = format!("--from-pr: {error:#}");
-                        eprintln!("{message}");
-                        self.setup_error = Some(message);
-                        self.running = false;
-                    }
+        if self.pr_context.is_none()
+            && let Some(ref url) = self.from_pr
+        {
+            match crate::from_pr::fetch(url) {
+                Ok(context) => self.pr_context = Some(context.block),
+                Err(error) => {
+                    let message = format!("--from-pr: {error:#}");
+                    eprintln!("{message}");
+                    self.setup_error = Some(message);
+                    self.running = false;
                 }
             }
         }
@@ -4125,10 +4122,9 @@ impl ReplLoop {
                 .get("name")
                 .and_then(serde_json::Value::as_str)
                 .is_none()
+                && let Some(object) = value.as_object_mut()
             {
-                if let Some(object) = value.as_object_mut() {
-                    object.insert("name".to_string(), serde_json::Value::String(name.clone()));
-                }
+                object.insert("name".to_string(), serde_json::Value::String(name.clone()));
             }
             match serde_json::from_value::<coderex_agents::CustomAgentDef>(value) {
                 Ok(definition) => {
@@ -4177,10 +4173,10 @@ impl ReplLoop {
         // otherwise on the command line. `--model` is the only CLI override;
         // there is no max-token flag, so the definition's limit always wins
         // over the engine default.
-        if !self.explicit_model_override {
-            if let Some(model) = agent.model {
-                self.model = ModelId(model);
-            }
+        if !self.explicit_model_override
+            && let Some(model) = agent.model
+        {
+            self.model = ModelId(model);
         }
         if let Some(max_tokens) = agent.max_tokens.filter(|limit| *limit > 0) {
             self.max_tokens = max_tokens;
@@ -4311,10 +4307,8 @@ impl ReplLoop {
 
         if let Some(ref mut engine) = self.engine {
             let mut session = engine.session().clone();
-            if replace_session_id {
-                if let Ok(parsed) = uuid::Uuid::parse_str(session_id) {
-                    session.session_id = parsed;
-                }
+            if replace_session_id && let Ok(parsed) = uuid::Uuid::parse_str(session_id) {
+                session.session_id = parsed;
             }
             session.messages.clone_from(&messages);
             if session.title.is_none() {
@@ -4434,10 +4428,10 @@ impl ReplLoop {
         let session_id = session_id
             .map(ToString::to_string)
             .or_else(|| self.current_session_id());
-        if let Some(session_id) = session_id {
-            if let Err(err) = session_resume::remove_snapshot(&self.cwd, &session_id) {
-                tracing::warn!("Failed to remove interactive snapshot for {session_id}: {err}");
-            }
+        if let Some(session_id) = session_id
+            && let Err(err) = session_resume::remove_snapshot(&self.cwd, &session_id)
+        {
+            tracing::warn!("Failed to remove interactive snapshot for {session_id}: {err}");
         }
     }
 
@@ -4735,35 +4729,33 @@ impl ReplLoop {
         // A fresh session leaves the transcript empty; the TUI then paints its
         // welcome page (name, version, model, mascot) instead of a banner
         // message that would scroll away with the first turn.
-        if let Some(ref engine) = self.engine {
-            if !engine.session().messages.is_empty() {
-                let snapshot = session_resume::load_snapshot(
-                    &self.cwd,
-                    &engine.session().session_id.to_string(),
+        if let Some(ref engine) = self.engine
+            && !engine.session().messages.is_empty()
+        {
+            let snapshot =
+                session_resume::load_snapshot(&self.cwd, &engine.session().session_id.to_string());
+            Self::restore_session_into_ui(
+                &mut ui_state,
+                &engine.session().messages,
+                snapshot.as_ref(),
+            );
+            if self.resume_session.is_some() {
+                let mut note = format!(
+                    "Resumed session: {}\nLoaded {} messages from transcript.",
+                    engine.session().session_id,
+                    engine.session().messages.len()
                 );
-                Self::restore_session_into_ui(
-                    &mut ui_state,
-                    &engine.session().messages,
-                    snapshot.as_ref(),
-                );
-                if self.resume_session.is_some() {
-                    let mut note = format!(
-                        "Resumed session: {}\nLoaded {} messages from transcript.",
-                        engine.session().session_id,
-                        engine.session().messages.len()
-                    );
-                    if let Some(summary) = snapshot.and_then(|state| state.unfinished_context()) {
-                        note.push_str("\n\n");
-                        note.push_str(&summary);
-                    }
-                    ui_state.messages.push(Message {
-                        role: MessageRole::System,
-                        content: note.into(),
-                        tool_name: None,
-                        streaming: false,
-                        folded: false,
-                    });
+                if let Some(summary) = snapshot.and_then(|state| state.unfinished_context()) {
+                    note.push_str("\n\n");
+                    note.push_str(&summary);
                 }
+                ui_state.messages.push(Message {
+                    role: MessageRole::System,
+                    content: note.into(),
+                    tool_name: None,
+                    streaming: false,
+                    folded: false,
+                });
             }
         }
 
@@ -4783,10 +4775,10 @@ impl ReplLoop {
             loop {
                 match crossterm::event::poll(Duration::from_millis(50)) {
                     Ok(true) => {
-                        if let Ok(event) = crossterm::event::read() {
-                            if ct_tx.send(event).is_err() {
-                                break;
-                            }
+                        if let Ok(event) = crossterm::event::read()
+                            && ct_tx.send(event).is_err()
+                        {
+                            break;
                         }
                     }
                     Ok(false) => {}
@@ -5170,8 +5162,8 @@ impl ReplLoop {
                             // only when it has focus and no overlay is asking
                             // for the keyboard. Ordinary characters are never
                             // consumed here, so typing still reaches the line.
-                            if !ui_state.overlays.is_active() && pending_confirmation.is_none() {
-                                if let Some(action) = mod_ui_key_action(
+                            if !ui_state.overlays.is_active() && pending_confirmation.is_none()
+                                && let Some(action) = mod_ui_key_action(
                                     key.code,
                                     key.modifiers,
                                     mod_ui_focus.focused,
@@ -5209,7 +5201,6 @@ impl ReplLoop {
                                     }
                                     continue;
                                 }
-                            }
 
                             // Shift+Tab: cycle permission mode
                             if key.code == KeyCode::BackTab {
@@ -5882,8 +5873,8 @@ impl ReplLoop {
                                     }
                                 }
                                 MouseEventKind::Up(MouseButton::Left) => {
-                                    if let Some(selection) = ui_state.selection.take() {
-                                        if !selection.is_empty() {
+                                    if let Some(selection) = ui_state.selection.take()
+                                        && !selection.is_empty() {
                                             let text = terminal_ui.selected_text(&selection);
                                             if !text.is_empty() {
                                                 match coderex_ui::export::copy_to_clipboard(&text)
@@ -5900,7 +5891,6 @@ impl ReplLoop {
                                                 }
                                             }
                                         }
-                                    }
                                 }
                                 _ => {}
                             }
@@ -6070,11 +6060,10 @@ impl ReplLoop {
                             }
                         }
                         EngineEvent::PermissionExplanation { tool, explanation } => {
-                            if let Some(detail) = ui_state.permission_detail.as_mut() {
-                                if detail.tool.eq_ignore_ascii_case(&tool) {
+                            if let Some(detail) = ui_state.permission_detail.as_mut()
+                                && detail.tool.eq_ignore_ascii_case(&tool) {
                                     detail.risk_summary.clone_from(&explanation);
                                 }
-                            }
                             if matches!(
                                 ui_state.overlays.top(),
                                 Some(Overlay::PermissionDialog { .. })
@@ -7157,15 +7146,15 @@ impl ReplLoop {
                 }
             }
         }
-        if let Some(budget_usd) = self.max_budget_usd {
-            if budget_usd > 0.0 {
-                // Convert USD to tokens using a conservative rate ($3 per 1M tokens)
-                // `budget_usd > 0.0` and `.max(1.0)` guarantee a positive value,
-                // and the cast saturates for very large budgets, so this is safe.
-                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-                let tokens = ((budget_usd / 3.0) * 1_000_000.0).max(1.0) as u64;
-                options.task_budget_tokens = tokens;
-            }
+        if let Some(budget_usd) = self.max_budget_usd
+            && budget_usd > 0.0
+        {
+            // Convert USD to tokens using a conservative rate ($3 per 1M tokens)
+            // `budget_usd > 0.0` and `.max(1.0)` guarantee a positive value,
+            // and the cast saturates for very large budgets, so this is safe.
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let tokens = ((budget_usd / 3.0) * 1_000_000.0).max(1.0) as u64;
+            options.task_budget_tokens = tokens;
         }
         if let Some(turns) = self.max_turns {
             options.max_turns = turns;
@@ -7621,10 +7610,10 @@ impl ReplLoop {
 
     /// Apply effects from a CommandResult to session state.
     fn apply_command_effects(&mut self, result: &CommandResult) {
-        if let Some(profile) = result.prompt_profile {
-            if !self.session_effects.prompt_profiles.contains(&profile) {
-                self.session_effects.prompt_profiles.push(profile);
-            }
+        if let Some(profile) = result.prompt_profile
+            && !self.session_effects.prompt_profiles.contains(&profile)
+        {
+            self.session_effects.prompt_profiles.push(profile);
         }
 
         if let Some(ref prompt) = result.override_system_prompt {
@@ -7669,11 +7658,12 @@ impl ReplLoop {
             return true;
         }
 
-        if cmd_name == "theme" && result.state_changed {
-            if let Some(theme_name) = result.output.strip_prefix("Theme changed to: ") {
-                self.current_theme = theme_name.trim().to_string();
-                return true;
-            }
+        if cmd_name == "theme"
+            && result.state_changed
+            && let Some(theme_name) = result.output.strip_prefix("Theme changed to: ")
+        {
+            self.current_theme = theme_name.trim().to_string();
+            return true;
         }
 
         false
@@ -7906,13 +7896,11 @@ impl ReplLoop {
                     None => std::future::pending().await,
                 }
             }, if live_events.is_some() => {
-                if let Some(sink) = protocol.as_mut() {
-                    if let Some(frame) = protocol_frame(&event, &session_id) {
-                        if let Err(error) = sink.emit(&frame) {
+                if let Some(sink) = protocol.as_mut()
+                    && let Some(frame) = protocol_frame(&event, &session_id)
+                        && let Err(error) = sink.emit(&frame) {
                             tracing::warn!("could not write a protocol frame: {error}");
                         }
-                    }
-                }
                 if let EngineEvent::TextDelta(delta) = &event {
                     output.push_str(delta);
                 }
@@ -8078,22 +8066,21 @@ impl ReplLoop {
             self.trigger_background_features(prompt);
         }
 
-        if !self.session_effects.title_generated {
-            if let Some(ref client) = self.api_client {
-                if let Ok(title) = prompts::generate_session_title(client.as_ref(), prompt).await {
-                    self.session_effects.title_generated = true;
-                    if let Some(ref mut engine) = self.engine {
-                        let mut session = engine.session().clone();
-                        if session.title.is_none() {
-                            session.title = Some(title.clone());
-                            engine.set_session(session);
-                        }
-                    }
-                    // The title belongs to the session (resume, `/status`),
-                    // not to the answer: `-p` output is piped and parsed, so
-                    // prefixing it with a bracketed notice would corrupt it.
+        if !self.session_effects.title_generated
+            && let Some(ref client) = self.api_client
+            && let Ok(title) = prompts::generate_session_title(client.as_ref(), prompt).await
+        {
+            self.session_effects.title_generated = true;
+            if let Some(ref mut engine) = self.engine {
+                let mut session = engine.session().clone();
+                if session.title.is_none() {
+                    session.title = Some(title.clone());
+                    engine.set_session(session);
                 }
             }
+            // The title belongs to the session (resume, `/status`),
+            // not to the answer: `-p` output is piped and parsed, so
+            // prefixing it with a bracketed notice would corrupt it.
         }
 
         match result {
@@ -8147,10 +8134,10 @@ impl ReplLoop {
                 .map(|c| format!("/{} - {}", c.name, c.description))
                 .collect();
             // Replace existing palette overlay so suggestions stay in sync.
-            if let Some(top) = ui_state.overlays.top() {
-                if matches!(top, Overlay::CommandPalette { .. }) {
-                    ui_state.overlays.pop();
-                }
+            if let Some(top) = ui_state.overlays.top()
+                && matches!(top, Overlay::CommandPalette { .. })
+            {
+                ui_state.overlays.pop();
             }
             ui_state.overlays.push(Overlay::CommandPalette {
                 query: ui_state.input.text.clone(),
@@ -8159,10 +8146,10 @@ impl ReplLoop {
             });
         } else {
             // Remove palette overlay when input no longer starts with '/'.
-            if let Some(top) = ui_state.overlays.top() {
-                if matches!(top, Overlay::CommandPalette { .. }) {
-                    ui_state.overlays.pop();
-                }
+            if let Some(top) = ui_state.overlays.top()
+                && matches!(top, Overlay::CommandPalette { .. })
+            {
+                ui_state.overlays.pop();
             }
         }
     }
@@ -8542,14 +8529,15 @@ impl ReplLoop {
 
             // Check for macro expansion first. A macro expands into slash
             // commands, so it is subject to the same switch.
-            if !self.no_slash_commands && self.macro_registry.has(cmd_name) {
-                if let Some(commands) = self.macro_registry.get(cmd_name) {
-                    let cmds: Vec<String> = commands.to_vec();
-                    for macro_cmd in cmds {
-                        self.execute_single_command(&macro_cmd, ui_state);
-                    }
-                    return;
+            if !self.no_slash_commands
+                && self.macro_registry.has(cmd_name)
+                && let Some(commands) = self.macro_registry.get(cmd_name)
+            {
+                let cmds: Vec<String> = commands.to_vec();
+                for macro_cmd in cmds {
+                    self.execute_single_command(&macro_cmd, ui_state);
                 }
+                return;
             }
 
             // Check for pipe operator
@@ -8559,19 +8547,19 @@ impl ReplLoop {
             }
 
             // Check for destructive command confirmation
-            if let Some(cmd) = self.commands.find(cmd_name) {
-                if cmd.destructive {
-                    self.pending_destructive_cmd = Some((cmd_name.to_string(), args));
-                    ui_state
-                        .overlays
-                        .push(coderex_ui::overlay::Overlay::Confirm {
-                            message: format!(
-                                "Are you sure you want to run /{}? This action may be destructive.",
-                                cmd.name
-                            ),
-                        });
-                    return;
-                }
+            if let Some(cmd) = self.commands.find(cmd_name)
+                && cmd.destructive
+            {
+                self.pending_destructive_cmd = Some((cmd_name.to_string(), args));
+                ui_state
+                    .overlays
+                    .push(coderex_ui::overlay::Overlay::Confirm {
+                        message: format!(
+                            "Are you sure you want to run /{}? This action may be destructive.",
+                            cmd.name
+                        ),
+                    });
+                return;
             }
 
             // Execute the command directly
@@ -8792,20 +8780,21 @@ impl ReplLoop {
         let ctx = self.build_context();
         let result = self.commands.execute(cmd_name, &ctx, args);
         self.sync_command_state(cmd_name, &result);
-        if cmd_name == "theme" && result.state_changed {
-            if let Some(theme_name) = args.first() {
-                if self.apply_tui_theme(ui_state, theme_name) {
-                    ui_state
-                        .notifications
-                        .info(format!("Theme changed to: {theme_name}"));
-                } else {
-                    // The command accepted the name (it is installed), but
-                    // the file failed to parse or register. The settings file
-                    // already holds the name; say the theme is not live.
-                    ui_state
-                        .notifications
-                        .warn(format!("Theme could not be loaded: {theme_name}"));
-                }
+        if cmd_name == "theme"
+            && result.state_changed
+            && let Some(theme_name) = args.first()
+        {
+            if self.apply_tui_theme(ui_state, theme_name) {
+                ui_state
+                    .notifications
+                    .info(format!("Theme changed to: {theme_name}"));
+            } else {
+                // The command accepted the name (it is installed), but
+                // the file failed to parse or register. The settings file
+                // already holds the name; say the theme is not live.
+                ui_state
+                    .notifications
+                    .warn(format!("Theme could not be loaded: {theme_name}"));
             }
         }
 
@@ -9046,16 +9035,17 @@ impl ReplLoop {
 
         // Check for macro expansion. A macro expands into slash commands, so
         // it follows the same switch as the built-ins below.
-        if !self.no_slash_commands && self.macro_registry.has(cmd_name) {
-            if let Some(commands) = self.macro_registry.get(cmd_name) {
-                let cmds: Vec<String> = commands.to_vec();
-                for macro_cmd in cmds {
-                    // The full entry path, so a macro segment can be a
-                    // built-in or a pipe, not only a registry command.
-                    Box::pin(self.execute_command(&macro_cmd, &mut *stdout)).await?;
-                }
-                return Ok(());
+        if !self.no_slash_commands
+            && self.macro_registry.has(cmd_name)
+            && let Some(commands) = self.macro_registry.get(cmd_name)
+        {
+            let cmds: Vec<String> = commands.to_vec();
+            for macro_cmd in cmds {
+                // The full entry path, so a macro segment can be a
+                // built-in or a pipe, not only a registry command.
+                Box::pin(self.execute_command(&macro_cmd, &mut *stdout)).await?;
             }
+            return Ok(());
         }
 
         // Built-in REPL commands that don't go through registry.
@@ -9299,10 +9289,10 @@ impl ReplLoop {
                                 return Ok(());
                             }
                         };
-                        if let Some(ref engine) = self.engine {
-                            if let Ok(mut checker) = engine.permission_checker().lock() {
-                                checker.set_mode(mode);
-                            }
+                        if let Some(ref engine) = self.engine
+                            && let Ok(mut checker) = engine.permission_checker().lock()
+                        {
+                            checker.set_mode(mode);
                         }
                         self.permission_mode = Some(mode);
                         writeln!(stdout, "Permission mode set to: {mode:?}")?;
@@ -9555,15 +9545,15 @@ impl ReplLoop {
             "enable" => {
                 let mut config = dream.config.clone();
                 config.enabled = true;
-                if args.len() >= 2 {
-                    if let Ok(n) = args[1].parse::<usize>() {
-                        config.session_threshold = n;
-                    }
+                if args.len() >= 2
+                    && let Ok(n) = args[1].parse::<usize>()
+                {
+                    config.session_threshold = n;
                 }
-                if args.len() >= 3 {
-                    if let Ok(n) = args[2].parse::<i64>() {
-                        config.time_threshold_hours = n;
-                    }
+                if args.len() >= 3
+                    && let Ok(n) = args[2].parse::<i64>()
+                {
+                    config.time_threshold_hours = n;
                 }
                 // Record a session to trigger immediate check if threshold is 1
                 let _ = dream.record_session();

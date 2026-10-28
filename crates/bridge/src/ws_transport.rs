@@ -287,12 +287,11 @@ impl BridgeTokenStore {
 
     /// Load tokens from a specific path.
     pub fn load_from(path: &std::path::Path) -> Self {
-        if path.exists() {
-            if let Ok(content) = std::fs::read_to_string(path) {
-                if let Ok(tokens) = serde_json::from_str::<HashMap<String, String>>(&content) {
-                    return Self { tokens };
-                }
-            }
+        if path.exists()
+            && let Ok(content) = std::fs::read_to_string(path)
+            && let Ok(tokens) = serde_json::from_str::<HashMap<String, String>>(&content)
+        {
+            return Self { tokens };
         }
         Self::default()
     }

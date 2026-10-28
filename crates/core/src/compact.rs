@@ -364,10 +364,10 @@ pub fn reactive_compact(messages: &[Message], keep_recent_turns: usize) -> Compa
     }
 
     // Add boundary marker if there's a gap
-    if let Some(first_idx) = first_user_idx {
-        if keep_from > first_idx + 1 {
-            insert_compact_boundary_messages(&mut result);
-        }
+    if let Some(first_idx) = first_user_idx
+        && keep_from > first_idx + 1
+    {
+        insert_compact_boundary_messages(&mut result);
     }
 
     // Add the last N turns
@@ -434,10 +434,10 @@ pub fn snip_compact(messages: &[Message], target_tokens: usize) -> CompactResult
     }
 
     // Ensure we don't snip before the first user message
-    if let Some(idx) = first_user_idx {
-        if snip_point <= idx {
-            snip_point = idx + 1;
-        }
+    if let Some(idx) = first_user_idx
+        && snip_point <= idx
+    {
+        snip_point = idx + 1;
     }
 
     let mut result = Vec::new();

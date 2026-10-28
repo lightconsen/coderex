@@ -597,14 +597,15 @@ fn value_to_env_string(value: &Value) -> Option<String> {
 /// is absent, matching Claude's manifests, where `min`/`max` carry the numeric
 /// intent on their own.
 fn validate_option_value(key: &str, field: &UserConfigField, value: &str) -> Result<(), String> {
-    if let Some(allowed) = declared_options(field) {
-        if !allowed.is_empty() && !allowed.iter().any(|candidate| candidate == value) {
-            return Err(format!(
-                "userConfig option '{key}' value '{value}' is not one of the allowed options \
+    if let Some(allowed) = declared_options(field)
+        && !allowed.is_empty()
+        && !allowed.iter().any(|candidate| candidate == value)
+    {
+        return Err(format!(
+            "userConfig option '{key}' value '{value}' is not one of the allowed options \
                  ({}); update the plugin configuration",
-                allowed.join(", ")
-            ));
-        }
+            allowed.join(", ")
+        ));
     }
 
     let declared_type = field.value_type.as_deref().map(str::to_ascii_lowercase);
@@ -615,19 +616,19 @@ fn validate_option_value(key: &str, field: &UserConfigField, value: &str) -> Res
         let parsed: f64 = value.parse().map_err(|_| {
             format!("userConfig option '{key}' expects a number but the value '{value}' is not one")
         })?;
-        if let Some(min) = field.min.as_ref().and_then(Value::as_f64) {
-            if parsed < min {
-                return Err(format!(
-                    "userConfig option '{key}' value {parsed} is below the declared minimum {min}"
-                ));
-            }
+        if let Some(min) = field.min.as_ref().and_then(Value::as_f64)
+            && parsed < min
+        {
+            return Err(format!(
+                "userConfig option '{key}' value {parsed} is below the declared minimum {min}"
+            ));
         }
-        if let Some(max) = field.max.as_ref().and_then(Value::as_f64) {
-            if parsed > max {
-                return Err(format!(
-                    "userConfig option '{key}' value {parsed} is above the declared maximum {max}"
-                ));
-            }
+        if let Some(max) = field.max.as_ref().and_then(Value::as_f64)
+            && parsed > max
+        {
+            return Err(format!(
+                "userConfig option '{key}' value {parsed} is above the declared maximum {max}"
+            ));
         }
         return Ok(());
     }
@@ -894,12 +895,12 @@ fn classify_rev(rev: Option<&str>) -> (Option<String>, Option<String>) {
 /// `git` as if it were a branch name — a caller that asked for a commit and
 /// silently got a branch tip is the failure this avoids.
 fn checkout_rev<'a>(rev: Option<&'a str>, sha: Option<&'a str>) -> Result<Option<&'a str>, String> {
-    if let Some(sha) = sha {
-        if !is_full_commit_sha(sha) {
-            return Err(format!(
-                "'{sha}' is not a full 40-character commit SHA, so it cannot be a source's sha"
-            ));
-        }
+    if let Some(sha) = sha
+        && !is_full_commit_sha(sha)
+    {
+        return Err(format!(
+            "'{sha}' is not a full 40-character commit SHA, so it cannot be a source's sha"
+        ));
     }
     Ok(sha.or(rev))
 }
@@ -1409,15 +1410,15 @@ fn validate_relative_component_path(path: &str) -> Result<(), String> {
 /// written should not stop the rest of the type surface from being exported.
 /// Returns whether the file was written.
 fn write_exported_declaration(destination: &Path, content: &str) -> bool {
-    if let Some(parent) = destination.parent() {
-        if let Err(error) = std::fs::create_dir_all(parent) {
-            tracing::warn!(
-                path = %parent.display(),
-                %error,
-                "cannot create the types directory"
-            );
-            return false;
-        }
+    if let Some(parent) = destination.parent()
+        && let Err(error) = std::fs::create_dir_all(parent)
+    {
+        tracing::warn!(
+            path = %parent.display(),
+            %error,
+            "cannot create the types directory"
+        );
+        return false;
     }
     match std::fs::write(destination, content) {
         Ok(()) => true,
@@ -1452,12 +1453,12 @@ fn read_component_text(plugin_dir: &Path, relative: &str) -> Result<String, Stri
     validate_relative_component_path(relative)?;
 
     let full = plugin_dir.join(relative);
-    if let (Ok(root), Ok(target)) = (plugin_dir.canonicalize(), full.canonicalize()) {
-        if !target.starts_with(&root) {
-            return Err(format!(
-                "'{relative}' resolves outside the plugin directory"
-            ));
-        }
+    if let (Ok(root), Ok(target)) = (plugin_dir.canonicalize(), full.canonicalize())
+        && !target.starts_with(&root)
+    {
+        return Err(format!(
+            "'{relative}' resolves outside the plugin directory"
+        ));
     }
 
     let file = std::fs::File::open(&full)
@@ -1931,13 +1932,14 @@ fn normalize_lsp_component(plugin: &str, plugin_dir: &Path, value: &Value) -> Ve
                     Ok(parsed) => {
                         // A file may hold one server config or a map of
                         // server name to config; a map merges by name.
-                        if let Value::Object(entries) = &parsed {
-                            if entries.len() > 1 && entries.values().all(Value::is_object) {
-                                return entries
-                                    .iter()
-                                    .map(|(name, config)| (name.clone(), config.clone()))
-                                    .collect();
-                            }
+                        if let Value::Object(entries) = &parsed
+                            && entries.len() > 1
+                            && entries.values().all(Value::is_object)
+                        {
+                            return entries
+                                .iter()
+                                .map(|(name, config)| (name.clone(), config.clone()))
+                                .collect();
                         }
                         vec![(plugin.to_string(), parsed)]
                     }
@@ -2704,12 +2706,12 @@ impl PluginManager {
     /// Unload a plugin, stop its runtime, and clean up its directory.
     pub fn unload_plugin(&self, name: &str) -> bool {
         // Stop the process first (only if a tokio runtime is available)
-        if let Some((_, mut process)) = self.active_processes.remove(name) {
-            if tokio::runtime::Handle::try_current().is_ok() {
-                drop(tokio::spawn(async move {
-                    let _ = process.terminate().await;
-                }));
-            }
+        if let Some((_, mut process)) = self.active_processes.remove(name)
+            && tokio::runtime::Handle::try_current().is_ok()
+        {
+            drop(tokio::spawn(async move {
+                let _ = process.terminate().await;
+            }));
         }
 
         // Remove WASM instance if present
@@ -2717,10 +2719,10 @@ impl PluginManager {
 
         if let Some((_, handle)) = self.plugins.remove(name) {
             // Clean up plugin directory if it exists
-            if handle.path.exists() {
-                if let Err(e) = std::fs::remove_dir_all(&handle.path) {
-                    tracing::warn!("failed to remove plugin directory for '{}': {e}", name);
-                }
+            if handle.path.exists()
+                && let Err(e) = std::fs::remove_dir_all(&handle.path)
+            {
+                tracing::warn!("failed to remove plugin directory for '{}': {e}", name);
             }
             self.needs_refresh.store(true, Ordering::SeqCst);
             true
@@ -3747,13 +3749,13 @@ impl PluginManager {
                     response.status()
                 ));
             }
-            if let Some(length) = response.content_length() {
-                if length > MAX_PLUGIN_BINARY_BYTES as u64 {
-                    return Err(format!(
-                        "plugin binary '{name}' is {length} bytes, larger than the \
+            if let Some(length) = response.content_length()
+                && length > MAX_PLUGIN_BINARY_BYTES as u64
+            {
+                return Err(format!(
+                    "plugin binary '{name}' is {length} bytes, larger than the \
                          {MAX_PLUGIN_BINARY_BYTES} byte limit"
-                    ));
-                }
+                ));
             }
 
             let mut bytes = Vec::new();
@@ -4598,12 +4600,12 @@ impl PluginManager {
             .trim()
             .to_string();
 
-        if let Some(sha) = commit_rev {
-            if !commit.eq_ignore_ascii_case(sha) {
-                return Err(format!(
-                    "git checkout is at {commit}, not the requested commit {sha}"
-                ));
-            }
+        if let Some(sha) = commit_rev
+            && !commit.eq_ignore_ascii_case(sha)
+        {
+            return Err(format!(
+                "git checkout is at {commit}, not the requested commit {sha}"
+            ));
         }
 
         // The checkout is a snapshot now. Dropping `.git` keeps the installed
@@ -5786,15 +5788,15 @@ impl MarketplaceReconciler {
     ) -> Result<ReconciliationReport, String> {
         let report = manager.reconcile().await?;
 
-        if self.auto_install {
-            if let Some(dir) = install_dir {
-                let results = manager.auto_install_new(dir).await;
-                let installed = results.iter().filter(|r| r.is_ok()).count();
-                let failed = results.iter().filter(|r| r.is_err()).count();
+        if self.auto_install
+            && let Some(dir) = install_dir
+        {
+            let results = manager.auto_install_new(dir).await;
+            let installed = results.iter().filter(|r| r.is_ok()).count();
+            let failed = results.iter().filter(|r| r.is_err()).count();
 
-                if installed > 0 {
-                    tracing::info!("auto-installed {} plugins, {} failed", installed, failed);
-                }
+            if installed > 0 {
+                tracing::info!("auto-installed {} plugins, {} failed", installed, failed);
             }
         }
 

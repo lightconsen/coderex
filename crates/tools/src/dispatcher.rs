@@ -384,10 +384,10 @@ impl CoreToolExecutor for RegistryToolDispatcher {
                 // A tool that names its flag is offered only when that flag
                 // is in the resolved set — "some other flag is on" is not
                 // enough. Tools that name none keep the generic gate below.
-                if let Some(flag) = crate::required_feature_flag(&d.name) {
-                    if !flags.is_enabled(flag) {
-                        return false;
-                    }
+                if let Some(flag) = crate::required_feature_flag(&d.name)
+                    && !flags.is_enabled(flag)
+                {
+                    return false;
                 }
                 if d.name.starts_with("chrome_") {
                     return chrome_enabled && chrome_available.contains(&d.name);
@@ -474,20 +474,20 @@ impl CoreToolExecutor for RegistryToolDispatcher {
         // is off is not offered, and calling it anyway is refused with the
         // flag that would turn it on.
         let flags = self.feature_flags();
-        if let Some(flag) = crate::required_feature_flag(tool_name) {
-            if !flags.is_enabled(flag) {
-                return ToolDispatchOutcome {
-                    result: ToolResult {
-                        tool_call_id: tool_call_id.to_string(),
-                        output: format!(
-                            "tool '{tool_name}' is not enabled: the '{flag}' feature flag is off \
+        if let Some(flag) = crate::required_feature_flag(tool_name)
+            && !flags.is_enabled(flag)
+        {
+            return ToolDispatchOutcome {
+                result: ToolResult {
+                    tool_call_id: tool_call_id.to_string(),
+                    output: format!(
+                        "tool '{tool_name}' is not enabled: the '{flag}' feature flag is off \
                              (enable it with --betas {flag})"
-                        ),
-                        is_error: true,
-                        images: Vec::new(),
-                    },
-                };
-            }
+                    ),
+                    is_error: true,
+                    images: Vec::new(),
+                },
+            };
         }
 
         let is_chrome = tool_name.starts_with("chrome_");
@@ -571,10 +571,10 @@ impl CoreToolExecutor for RegistryToolDispatcher {
         }
 
         // Inject elicitation channel if available
-        if let Ok(guard) = self.elicit_tx.lock() {
-            if let Some(ref tx) = *guard {
-                ctx = ctx.with_elicit_tx(tx.clone());
-            }
+        if let Ok(guard) = self.elicit_tx.lock()
+            && let Some(ref tx) = *guard
+        {
+            ctx = ctx.with_elicit_tx(tx.clone());
         }
 
         // Build shared state map
@@ -993,10 +993,10 @@ pub fn path_arguments(input: &Value) -> Vec<std::path::PathBuf> {
     // so any string that looks like a path is offered to it.
     if paths.is_empty() {
         for value in map.values() {
-            if let Value::String(text) = value {
-                if text.starts_with('/') || text.starts_with('~') || text.contains('/') {
-                    paths.push(std::path::PathBuf::from(text));
-                }
+            if let Value::String(text) = value
+                && (text.starts_with('/') || text.starts_with('~') || text.contains('/'))
+            {
+                paths.push(std::path::PathBuf::from(text));
             }
         }
     }

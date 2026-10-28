@@ -656,10 +656,10 @@ async fn spawn_background_agent(
 
 async fn wait_for_terminal(store: &JobStore, id: &str) -> JobRecord {
     for _ in 0..400 {
-        if let Ok(Some(record)) = store.load(id) {
-            if record.state != JobState::Running {
-                return record;
-            }
+        if let Ok(Some(record)) = store.load(id)
+            && record.state != JobState::Running
+        {
+            return record;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }

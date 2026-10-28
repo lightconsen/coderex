@@ -1083,13 +1083,13 @@ impl CrashReporter {
                 continue;
             }
 
-            if let Ok(content) = std::fs::read_to_string(&path) {
-                if let Ok(report) = serde_json::from_str::<CrashReport>(&content) {
-                    let record = self.crash_record(&report, &scrubber);
-                    if store.insert_crash_record(&record).is_ok() {
-                        let _ = std::fs::remove_file(&path);
-                        count += 1;
-                    }
+            if let Ok(content) = std::fs::read_to_string(&path)
+                && let Ok(report) = serde_json::from_str::<CrashReport>(&content)
+            {
+                let record = self.crash_record(&report, &scrubber);
+                if store.insert_crash_record(&record).is_ok() {
+                    let _ = std::fs::remove_file(&path);
+                    count += 1;
                 }
             }
         }
@@ -1366,10 +1366,10 @@ fn classification_from_report(report: &CrashReport) -> PanicClassification {
 /// Recover symbol-only frames from a captured report, symbolizing a legacy raw
 /// backtrace when the report predates symbol capture.
 fn symbols_from_report(report: &CrashReport) -> Option<BacktraceSymbols> {
-    if let Some(frames) = report.backtrace_symbols.as_deref() {
-        if let Some(symbols) = rebuild_symbols(frames, report.backtrace_frame_count) {
-            return Some(symbols);
-        }
+    if let Some(frames) = report.backtrace_symbols.as_deref()
+        && let Some(symbols) = rebuild_symbols(frames, report.backtrace_frame_count)
+    {
+        return Some(symbols);
     }
     report
         .backtrace

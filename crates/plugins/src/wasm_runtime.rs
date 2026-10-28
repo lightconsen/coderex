@@ -503,12 +503,11 @@ fn resolved_compiler_command() -> Option<WasmCompilerCommand> {
 #[cfg(feature = "wasm-runtime")]
 fn compile_timeout() -> std::time::Duration {
     #[cfg(debug_assertions)]
-    if let Ok(raw) = std::env::var(WASM_COMPILE_TIMEOUT_ENV) {
-        if let Ok(millis) = raw.parse::<u64>() {
-            if millis > 0 {
-                return std::time::Duration::from_millis(millis);
-            }
-        }
+    if let Ok(raw) = std::env::var(WASM_COMPILE_TIMEOUT_ENV)
+        && let Ok(millis) = raw.parse::<u64>()
+        && millis > 0
+    {
+        return std::time::Duration::from_millis(millis);
     }
     WASM_COMPILE_TIMEOUT
 }
@@ -1102,17 +1101,17 @@ fn load_module(
     // without the AOT cache.
     let cache_key = cache_hmac_key(cache_dir);
 
-    if let Some(key) = &cache_key {
-        if let Some(module) = read_cached_module(
+    if let Some(key) = &cache_key
+        && let Some(module) = read_cached_module(
             engine,
             &engine_hash,
             &module_hash,
             &cache_path,
             wasm_path,
             key,
-        ) {
-            return Ok(module);
-        }
+        )
+    {
+        return Ok(module);
     }
 
     let Some(command) = compiler else {
@@ -1140,15 +1139,14 @@ fn load_module(
         )
     })?;
 
-    if let Some(key) = &cache_key {
-        if let Err(e) =
+    if let Some(key) = &cache_key
+        && let Err(e) =
             store_cached_module(&cache_path, &engine_hash, &module_hash, &serialized, key)
-        {
-            tracing::warn!(
-                cache = %cache_path.display(),
-                "failed to store the WASM AOT cache entry: {e}"
-            );
-        }
+    {
+        tracing::warn!(
+            cache = %cache_path.display(),
+            "failed to store the WASM AOT cache entry: {e}"
+        );
     }
     Ok(module)
 }
@@ -1586,10 +1584,10 @@ fn compile_sandbox_config(
             "CODEREX_WASM_COMPILE_TEST_COUNT_FILE",
             "CODEREX_WASM_COMPILE_TEST_CHILD_PID_FILE",
         ] {
-            if let Some(path) = std::env::var_os(key) {
-                if let Some(parent) = std::path::Path::new(&path).parent() {
-                    allowed_write_paths.push(parent.to_path_buf());
-                }
+            if let Some(path) = std::env::var_os(key)
+                && let Some(parent) = std::path::Path::new(&path).parent()
+            {
+                allowed_write_paths.push(parent.to_path_buf());
             }
         }
     }
@@ -1944,31 +1942,29 @@ mod compiler_test_hooks {
     use std::io::Write as _;
 
     pub fn before_compile() {
-        if let Ok(path) = std::env::var("CODEREX_WASM_COMPILE_TEST_COUNT_FILE") {
-            if let Ok(mut file) = std::fs::OpenOptions::new()
+        if let Ok(path) = std::env::var("CODEREX_WASM_COMPILE_TEST_COUNT_FILE")
+            && let Ok(mut file) = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
                 .open(path)
-            {
-                let _ = writeln!(file, "compile");
-            }
+        {
+            let _ = writeln!(file, "compile");
         }
 
         // Spawn a descendant that outlives the compiler unless the parent's
         // timeout kill takes the whole process group / job.
         #[cfg(unix)]
-        if let Ok(path) = std::env::var("CODEREX_WASM_COMPILE_TEST_CHILD_PID_FILE") {
-            if let Ok(child) = std::process::Command::new("sleep")
+        if let Ok(path) = std::env::var("CODEREX_WASM_COMPILE_TEST_CHILD_PID_FILE")
+            && let Ok(child) = std::process::Command::new("sleep")
                 .arg("60")
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .spawn()
-            {
-                let _ = std::fs::write(path, child.id().to_string());
-                // Dropping `Child` does not kill it; it runs until the group
-                // kill or its own `sleep` ends.
-            }
+        {
+            let _ = std::fs::write(path, child.id().to_string());
+            // Dropping `Child` does not kill it; it runs until the group
+            // kill or its own `sleep` ends.
         }
 
         #[cfg(target_os = "windows")]
@@ -2009,10 +2005,10 @@ mod compiler_test_hooks {
             }
         }
 
-        if let Ok(raw) = std::env::var("CODEREX_WASM_COMPILE_TEST_SLEEP_MS") {
-            if let Ok(millis) = raw.parse::<u64>() {
-                std::thread::sleep(std::time::Duration::from_millis(millis));
-            }
+        if let Ok(raw) = std::env::var("CODEREX_WASM_COMPILE_TEST_SLEEP_MS")
+            && let Ok(millis) = raw.parse::<u64>()
+        {
+            std::thread::sleep(std::time::Duration::from_millis(millis));
         }
     }
 }

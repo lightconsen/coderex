@@ -7,8 +7,8 @@
 
 use coderex_cli::repl::{ReplLoop, ReplSession, parse_input};
 use coderex_core::permissions::PermissionMode;
-use coderex_core::types::{ModelId, ToolCall};
-use coderex_test_utils::{MockApiClient, mock_response, mock_response_with_tool_calls};
+use coderex_core::types::ModelId;
+use coderex_test_utils::{MockApiClient, mock_response};
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  14.1 ReplLoop Construction

@@ -243,10 +243,10 @@ pub(crate) fn selection_text(area: Rect, rows: &[Vec<char>], selection: &TextSel
         };
         let mut line = String::new();
         for column in left..=right {
-            if let Some(character) = cells.get((column - area.left()) as usize) {
-                if *character != '\0' {
-                    line.push(*character);
-                }
+            if let Some(character) = cells.get((column - area.left()) as usize)
+                && *character != '\0'
+            {
+                line.push(*character);
             }
         }
         lines.push(line.trim_end().to_string());
@@ -971,13 +971,11 @@ fn message_render_height(
     is_compact: bool,
     mod_ui_blocks: &[ModUiBlockSpec],
 ) -> usize {
-    if !is_compact {
-        if let Some(spec) = matching_mod_ui_block(msg, index, mod_ui_blocks) {
-            let prefix_width = unicode_width::UnicodeWidthStr::width(message_prefix(msg.role));
-            let wrap_width = width.saturating_sub(prefix_width);
-            if let Some((lines, _)) = mod_ui_block_lines(spec, wrap_width) {
-                return lines.len();
-            }
+    if !is_compact && let Some(spec) = matching_mod_ui_block(msg, index, mod_ui_blocks) {
+        let prefix_width = unicode_width::UnicodeWidthStr::width(message_prefix(msg.role));
+        let wrap_width = width.saturating_sub(prefix_width);
+        if let Some((lines, _)) = mod_ui_block_lines(spec, wrap_width) {
+            return lines.len();
         }
     }
     message_display_height(msg, width)
@@ -1259,30 +1257,29 @@ fn append_message_lines(
     // A live mod UI block is re-rendered from its tree at the pane's actual
     // width. That keeps the drawn button columns identical to the hit columns
     // even when the stored text was rendered at a different width.
-    if !is_compact {
-        if let Some(spec) = matching_mod_ui_block(msg, index, mod_ui_blocks) {
-            if let Some((block_lines, hits)) = mod_ui_block_lines(spec, wrap_width) {
-                let start = lines.len();
-                for (row, line) in block_lines.into_iter().enumerate() {
-                    let gutter = if row == 0 {
-                        prefix.to_string()
-                    } else {
-                        " ".repeat(prefix_width)
-                    };
-                    let mut spans = Vec::with_capacity(line.spans.len() + 1);
-                    spans.push(Span::styled(gutter, style));
-                    spans.extend(line.spans);
-                    lines.push(Line::from(spans));
-                }
-                return Some(ModUiBlockSpan {
-                    message_index: index,
-                    start,
-                    end: lines.len(),
-                    prefix_width: u16::try_from(prefix_width).unwrap_or(u16::MAX),
-                    hits,
-                });
-            }
+    if !is_compact
+        && let Some(spec) = matching_mod_ui_block(msg, index, mod_ui_blocks)
+        && let Some((block_lines, hits)) = mod_ui_block_lines(spec, wrap_width)
+    {
+        let start = lines.len();
+        for (row, line) in block_lines.into_iter().enumerate() {
+            let gutter = if row == 0 {
+                prefix.to_string()
+            } else {
+                " ".repeat(prefix_width)
+            };
+            let mut spans = Vec::with_capacity(line.spans.len() + 1);
+            spans.push(Span::styled(gutter, style));
+            spans.extend(line.spans);
+            lines.push(Line::from(spans));
         }
+        return Some(ModUiBlockSpan {
+            message_index: index,
+            start,
+            end: lines.len(),
+            prefix_width: u16::try_from(prefix_width).unwrap_or(u16::MAX),
+            hits,
+        });
     }
 
     // A Read result is a file body with no fence. Highlight it from a
@@ -1290,20 +1287,18 @@ fn append_message_lines(
     if msg.role == MessageRole::ToolResult
         && !is_compact
         && msg.tool_name.as_deref() == Some("Read")
+        && let Some(language) = guess_language(&msg.content)
+        && let Some(code_lines) = highlighted_code_lines(
+            &msg.content,
+            language,
+            prefix,
+            prefix_width,
+            style,
+            body_style,
+        )
     {
-        if let Some(language) = guess_language(&msg.content) {
-            if let Some(code_lines) = highlighted_code_lines(
-                &msg.content,
-                language,
-                prefix,
-                prefix_width,
-                style,
-                body_style,
-            ) {
-                lines.extend(code_lines);
-                return None;
-            }
-        }
+        lines.extend(code_lines);
+        return None;
     }
 
     // Use syntax highlighting for assistant messages that contain code blocks.

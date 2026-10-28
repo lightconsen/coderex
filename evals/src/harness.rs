@@ -290,13 +290,14 @@ impl Variant {
         if let Some(name) = id.strip_prefix("ref/") {
             return Ok(Self::Reference(assert_in_flow(name)?.to_string()));
         }
-        if let Some(number) = id.strip_prefix('v') {
-            if !number.is_empty() && number.chars().all(|c| c.is_ascii_digit()) {
-                let number = number.parse().map_err(|_| {
-                    HarnessError::Invalid(format!("'{id}' is not a usable variant number"))
-                })?;
-                return Ok(Self::Numbered(number));
-            }
+        if let Some(number) = id.strip_prefix('v')
+            && !number.is_empty()
+            && number.chars().all(|c| c.is_ascii_digit())
+        {
+            let number = number.parse().map_err(|_| {
+                HarnessError::Invalid(format!("'{id}' is not a usable variant number"))
+            })?;
+            return Ok(Self::Numbered(number));
         }
         Err(HarnessError::Invalid(format!(
             "variant '{id}' must be 'baseline' or 'v<N>'"

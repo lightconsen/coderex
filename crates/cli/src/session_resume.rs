@@ -250,30 +250,30 @@ pub fn search_sessions(cwd: &str, query: &str, limit: usize) -> Vec<SessionMeta>
 
     let fts = fts_query(query);
     let mut results = Vec::new();
-    if !fts.is_empty() {
-        if let Some(index) = cached_index(cwd) {
-            let index = index.lock();
-            match index.search(&fts, limit) {
-                Ok(rows) => results = rows,
-                Err(error) => tracing::warn!(
-                    db = %sessions_db_path(cwd).display(),
-                    "session index search failed; falling back to transcripts: {error}"
-                ),
-            }
-            // No keyword hit does not mean no match: the TF-IDF table is
-            // filled beside the FTS index, so use it before scanning files.
-            if results.is_empty() {
-                match index.search_semantic(query, limit) {
-                    Ok(ranked) if !ranked.is_empty() => {
-                        for (session_id, _score) in ranked {
-                            if let Ok(Some(meta)) = index.get(&session_id) {
-                                results.push(meta);
-                            }
+    if !fts.is_empty()
+        && let Some(index) = cached_index(cwd)
+    {
+        let index = index.lock();
+        match index.search(&fts, limit) {
+            Ok(rows) => results = rows,
+            Err(error) => tracing::warn!(
+                db = %sessions_db_path(cwd).display(),
+                "session index search failed; falling back to transcripts: {error}"
+            ),
+        }
+        // No keyword hit does not mean no match: the TF-IDF table is
+        // filled beside the FTS index, so use it before scanning files.
+        if results.is_empty() {
+            match index.search_semantic(query, limit) {
+                Ok(ranked) if !ranked.is_empty() => {
+                    for (session_id, _score) in ranked {
+                        if let Ok(Some(meta)) = index.get(&session_id) {
+                            results.push(meta);
                         }
                     }
-                    Ok(_) => {}
-                    Err(error) => tracing::debug!(%error, "semantic session search failed"),
                 }
+                Ok(_) => {}
+                Err(error) => tracing::debug!(%error, "semantic session search failed"),
             }
         }
     }

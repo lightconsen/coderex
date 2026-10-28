@@ -249,20 +249,19 @@ fn extract_last_user_prompt(body: &str) -> String {
     let value: serde_json::Value = serde_json::from_str(body).unwrap_or_default();
     if let Some(messages) = value.get("messages").and_then(|m| m.as_array()) {
         for msg in messages.iter().rev() {
-            if msg.get("role").and_then(|r| r.as_str()) == Some("user") {
-                if let Some(content) = msg.get("content") {
-                    if let Some(text) = content.as_str() {
-                        return text.to_string();
-                    }
-                    if let Some(parts) = content.as_array() {
-                        for part in parts {
-                            if part.get("type").and_then(|t| t.as_str()) == Some("text") {
-                                if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
-                                    if !text.is_empty() {
-                                        return text.to_string();
-                                    }
-                                }
-                            }
+            if msg.get("role").and_then(|r| r.as_str()) == Some("user")
+                && let Some(content) = msg.get("content")
+            {
+                if let Some(text) = content.as_str() {
+                    return text.to_string();
+                }
+                if let Some(parts) = content.as_array() {
+                    for part in parts {
+                        if part.get("type").and_then(|t| t.as_str()) == Some("text")
+                            && let Some(text) = part.get("text").and_then(|t| t.as_str())
+                            && !text.is_empty()
+                        {
+                            return text.to_string();
                         }
                     }
                 }

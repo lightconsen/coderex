@@ -414,14 +414,14 @@ impl SessionState {
     /// permission and elicitation trackers are restored from it.
     pub async fn load_or_new(id: String) -> Self {
         let session = Self::new(id.clone());
-        if let Ok(store) = crate::store::SessionStore::for_session(&id) {
-            if let Ok((perms, elics)) = store.load().await {
-                let mut p = session.permissions.lock().await;
-                *p = perms;
-                drop(p);
-                let mut e = session.elicitations.lock().await;
-                *e = elics;
-            }
+        if let Ok(store) = crate::store::SessionStore::for_session(&id)
+            && let Ok((perms, elics)) = store.load().await
+        {
+            let mut p = session.permissions.lock().await;
+            *p = perms;
+            drop(p);
+            let mut e = session.elicitations.lock().await;
+            *e = elics;
         }
         session
     }

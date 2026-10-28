@@ -813,10 +813,10 @@ fn cache_max_age(headers: &reqwest::header::HeaderMap) -> u64 {
             let Some((name, raw)) = directive.split_once('=') else {
                 continue;
             };
-            if name.trim().eq_ignore_ascii_case("max-age") {
-                if let Ok(seconds) = raw.trim().trim_matches('"').parse::<u64>() {
-                    max_age = Some(seconds);
-                }
+            if name.trim().eq_ignore_ascii_case("max-age")
+                && let Ok(seconds) = raw.trim().trim_matches('"').parse::<u64>()
+            {
+                max_age = Some(seconds);
             }
         }
     }
@@ -1397,12 +1397,12 @@ impl OAuthManager {
         }
 
         self.ensure_client_registered(server_url, client).await?;
-        if let Some(state) = self.get_mut(server_url) {
-            if !state.has_configured_client_id() {
-                // Preserve the historical default when the server offers no
-                // registration endpoint at all.
-                state.client_id = "coderex-cli".to_string();
-            }
+        if let Some(state) = self.get_mut(server_url)
+            && !state.has_configured_client_id()
+        {
+            // Preserve the historical default when the server offers no
+            // registration endpoint at all.
+            state.client_id = "coderex-cli".to_string();
         }
 
         self.save_tokens().map_err(|source| OAuthError::Store {
@@ -1494,17 +1494,15 @@ impl OAuthManager {
     ) -> Result<ProtectedResourceMetadata, OAuthError> {
         let now = chrono::Utc::now().timestamp();
         let cached = self.get(server_url).cloned();
-        if resource_metadata_url.is_none() {
-            if let Some(state) = &cached {
-                if let (Some(metadata), Some(expires_at)) = (
-                    &state.protected_resource,
-                    state.resource_metadata_expires_at,
-                ) {
-                    if now < expires_at {
-                        return Ok(metadata.clone());
-                    }
-                }
-            }
+        if resource_metadata_url.is_none()
+            && let Some(state) = &cached
+            && let (Some(metadata), Some(expires_at)) = (
+                &state.protected_resource,
+                state.resource_metadata_expires_at,
+            )
+            && now < expires_at
+        {
+            return Ok(metadata.clone());
         }
 
         let url = match resource_metadata_url {
@@ -1730,29 +1728,27 @@ impl OAuthManager {
         let challenge = www_authenticate
             .map(parse_www_authenticate)
             .unwrap_or_default();
-        if let Some(error) = challenge.error.as_deref() {
-            if error != "invalid_token" {
-                return Err(OAuthError::ReauthRequired {
-                    server_url: server_url.to_string(),
-                    detail: format!("the server rejected the credential with '{error}'"),
-                });
-            }
+        if let Some(error) = challenge.error.as_deref()
+            && error != "invalid_token"
+        {
+            return Err(OAuthError::ReauthRequired {
+                server_url: server_url.to_string(),
+                detail: format!("the server rejected the credential with '{error}'"),
+            });
         }
 
-        if let Some(rejected) = rejected_token {
-            if let Some(current) = self
+        if let Some(rejected) = rejected_token
+            && let Some(current) = self
                 .get(server_url)
                 .and_then(|state| state.access_token.as_deref())
-            {
-                if current != rejected {
-                    tracing::debug!(
-                        server = %server_url,
-                        "another request already replaced the rejected access token; \
-                         reusing it instead of refreshing again"
-                    );
-                    return Ok(current.to_string());
-                }
-            }
+            && current != rejected
+        {
+            tracing::debug!(
+                server = %server_url,
+                "another request already replaced the rejected access token; \
+                 reusing it instead of refreshing again"
+            );
+            return Ok(current.to_string());
         }
 
         let Some(state) = self.get_mut(server_url) else {
@@ -1930,10 +1926,10 @@ impl OAuthManager {
         if auth_method != "client_secret_basic" {
             form.push(("client_id", client_id.clone()));
         }
-        if auth_method == "client_secret_post" {
-            if let Some(secret) = &client_secret {
-                form.push(("client_secret", secret.clone()));
-            }
+        if auth_method == "client_secret_post"
+            && let Some(secret) = &client_secret
+        {
+            form.push(("client_secret", secret.clone()));
         }
 
         let mut request = client.post(&endpoint);

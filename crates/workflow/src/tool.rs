@@ -169,15 +169,15 @@ impl WorkflowTool {
 
     fn limits() -> Limits {
         let mut limits = Limits::default();
-        if let Ok(value) = std::env::var(MAX_CONCURRENT_ENV) {
-            if let Ok(parsed) = value.parse::<usize>() {
-                limits.max_concurrent = parsed.clamp(1, 64);
-            }
+        if let Ok(value) = std::env::var(MAX_CONCURRENT_ENV)
+            && let Ok(parsed) = value.parse::<usize>()
+        {
+            limits.max_concurrent = parsed.clamp(1, 64);
         }
-        if let Ok(value) = std::env::var(TOKEN_BUDGET_ENV) {
-            if let Ok(parsed) = value.parse::<u64>() {
-                limits.token_budget = Some(parsed);
-            }
+        if let Ok(value) = std::env::var(TOKEN_BUDGET_ENV)
+            && let Ok(parsed) = value.parse::<u64>()
+        {
+            limits.token_budget = Some(parsed);
         }
         limits
     }

@@ -141,19 +141,20 @@ async fn authenticate_with(
         .as_ref()
         .and_then(|entry| entry.client_secret.clone());
 
-    if requested_client_id.is_none() && client_id.is_none() {
-        if let Some(registration_endpoint) = discovery.registration_endpoint.as_deref() {
-            let registration = register_client(
-                &client,
-                registration_endpoint,
-                &discovery,
-                persistence,
-                &server_url,
-            )
-            .await?;
-            client_id = Some(registration.client_id);
-            client_secret = registration.client_secret;
-        }
+    if requested_client_id.is_none()
+        && client_id.is_none()
+        && let Some(registration_endpoint) = discovery.registration_endpoint.as_deref()
+    {
+        let registration = register_client(
+            &client,
+            registration_endpoint,
+            &discovery,
+            persistence,
+            &server_url,
+        )
+        .await?;
+        client_id = Some(registration.client_id);
+        client_secret = registration.client_secret;
     }
     let client_id = client_id.unwrap_or_else(|| "coderex-cli".into());
     let auth_method = select_client_auth_method(
@@ -336,10 +337,10 @@ async fn authenticate_with(
     if auth_method != "client_secret_basic" {
         form.push(("client_id", client_id.clone()));
     }
-    if auth_method == "client_secret_post" {
-        if let Some(secret) = &client_secret {
-            form.push(("client_secret", secret.clone()));
-        }
+    if auth_method == "client_secret_post"
+        && let Some(secret) = &client_secret
+    {
+        form.push(("client_secret", secret.clone()));
     }
     let mut request = client.post(&token_endpoint);
     if auth_method == "client_secret_basic" {
@@ -843,10 +844,10 @@ fn cache_max_age(headers: &reqwest::header::HeaderMap) -> u64 {
             let Some((name, raw)) = directive.split_once('=') else {
                 continue;
             };
-            if name.trim().eq_ignore_ascii_case("max-age") {
-                if let Ok(seconds) = raw.trim().trim_matches('"').parse::<u64>() {
-                    max_age = Some(seconds);
-                }
+            if name.trim().eq_ignore_ascii_case("max-age")
+                && let Ok(seconds) = raw.trim().trim_matches('"').parse::<u64>()
+            {
+                max_age = Some(seconds);
             }
         }
     }
@@ -926,22 +927,20 @@ async fn fetch_protected_resource(
 ) -> Option<(ProtectedResourceMetadata, String, Option<String>, u64)> {
     let entry = load_token_entry(persistence, server_url);
     let now = chrono::Utc::now().timestamp();
-    if let Some(entry) = &entry {
-        if let (Some(metadata), Some(expires_at)) = (
+    if let Some(entry) = &entry
+        && let (Some(metadata), Some(expires_at)) = (
             &entry.protected_resource,
             entry.resource_metadata_expires_at,
-        ) {
-            if now < expires_at {
-                if let Some(url) = entry.resource_metadata_url.clone() {
-                    return Some((
-                        metadata.clone(),
-                        url,
-                        entry.resource_metadata_etag.clone(),
-                        0,
-                    ));
-                }
-            }
-        }
+        )
+        && now < expires_at
+        && let Some(url) = entry.resource_metadata_url.clone()
+    {
+        return Some((
+            metadata.clone(),
+            url,
+            entry.resource_metadata_etag.clone(),
+            0,
+        ));
     }
 
     let url = protected_resource_candidate(server_url)?;
@@ -990,10 +989,11 @@ async fn fetch_issuer_metadata(
     cached: Option<&IssuerMetadataEntry>,
 ) -> Option<(DiscoveredEndpoints, IssuerMetadataEntry)> {
     let now = chrono::Utc::now().timestamp();
-    if let Some(cached) = cached {
-        if cached.is_fresh(now) && cached.has_endpoints() {
-            return Some((cached.clone().into_discovery(), cached.clone()));
-        }
+    if let Some(cached) = cached
+        && cached.is_fresh(now)
+        && cached.has_endpoints()
+    {
+        return Some((cached.clone().into_discovery(), cached.clone()));
     }
     let candidates = discovery_candidates(issuer)?;
     for candidate in candidates {
@@ -1606,10 +1606,10 @@ fn persist_authenticated_at(
     entry.refresh_token = refresh_token.map(String::from);
     entry.expires_at = Some(now.saturating_add(expires_in));
     record_discovery_fields(entry, discovery, now);
-    if let Some(issuer) = &discovery.issuer {
-        if let Some(cache) = &discovery.issuer_entry {
-            store.issuer_metadata.insert(issuer.clone(), cache.clone());
-        }
+    if let Some(issuer) = &discovery.issuer
+        && let Some(cache) = &discovery.issuer_entry
+    {
+        store.issuer_metadata.insert(issuer.clone(), cache.clone());
     }
     save_token_store(persistence, &store)
 }
@@ -1675,10 +1675,10 @@ fn record_discovery_fields(entry: &mut TokenEntry, discovery: &DiscoveredEndpoin
             now.saturating_add(i64::try_from(discovery.resource_metadata_ttl).unwrap_or(i64::MAX)),
         );
     }
-    if let Some(cache) = &discovery.issuer_entry {
-        if let Some(expires_at) = cache.expires_at {
-            entry.discovery_expires_at = Some(expires_at);
-        }
+    if let Some(cache) = &discovery.issuer_entry
+        && let Some(expires_at) = cache.expires_at
+    {
+        entry.discovery_expires_at = Some(expires_at);
     }
 }
 
@@ -1693,10 +1693,10 @@ fn cache_discovery_record_at(
     let now = chrono::Utc::now().timestamp();
     let entry = entry_for(&mut store, server_url, client_id);
     record_discovery_fields(entry, discovery, now);
-    if let Some(issuer) = &discovery.issuer {
-        if let Some(cache) = &discovery.issuer_entry {
-            store.issuer_metadata.insert(issuer.clone(), cache.clone());
-        }
+    if let Some(issuer) = &discovery.issuer
+        && let Some(cache) = &discovery.issuer_entry
+    {
+        store.issuer_metadata.insert(issuer.clone(), cache.clone());
     }
     save_token_store(persistence, &store)
 }

@@ -233,15 +233,14 @@ impl OpenAiCompatibleProvider {
             .and_then(|ctx| ctx.session_id.clone())
             .or_else(|| self.session_id.clone())
             .or_else(|| std::env::var("CODEREX_SESSION_ID").ok())
+            && !session_id.trim().is_empty()
         {
-            if !session_id.trim().is_empty() {
-                req = req.header("X-CodeRex-Session-Id", session_id);
-            }
+            req = req.header("X-CodeRex-Session-Id", session_id);
         }
-        if let Some(agent_id) = self.request_context().and_then(|ctx| ctx.agent_id.clone()) {
-            if !agent_id.trim().is_empty() {
-                req = req.header("X-CodeRex-Agent-Id", agent_id);
-            }
+        if let Some(agent_id) = self.request_context().and_then(|ctx| ctx.agent_id.clone())
+            && !agent_id.trim().is_empty()
+        {
+            req = req.header("X-CodeRex-Agent-Id", agent_id);
         }
         if self.resolved_profile().name == "dashscope" {
             req = req
@@ -1046,21 +1045,20 @@ fn parse_openai_chat_sse_message(message: &str, state: &mut OpenAiSseState) -> V
                     .get("reasoning_content")
                     .or_else(|| delta.get("reasoning"))
                     .and_then(serde_json::Value::as_str)
+                    && !reasoning.is_empty()
                 {
-                    if !reasoning.is_empty() {
-                        events.push(StreamEvent::ThinkingDelta(reasoning.to_string()));
-                    }
+                    events.push(StreamEvent::ThinkingDelta(reasoning.to_string()));
                 }
-                if let Some(content) = delta.get("content").and_then(serde_json::Value::as_str) {
-                    if !content.is_empty() {
-                        if error_finish {
-                            // An in-band failure carries the error text in
-                            // `content` with `finish_reason: "error_finish"`.
-                            // Surface it as an error, not as answer text.
-                            events.push(StreamEvent::Error(ApiError::Http(content.to_string())));
-                        } else {
-                            events.push(StreamEvent::TextDelta(content.to_string()));
-                        }
+                if let Some(content) = delta.get("content").and_then(serde_json::Value::as_str)
+                    && !content.is_empty()
+                {
+                    if error_finish {
+                        // An in-band failure carries the error text in
+                        // `content` with `finish_reason: "error_finish"`.
+                        // Surface it as an error, not as answer text.
+                        events.push(StreamEvent::Error(ApiError::Http(content.to_string())));
+                    } else {
+                        events.push(StreamEvent::TextDelta(content.to_string()));
                     }
                 }
                 if let Some(tool_calls) = delta
@@ -1115,35 +1113,34 @@ fn handle_openai_chat_tool_delta(
     };
 
     let tool_state = state.tool_calls.entry(index).or_default();
-    if let Some(id) = tool_delta.get("id").and_then(serde_json::Value::as_str) {
-        if !id.is_empty() {
-            tool_state.id = Some(id.to_string());
-        }
+    if let Some(id) = tool_delta.get("id").and_then(serde_json::Value::as_str)
+        && !id.is_empty()
+    {
+        tool_state.id = Some(id.to_string());
     }
     if let Some(name) = tool_delta
         .get("function")
         .and_then(|f| f.get("name"))
         .and_then(serde_json::Value::as_str)
+        && !name.is_empty()
     {
-        if !name.is_empty() {
-            tool_state.name = Some(name.to_string());
-        }
+        tool_state.name = Some(name.to_string());
     }
 
     let mut events = Vec::new();
-    if !tool_state.start_emitted {
-        if let (Some(id), Some(name)) = (tool_state.id.clone(), tool_state.name.clone()) {
-            events.push(StreamEvent::ToolCallBlockStart {
-                id: id.clone(),
-                name,
+    if !tool_state.start_emitted
+        && let (Some(id), Some(name)) = (tool_state.id.clone(), tool_state.name.clone())
+    {
+        events.push(StreamEvent::ToolCallBlockStart {
+            id: id.clone(),
+            name,
+        });
+        tool_state.start_emitted = true;
+        if !tool_state.buffered_arguments.is_empty() {
+            events.push(StreamEvent::ToolCallInputDelta {
+                id,
+                delta: std::mem::take(&mut tool_state.buffered_arguments),
             });
-            tool_state.start_emitted = true;
-            if !tool_state.buffered_arguments.is_empty() {
-                events.push(StreamEvent::ToolCallInputDelta {
-                    id,
-                    delta: std::mem::take(&mut tool_state.buffered_arguments),
-                });
-            }
         }
     }
 
@@ -1151,18 +1148,17 @@ fn handle_openai_chat_tool_delta(
         .get("function")
         .and_then(|f| f.get("arguments"))
         .and_then(serde_json::Value::as_str)
+        && !arguments.is_empty()
     {
-        if !arguments.is_empty() {
-            if tool_state.start_emitted {
-                if let Some(id) = tool_state.id.clone() {
-                    events.push(StreamEvent::ToolCallInputDelta {
-                        id,
-                        delta: arguments.to_string(),
-                    });
-                }
-            } else {
-                tool_state.buffered_arguments.push_str(arguments);
+        if tool_state.start_emitted {
+            if let Some(id) = tool_state.id.clone() {
+                events.push(StreamEvent::ToolCallInputDelta {
+                    id,
+                    delta: arguments.to_string(),
+                });
             }
+        } else {
+            tool_state.buffered_arguments.push_str(arguments);
         }
     }
 
@@ -1175,29 +1171,29 @@ fn finish_openai_chat_tool_calls(state: &mut OpenAiSseState) -> Vec<StreamEvent>
 
     let mut events = Vec::new();
     for (_, mut tool_state) in entries {
-        if !tool_state.start_emitted {
-            if let (Some(id), Some(name)) = (tool_state.id.clone(), tool_state.name.clone()) {
-                events.push(StreamEvent::ToolCallBlockStart {
+        if !tool_state.start_emitted
+            && let (Some(id), Some(name)) = (tool_state.id.clone(), tool_state.name.clone())
+        {
+            events.push(StreamEvent::ToolCallBlockStart {
+                id: id.clone(),
+                name,
+            });
+            tool_state.start_emitted = true;
+            if !tool_state.buffered_arguments.is_empty() {
+                events.push(StreamEvent::ToolCallInputDelta {
                     id: id.clone(),
-                    name,
+                    delta: std::mem::take(&mut tool_state.buffered_arguments),
                 });
-                tool_state.start_emitted = true;
-                if !tool_state.buffered_arguments.is_empty() {
-                    events.push(StreamEvent::ToolCallInputDelta {
-                        id: id.clone(),
-                        delta: std::mem::take(&mut tool_state.buffered_arguments),
-                    });
-                }
             }
         }
 
-        if tool_state.start_emitted {
-            if let Some(id) = tool_state.id {
-                events.push(StreamEvent::ToolCallBlockEnd {
-                    id,
-                    input: serde_json::Value::Null,
-                });
-            }
+        if tool_state.start_emitted
+            && let Some(id) = tool_state.id
+        {
+            events.push(StreamEvent::ToolCallBlockEnd {
+                id,
+                input: serde_json::Value::Null,
+            });
         }
     }
 
@@ -1349,10 +1345,9 @@ fn parse_openai_responses_sse_message(
                 .get("response")
                 .and_then(|response| response.get("status"))
                 .and_then(serde_json::Value::as_str)
+                && !status.is_empty()
             {
-                if !status.is_empty() {
-                    events.push(StreamEvent::StopReason(status.to_string()));
-                }
+                events.push(StreamEvent::StopReason(status.to_string()));
             }
         }
         Some("response.incomplete") => {

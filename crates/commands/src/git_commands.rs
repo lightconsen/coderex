@@ -101,11 +101,10 @@ pub fn register(registry: &mut CommandRegistry) {
 
             // Stage and commit
             let _ = run_git(dir, &["add", "-A"]);
-            if let Err(e) = run_git(dir, &["commit", "-m", msg]) {
-                if !e.contains("nothing to commit") {
+            if let Err(e) = run_git(dir, &["commit", "-m", msg])
+                && !e.contains("nothing to commit") {
                     return CommandResult::error(format!("Commit failed: {e}"));
                 }
-            }
 
             // Push
             let branch = current_branch(dir);

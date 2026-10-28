@@ -137,10 +137,10 @@ fn extract_last_user_prompt(body: &str) -> String {
     let value: serde_json::Value = serde_json::from_str(body).unwrap_or_default();
     if let Some(messages) = value.get("messages").and_then(|m| m.as_array()) {
         for msg in messages.iter().rev() {
-            if msg.get("role").and_then(|r| r.as_str()) == Some("user") {
-                if let Some(text) = msg.get("content").and_then(|c| c.as_str()) {
-                    return text.to_string();
-                }
+            if msg.get("role").and_then(|r| r.as_str()) == Some("user")
+                && let Some(text) = msg.get("content").and_then(|c| c.as_str())
+            {
+                return text.to_string();
             }
         }
     }

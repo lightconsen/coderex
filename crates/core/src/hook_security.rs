@@ -118,22 +118,21 @@ impl UrlValidator {
         }
 
         // Allowed hosts
-        if let Some(ref allowed) = self.allowed_hosts {
-            if !allowed.iter().any(|a| {
+        if let Some(ref allowed) = self.allowed_hosts
+            && !allowed.iter().any(|a| {
                 let a = a.to_lowercase();
                 host == a || host.ends_with(&format!(".{a}"))
-            }) {
-                return Err(UrlValidationError::NotInAllowlist(host));
-            }
+            })
+        {
+            return Err(UrlValidationError::NotInAllowlist(host));
         }
 
         // Port check
-        if let Some(port) = parsed.port() {
-            if let Some(ref allowed) = self.allowed_ports {
-                if !allowed.contains(&port) {
-                    return Err(UrlValidationError::DisallowedPort(port));
-                }
-            }
+        if let Some(port) = parsed.port()
+            && let Some(ref allowed) = self.allowed_ports
+            && !allowed.contains(&port)
+        {
+            return Err(UrlValidationError::DisallowedPort(port));
         }
 
         Ok(())

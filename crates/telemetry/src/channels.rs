@@ -249,16 +249,16 @@ impl TelemetryChannels {
 
         let mut errors = Vec::new();
 
-        if let Some(endpoint) = self.config.otlp_logs_endpoint() {
-            if let Err(error) = self.send_otlp(&endpoint, events).await {
-                errors.push(format!("OTLP: {error}"));
-            }
+        if let Some(endpoint) = self.config.otlp_logs_endpoint()
+            && let Err(error) = self.send_otlp(&endpoint, events).await
+        {
+            errors.push(format!("OTLP: {error}"));
         }
 
-        if let Some(endpoint) = self.config.datadog_logs_endpoint() {
-            if let Err(error) = self.send_datadog(&endpoint, events).await {
-                errors.push(format!("Datadog: {error}"));
-            }
+        if let Some(endpoint) = self.config.datadog_logs_endpoint()
+            && let Err(error) = self.send_datadog(&endpoint, events).await
+        {
+            errors.push(format!("Datadog: {error}"));
         }
 
         if errors.is_empty() {

@@ -101,8 +101,8 @@ pub fn register(registry: &mut CommandRegistry) {
                 std::time::Duration::from_millis(50),
             ).is_ok();
 
-            if let Some(arg) = args.first() {
-                if arg == "--tools" {
+            if let Some(arg) = args.first()
+                && arg == "--tools" {
                     return CommandResult::success(
                         "Chrome Tools\n───────────\n\
 chrome_list_tabs      — List open Chrome tabs\n\
@@ -112,7 +112,6 @@ chrome_screenshot     — Capture a screenshot (base64 PNG)\n\
 chrome_get_content    — Extract page HTML as markdown"
                     );
                 }
-            }
 
             let status = if connected {
                 "Connected\nDebugger listening on port 9222."

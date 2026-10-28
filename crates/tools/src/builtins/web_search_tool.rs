@@ -52,12 +52,12 @@ impl Tool for WebSearchTool {
         let blocked_domains = extract_string_array(&input.arguments, "blocked_domains");
 
         // Rate limit check
-        if let Some(limiter) = crate::rate_limiter::get_rate_limiter(&_ctx) {
-            if !limiter.check("WebSearch", 10) {
-                return Err(ToolError::RateLimited {
-                    name: "WebSearch".into(),
-                });
-            }
+        if let Some(limiter) = crate::rate_limiter::get_rate_limiter(&_ctx)
+            && !limiter.check("WebSearch", 10)
+        {
+            return Err(ToolError::RateLimited {
+                name: "WebSearch".into(),
+            });
         }
 
         let client = reqwest::Client::builder()
@@ -153,14 +153,14 @@ fn parse_ddg_results(html: &str, allowed: &[String], blocked: &[String]) -> Vec<
 
 fn extract_ddg_url(line: &str) -> Option<String> {
     // DDG result links look like: <a rel="nofollow" class="result__a" href="https://example.com/...">
-    if line.contains("result__a") || line.contains("class=\"result\"") {
-        if let Some(start) = line.find("href=\"") {
-            let rest = &line[start + 6..];
-            if let Some(end) = rest.find('"') {
-                let url = &rest[..end];
-                if url.starts_with("http") {
-                    return Some(url.to_string());
-                }
+    if (line.contains("result__a") || line.contains("class=\"result\""))
+        && let Some(start) = line.find("href=\"")
+    {
+        let rest = &line[start + 6..];
+        if let Some(end) = rest.find('"') {
+            let url = &rest[..end];
+            if url.starts_with("http") {
+                return Some(url.to_string());
             }
         }
     }

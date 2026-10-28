@@ -71,28 +71,28 @@ pub async fn run_tool_calls<S: std::hash::BuildHasher + Sync>(
     // ─── Phase 1: Sequential validation ────────────────────────────────────
     for (idx, call) in calls.iter().enumerate() {
         // 1. allowed_tools_override
-        if let Some(ref allowed) = options.allowed_tools_override {
-            if !allowed.iter().any(|t| t.eq_ignore_ascii_case(&call.name)) {
-                denied_tools.push(DeniedToolCall {
-                    name: call.name.clone(),
-                    reason: "tool is not in the allowed tools override".to_string(),
-                });
-                let result = ToolResult {
-                    tool_call_id: call.id.clone(),
-                    output: format!(
-                        "tool '{}' blocked: not in allowed tools override",
-                        call.name
-                    ),
-                    is_error: true,
-                    images: Vec::new(),
-                };
-                let _ = event_tx.send(EngineEvent::ToolCallEnd {
-                    id: call.id.clone(),
-                    result: result.clone(),
-                });
-                results[idx] = Some(result);
-                continue;
-            }
+        if let Some(ref allowed) = options.allowed_tools_override
+            && !allowed.iter().any(|t| t.eq_ignore_ascii_case(&call.name))
+        {
+            denied_tools.push(DeniedToolCall {
+                name: call.name.clone(),
+                reason: "tool is not in the allowed tools override".to_string(),
+            });
+            let result = ToolResult {
+                tool_call_id: call.id.clone(),
+                output: format!(
+                    "tool '{}' blocked: not in allowed tools override",
+                    call.name
+                ),
+                is_error: true,
+                images: Vec::new(),
+            };
+            let _ = event_tx.send(EngineEvent::ToolCallEnd {
+                id: call.id.clone(),
+                result: result.clone(),
+            });
+            results[idx] = Some(result);
+            continue;
         }
 
         // 2. ToolCallStart event

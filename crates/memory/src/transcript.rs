@@ -294,10 +294,10 @@ impl TranscriptStore {
         for entry in std::fs::read_dir(&self.base_path)? {
             let entry = entry?;
             let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
-                if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                    sessions.push(stem.to_string());
-                }
+            if path.extension().and_then(|e| e.to_str()) == Some("jsonl")
+                && let Some(stem) = path.file_stem().and_then(|s| s.to_str())
+            {
+                sessions.push(stem.to_string());
             }
         }
         sessions.sort();

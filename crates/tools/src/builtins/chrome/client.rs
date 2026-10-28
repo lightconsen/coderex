@@ -169,12 +169,11 @@ impl ChromeClient {
 
         let response = tokio::time::timeout(WS_TIMEOUT, async {
             while let Some(Ok(msg)) = futures_util::StreamExt::next(&mut read).await {
-                if let WsMessage::Text(text) = msg {
-                    if let Ok(value) = serde_json::from_str::<Value>(&text) {
-                        if value.get("id").is_some() {
-                            return Some(value);
-                        }
-                    }
+                if let WsMessage::Text(text) = msg
+                    && let Ok(value) = serde_json::from_str::<Value>(&text)
+                    && value.get("id").is_some()
+                {
+                    return Some(value);
                 }
             }
             None

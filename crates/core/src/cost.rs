@@ -226,13 +226,13 @@ impl CostTracker {
         });
 
         // Broadcast to team context if present
-        if let Some(ref team_ctx) = self.team_context {
-            if let Ok(mut ctx) = team_ctx.lock() {
-                ctx.record_activity(
-                    "cost_tracker".into(),
-                    format!("Turn {turn_number} cost: ${cost:.4} ({})", model.0),
-                );
-            }
+        if let Some(ref team_ctx) = self.team_context
+            && let Ok(mut ctx) = team_ctx.lock()
+        {
+            ctx.record_activity(
+                "cost_tracker".into(),
+                format!("Turn {turn_number} cost: ${cost:.4} ({})", model.0),
+            );
         }
     }
 

@@ -483,15 +483,15 @@ impl MemoryService {
         let _guard = self.lock_writers();
 
         let found = self.current_version(store, &key)?;
-        if let Some(expected) = if_version {
-            if expected != found {
-                return Err(MemoryServiceError::VersionMismatch {
-                    store,
-                    key,
-                    expected,
-                    found,
-                });
-            }
+        if let Some(expected) = if_version
+            && expected != found
+        {
+            return Err(MemoryServiceError::VersionMismatch {
+                store,
+                key,
+                expected,
+                found,
+            });
         }
 
         #[cfg(test)]
@@ -546,15 +546,15 @@ impl MemoryService {
         if found == 0 {
             return Err(MemoryServiceError::NotFound { store, key });
         }
-        if let Some(expected) = if_version {
-            if expected != found {
-                return Err(MemoryServiceError::VersionMismatch {
-                    store,
-                    key,
-                    expected,
-                    found,
-                });
-            }
+        if let Some(expected) = if_version
+            && expected != found
+        {
+            return Err(MemoryServiceError::VersionMismatch {
+                store,
+                key,
+                expected,
+                found,
+            });
         }
 
         match store {

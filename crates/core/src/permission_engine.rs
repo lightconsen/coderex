@@ -451,14 +451,13 @@ impl PermissionEngine {
                         serde_json::from_str(&req.arguments).unwrap_or(serde_json::Value::Null),
                     )
                 });
-            if let Some((tool, arguments)) = found {
-                if !self
+            if let Some((tool, arguments)) = found
+                && !self
                     .exemptions_for(&tool, &arguments)
                     .suppresses_always_allow_rule
-                {
-                    let mut checker = self.checker.lock().unwrap();
-                    checker.record_session_approval(tool, true);
-                }
+            {
+                let mut checker = self.checker.lock().unwrap();
+                checker.record_session_approval(tool, true);
             }
         }
 
@@ -611,15 +610,15 @@ impl PermissionHook for BackgroundAgentDenyHook {
         request: &PermissionRequest,
         _mode: crate::permissions::PermissionMode,
     ) -> Result<Option<PermissionResult>, PermissionRequestError> {
-        if let Some(exec_mode) = request.context.get("execution_mode") {
-            if exec_mode == "background" || exec_mode == "agent" {
-                return Ok(Some(PermissionResult::Deny {
-                    reason: format!(
-                        "tool '{}' denied in background agent mode",
-                        request.tool_name
-                    ),
-                }));
-            }
+        if let Some(exec_mode) = request.context.get("execution_mode")
+            && (exec_mode == "background" || exec_mode == "agent")
+        {
+            return Ok(Some(PermissionResult::Deny {
+                reason: format!(
+                    "tool '{}' denied in background agent mode",
+                    request.tool_name
+                ),
+            }));
         }
         Ok(None)
     }

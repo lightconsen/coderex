@@ -81,14 +81,14 @@ impl ToolCache {
         let entry = self.inner.get(&key).await?;
 
         // TTL is handled by moka, but we still need mtime checks
-        if tool_name == "Read" {
-            if let Some(ref path_str) = entry.file_path {
-                let current_mtime = std::fs::metadata(path_str).and_then(|m| m.modified()).ok();
-                if current_mtime != entry.file_mtime {
-                    // File changed — invalidate
-                    self.inner.invalidate(&key).await;
-                    return None;
-                }
+        if tool_name == "Read"
+            && let Some(ref path_str) = entry.file_path
+        {
+            let current_mtime = std::fs::metadata(path_str).and_then(|m| m.modified()).ok();
+            if current_mtime != entry.file_mtime {
+                // File changed — invalidate
+                self.inner.invalidate(&key).await;
+                return None;
             }
         }
 

@@ -997,12 +997,12 @@ impl AnthropicApiClient {
         let shape = crate::providers::cloud::RequestShape::for_provider(cloud.kind);
         shape.apply_to_body(body);
 
-        if shape.model_in_path {
-            if let Some(object) = body.as_object_mut() {
-                // The model is in the path now; Bedrock rejects a body that
-                // names it as well.
-                object.remove("model");
-            }
+        if shape.model_in_path
+            && let Some(object) = body.as_object_mut()
+        {
+            // The model is in the path now; Bedrock rejects a body that
+            // names it as well.
+            object.remove("model");
         }
         let _ = model_name;
     }
@@ -1251,10 +1251,9 @@ impl AnthropicApiClient {
             .and_then(|ctx| ctx.session_id.clone())
             .or_else(|| self.config.session_id.clone())
             .or_else(|| std::env::var("CODEREX_SESSION_ID").ok())
+            && !session_id.trim().is_empty()
         {
-            if !session_id.trim().is_empty() {
-                req = req.header("X-CodeRex-Session-Id", session_id);
-            }
+            req = req.header("X-CodeRex-Session-Id", session_id);
         }
 
         if let Some(agent_id) = self
@@ -1262,10 +1261,9 @@ impl AnthropicApiClient {
             .request_context
             .as_ref()
             .and_then(|ctx| ctx.agent_id.clone())
+            && !agent_id.trim().is_empty()
         {
-            if !agent_id.trim().is_empty() {
-                req = req.header("X-CodeRex-Agent-Id", agent_id);
-            }
+            req = req.header("X-CodeRex-Agent-Id", agent_id);
         }
 
         if self.profile_name() == "dashscope" {
@@ -1852,25 +1850,25 @@ fn apply_cache_breakpoints(body: &mut serde_json::Value) {
         }
     }
 
-    if let Some(serde_json::Value::Array(tools)) = object.get_mut("tools") {
-        if mark_last_block(tools) {
-            breakpoints += 1;
-        }
+    if let Some(serde_json::Value::Array(tools)) = object.get_mut("tools")
+        && mark_last_block(tools)
+    {
+        breakpoints += 1;
     }
 
     if let Some(serde_json::Value::Array(messages)) = object.get_mut("messages") {
-        if breakpoints < 4 {
-            if let Some(last) = messages.last_mut() {
-                if mark_message(last) {
-                    breakpoints += 1;
-                }
-            }
+        if breakpoints < 4
+            && let Some(last) = messages.last_mut()
+            && mark_message(last)
+        {
+            breakpoints += 1;
         }
         let message_count = messages.len();
-        if breakpoints < 4 && message_count >= 2 {
-            if let Some(second_to_last) = messages.get_mut(message_count - 2) {
-                let _ = mark_message(second_to_last);
-            }
+        if breakpoints < 4
+            && message_count >= 2
+            && let Some(second_to_last) = messages.get_mut(message_count - 2)
+        {
+            let _ = mark_message(second_to_last);
         }
     }
 }

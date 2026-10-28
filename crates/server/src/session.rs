@@ -425,12 +425,11 @@ impl Shared {
     fn disconnect(&mut self, session_id: &str) -> bool {
         self.engines.remove(session_id);
         let removed = self.sessions.remove(session_id).is_some();
-        if removed {
-            if let Some(ref mut store) = self.store {
-                if let Err(e) = store.remove(session_id) {
-                    warn!("Failed to remove session {session_id} from store: {e}");
-                }
-            }
+        if removed
+            && let Some(ref mut store) = self.store
+            && let Err(e) = store.remove(session_id)
+        {
+            warn!("Failed to remove session {session_id} from store: {e}");
         }
         removed
     }
@@ -807,14 +806,13 @@ impl Connection {
                                             id: id.clone(),
                                             kind: WsResponseKind::StreamChunk { chunk },
                                         };
-                                        if let Ok(json) = serde_json::to_string(&frame) {
-                                            if out.send(json).is_err() {
+                                        if let Ok(json) = serde_json::to_string(&frame)
+                                            && out.send(json).is_err() {
                                                 // The client is gone; the
                                                 // connection loop will interrupt
                                                 // the turn on disconnect.
                                                 break Err("client disconnected".to_string());
                                             }
-                                        }
                                     }
                                 }
                                 result = &mut submit => break result,

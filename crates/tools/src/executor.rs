@@ -166,12 +166,11 @@ async fn run_tool_call(
     let cap = output_cap(config, tool.capabilities());
 
     // Try cache for read-only tools
-    if desc.is_read_only {
-        if let Some(cache) = cache {
-            if let Some(cached) = cache.get(&desc.name, &input.arguments).await {
-                return Ok(truncate_output(cached, cap));
-            }
-        }
+    if desc.is_read_only
+        && let Some(cache) = cache
+        && let Some(cached) = cache.get(&desc.name, &input.arguments).await
+    {
+        return Ok(truncate_output(cached, cap));
     }
 
     let result = timeout(config.default_timeout, tool.execute(input.clone(), ctx))
@@ -183,12 +182,12 @@ async fn run_tool_call(
     let result = result.map(|output| truncate_output(output, cap));
 
     // Cache successful read-only results
-    if desc.is_read_only {
-        if let (Some(cache), Ok(output)) = (cache, &result) {
-            cache
-                .insert(&desc.name, &input.arguments, output.clone())
-                .await;
-        }
+    if desc.is_read_only
+        && let (Some(cache), Ok(output)) = (cache, &result)
+    {
+        cache
+            .insert(&desc.name, &input.arguments, output.clone())
+            .await;
     }
 
     result

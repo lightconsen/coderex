@@ -1928,11 +1928,11 @@ fn spawn_legacy_sse_server() -> (SocketAddr, Arc<std::sync::Mutex<Vec<String>>>)
                     )),
                     _ => None,
                 };
-                if let Some(event) = event {
-                    if let Some(sse) = open_stream.lock().unwrap().as_mut() {
-                        sse.write_all(event.as_bytes()).unwrap();
-                        sse.flush().unwrap();
-                    }
+                if let Some(event) = event
+                    && let Some(sse) = open_stream.lock().unwrap().as_mut()
+                {
+                    sse.write_all(event.as_bytes()).unwrap();
+                    sse.flush().unwrap();
                 }
             });
         }

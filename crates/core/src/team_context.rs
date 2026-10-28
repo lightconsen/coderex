@@ -258,12 +258,12 @@ impl SessionPointerStore {
 
     /// Update the last-active timestamp for a session.
     pub fn touch(&mut self, project_hash: &str, session_id: &str, timestamp: u64) {
-        if let Some(entries) = self.sessions.get_mut(project_hash) {
-            if let Some(entry) = entries.iter_mut().find(|e| e.session_id == session_id) {
-                entry.last_active_at = timestamp;
-                // Re-sort
-                entries.sort_by_key(|e| std::cmp::Reverse(e.last_active_at));
-            }
+        if let Some(entries) = self.sessions.get_mut(project_hash)
+            && let Some(entry) = entries.iter_mut().find(|e| e.session_id == session_id)
+        {
+            entry.last_active_at = timestamp;
+            // Re-sort
+            entries.sort_by_key(|e| std::cmp::Reverse(e.last_active_at));
         }
     }
 

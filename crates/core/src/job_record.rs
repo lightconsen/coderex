@@ -353,11 +353,11 @@ pub fn adopt(records: &[JobRecord], now_ms: i64, session_id: &str) -> AdoptOutco
     let mut outcome = AdoptOutcome::default();
 
     for record in records {
-        if let Some(owner) = record.session_id.as_deref() {
-            if owner != session_id {
-                outcome.foreign.push(record.clone());
-                continue;
-            }
+        if let Some(owner) = record.session_id.as_deref()
+            && owner != session_id
+        {
+            outcome.foreign.push(record.clone());
+            continue;
         }
 
         if record.state.is_terminal() {

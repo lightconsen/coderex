@@ -444,19 +444,13 @@ impl Bridge {
             self.permission_relay.forget(request_id);
             if let Some(resp) = self.permission_router.get_response(&router_id) {
                 let allowed = matches!(resp, PermissionResponse::Allow { .. });
-                if allowed {
-                    if let Some(ref request) = pending {
-                        // Keyed by the id the person actually saw and the
-                        // relayed call will carry.
-                        self.relay_approvals.confirm(
-                            request_id,
-                            ApprovedIntent::for_call(
-                                &request.session_id,
-                                &request.tool,
-                                &request.args,
-                            ),
-                        );
-                    }
+                if allowed && let Some(ref request) = pending {
+                    // Keyed by the id the person actually saw and the
+                    // relayed call will carry.
+                    self.relay_approvals.confirm(
+                        request_id,
+                        ApprovedIntent::for_call(&request.session_id, &request.tool, &request.args),
+                    );
                 }
                 self.emit(BridgeEvent::PermissionResolved {
                     request_id: request_id.to_string(),
@@ -704,10 +698,9 @@ impl Bridge {
                     .heartbeat_loop
                     .as_ref()
                     .map(super::heartbeat::HeartbeatLoop::heartbeat)
+                    && let Ok(mut beat) = heartbeat.lock()
                 {
-                    if let Ok(mut beat) = heartbeat.lock() {
-                        beat.record_success();
-                    }
+                    beat.record_success();
                 }
                 Some(transport_reply(message, "heartbeat_ack", "{}".into()))
             }
@@ -1052,10 +1045,10 @@ impl Bridge {
         }
 
         // Clean up worktree if created
-        if let Some(session) = self.sessions.remove(session_id) {
-            if session.worktree_created {
-                let _ = self.spawner.cleanup_worktree(session_id);
-            }
+        if let Some(session) = self.sessions.remove(session_id)
+            && session.worktree_created
+        {
+            let _ = self.spawner.cleanup_worktree(session_id);
         }
 
         // The session was transitioned through Completed above.
@@ -1077,12 +1070,12 @@ impl Bridge {
     /// Every non-terminal state has an edge to `Failed`; a session already in
     /// a terminal state keeps the state it reached first.
     pub fn fail_session(&mut self, session_id: &str, reason: String) {
-        if let Some(session) = self.sessions.get_mut(session_id) {
-            if !session.state_machine.is_terminal() {
-                let _ = session
-                    .state_machine
-                    .transition(BridgeSessionState::Failed(reason.clone()));
-            }
+        if let Some(session) = self.sessions.get_mut(session_id)
+            && !session.state_machine.is_terminal()
+        {
+            let _ = session
+                .state_machine
+                .transition(BridgeSessionState::Failed(reason.clone()));
         }
         // A failed session never reaches `complete_session`, so its process
         // entry has to be dropped here or it would stay in the registry

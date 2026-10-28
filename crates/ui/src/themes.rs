@@ -620,11 +620,11 @@ impl ThemeManager {
             if path.extension().and_then(|e| e.to_str()) != Some("json") {
                 continue;
             }
-            if let Ok(content) = std::fs::read_to_string(&path) {
-                if let Ok(theme) = Theme::from_json(&content) {
-                    self.themes.insert(theme.name.clone(), theme);
-                    count += 1;
-                }
+            if let Ok(content) = std::fs::read_to_string(&path)
+                && let Ok(theme) = Theme::from_json(&content)
+            {
+                self.themes.insert(theme.name.clone(), theme);
+                count += 1;
             }
         }
         Ok(count)
@@ -748,18 +748,18 @@ impl ThemeManager {
 
             let mut watcher =
                 match notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-                    if let Ok(event) = res {
-                        if matches!(
+                    if let Ok(event) = res
+                        && matches!(
                             event.kind,
                             EventKind::Modify(_) | EventKind::Create(_) | EventKind::Remove(_)
-                        ) {
-                            let has_json = event
-                                .paths
-                                .iter()
-                                .any(|p| p.extension().and_then(|e| e.to_str()) == Some("json"));
-                            if has_json {
-                                let _ = tx.send(());
-                            }
+                        )
+                    {
+                        let has_json = event
+                            .paths
+                            .iter()
+                            .any(|p| p.extension().and_then(|e| e.to_str()) == Some("json"));
+                        if has_json {
+                            let _ = tx.send(());
                         }
                     }
                 }) {

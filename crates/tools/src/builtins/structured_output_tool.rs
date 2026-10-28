@@ -97,68 +97,66 @@ fn validate_node(
     };
 
     // Type check
-    if let Some(type_val) = obj.get("type") {
-        if let Some(type_str) = type_val.as_str() {
-            let matches = match type_str {
-                "string" => value.is_string(),
-                "number" => value.is_number(),
-                "integer" => value.is_i64() || value.is_u64(),
-                "boolean" => value.is_boolean(),
-                "array" => value.is_array(),
-                "object" => value.is_object(),
-                "null" => value.is_null(),
-                _ => true,
+    if let Some(type_val) = obj.get("type")
+        && let Some(type_str) = type_val.as_str()
+    {
+        let matches = match type_str {
+            "string" => value.is_string(),
+            "number" => value.is_number(),
+            "integer" => value.is_i64() || value.is_u64(),
+            "boolean" => value.is_boolean(),
+            "array" => value.is_array(),
+            "object" => value.is_object(),
+            "null" => value.is_null(),
+            _ => true,
+        };
+        if !matches {
+            return ValidationResult {
+                is_valid: false,
+                error: format!("{path}: expected type '{type_str}'"),
             };
-            if !matches {
-                return ValidationResult {
-                    is_valid: false,
-                    error: format!("{path}: expected type '{type_str}'"),
-                };
-            }
         }
     }
 
     // Enum check
-    if let Some(enum_val) = obj.get("enum") {
-        if let Some(arr) = enum_val.as_array() {
-            if !arr.contains(value) {
-                return ValidationResult {
-                    is_valid: false,
-                    error: format!("{path}: value not in enum"),
-                };
-            }
-        }
+    if let Some(enum_val) = obj.get("enum")
+        && let Some(arr) = enum_val.as_array()
+        && !arr.contains(value)
+    {
+        return ValidationResult {
+            is_valid: false,
+            error: format!("{path}: value not in enum"),
+        };
     }
 
     // Object properties
     if value.is_object() {
         // Required
-        if let Some(req) = obj.get("required") {
-            if let Some(arr) = req.as_array() {
-                for r in arr {
-                    if let Some(key) = r.as_str() {
-                        if value.get(key).is_none() {
-                            return ValidationResult {
-                                is_valid: false,
-                                error: format!("{path}: missing required field '{key}'"),
-                            };
-                        }
-                    }
+        if let Some(req) = obj.get("required")
+            && let Some(arr) = req.as_array()
+        {
+            for r in arr {
+                if let Some(key) = r.as_str()
+                    && value.get(key).is_none()
+                {
+                    return ValidationResult {
+                        is_valid: false,
+                        error: format!("{path}: missing required field '{key}'"),
+                    };
                 }
             }
         }
 
         // Properties
-        if let Some(props) = obj.get("properties") {
-            if let Some(prop_obj) = props.as_object() {
-                if let Some(val_obj) = value.as_object() {
-                    for (key, prop_schema) in prop_obj {
-                        if let Some(val) = val_obj.get(key) {
-                            let child = validate_node(prop_schema, val, &format!("{path}.{key}"));
-                            if !child.is_valid {
-                                return child;
-                            }
-                        }
+        if let Some(props) = obj.get("properties")
+            && let Some(prop_obj) = props.as_object()
+            && let Some(val_obj) = value.as_object()
+        {
+            for (key, prop_schema) in prop_obj {
+                if let Some(val) = val_obj.get(key) {
+                    let child = validate_node(prop_schema, val, &format!("{path}.{key}"));
+                    if !child.is_valid {
+                        return child;
                     }
                 }
             }
@@ -166,15 +164,14 @@ fn validate_node(
     }
 
     // Array items
-    if value.is_array() {
-        if let Some(items) = obj.get("items") {
-            if let Some(arr) = value.as_array() {
-                for (i, item) in arr.iter().enumerate() {
-                    let child = validate_node(items, item, &format!("{path}[{i}]"));
-                    if !child.is_valid {
-                        return child;
-                    }
-                }
+    if value.is_array()
+        && let Some(items) = obj.get("items")
+        && let Some(arr) = value.as_array()
+    {
+        for (i, item) in arr.iter().enumerate() {
+            let child = validate_node(items, item, &format!("{path}[{i}]"));
+            if !child.is_valid {
+                return child;
             }
         }
     }

@@ -156,12 +156,12 @@ fn resolve_path(file_path: &str, cwd: &std::path::Path) -> String {
         // Some providers occasionally emit repo-relative paths with a leading
         // slash (e.g. "/src/lib.rs"). If that absolute path does not exist but
         // `<cwd>/<trimmed>` does, prefer the workspace-local file.
-        if !path.exists() {
-            if let Ok(trimmed) = path.strip_prefix("/") {
-                let candidate = cwd.join(trimmed);
-                if candidate.exists() {
-                    return candidate.to_string_lossy().to_string();
-                }
+        if !path.exists()
+            && let Ok(trimmed) = path.strip_prefix("/")
+        {
+            let candidate = cwd.join(trimmed);
+            if candidate.exists() {
+                return candidate.to_string_lossy().to_string();
             }
         }
         file_path.to_string()

@@ -474,10 +474,10 @@ impl RequestContext {
             return;
         };
         let value = value.trim();
-        if !value.is_empty() {
-            if let Ok(mut slot) = self.session_id.write() {
-                *slot = Some(value.to_string());
-            }
+        if !value.is_empty()
+            && let Ok(mut slot) = self.session_id.write()
+        {
+            *slot = Some(value.to_string());
         }
     }
 
@@ -488,10 +488,10 @@ impl RequestContext {
             .and_then(Value::as_str)
             .unwrap_or(DEFAULT_PROTOCOL_VERSION)
             .trim();
-        if !version.is_empty() {
-            if let Ok(mut slot) = self.protocol_version.write() {
-                *slot = Some(version.to_string());
-            }
+        if !version.is_empty()
+            && let Ok(mut slot) = self.protocol_version.write()
+        {
+            *slot = Some(version.to_string());
         }
     }
 
@@ -1263,10 +1263,10 @@ impl HttpChannel {
 
     /// Cancel the stream without awaiting it (used by `Drop` and by restart).
     fn stop_event_stream_now(&self) {
-        if let Ok(mut slot) = self.event_stream.lock() {
-            if let Some(handle) = slot.take() {
-                handle.cancel.cancel();
-            }
+        if let Ok(mut slot) = self.event_stream.lock()
+            && let Some(handle) = slot.take()
+        {
+            handle.cancel.cancel();
         }
     }
 
@@ -2104,10 +2104,10 @@ async fn read_event_stream_once(
                 // merely the last one read: an event the worker could not
                 // handle (a keep-alive, an unparseable payload) must not move
                 // `Last-Event-ID` past it, or a reconnect could skip it.
-                if let Some(id) = event_id {
-                    if let Ok(mut slot) = worker_last_id.lock() {
-                        *slot = Some(id);
-                    }
+                if let Some(id) = event_id
+                    && let Ok(mut slot) = worker_last_id.lock()
+                {
+                    *slot = Some(id);
                 }
             }
         }

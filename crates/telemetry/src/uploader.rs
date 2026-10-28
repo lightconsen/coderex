@@ -187,12 +187,11 @@ impl RateLimiter {
     fn allow(&self) -> bool {
         let now = Instant::now();
 
-        if let Ok(suppressed) = self.suppressed_until.lock() {
-            if let Some(until) = *suppressed {
-                if now < until {
-                    return false;
-                }
-            }
+        if let Ok(suppressed) = self.suppressed_until.lock()
+            && let Some(until) = *suppressed
+            && now < until
+        {
+            return false;
         }
 
         let Ok(mut window) = self.window.lock() else {
@@ -493,10 +492,10 @@ impl TelemetryUploader {
         // Channel delivery is best-effort: the first-party upload already
         // succeeded and the rows are marked, so a channel outage is logged
         // rather than retried into a duplicate first-party upload.
-        if let Some(channels) = &self.channels {
-            if let Err(e) = channels.send_events(&events).await {
-                tracing::warn!("telemetry export channel delivery failed: {e}");
-            }
+        if let Some(channels) = &self.channels
+            && let Err(e) = channels.send_events(&events).await
+        {
+            tracing::warn!("telemetry export channel delivery failed: {e}");
         }
 
         // Also upload crash reports

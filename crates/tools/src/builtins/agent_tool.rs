@@ -236,12 +236,12 @@ impl Tool for AgentTool {
                 ..Default::default()
             };
             let mut message_count = 0;
-            if let Some(snapshot) = self.parent_context.as_ref().and_then(|provider| provider()) {
-                if snapshot.has_prefix() {
-                    options.parent_cache_safe_params = Some(snapshot.cache_safe_params());
-                    message_count = snapshot.messages.len();
-                    options.parent_prefix = snapshot.messages;
-                }
+            if let Some(snapshot) = self.parent_context.as_ref().and_then(|provider| provider())
+                && snapshot.has_prefix()
+            {
+                options.parent_cache_safe_params = Some(snapshot.cache_safe_params());
+                message_count = snapshot.messages.len();
+                options.parent_prefix = snapshot.messages;
             }
 
             let mut mgr = manager.lock().await;

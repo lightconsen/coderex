@@ -291,17 +291,16 @@ impl SkillLoader {
         if let Ok(entries) = std::fs::read_dir(dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
-                if path.extension().and_then(|e| e.to_str()) == Some("md") {
-                    if let Ok(content) = std::fs::read_to_string(&path) {
-                        if let Some(skill_file) = parse_skill_file(&content) {
-                            self.skills.push(Skill {
-                                metadata: skill_file.metadata,
-                                source,
-                                path,
-                                plugin_name: None,
-                            });
-                        }
-                    }
+                if path.extension().and_then(|e| e.to_str()) == Some("md")
+                    && let Ok(content) = std::fs::read_to_string(&path)
+                    && let Some(skill_file) = parse_skill_file(&content)
+                {
+                    self.skills.push(Skill {
+                        metadata: skill_file.metadata,
+                        source,
+                        path,
+                        plugin_name: None,
+                    });
                 }
             }
         }

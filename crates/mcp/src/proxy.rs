@@ -198,22 +198,22 @@ impl McpToolRegistry {
     /// [`Self::conflicts`]. Turn the prefix back on to reach it.
     pub fn register(&mut self, info: McpToolInfo) {
         let public = info.qualified_name();
-        if let Some(existing) = self.tools.get(&public) {
-            if existing.server != info.server {
-                tracing::warn!(
-                    tool = %public,
-                    held_by = %existing.server,
-                    refused = %info.server,
-                    "MCP tool name is not unique without the server prefix; \
-                     the later registration was refused"
-                );
-                self.conflicts.push(McpToolNameConflict {
-                    name: info.name,
-                    held_by: existing.server.clone(),
-                    refused: info.server,
-                });
-                return;
-            }
+        if let Some(existing) = self.tools.get(&public)
+            && existing.server != info.server
+        {
+            tracing::warn!(
+                tool = %public,
+                held_by = %existing.server,
+                refused = %info.server,
+                "MCP tool name is not unique without the server prefix; \
+                 the later registration was refused"
+            );
+            self.conflicts.push(McpToolNameConflict {
+                name: info.name,
+                held_by: existing.server.clone(),
+                refused: info.server,
+            });
+            return;
         }
         self.tools.insert(public, info);
     }

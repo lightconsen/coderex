@@ -230,10 +230,10 @@ impl TaskHandle {
     ///
     /// Reads the output file if it exists.
     pub fn get_output(&self) -> Result<Option<String>, std::io::Error> {
-        if let Some(ref path) = self.output_path {
-            if path.exists() {
-                return Ok(Some(std::fs::read_to_string(path)?));
-            }
+        if let Some(ref path) = self.output_path
+            && path.exists()
+        {
+            return Ok(Some(std::fs::read_to_string(path)?));
         }
         Ok(None)
     }
@@ -396,10 +396,10 @@ impl TaskManager {
         if !self.tasks.contains_key(id) {
             return Err(TaskError::NotFound(id.to_string()));
         }
-        if let Some(handle) = self.tasks.get(id) {
-            if handle.is_terminal() {
-                return Err(TaskError::AlreadyTerminated(id.to_string()));
-            }
+        if let Some(handle) = self.tasks.get(id)
+            && handle.is_terminal()
+        {
+            return Err(TaskError::AlreadyTerminated(id.to_string()));
         }
         self.foreground_task_id = Some(id.to_string());
         Ok(())
@@ -459,13 +459,13 @@ impl TaskManager {
 
     /// Remove a terminated task from the manager.
     pub fn remove_task(&mut self, id: &str) -> Result<TaskHandle, TaskError> {
-        if let Some(handle) = self.tasks.get(id) {
-            if !handle.is_terminal() {
-                return Err(TaskError::InvalidTransition {
-                    from: handle.state,
-                    to: TaskState::Stopped,
-                });
-            }
+        if let Some(handle) = self.tasks.get(id)
+            && !handle.is_terminal()
+        {
+            return Err(TaskError::InvalidTransition {
+                from: handle.state,
+                to: TaskState::Stopped,
+            });
         }
         self.tasks
             .remove(id)

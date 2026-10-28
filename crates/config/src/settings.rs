@@ -482,29 +482,29 @@ impl Settings {
 
     /// Validate settings constraints.
     pub fn validate(&self) -> Result<(), ConfigError> {
-        if let Some(ref model) = self.model {
-            if model.trim().is_empty() {
-                return Err(ConfigError::Validation {
-                    field: "model".to_string(),
-                    message: "model must not be empty".to_string(),
-                });
-            }
+        if let Some(ref model) = self.model
+            && model.trim().is_empty()
+        {
+            return Err(ConfigError::Validation {
+                field: "model".to_string(),
+                message: "model must not be empty".to_string(),
+            });
         }
-        if let Some(budget) = self.max_budget_usd {
-            if budget < 0.0 {
-                return Err(ConfigError::Validation {
-                    field: "max_budget_usd".to_string(),
-                    message: "budget must be non-negative".to_string(),
-                });
-            }
+        if let Some(budget) = self.max_budget_usd
+            && budget < 0.0
+        {
+            return Err(ConfigError::Validation {
+                field: "max_budget_usd".to_string(),
+                message: "budget must be non-negative".to_string(),
+            });
         }
-        if let Some(ref mode) = self.permission_mode {
-            if !VALID_PERMISSION_MODES.contains(&mode.as_str()) {
-                return Err(ConfigError::Validation {
-                    field: "permission_mode".to_string(),
-                    message: format!("must be one of: {}", VALID_PERMISSION_MODES.join(", ")),
-                });
-            }
+        if let Some(ref mode) = self.permission_mode
+            && !VALID_PERMISSION_MODES.contains(&mode.as_str())
+        {
+            return Err(ConfigError::Validation {
+                field: "permission_mode".to_string(),
+                message: format!("must be one of: {}", VALID_PERMISSION_MODES.join(", ")),
+            });
         }
         if let Some(ref api_key) = self.api_key {
             if api_key.starts_with("keyring://") {
@@ -523,21 +523,21 @@ impl Settings {
             }
         }
         if let Some(ref telemetry) = self.telemetry {
-            if let Some(sample_rate) = telemetry.sample_rate {
-                if !(0.0..=1.0).contains(&sample_rate) {
-                    return Err(ConfigError::Validation {
-                        field: "telemetry.sample_rate".to_string(),
-                        message: "sample_rate must be between 0.0 and 1.0".to_string(),
-                    });
-                }
+            if let Some(sample_rate) = telemetry.sample_rate
+                && !(0.0..=1.0).contains(&sample_rate)
+            {
+                return Err(ConfigError::Validation {
+                    field: "telemetry.sample_rate".to_string(),
+                    message: "sample_rate must be between 0.0 and 1.0".to_string(),
+                });
             }
-            if let Some(batch_size) = telemetry.batch_size {
-                if batch_size == 0 {
-                    return Err(ConfigError::Validation {
-                        field: "telemetry.batch_size".to_string(),
-                        message: "batch_size must be > 0".to_string(),
-                    });
-                }
+            if let Some(batch_size) = telemetry.batch_size
+                && batch_size == 0
+            {
+                return Err(ConfigError::Validation {
+                    field: "telemetry.batch_size".to_string(),
+                    message: "batch_size must be > 0".to_string(),
+                });
             }
         }
         if let Some(ref provider) = self.provider {
@@ -1298,13 +1298,13 @@ pub(crate) fn finalize_settings(
 ) -> Result<Settings, ConfigError> {
     migrate_settings(&mut settings, source);
 
-    if let Some(mode) = settings.permission_mode.as_deref() {
-        if !VALID_PERMISSION_MODES.contains(&mode) {
-            tracing::warn!(
-                "invalid permission_mode '{mode}' in {source} settings — ignoring it (falling back to a more restrictive mode)"
-            );
-            settings.permission_mode = None;
-        }
+    if let Some(mode) = settings.permission_mode.as_deref()
+        && !VALID_PERMISSION_MODES.contains(&mode)
+    {
+        tracing::warn!(
+            "invalid permission_mode '{mode}' in {source} settings — ignoring it (falling back to a more restrictive mode)"
+        );
+        settings.permission_mode = None;
     }
 
     settings.validate()?;
@@ -1380,10 +1380,10 @@ pub fn resolve_api_key(api_key: &str) -> String {
     if let Some(item) = api_key.strip_prefix("keyring://") {
         #[cfg(feature = "keyring")]
         {
-            if let Ok(entry) = keyring::Entry::new("coderex", item) {
-                if let Ok(secret) = entry.get_password() {
-                    return secret;
-                }
+            if let Ok(entry) = keyring::Entry::new("coderex", item)
+                && let Ok(secret) = entry.get_password()
+            {
+                return secret;
             }
             tracing::warn!("keyring lookup failed for '{item}', returning reference as-is");
         }

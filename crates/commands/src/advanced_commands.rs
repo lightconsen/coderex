@@ -153,31 +153,29 @@ pub fn register(registry: &mut CommandRegistry) {
                                 ctx.session_id, total_msgs
                             );
                             for line in lines.iter().take(10) {
-                                if let Ok(msg) = serde_json::from_str::<serde_json::Value>(line) {
-                                    if let Some(role) = msg.get("role").and_then(|r| r.as_str()) {
-                                        let preview = msg
-                                            .get("content")
-                                            .and_then(|c| c.as_str())
-                                            .map_or_else(
-                                                || "(non-text)".to_string(),
-                                                |s| {
-                                                    let s = s.trim();
-                                                    if s.len() > 60 {
-                                                        format!("{}...", &s[..57])
-                                                    } else {
-                                                        s.to_string()
-                                                    }
-                                                },
-                                            );
-                                        let role_label = match role {
-                                            "user" => "User",
-                                            "assistant" => "Assistant",
-                                            "tool" => "Tool",
-                                            "system" => "System",
-                                            _ => role,
-                                        };
-                                        let _ = writeln!(output, "  [{role_label}] {preview}");
-                                    }
+                                if let Ok(msg) = serde_json::from_str::<serde_json::Value>(line)
+                                    && let Some(role) = msg.get("role").and_then(|r| r.as_str())
+                                {
+                                    let preview =
+                                        msg.get("content").and_then(|c| c.as_str()).map_or_else(
+                                            || "(non-text)".to_string(),
+                                            |s| {
+                                                let s = s.trim();
+                                                if s.len() > 60 {
+                                                    format!("{}...", &s[..57])
+                                                } else {
+                                                    s.to_string()
+                                                }
+                                            },
+                                        );
+                                    let role_label = match role {
+                                        "user" => "User",
+                                        "assistant" => "Assistant",
+                                        "tool" => "Tool",
+                                        "system" => "System",
+                                        _ => role,
+                                    };
+                                    let _ = writeln!(output, "  [{role_label}] {preview}");
                                 }
                             }
                             if total_msgs > 10 {
@@ -210,8 +208,8 @@ pub fn register(registry: &mut CommandRegistry) {
             if ctx.is_feature_enabled("thinkback") {
                 let transcript_dir = std::path::Path::new(&ctx.cwd).join(".coderex/transcripts");
                 let mut found = 0;
-                if transcript_dir.exists() {
-                    if let Ok(entries) = std::fs::read_dir(&transcript_dir) {
+                if transcript_dir.exists()
+                    && let Ok(entries) = std::fs::read_dir(&transcript_dir) {
                         for entry in entries.flatten() {
                             let path = entry.path();
                             if path.extension().is_some_and(|e| e == "jsonl") {
@@ -219,7 +217,6 @@ pub fn register(registry: &mut CommandRegistry) {
                             }
                         }
                     }
-                }
                 if found == 0 {
                     return CommandResult::success(
                         "Thinkback Play\n─────────────\nNo transcripts found; there is nothing to replay.",

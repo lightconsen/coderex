@@ -82,14 +82,12 @@ impl Tool for EditTool {
             .extra
             .get("sandbox_config")
             .and_then(|value| value.downcast_ref::<coderex_core::sandbox::SandboxConfig>())
+            && (!crate::sandbox_policy::is_path_allowed(&actual, &config.allowed_read_paths)
+                || !crate::sandbox_policy::is_path_allowed(&actual, &config.allowed_write_paths))
         {
-            if !crate::sandbox_policy::is_path_allowed(&actual, &config.allowed_read_paths)
-                || !crate::sandbox_policy::is_path_allowed(&actual, &config.allowed_write_paths)
-            {
-                return Err(ToolError::PermissionDenied {
-                    name: "Edit".into(),
-                });
-            }
+            return Err(ToolError::PermissionDenied {
+                name: "Edit".into(),
+            });
         }
         let mut content = String::new();
         verified
