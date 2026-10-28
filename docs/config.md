@@ -16,7 +16,6 @@ Configuration layers: defaults → user config (`~/.coderex/settings.json`) → 
 - **`RuntimeOverrides`** (`settings.rs`) — Environment-variable and CLI-arg overrides.
 - **`ConfigError`** (`settings.rs`) — Error enum with `Io`, `Json`, `Validation`, `UnknownField`, and `TooLarge` variants.
 - **`ConfigDiff`/`ConfigDiffEntry`** (`settings.rs`) — Structured diff between current settings and defaults with `render()` for human-readable output.
-- **`ConfigWatcher`** (`settings.rs`) — File watcher for the user and project settings files. Enabled by the `hot-reload` feature (on by default in `coderex-cli`). Its watch channel carries `Vec<String>` — the paths from the `notify` event — so a consumer can name what changed. The TUI loop consumes the receiver and fires the `FileChanged` hook; the headless one-shot path has no loop to drain it. The watcher object must be kept alive: dropping it stops `notify` and closes the channel.
 - **`config_home()`** (`settings.rs`) — Returns `~/.coderex`.
 - **`managed.rs`** — OS-level managed-settings carriers. `load_managed_plist` converts a macOS MDM property list (via the `plist` crate) to `Settings`; `load_managed_registry` reads `HKLM\SOFTWARE\CodeRex` (via `winreg`, Windows-only) and converts registry values to `Settings`. `default_managed_plist_path`, `DEFAULT_MACOS_MANAGED_PLIST_DOMAIN` and `WINDOWS_MANAGED_REGISTRY_KEY` expose the defaults.
 - **`TelemetrySubConfig`** (`settings.rs`) — Endpoint/batch/sampling settings plus optional export-channel settings: `otlp_endpoint`, `otlp_headers`, `datadog_api_key`, `datadog_site`, `datadog_endpoint` (see [`docs/telemetry.md`](telemetry.md#channels)). `strict: true` enables the strict/HIPAA redaction mode; it is OR-ed with `CODEREX_HIPAA` and can only add the stricter mode, never remove it.
@@ -138,6 +137,24 @@ choice as `statusline.theme`) or set that key directly:
 
 ```json
 { "statusline": { "theme": "light" } }
+```
+
+`statusline.format` replaces the default statusline layout with a template.
+Placeholders are bracketed and expanded from session state:
+
+| Placeholder | Value |
+|---|---|
+| `[model]` | active model id |
+| `[title]` | session title (shown once a title has been generated) |
+| `[tokens]` | total tokens used in the session |
+| `[cost]` | session cost |
+| `[branch]` | current git branch |
+
+An unknown placeholder is left visible as written, so a typo is visible rather
+than silently dropped; an empty template falls back to the default layout.
+
+```json
+{ "statusline": { "format": "[branch] > [model] ([tokens])", "theme": "dark" } }
 ```
 
 Custom themes are JSON files in `~/.coderex/themes/`. The theme is keyed by

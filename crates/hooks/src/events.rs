@@ -52,7 +52,7 @@ pub enum HookEvent {
     CwdChanged,
     /// When a file changes.
     ///
-    /// Fired by the REPL's TUI loop when `coderex_config::ConfigWatcher`
+    /// Fired by the REPL's TUI loop when its settings-file watcher
     /// reports a change to the user or project settings file. The hook input
     /// and its `paths` context entry name the changed paths. The watcher is
     /// drained only by the long-lived TUI loop: a headless one-shot run has
@@ -191,7 +191,7 @@ impl HookEvent {
     /// - `TaskCompleted` — the `TaskUpdate` tool
     /// - `CwdChanged` — `coderex_tools::RegistryToolDispatcher::set_cwd`
     /// - `Setup` — the REPL, when `/init` succeeds
-    /// - `FileChanged` — the REPL's TUI loop, when `ConfigWatcher` reports a
+    /// - `FileChanged` — the REPL's TUI loop, when its settings watcher reports a
     ///   settings-file change (not the headless one-shot path)
     ///
     /// Every name CodeRex accepts is fired somewhere; there are no reserved

@@ -40,7 +40,7 @@ pub use task_store::{TASK_STORE_KEY, TaskRecord, TaskStatus, TaskStore};
 pub use todo_store::{TODO_STORE_KEY, TodoItem, TodoStatus, TodoStore};
 pub use tool::{
     Backgrounding, ElicitRequest, InterruptBehavior, MaxResultSizeChars, RuleContentField, Tool,
-    ToolCapabilities, ToolContext, ToolDescriptor, ToolInput, ToolTier,
+    ToolCapabilities, ToolContext, ToolDescriptor, ToolInput, ToolTier, fire_tool_hook,
 };
 pub use tool_cache::{ToolCache, ToolCacheConfig};
 

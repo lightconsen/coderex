@@ -134,20 +134,18 @@ impl RegistryToolDispatcher {
         self.feature_flags.read().clone()
     }
 
-    /// Move the working directory tools run in.
+    /// Fire `CwdChanged` for a move that happened before hooks were installed.
     ///
-    /// Used when the session is given a checkout of its own — a worktree — so
-    /// the tools work where the session says it is. Moving the session fires
-    /// the `CwdChanged` hook with the old and new directories.
-    pub fn set_cwd(&self, cwd: PathBuf) {
-        let previous = std::mem::replace(&mut *self.cwd.write(), cwd.clone());
-        if previous == cwd {
-            return;
-        }
-        // The setter is synchronous — the CLI calls it while moving the
-        // session into a worktree — so the fire is spawned onto the current
-        // runtime. With no runtime (a bare test context) there is nothing to
-        // fire on.
+    /// `set_cwd` fires the hook itself, but the CLI moves the session into a
+    /// worktree during startup, before the settings hooks are loaded. Without
+    /// this the event existed and never fired in production. The caller
+    /// supplies the directory the session came from.
+    pub fn refire_cwd_changed(&self, previous: PathBuf) {
+        let cwd = self.cwd.read().clone();
+        self.fire_cwd_changed(previous, cwd);
+    }
+
+    fn fire_cwd_changed(&self, previous: PathBuf, cwd: PathBuf) {
         let Some(hooks) = self.hooks.read().clone() else {
             return;
         };
@@ -168,6 +166,23 @@ impl RegistryToolDispatcher {
                 tracing::warn!(errors = ?result.errors, "CwdChanged hook errors");
             }
         });
+    }
+
+    /// Move the working directory tools run in.
+    ///
+    /// Used when the session is given a checkout of its own — a worktree — so
+    /// the tools work where the session says it is. Moving the session fires
+    /// the `CwdChanged` hook with the old and new directories.
+    pub fn set_cwd(&self, cwd: PathBuf) {
+        let previous = std::mem::replace(&mut *self.cwd.write(), cwd.clone());
+        if previous == cwd {
+            return;
+        }
+        // The setter is synchronous — the CLI calls it while moving the
+        // session into a worktree — so the fire is spawned onto the current
+        // runtime. With no runtime (a bare test context) there is nothing to
+        // fire on.
+        self.fire_cwd_changed(previous, cwd);
     }
 
     /// Give the dispatcher the session's hook executor.
@@ -1959,6 +1974,43 @@ mod tests {
         };
         assert_eq!(input, "/tmp/moved");
         assert_eq!(context.get("cwd").map(String::as_str), Some("/tmp/moved"));
+        assert_eq!(
+            context.get("previous_cwd").map(String::as_str),
+            Some("/tmp")
+        );
+    }
+
+    /// A move made before hooks existed is replayed once they are installed.
+    ///
+    /// `--worktree` moves the session during startup, before the settings
+    /// hooks are loaded; without the replay `CwdChanged` existed and never
+    /// fired in production.
+    #[tokio::test]
+    async fn a_move_made_before_the_hooks_were_installed_is_replayed() {
+        let dispatcher = dispatcher_with_webfetch_and_echo();
+        dispatcher.set_cwd(PathBuf::from("/tmp/worktree"));
+        assert!(
+            dispatcher.hooks.read().is_none(),
+            "the fixture installed hooks too early"
+        );
+
+        let hooks = Arc::new(RecordingHooks::default());
+        dispatcher.set_hooks(hooks.clone() as Arc<dyn coderex_core::hook_executor::HookExecutor>);
+        dispatcher.refire_cwd_changed(PathBuf::from("/tmp"));
+
+        for _ in 0..50 {
+            if !hooks.fired.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        let fired = hooks.fired.lock().unwrap();
+        let (_, input, context) = fired
+            .iter()
+            .find(|(name, _, _)| name == "CwdChanged")
+            .expect("CwdChanged was not replayed");
+        assert_eq!(input, "/tmp/worktree");
         assert_eq!(
             context.get("previous_cwd").map(String::as_str),
             Some("/tmp")

@@ -100,7 +100,7 @@ tokio-tungstenite.workspace = true
 default = ["core", "hot-reload"]
 core = []
 full = ["core"]
-hot-reload = ["coderex-config/hot-reload", "dep:notify"]
+hot-reload = ["dep:notify"]
 enterprise = ["full", "coderex-config/enterprise"]
 
 [package.metadata.dist]

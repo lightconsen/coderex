@@ -28,7 +28,6 @@ pub mod markdown;
 pub mod model_router;
 pub mod orchestrator;
 pub mod permission_engine;
-pub mod permission_manager;
 pub mod permissions;
 pub mod process_tree;
 pub mod prompt;
@@ -39,6 +38,7 @@ pub mod provider_router;
 pub mod providers;
 pub mod query_profiles;
 pub mod runtime;
+pub mod runtime_snapshot;
 pub mod sandbox;
 pub mod sandbox_windows;
 pub mod scheduler;
@@ -124,10 +124,6 @@ pub use query_profiles::{ModelProfile, PromptProfile, QueryKind, QueryRequest};
 
 pub use confirmation_bus::{
     AutoApproveBus, AutoDenyBus, ConfirmationBus, ConfirmationRequest, ConfirmationResponse,
-};
-
-pub use permission_manager::{
-    PermissionManager, PermissionManagerConfig, PermissionManagerError, RuleGroup,
 };
 
 pub use permission_engine::{

@@ -68,6 +68,15 @@ Implements the `/` slash command system that users type in the REPL. Provides a 
 - Feature-gated commands (`/ultraplan`, `/thinkback`, `/thinkback-play`, `/voice`, `/ctx_viz`, `/heapdump`, `/mock-limits`, `/stickers`) check `CommandContext.feature_flags`, which the REPL now fills from the resolved `FeatureFlags` (env + `--betas`).
 - `/bridge` and `/bridge-kick` check `CODEREX_BRIDGE_URL` env var.
 - `/insights` aggregates project file counts, git info, and session token usage.
+- `/ultraplan` activates a session-scoped planning mode: it adds multi-phase planning
+  instructions to the prompt and writes nothing to `settings.json` (`ultraplan` is not a
+  settings key, so persisting it would make the next load reject the whole file).
+- `/thinkback-play` reviews the saved transcripts and hands the session a prompt for the
+  next turn — the same `extra_context` + `append_system_prompt` mechanism `/advisor` uses.
+  With no transcripts it says so instead of promising a turn.
+- `/heapdump` writes a process snapshot (version, OS, pid, RSS/VSZ/threads, open file
+  descriptors) to `/tmp/coderex-heap.prof` and reports the byte count. It is a process
+  snapshot, not a heap profile, and the command says so in its output.
 - Command chaining via `|` operator (e.g., `/diff | /commit`) passes output between commands.
 - Command history is recorded for built-ins and registry commands alike (both REPL paths record before dispatch) and persisted; `/history` reads it, with `[n]` and `search <query>`.
 - `/macro define|list|run|delete` is a REPL built-in backed by `~/.coderex/macros.json`; macro names also expand directly.

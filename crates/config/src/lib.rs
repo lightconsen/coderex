@@ -28,8 +28,6 @@ pub use remote_settings::{
     FetchState, LoadingBarrier, RemoteManagedSettings, RemoteManagedSettingsClient,
     RemoteSettingsError, RemoteSettingsManager, RemoteSettingsResponse,
 };
-#[cfg(feature = "hot-reload")]
-pub use settings::ConfigWatcher;
 pub use settings::{
     CURRENT_SCHEMA_VERSION, ConfigDiff, ConfigDiffEntry, ConfigError, ConfigService, HookLayers,
     MarketplaceSetting, PermissionsSettings, PluginHostSettings, ProviderSettings,

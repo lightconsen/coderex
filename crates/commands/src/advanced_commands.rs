@@ -4,48 +4,6 @@ use crate::registry::{CommandContext, CommandRegistry, CommandResult, SlashComma
 use std::fmt::Write as _;
 use std::sync::Arc;
 
-thread_local! {
-    static TEST_CONFIG_HOME: std::cell::RefCell<Option<std::path::PathBuf>> = const { std::cell::RefCell::new(None) };
-}
-
-#[cfg(test)]
-fn set_test_config_home(path: std::path::PathBuf) {
-    TEST_CONFIG_HOME.with(|h| *h.borrow_mut() = Some(path));
-}
-
-fn config_home() -> std::path::PathBuf {
-    TEST_CONFIG_HOME.with(|h| {
-        h.borrow()
-            .clone()
-            .unwrap_or_else(coderex_config::settings::config_home)
-    })
-}
-
-/// Read the user settings.json as a JSON object.
-fn read_user_settings() -> Option<serde_json::Map<String, serde_json::Value>> {
-    let path = config_home().join("settings.json");
-    if !path.exists() {
-        return None;
-    }
-    std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-        .and_then(|v| v.as_object().cloned())
-}
-
-/// Write the user settings.json.
-fn write_user_settings(
-    settings: &serde_json::Map<String, serde_json::Value>,
-) -> Result<(), String> {
-    let home = config_home();
-    std::fs::create_dir_all(&home).map_err(|e| e.to_string())?;
-    let path = home.join("settings.json");
-    let value = serde_json::Value::Object(settings.clone());
-    let json = serde_json::to_string_pretty(&value).map_err(|e| e.to_string())?;
-    std::fs::write(&path, json).map_err(|e| e.to_string())?;
-    Ok(())
-}
-
 /// Register advanced commands.
 pub fn register(registry: &mut CommandRegistry) {
     // /bridge — Bridge status/management
@@ -110,18 +68,24 @@ pub fn register(registry: &mut CommandRegistry) {
         true,
         Arc::new(|ctx: &CommandContext, _args: &[String]| {
             if ctx.is_feature_enabled("ultraplan") {
-                let mut settings = read_user_settings().unwrap_or_default();
-                settings.insert(
-                    "ultraplan".to_string(),
-                    serde_json::Value::Bool(true),
-                );
-                let persist_msg = match write_user_settings(&settings) {
-                    Ok(()) => "Saved to settings.json.".to_string(),
-                    Err(e) => format!("Failed to save settings: {e}"),
-                };
-                CommandResult::success(format!(
-                    "Ultra Plan Mode activated.\n(Detailed multi-phase planning enabled)\n{persist_msg}",
-                ))
+                // Session-scoped, like /advisor: there is no cloud planning
+                // backend, so the mode is a prompt instruction. It is not
+                // persisted — `ultraplan` is not a settings key, and writing
+                // one would make the next load reject the whole file.
+                CommandResult::success(
+                    "Ultra Plan Mode activated for this session.\n\
+                     (Multi-phase planning instructions added to the prompt)",
+                )
+                .with_context(
+                    "Ultra Plan mode: before changing files, produce a multi-phase plan \
+                     (goals, constraints, ordered steps, verification for each step) and \
+                     keep it updated as work progresses.",
+                )
+                .with_append_system_prompt(
+                    "You are in Ultra Plan mode. Plan in explicit phases, call out \
+                     assumptions and verification steps, and prefer a short plan over \
+                     immediate edits.",
+                )
                 .with_state_change(true)
             } else {
                 CommandResult::error("ultraplan feature is not enabled.")
@@ -256,9 +220,30 @@ pub fn register(registry: &mut CommandRegistry) {
                         }
                     }
                 }
+                if found == 0 {
+                    return CommandResult::success(
+                        "Thinkback Play\n─────────────\nNo transcripts found; there is nothing to replay.",
+                    );
+                }
+                // The play step is a model turn built from a local transcript
+                // review, not a hidden REPL branch: the command hands the
+                // session a prompt, the way /advisor hands it a profile.
                 CommandResult::success(format!(
-                    "Thinkback Play\n─────────────\nFound {found} transcript file(s).\nUse /thinkback to review before executing.\n(Execution is handled by the REPL.)"
-                )).with_state_change(true)
+                    "Thinkback Play\n─────────────\nFound {found} transcript file(s).\n\
+                     Reviewing them in the next turn."
+                ))
+                .with_context(format!(
+                    "Thinkback Play: review the {found} transcript file(s) under {} \
+                     and propose the concrete next actions they imply. Read only what you \
+                     need before steering the work.",
+                    transcript_dir.display()
+                ))
+                .with_append_system_prompt(
+                    "Thinkback Play: you have just reviewed earlier sessions. Summarise \
+                     what was learned and continue the work from those findings rather than \
+                     starting over.",
+                )
+                .with_state_change(true)
             } else {
                 CommandResult::error("thinkback feature is not enabled.")
             }
@@ -335,8 +320,14 @@ mod tests {
 
     #[test]
     fn ultraplans_when_enabled() {
-        let tmp = tempfile::tempdir().unwrap();
-        set_test_config_home(tmp.path().to_path_buf());
+        let home = tempfile::tempdir().unwrap();
+        // A settings file this command must not touch: `ultraplan` is not a
+        // known settings key, and writing it would make the next load reject
+        // the whole file as an unknown field.
+        let settings_path = home.path().join("settings.json");
+        std::fs::write(&settings_path, r#"{"config_version": 4}"#).unwrap();
+        let before = std::fs::read_to_string(&settings_path).unwrap();
+
         let mut flags = std::collections::HashMap::new();
         flags.insert("ultraplan".into(), true);
         let c = CommandContext {
@@ -351,12 +342,66 @@ mod tests {
         let result = reg.execute("ultraplan", &c, &[]);
         assert!(result.output.contains("Ultra Plan Mode"));
         assert!(result.state_changed);
-        // Verify settings.json was written
-        let settings_path = tmp.path().join("settings.json");
-        assert!(settings_path.exists());
-        let content = std::fs::read_to_string(&settings_path).unwrap();
-        assert!(content.contains("ultraplan"));
-        assert!(content.contains("true"));
+        assert!(
+            result.append_system_prompt.is_some(),
+            "the mode must reach the prompt"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&settings_path).unwrap(),
+            before,
+            "the command rewrote settings.json"
+        );
+    }
+
+    #[test]
+    fn thinkback_play_hands_the_session_a_prompt() {
+        let workspace = tempfile::tempdir().unwrap();
+        let transcripts = workspace.path().join(".coderex/transcripts");
+        std::fs::create_dir_all(&transcripts).unwrap();
+        std::fs::write(transcripts.join("sess_1.jsonl"), "{}\n").unwrap();
+
+        let mut flags = std::collections::HashMap::new();
+        flags.insert("thinkback".into(), true);
+        let c = CommandContext {
+            feature_flags: flags,
+            cwd: workspace.path().to_string_lossy().to_string(),
+            ..ctx()
+        };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
+        let result = reg.execute("thinkback-play", &c, &[]);
+        assert!(result.output.contains("1 transcript"), "{}", result.output);
+        assert!(result.state_changed);
+        let context = result.extra_context.expect("review context");
+        assert!(context.contains("Thinkback Play"), "{context}");
+        assert!(result.append_system_prompt.is_some());
+    }
+
+    #[test]
+    fn thinkback_play_with_no_transcripts_does_not_promise_a_turn() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut flags = std::collections::HashMap::new();
+        flags.insert("thinkback".into(), true);
+        let c = CommandContext {
+            feature_flags: flags,
+            cwd: workspace.path().to_string_lossy().to_string(),
+            ..ctx()
+        };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
+        let result = reg.execute("thinkback-play", &c, &[]);
+        assert!(
+            result.output.contains("nothing to replay"),
+            "{}",
+            result.output
+        );
+        assert!(result.extra_context.is_none());
     }
 
     #[test]

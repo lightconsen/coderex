@@ -37,6 +37,13 @@ pub struct Statusline {
     pub show_cost: bool,
     /// Show git branch.
     pub show_git_branch: bool,
+    /// Template from `statusline.format` in settings, when one is configured.
+    ///
+    /// Placeholders are written in brackets: `[model]`, `[title]`, `[tokens]`,
+    /// `[cost]`, `[branch]`. An unknown placeholder is left as written, so a
+    /// typo is visible instead of silently dropping a segment. An empty or
+    /// whitespace-only template falls back to the built-in layout.
+    pub format: Option<String>,
 }
 
 impl Statusline {
@@ -58,6 +65,7 @@ impl Statusline {
             show_tokens: true,
             show_cost: true,
             show_git_branch: true,
+            format: None,
         }
     }
 
@@ -145,12 +153,51 @@ impl Statusline {
             segments.push(self.git_branch.clone());
         }
 
-        let full = segments.join(" | ");
+        let full = self
+            .format
+            .as_deref()
+            .filter(|template| !template.trim().is_empty())
+            .map_or_else(|| segments.join(" | "), |template| self.expand(template));
         if UnicodeWidthStr::width(full.as_str()) <= width {
             full
         } else {
             truncate_to_width(&full, width)
         }
+    }
+
+    /// Expand a `statusline.format` template.
+    ///
+    /// Only the documented placeholders are substituted; everything else —
+    /// including an unknown `[placeholder]` — is copied through so a typo is
+    /// visible rather than silently dropping a segment.
+    fn expand(&self, template: &str) -> String {
+        let tokens = self.total_tokens.to_string();
+        let cost = format!("${:.2}", self.cost_usd);
+        let mut out = String::with_capacity(template.len());
+        let mut rest = template;
+        while let Some(open) = rest.find('[') {
+            out.push_str(&rest[..open]);
+            let Some(close) = rest[open..].find(']') else {
+                out.push_str(&rest[open..]);
+                return out;
+            };
+            let name = &rest[open + 1..open + close];
+            match name {
+                "model" => out.push_str(&self.model),
+                "title" => out.push_str(&self.session_title),
+                "tokens" => out.push_str(&tokens),
+                "cost" => out.push_str(&cost),
+                "branch" => out.push_str(&self.git_branch),
+                _ => {
+                    out.push('[');
+                    out.push_str(name);
+                    out.push(']');
+                }
+            }
+            rest = &rest[open + close + 1..];
+        }
+        out.push_str(rest);
+        out
     }
 }
 
@@ -185,6 +232,61 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_format_template_replaces_the_default_layout() {
+        let sl = Statusline {
+            model: "sonnet".into(),
+            total_tokens: 1234,
+            cost_usd: 0.42,
+            git_branch: "main".into(),
+            session_title: "Fix bug".into(),
+            thinking: false,
+            thinking_started: None,
+            last_duration: None,
+            plan_status: None,
+            thinking_label: None,
+            spinner_frame: 0,
+            show_tokens: true,
+            show_cost: true,
+            show_git_branch: true,
+            format: Some("[branch] > [model] ([tokens])".into()),
+        };
+        assert_eq!(sl.render(200), "main > sonnet (1234)");
+    }
+
+    #[test]
+    fn an_unknown_placeholder_is_left_visible() {
+        let sl = Statusline {
+            model: "sonnet".into(),
+            format: Some("[modle] [model]".into()),
+            ..Statusline::new()
+        };
+        assert_eq!(sl.render(200), "[modle] sonnet");
+    }
+
+    #[test]
+    fn an_empty_template_falls_back_to_the_default_layout() {
+        let sl = Statusline {
+            model: "sonnet".into(),
+            format: Some("   ".into()),
+            ..Statusline::new()
+        };
+        let rendered = sl.render(200);
+        assert!(rendered.contains("sonnet"), "{rendered}");
+        assert!(rendered.contains(" | "), "{rendered}");
+    }
+
+    #[test]
+    fn a_long_template_is_truncated_to_the_width() {
+        let sl = Statusline {
+            session_title: "a very long session title that will not fit".into(),
+            format: Some("[title]".into()),
+            ..Statusline::new()
+        };
+        let rendered = sl.render(10);
+        assert_eq!(UnicodeWidthStr::width(rendered.as_str()), 10);
+    }
+
+    #[test]
     fn render_basic() {
         let sl = Statusline {
             model: "sonnet".into(),
@@ -201,6 +303,7 @@ mod tests {
             show_tokens: true,
             show_cost: true,
             show_git_branch: true,
+            format: None,
         };
         let rendered = sl.render(200);
         assert!(rendered.contains("sonnet"));
@@ -226,6 +329,7 @@ mod tests {
             show_tokens: true,
             show_cost: true,
             show_git_branch: true,
+            format: None,
         };
         let rendered = sl.render(20);
         assert!(UnicodeWidthStr::width(rendered.as_str()) <= 20);
@@ -284,6 +388,7 @@ mod tests {
             show_tokens: true,
             show_cost: true,
             show_git_branch: true,
+            format: None,
         };
         let rendered = sl.render(20);
         // Each CJK char is 2 columns wide, so truncation should handle correctly

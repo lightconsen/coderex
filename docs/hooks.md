@@ -346,8 +346,9 @@ not read as a decision.
 
 1. The settings files by default, when they exist: the user settings
    (`~/.coderex/settings.json`) and the project settings
-   (`.coderex/settings.json`). `hot-reload` is a default feature of
-   `coderex-cli`; a build that disables default features compiles the watcher
+   (`.coderex/settings.json`). The REPL's own `HookFileWatcher` (the `hot-reload` feature, a default feature of
+   `coderex-cli`) watches those files and reports both the path and the kind
+   of change; a build that disables default features compiles the watcher
    out.
 2. A `SessionStart` hook may return absolute paths in `watchPaths`, as a string
    or an array:

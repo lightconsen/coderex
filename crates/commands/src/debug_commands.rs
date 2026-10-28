@@ -36,17 +36,36 @@ pub fn register(registry: &mut CommandRegistry) {
     ));
 
     // /heapdump — memory snapshot (feature-gated)
+    //
+    // There is no in-process heap profiler: CodeRex is a Rust binary and a
+    // useful dump needs jemalloc/DHAT or an external profiler attached. The
+    // command used to claim it had written `/tmp/coderex-heap.prof`, which no
+    // file ever appeared at. It now writes a small, real runtime snapshot
+    // (process facts from /proc or `ps`) so the output names a file that
+    // exists, and says what it is not.
     registry.register(SlashCommand::local(
         "heapdump",
-        "Generate memory heap snapshot (feature-gated)",
+        "Write a runtime snapshot to a file (feature-gated)",
         false,
         false,
         false,
         Arc::new(|ctx: &CommandContext, _args: &[String]| {
-            if ctx.is_feature_enabled("heapdump") {
-                CommandResult::success("Heap dump generated: /tmp/coderex-heap.prof")
-            } else {
-                CommandResult::error("heapdump feature is not enabled.")
+            if !ctx.is_feature_enabled("heapdump") {
+                return CommandResult::error("heapdump feature is not enabled.");
+            }
+            let path = std::path::PathBuf::from("/tmp/coderex-heap.prof");
+            let snapshot = coderex_core::runtime_snapshot::capture();
+            match std::fs::write(&path, &snapshot) {
+                Ok(()) => CommandResult::success(format!(
+                    "Runtime snapshot written to {}\n\
+                     ({} bytes; process facts, not a heap profile — attach a profiler for allocations)",
+                    path.display(),
+                    snapshot.len()
+                )),
+                Err(error) => CommandResult::error(format!(
+                    "could not write {}: {error}",
+                    path.display()
+                )),
             }
         }),
     ));
@@ -236,7 +255,9 @@ mod tests {
     }
 
     #[test]
-    fn heapdump_enabled() {
+    fn heapdump_enabled_writes_a_real_file() {
+        let path = std::path::PathBuf::from("/tmp/coderex-heap.prof");
+        let _ = std::fs::remove_file(&path);
         let mut flags = std::collections::HashMap::new();
         flags.insert("heapdump".into(), true);
         let c = CommandContext {
@@ -249,7 +270,12 @@ mod tests {
             r
         };
         let result = reg.execute("heapdump", &c, &[]);
-        assert!(result.output.contains("heap.prof"));
+        assert!(!result.output.starts_with("Error:"), "{}", result.output);
+        assert!(result.output.contains("heap.prof"), "{}", result.output);
+        let written = std::fs::read_to_string(&path).expect("the command wrote no file");
+        assert!(written.contains("runtime snapshot"), "{written}");
+        assert!(written.contains(&format!("pid: {}", std::process::id())));
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

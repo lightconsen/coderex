@@ -21,7 +21,6 @@ enterprise = []
 # Apple Keychain, Windows Credential Manager and the freedesktop Secret
 # Service (zbus 5). There is no longer a mock fallback to enable by accident.
 keyring = ["dep:keyring"]
-hot-reload = ["dep:notify"]
 
 [dependencies]
 coderex-core = { path = "../core" }
@@ -40,7 +39,6 @@ bitflags.workspace = true
 async-trait.workspace = true
 chrono.workspace = true
 keyring = { version = "4", optional = true }
-notify = { version = "8", optional = true }
 plist = "1.10"
 
 [target.'cfg(windows)'.dependencies]

@@ -2164,6 +2164,7 @@ mod tests {
             show_tokens: true,
             show_cost: true,
             show_git_branch: true,
+            format: None,
         };
         let rendered = sl.render(80);
         assert!(rendered.len() <= 80);

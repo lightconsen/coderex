@@ -453,7 +453,7 @@ impl coderex_tools::Tool for EnterWorktreeWithState {
     async fn execute(
         &self,
         input: coderex_tools::ToolInput,
-        _ctx: coderex_tools::ToolContext<'_>,
+        ctx: coderex_tools::ToolContext<'_>,
     ) -> Result<coderex_tools::ToolOutput, coderex_tools::ToolError> {
         let branch = input
             .arguments
@@ -463,6 +463,15 @@ impl coderex_tools::Tool for EnterWorktreeWithState {
             .state
             .enter(branch)
             .map_err(|message| coderex_tools::ToolError::InvalidInput { message })?;
+        // The built-in tool fires `WorktreeCreate`; this replacement performs
+        // the same work, so it has to fire the same event. Without this a
+        // configured hook loaded, matched, and never ran in production.
+        let mut hook_context = std::collections::HashMap::new();
+        hook_context.insert("path".to_string(), path.clone());
+        if let Some(branch) = branch {
+            hook_context.insert("branch".to_string(), branch.to_string());
+        }
+        coderex_tools::fire_tool_hook(&ctx, "WorktreeCreate", &path, &hook_context).await;
         Ok(coderex_tools::ToolOutput {
             output: path,
             is_display: true,
@@ -1824,8 +1833,8 @@ struct FileChangeBatch {
 /// The settings files are supplied at construction. A `SessionStart` hook can
 /// return `watchPaths`, and a `FileChanged` hook may carry a static `watch`
 /// list; both are added with [`add_paths`](Self::add_paths) once known. Unlike
-/// [`coderex_config::ConfigWatcher`], which publishes only path lists, this
-/// watcher keeps the kind of each change so the hook input can name it.
+/// The watcher keeps the kind of each change (`add`/`change`/`unlink`) so the
+/// hook input can name it, which a path-only notification cannot.
 #[cfg(feature = "hot-reload")]
 struct HookFileWatcher {
     watcher: notify::RecommendedWatcher,
@@ -2314,6 +2323,11 @@ pub struct ReplLoop {
     settings_vim_mode: Option<bool>,
     /// `statusline.theme` from settings, applied at startup.
     settings_statusline_theme: Option<String>,
+    /// `statusline.format` from settings, applied at startup.
+    settings_statusline_format: Option<String>,
+    /// The directory `--worktree` moved the session out of, replayed into
+    /// `CwdChanged` once the hooks are installed.
+    worktree_previous_cwd: Option<std::path::PathBuf>,
     /// Session id to resume into the current interactive loop.
     resume_session: Option<String>,
 }
@@ -2610,6 +2624,8 @@ impl ReplLoop {
             current_theme: "dark".into(),
             settings_vim_mode: None,
             settings_statusline_theme: None,
+            settings_statusline_format: None,
+            worktree_previous_cwd: None,
             resume_session: None,
         };
         this.init_command_persistence();
@@ -3012,6 +3028,8 @@ impl ReplLoop {
             current_theme: "dark".into(),
             settings_vim_mode: None,
             settings_statusline_theme: None,
+            settings_statusline_format: None,
+            worktree_previous_cwd: None,
             resume_session: None,
         };
         this.init_command_persistence();
@@ -3476,9 +3494,11 @@ impl ReplLoop {
         &mut self,
         vim_mode: Option<bool>,
         statusline_theme: Option<String>,
+        statusline_format: Option<String>,
     ) {
         self.settings_vim_mode = vim_mode;
         self.settings_statusline_theme = statusline_theme;
+        self.settings_statusline_format = statusline_format;
     }
 
     pub fn with_betas(&mut self, betas: Vec<String>) {
@@ -3711,7 +3731,14 @@ impl ReplLoop {
         // reported rather than papered over: silently working in the checkout
         // is the thing the flag exists to prevent.
         if self.worktree {
+            let previous = std::path::PathBuf::from(&self.cwd);
             self.enter_worktree_mode();
+            // The hooks are installed later in this function; `set_cwd` fired
+            // `CwdChanged` when there was no executor to receive it. Remember
+            // the move so the install step can replay it.
+            if self.cwd != previous.to_string_lossy() {
+                self.worktree_previous_cwd = Some(previous);
+            }
         }
 
         // 6. Resume or fork an existing transcript into the current engine session
@@ -3999,33 +4026,66 @@ impl ReplLoop {
                         // or `CODEREX_MODS_DIR`): their hooks run first, then
                         // the hooks from settings.
                         let inner = registry.into_executor();
-                        engine.set_hooks(
-                            match coderex_mods::JsHookExecutor::load_from_env(
-                                mod_session,
-                                Some(Arc::clone(&inner)
-                                    as Arc<dyn coderex_core::hook_executor::HookExecutor>),
-                            ) {
-                                Some(Ok(executor)) => {
-                                    // One startup line. The hashes come from
-                                    // the load report and are informational:
-                                    // there is no signature or trust store.
-                                    let line = mods_startup_line(
-                                        executor.load_report(),
-                                        executor.runtime().dir(),
-                                    );
-                                    tracing::info!("{line}");
-                                    eprintln!("{line}");
-                                    self.mod_ui_handle = Some(executor.ui_handle());
-                                    self.mod_submit_queue = executor.submit_queue();
-                                    Arc::new(executor)
-                                }
-                                Some(Err(error)) => {
-                                    tracing::warn!("mods were not loaded: {error}");
-                                    inner
-                                }
-                                None => inner,
-                            },
-                        );
+                        let hooks: Arc<
+                            dyn coderex_core::hook_executor::HookExecutor + Send + Sync,
+                        > = match coderex_mods::JsHookExecutor::load_from_env(
+                            mod_session,
+                            Some(Arc::clone(&inner)
+                                as Arc<
+                                    dyn coderex_core::hook_executor::HookExecutor + Send + Sync,
+                                >),
+                        ) {
+                            Some(Ok(executor)) => {
+                                // One startup line. The hashes come from
+                                // the load report and are informational:
+                                // there is no signature or trust store.
+                                let line = mods_startup_line(
+                                    executor.load_report(),
+                                    executor.runtime().dir(),
+                                );
+                                tracing::info!("{line}");
+                                eprintln!("{line}");
+                                self.mod_ui_handle = Some(executor.ui_handle());
+                                self.mod_submit_queue = executor.submit_queue();
+                                Arc::new(executor)
+                            }
+                            Some(Err(error)) => {
+                                tracing::warn!("mods were not loaded: {error}");
+                                inner
+                            }
+                            None => inner,
+                        };
+                        engine.set_hooks(Arc::clone(&hooks));
+                        // The hooks fired from inside a tool (`WorktreeCreate`,
+                        // `TaskCompleted`) and from a sub-agent (`SubagentStart`,
+                        // `SubagentStop`, `TeammateIdle`) cannot reach the
+                        // engine's executor: the tool dispatcher and the agent
+                        // manager each hold their own reference. Installing the
+                        // same executor on all three is what makes a configured
+                        // hook on those events run at all.
+                        // Trait upcasting drops the auto-trait bounds the
+                        // engine's setter names; the executor is still one
+                        // allocation.
+                        let plain: Arc<dyn coderex_core::hook_executor::HookExecutor> =
+                            Arc::clone(&hooks) as _;
+                        if let Some(ref dispatcher) = self.dispatcher {
+                            dispatcher.set_hooks(Arc::clone(&plain));
+                            // `--worktree` moved the session before this point,
+                            // when no executor existed to hear `CwdChanged`.
+                            // Replay that one move now.
+                            if let Some(previous) = self.worktree_previous_cwd.take() {
+                                dispatcher.refire_cwd_changed(previous);
+                            }
+                        }
+                        if let Some(ref manager) = self.agent_manager {
+                            if let Ok(mut manager) = manager.try_lock() {
+                                manager.set_hooks(Arc::clone(&plain));
+                            } else {
+                                tracing::warn!(
+                                    "the sub-agent manager was busy; sub-agent hooks are not installed"
+                                );
+                            }
+                        }
                         installed_hook_count = hook_count;
                     }
                     Err(e) => tracing::warn!("hooks in settings were not loaded: {e}"),
@@ -7995,6 +8055,9 @@ impl ReplLoop {
     /// Sync REPL state into the TUI statusline.
     fn sync_statusline(&self, statusline: &mut coderex_ui::statusline::Statusline) {
         statusline.model.clone_from(&self.model.0);
+        statusline
+            .format
+            .clone_from(&self.settings_statusline_format);
         statusline.session_title = if self.session_effects.title_generated {
             "Active".into()
         } else {
@@ -10450,10 +10513,21 @@ mod tests {
     #[test]
     fn startup_preferences_from_settings_are_applied() {
         let mut repl = ReplLoop::new("/tmp".into(), ModelId::sonnet());
-        repl.with_startup_preferences(Some(true), Some("light".into()));
+        repl.with_startup_preferences(
+            Some(true),
+            Some("light".into()),
+            Some("[model] [branch]".into()),
+        );
         repl.apply_cli_config();
         assert!(repl.vim_mode_enabled, "vim_mode was not applied");
         assert_eq!(repl.current_theme, "light");
+        let mut statusline = coderex_ui::statusline::Statusline::new();
+        repl.sync_statusline(&mut statusline);
+        assert_eq!(
+            statusline.format.as_deref(),
+            Some("[model] [branch]"),
+            "statusline.format was not applied"
+        );
     }
 
     /// Ported from kimi-code's message-replay contract: a resumed transcript

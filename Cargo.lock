@@ -1089,7 +1089,6 @@ dependencies = [
  "coderex-core",
  "home",
  "keyring",
- "notify",
  "once_cell",
  "plist",
  "proptest",

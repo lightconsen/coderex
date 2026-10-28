@@ -834,7 +834,7 @@ impl StartupOrchestrator {
                         }
                         _ = sighup.recv() => {
                             tracing::info!("Received SIGHUP — config reload requested");
-                            // Config reload is handled by ConfigWatcher in the REPL loop
+                            // Config reload is handled by the REPL's settings-file watcher
                         }
                     }
                 }
@@ -2481,13 +2481,14 @@ impl StartupOrchestrator {
             .settings
             .as_ref()
             .and_then(|settings| settings.vim_mode);
-        let statusline_theme = self
+        let statusline = self
             .ctx
             .settings
             .as_ref()
-            .and_then(|settings| settings.statusline.as_ref())
-            .and_then(|statusline| statusline.theme.clone());
-        repl.with_startup_preferences(vim_mode, statusline_theme);
+            .and_then(|settings| settings.statusline.as_ref());
+        let statusline_theme = statusline.and_then(|statusline| statusline.theme.clone());
+        let statusline_format = statusline.and_then(|statusline| statusline.format.clone());
+        repl.with_startup_preferences(vim_mode, statusline_theme, statusline_format);
         repl.with_replay_user_messages(self.ctx.replay_user_messages);
         repl.with_include_partial_messages(self.ctx.include_partial_messages);
         repl.with_betas(self.ctx.betas.clone());

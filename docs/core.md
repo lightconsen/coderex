@@ -17,7 +17,6 @@ The foundational engine of CodeRex. Manages LLM API communication, conversation 
 - **`StructuredOutputValidator`** (`engine.rs`) — Custom JSON schema validator.
 - **`PermissionEngine`** (`permission_engine.rs`) — Evaluates whether tool calls are allowed, need approval, or denied. Supports hooks (`PermissionHook`, `ExplainPermissionHook`, `AutoApproveHook`, `BackgroundAgentDenyHook`). `evaluate_with_subjects` takes the call's rule subjects (Bash command, file path(s)) from the tool executor.
 - **`PermissionRuleSpec`** (`permissions.rs`) — Parsed Claude-style rule (`Tool`, `Tool(glob)`, `Bash(prefix:*)`, `Bash(glob)`); `PermissionChecker::add_spec` compiles it against a `RuleCompileContext { cwd, home }`. `ToolExecutor::rule_subjects` supplies `RuleSubject`s (one per command segment or file, each with raw/absolute/canonical forms); deny/ask match any subject, allow requires every subject to be covered. A subject marked opaque (unmodelled shell construct) can never be auto-approved. `PowerShell`/`pwsh` specifiers use the same command-segment and opaque analysis as `Bash`. Precedence is deny > ask > allow. `ToolExecutor::set_path_verifier` lets file tools re-check the real path of an opened handle, closing the check/open TOCTOU gap.
-- **`PermissionManager`** (`permission_manager.rs`) — Higher-level permission rule management with rule groups and persistent rule storage.
 - **`ConfirmationBus`** (`confirmation_bus.rs`) — Decoupled confirmation request/response channel for tool call permissions.
 - **`TokenBudget`** (`budget.rs`) — Tracks per-session and per-turn token consumption.
 - **`CostTracker`** (`cost.rs`) — Records USD cost per model/request. Loads `~/.coderex/pricing.json` with built-in fallbacks.
@@ -49,7 +48,7 @@ The foundational engine of CodeRex. Manages LLM API communication, conversation 
 
 ### Public API Surface
 
-Re-exports 50+ types from 44 submodules: `types`, `state`, `runtime`, `engine`, `api_client`, `budget`, `cost`, `permissions`, `permission_engine`, `permission_manager`, `confirmation_bus`, `sandbox`, `loop_detector`, `shell_security`, `file_traversal`, `fuzzy_matcher`, `markdown`, `syntax`, `scheduler`, `prompt`, `compact`, `stop_hook`, `hook_executor`, `hook_security`, `tool_executor`, `tool_scheduler`, `elicitation`, `task`, `worktree`, `team`, `coordinator`, `team_context`, `orchestrator`, `query_profiles`, `prompts`, `wire_protocol`, `wire_transport`, `wire_adapter`, `provider`, `providers`, `model_router`, `provider_config`.
+Re-exports 50+ types from 43 submodules: `types`, `state`, `runtime`, `engine`, `api_client`, `budget`, `cost`, `permissions`, `permission_engine`, `confirmation_bus`, `sandbox`, `loop_detector`, `shell_security`, `file_traversal`, `fuzzy_matcher`, `markdown`, `syntax`, `scheduler`, `prompt`, `compact`, `stop_hook`, `hook_executor`, `hook_security`, `tool_executor`, `tool_scheduler`, `elicitation`, `task`, `worktree`, `team`, `coordinator`, `team_context`, `orchestrator`, `query_profiles`, `prompts`, `wire_protocol`, `wire_transport`, `wire_adapter`, `provider`, `providers`, `model_router`, `provider_config`.
 
 ### Prompt caching
 
@@ -96,7 +95,7 @@ non-zero read, so a session can be checked.
 - Full SSE streaming parser with tool call assembly, stress-tested (50 concurrent tool calls, 100KB payloads, fragmented chunks).
 - Thinking-block round-tripping: `thinking` + `signature` are parsed from non-streaming responses and accumulated from streaming deltas, stored as `MessageContent::Thinking`, and prepended to the matching assistant turn when the next request is built. Nothing is sent unless the provider returned a block; none are synthesized.
 - Turn state machine with both blocking and streaming paths.
-- Permission engine with Allow/Deny/Ask/AllowForPath/Elevated results, hooks, and `PermissionManager` rule groups. Session-wide approval is recorded with `record_session_approval`.
+- Permission engine with Allow/Deny/Ask/AllowForPath/Elevated results, hooks and compiled rule specs. Session-wide approval is recorded with `record_session_approval`.
 - Token budget tracking and cost estimation with `~/.coderex/pricing.json` loading.
 - Context compaction with 4 strategies (micro, auto, reactive, snip).
 - Transcript persistence (atomic temp-file + rename).
