@@ -2,7 +2,7 @@
 
 ## Goal
 
-Implements the `/` slash command system that users type in the REPL. Provides a registry with type-safe dispatch across 77 commands covering sessions, configuration, diagnostics, Git integration, context management, macros, history, and advanced features.
+Implements the `/` slash command system that users type in the REPL. Provides a registry with type-safe dispatch across 76 commands covering sessions, configuration, diagnostics, Git integration, context management, macros, history, and advanced features.
 
 ## Design
 
@@ -17,7 +17,7 @@ Implements the `/` slash command system that users type in the REPL. Provides a 
 - **`CommandHistory`** (`history.rs`) — Ring buffer (max 1000) with JSONL file persistence (`~/.coderex/command_history.jsonl`). Tracks `{cmd, args, timestamp}` per entry. Supports `append`, `list(n)`, `search(query)`.
 - **`MacroRegistry`** (`macro_commands.rs`) — User-defined command sequences as `HashMap<String, Vec<String>>` with JSON persistence (`~/.coderex/macros.json`). Supports `define`, `delete`, `get`, `list`, `load`.
 
-### Command Inventory (77 commands across 13 registered modules)
+### Command Inventory (76 commands across 13 registered modules)
 
 | Module | Commands | Purpose |
 |--------|----------|---------|
@@ -29,7 +29,7 @@ Implements the `/` slash command system that users type in the REPL. Provides a 
 | `config_extension_commands` | `/theme`, `/hooks`, `/mcp`, `/plugin`, `/memory`, `/skills`, `/tasks`, `/plan` | Extended configuration |
 | `diagnostic_commands` | `/status`, `/doctor` | System health checks |
 | `context_commands` | `/copy`, `/init`, `/summary`, `/files`, `/context`, `/add-dir` | Context management |
-| `integration_commands` | `/ide`, `/chrome`, `/desktop`, `/mobile`, `/voice`, `/vim`, `/remote-env`, `/remote-setup`, `/statusline-setup` | External integrations |
+| `integration_commands` | `/chrome`, `/desktop`, `/mobile`, `/voice`, `/vim`, `/remote-env`, `/remote-setup`, `/statusline-setup` | External integrations |
 | `git_commands` | `/commit`, `/commit-push-pr`, `/review`, `/security-review`, `/autofix-pr`, `/branch` | Git & code review |
 | `debug_commands` | `/debug-tool-call`, `/heapdump`, `/mock-limits`, `/perf-issue`, `/ant-trace`, `/break-cache`, `/reload-plugins` | Debugging tools |
 | `advanced_commands` | `/bridge`, `/bridge-kick`, `/teleport`, `/ultraplan`, `/insights`, `/thinkback`, `/thinkback-play`, `/statusline` | Advanced/feature-gated |

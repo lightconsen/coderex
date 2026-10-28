@@ -200,12 +200,6 @@ pub struct Cli {
     #[arg(long, value_name = "AGENT")]
     pub agent: Option<String>,
 
-    /// Connect to a configured IDE MCP server and register its tools.
-    /// Requires `mcpServers.<name>`, `CODEREX_IDE_MCP_URL`, or
-    /// `CODEREX_IDE_MCP_COMMAND`; there is no bundled IDE.
-    #[arg(long, value_name = "IDE")]
-    pub ide: Option<String>,
-
     /// Worktree mode (isolated git worktree).
     #[arg(short = 'w', long)]
     pub worktree: bool,

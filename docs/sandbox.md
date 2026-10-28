@@ -335,7 +335,7 @@ and links the five test executables with the mingw linker. It does **not** run
 them: a macOS host cannot create an AppContainer, attach a container token, or
 spawn a confined process, so those runtime paths are still unverified locally.
 The `coderex-cli` lib-test target now compiles and links too: its test helpers
-in `crates/cli/src/ide.rs`, `from_pr.rs` and `tmux.rs` use Unix-only
+in `crates/cli/src/from_pr.rs` and `crates/cli/src/tmux.rs` use Unix-only
 `PermissionsExt::set_mode` and `/bin/sh` scripts, so those test modules are
 `cfg(unix)`-gated. `cargo test --no-run --lib --target x86_64-pc-windows-gnu`
 links five test executables (core, tools, hooks, config, cli).

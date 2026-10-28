@@ -18,7 +18,7 @@ Built in Rust for performance, reliability, and cross-platform support.
 - **MCP Support** — Model Context Protocol for dynamically discovered tools
 - **Plugin System** — WASM and process-based plugins with marketplace
 - **Remote Sessions** — Bridge/SSH for working on remote workspaces
-- **Server Mode** — WebSocket daemon for IDE integration and headless SDK consumers
+- **Server Mode** — WebSocket daemon for editor/IDE clients built on the SDK, and headless consumers
 - **Permission System** — Granular permission control with platform-native sandboxing
 - **Enterprise** — Remote managed settings, org-scoped team memory, security audits
 - **Cross-Platform** — Linux, macOS, and Windows
@@ -93,7 +93,7 @@ CodeRex is organized as a Rust workspace with 19 crates (plus the `evals` harnes
 | `cli` | Binary entry point, startup orchestrator, REPL, server |
 | `core` | QueryEngine, turn state machine, permission engine, API client |
 | `tools` | Tool trait, registry, executor, 44 baseline + 6 feature-gated tools |
-| `commands` | Slash command registry, 77 commands |
+| `commands` | Slash command registry, 76 commands |
 | `ui` | ratatui terminal UI, statusline, Vim mode, themes |
 | `memory` | Transcript storage, session index, long-term memory |
 | `agents` | Sub-agent manager, spawn/fork/send message |

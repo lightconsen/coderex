@@ -48,6 +48,22 @@ Some suites need extra setup:
 is **not** run with `-D warnings`; do not introduce new warnings in files you
 touch. `cargo fmt --all --check` is required.
 
+`scripts/verify.sh` runs the non-test checks and reports their current counts:
+
+```bash
+scripts/verify.sh audit        # cargo audit with .cargo/audit.toml ignores
+scripts/verify.sh deny         # cargo deny: advisories, bans, licenses, sources
+scripts/verify.sh clippy       # workspace clippy; prints the warning count
+scripts/verify.sh rustdoc      # cargo doc --workspace --no-deps; warning count
+scripts/verify.sh              # all four; logs under target/verify/
+scripts/verify.sh --strict     # clippy/rustdoc warnings become failures
+```
+
+Audit and deny are strict (a new advisory or license fails). The clippy and
+rustdoc backlogs are reported but do not fail unless `--strict` is passed.
+`.cargo/audit.toml` and `deny.toml` keep the same reviewed advisory ignores;
+update both together.
+
 `scripts/coverage.sh` runs the workspace suite under `cargo llvm-cov` and writes
 `target/coverage/lcov.info` plus a per-crate line-coverage table
 (`target/coverage/summary.md`). Test files under `crates/*/tests`, benches and

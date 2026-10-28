@@ -558,7 +558,7 @@ pub struct SlashCommand {
 - 配置：/config /model /theme /permissions /hooks /mcp /plugin /memory /skills /tasks /plan
 - 帮助/统计：/help /version /stats /status /usage /cost /doctor
 - 内容操作：/copy /init /compact /summary /files /context /ctx_viz /add-dir
-- 集成：/ide /chrome /desktop /mobile /voice /vim /remote-env /remote-setup
+- 集成：/chrome /desktop /mobile /voice /vim /remote-env /remote-setup
 - Git/PR：/commit /commit-push-pr /review /security-review /autofix-pr /pr_comments /branch
 - 调试诊断：/debug-tool-call /heapdump /mock-limits /perf-issue /ant-trace /break-cache /reload-plugins
 - 高级：/bridge /bridge-kick /teleport /ultraplan /insights /thinkback /thinkback-play /statusline

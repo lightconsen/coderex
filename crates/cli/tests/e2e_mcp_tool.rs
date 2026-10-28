@@ -239,17 +239,6 @@ fn a_model_tool_call_runs_in_the_configured_mcp_server() {
     let _ = std::fs::remove_file(&script);
 }
 
-#[test]
-fn the_ide_flag_connects_to_the_named_mcp_server() {
-    let (dir, script) = configured_workspace();
-    let (mut provider, base_url) = start_static_provider();
-    let output = run_coderex(dir.path(), &base_url, &["--ide", "mock"]);
-    let _ = provider.kill();
-    let _ = provider.wait();
-    assert_echoed(&output);
-    let _ = std::fs::remove_file(&script);
-}
-
 /// An `mcp_tool` PreToolUse hook asks the configured MCP server and applies
 /// its JSON answer: the verdict refuses the Write.
 #[test]

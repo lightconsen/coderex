@@ -43,4 +43,13 @@ unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 
 [advisories]
-ignore = []
+# Keep in sync with .cargo/audit.toml. Each entry is a reviewed,
+# informational advisory with no usable patched dependency; see that file for
+# the reasoning behind each one.
+ignore = [
+    "RUSTSEC-2024-0320", # yaml-rust: optional syntect feature, not enabled
+    "RUSTSEC-2025-0141", # bincode: syntect dump format, unmaintained
+    "RUSTSEC-2026-0370", # zvariant: zbus 5 stack, no patched version
+    "RUSTSEC-2026-0371", # zbus_names: zbus 5 stack, no patched version
+    "RUSTSEC-2026-0372", # zvariant_derive: zbus 5 stack, no patched version
+]

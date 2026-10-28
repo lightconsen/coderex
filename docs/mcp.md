@@ -296,9 +296,9 @@ the same clamped handler, because the environment variable is the explicit
 consent. Served sessions (`coderex serve`) install no sampling handler and
 therefore keep refusing.
 
-### IDE tool whitelist
+### IDE tools
 
-The reference allows two IDE tools (`mcp__ide__executeCode`, `mcp__ide__getDiagnostics`) to be used without a prompt. `--ide` in CodeRex connects to a configured IDE MCP endpoint and registers its tools like any other server, but there is no bundled IDE product, no fixed `ide` server, and no automatic allow rule for those names. Users who want them prompt-free add an explicit `mcp__ide__*` rule; CodeRex does not ship a product-specific allowlist.
+CodeRex has no IDE integration and no bundled IDE. An IDE's own MCP server can still be configured like any other server (`mcp_servers` / `.mcp.json`); its tools are named `mcp__<server>__<tool>` and follow the ordinary permission rules. There is no fixed `ide` server, no `--ide` flag and no product-specific allowlist: a user who wants `mcp__ide__executeCode` prompt-free adds an explicit `mcp__ide__*` rule like any other.
 
 ## Remaining Considerations
 

@@ -264,8 +264,6 @@ pub struct SessionContext {
     pub tmux: bool,
     /// Agent to use.
     pub agent: Option<String>,
-    /// IDE mode.
-    pub ide: Option<String>,
     /// Worktree mode.
     pub worktree: bool,
     /// Fork from session.
@@ -274,8 +272,6 @@ pub struct SessionContext {
     pub from_pr: Option<String>,
     /// The rendered pull-request context fetched for `--from-pr`.
     pub from_pr_context: Option<String>,
-    /// The live IDE MCP connection for `--ide`.
-    pub ide_connection: Option<crate::ide::IdeConnection>,
     /// Show setting sources.
     pub setting_sources: bool,
     /// Verbose mode.
@@ -652,12 +648,10 @@ impl StartupOrchestrator {
                 no_chrome: false,
                 tmux: false,
                 agent: None,
-                ide: None,
                 worktree: false,
                 fork_session: None,
                 from_pr: None,
                 from_pr_context: None,
-                ide_connection: None,
                 setting_sources: false,
                 verbose: false,
                 debug: false,
@@ -731,7 +725,6 @@ impl StartupOrchestrator {
                 bail!("{error}");
             }
         }
-        self.ctx.ide.clone_from(&args.ide);
         self.ctx.worktree = args.worktree;
         self.ctx.fork_session.clone_from(&args.fork_session);
         self.ctx.from_pr.clone_from(&args.from_pr);
@@ -787,10 +780,6 @@ impl StartupOrchestrator {
         self.run_phase(StartupPhase::ReconcileMarketplaces, &args)
             .await?;
         self.run_phase(StartupPhase::InitMcp, &args).await?;
-        // `--ide` connects to a configured IDE MCP server. It runs after the
-        // general MCP phase so an unreachable IDE server is reported as an
-        // IDE failure rather than hidden among optional servers.
-        self.phase_init_ide().await?;
         self.run_phase(StartupPhase::InitMemory, &args).await?;
         self.run_phase(StartupPhase::InitRemoteServices, &args)
             .await?;
@@ -2132,33 +2121,6 @@ impl StartupOrchestrator {
         Ok(())
     }
 
-    /// Connect `--ide` to its configured IDE MCP server.
-    ///
-    /// There is no bundled IDE, so "no configuration" is an error rather than
-    /// a no-op. This mirrors the reference CLI only in spirit: the flag names
-    /// an integration, so something must actually be integrated.
-    async fn phase_init_ide(&mut self) -> Result<()> {
-        let Some(ref ide) = self.ctx.ide else {
-            return Ok(());
-        };
-
-        let cwd = std::path::Path::new(&self.ctx.cwd);
-        let server = crate::ide::resolve_server(
-            ide,
-            self.ctx.settings.as_ref(),
-            cwd,
-            self.ctx.mcp_config_path.as_deref(),
-        )?;
-        let connection = crate::ide::connect(server).await?;
-        let status = connection.status_line();
-        tracing::info!("{status}");
-        // Reported on stderr so it is visible even when tracing is quiet. In
-        // headless mode stdout stays reserved for the answer.
-        eprintln!("{status}");
-        self.ctx.ide_connection = Some(connection);
-        Ok(())
-    }
-
     /// InitMemory: initialize memory subsystem (auto dream, team memory).
     // Retained `async`: the startup/dispatch pipeline awaits these on the current
     // task, and removing it cascades into unnecessary_wraps/unused_self.
@@ -2546,14 +2508,10 @@ impl StartupOrchestrator {
             self.configure_plugin_components(repl, manager);
         }
         repl.with_explicit_model_override(self.ctx.model_explicit);
-        repl.with_ide(self.ctx.ide.clone());
         repl.with_worktree(self.ctx.worktree);
         repl.with_fork_session(self.ctx.fork_session.clone());
         repl.with_from_pr(self.ctx.from_pr.clone());
         repl.with_pr_context(self.interactive_context(interactive));
-        if let Some(ref ide) = self.ctx.ide_connection {
-            repl.with_ide_connection(Arc::clone(&ide.manager), ide.status_line());
-        }
         repl.with_session_name(self.ctx.session_name.clone());
         repl.with_add_dir(self.ctx.add_dir.clone());
         repl.with_input_format(self.ctx.input_format.clone());
@@ -4364,7 +4322,6 @@ mod tests {
             no_chrome: false,
             tmux: false,
             agent: None,
-            ide: None,
             worktree: false,
             prompt: Vec::new(),
             command: None,
@@ -4522,32 +4479,6 @@ mod tests {
     fn no_pull_request_context_leaves_the_prompt_untouched() {
         let orch = StartupOrchestrator::new();
         assert_eq!(orch.build_headless_prompt("hello"), "hello");
-    }
-
-    #[tokio::test]
-    async fn ide_phase_without_configuration_fails_clearly() {
-        let temp = tempfile::tempdir().unwrap();
-        let mut orch = StartupOrchestrator::new();
-        orch.ctx.cwd = temp.path().to_string_lossy().into_owned();
-        orch.ctx.ide = Some("vscode".into());
-
-        let error = orch
-            .phase_init_ide()
-            .await
-            .expect_err("--ide without configuration must fail");
-        assert!(
-            error
-                .to_string()
-                .contains("no IDE MCP server is configured"),
-            "{error}"
-        );
-    }
-
-    #[tokio::test]
-    async fn ide_phase_is_a_no_op_when_the_flag_is_absent() {
-        let mut orch = StartupOrchestrator::new();
-        orch.phase_init_ide().await.unwrap();
-        assert!(orch.ctx.ide_connection.is_none());
     }
 
     #[test]

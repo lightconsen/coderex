@@ -50,6 +50,8 @@ wasm-runtime = ["dep:wasmtime", "dep:wasmparser", "dep:wat"]
 [dependencies.wasmtime]
 version = "50.0.0"
 optional = true
+default-features = false
+features = ["anyhow", "cranelift", "runtime", "std", "threads"]
 
 [[bin]]
 name = "coderex-wasm-compile"

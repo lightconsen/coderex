@@ -751,7 +751,6 @@
 - **依赖**：12.1, 7.1, 2.1
 
 ### 12.10 集成命令 (crate: `commands`)
-- [x] 实现 `/ide`：IDE 集成连接/断开
 - [x] 实现 `/chrome`：Chrome DevTools 集成
 - [x] 实现 `/desktop`：桌面应用集成
 - [x] 实现 `/mobile`：移动端远程连接

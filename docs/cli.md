@@ -96,7 +96,6 @@ main() → parse_args() → StartupOrchestrator::run()
 | `--no-chrome` | | Disable browser / web integration (removes `ChromeClient` from dispatcher) |
 | `--tmux` | | Run in tmux: re-launch in a new session outside tmux, set the title inside tmux |
 | `--agent AGENT` | | Use a named built-in or custom agent definition for the session |
-| `--ide IDE` | | Connect to a configured IDE MCP server and register its tools |
 | `--worktree` | `-w` | Worktree mode (detects git branch, sets `WorktreeState`) |
 
 ### Subcommands
@@ -253,42 +252,6 @@ context.
   sets the pane title, and turns `automatic-rename` off.
 - If `tmux` is not available, `--tmux` fails with an actionable message.
 
-### `--ide IDE`
-
-CodeRex does not bundle an IDE. `--ide` connects to a configured IDE MCP
-server and registers the tools it exposes (`executeCode`, `getDiagnostics`,
-and anything else the server lists) into the same registry the model
-dispatches through. The connection status and discovered tool names are
-reported on stderr and in the log.
-
-Configuration is resolved in this order:
-
-1. `CODEREX_IDE_MCP_URL` — a remote HTTP/SSE MCP endpoint.
-2. `CODEREX_IDE_MCP_COMMAND` — a stdio MCP server command line, split on
-   whitespace (`"ide-mcp --stdio"`).
-3. `mcp_servers` (or `mcpServers`) in settings, looked up first under the
-   `--ide` value (for example `vscode`) and then under `ide`.
-4. `.mcp.json` in the working directory (or the `--mcp-config` file), with
-   the same name lookup.
-
-Example settings entry:
-
-```json
-{
-  "mcp_servers": {
-    "ide": {
-      "type": "stdio",
-      "command": "/usr/local/bin/ide-mcp",
-      "args": ["--stdio"]
-    }
-  }
-}
-```
-
-If no server is configured, the configured server cannot be started, or it
-answers `tools/list` with no tools, startup fails with a message naming the
-server and the configuration source. `--ide` is never a silent no-op.
-
 ## CLI Flag Application Architecture
 
 CLI flags are parsed by clap, stored in `SessionContext` during `StartupOrchestrator::run()`, and applied to the `ReplLoop` via `configure_repl()`. The `ReplLoop::apply_cli_config()` method performs the actual side effects:
@@ -303,7 +266,6 @@ CLI flags are parsed by clap, stored in `SessionContext` during `StartupOrchestr
 8. **Add directories** — `--add-dir` reads directory listings into `session_effects.extra_context`.
 9. **Beta flags** — `--betas` parses `+name`/`-name`/`name` over `CODEREX_FEATURE_FLAGS`, stores the result as the session `FeatureFlags`, and derives the session `CapabilitySet`. Unknown names fail startup.
 10. **PR context** — `--from-pr` is fetched during orchestrator startup and prepended to the initial prompt (headless) or added to `session_effects.extra_context` (interactive).
-11. **IDE** — `--ide` connects to a configured IDE MCP server during startup and registers its discovered tools into the dispatcher registry.
 12. **tmux** — `--tmux` is applied before any startup phase; outside tmux it re-launches the binary in a new session.
 13. **JSON schema** — `--json-schema` is parsed and passed to `SubmitOptions`.
 14. **Partial messages** — `--include-partial-messages` is passed to `SubmitOptions`.

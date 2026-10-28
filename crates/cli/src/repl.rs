@@ -2284,16 +2284,10 @@ pub struct ReplLoop {
     context_window_settings: coderex_core::types::ContextWindowOverrides,
     /// Pull-request context fetched for `--from-pr`.
     pr_context: Option<String>,
-    /// Live IDE MCP connection for `--ide`, kept for the session.
-    ide_manager: Option<Arc<coderex_mcp::manager::McpManager>>,
-    /// Human-readable IDE connection status.
-    ide_status: Option<String>,
     /// Chrome integration enabled (--chrome / --no-chrome).
     chrome_enabled: bool,
     /// Agent to use (--agent).
     agent: Option<String>,
-    /// IDE mode (--ide).
-    ide: Option<String>,
     /// Worktree mode (--worktree).
     worktree: bool,
     /// Fork from session ID (--fork-session).
@@ -2601,11 +2595,8 @@ impl ReplLoop {
             capabilities: coderex_config::flags::FeatureFlags::from_env().capabilities(),
             context_window_settings: coderex_core::types::ContextWindowOverrides::default(),
             pr_context: None,
-            ide_manager: None,
-            ide_status: None,
             chrome_enabled: true,
             agent: None,
-            ide: None,
             worktree: false,
             fork_session: None,
             from_pr: None,
@@ -3006,11 +2997,8 @@ impl ReplLoop {
             capabilities: coderex_config::flags::FeatureFlags::from_env().capabilities(),
             context_window_settings: coderex_core::types::ContextWindowOverrides::default(),
             pr_context: None,
-            ide_manager: None,
-            ide_status: None,
             chrome_enabled: true,
             agent: None,
-            ide: None,
             worktree: false,
             fork_session: None,
             from_pr: None,
@@ -3559,26 +3547,6 @@ impl ReplLoop {
         self.capabilities
     }
 
-    /// Wire a live IDE MCP connection into the session.
-    ///
-    /// Registers the server's tools into the dispatcher's registry and keeps
-    /// the manager alive so calls can resolve their connection later.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the MCP slot's lock is poisoned.
-    pub fn with_ide_connection(
-        &mut self,
-        manager: Arc<coderex_mcp::manager::McpManager>,
-        status: String,
-    ) {
-        if let Some(ref dispatcher) = self.dispatcher {
-            manager.register_tools_into(dispatcher.registry());
-        }
-        self.ide_manager = Some(manager);
-        self.ide_status = Some(status);
-    }
-
     pub const fn with_chrome_enabled(&mut self, enabled: bool) {
         self.chrome_enabled = enabled;
     }
@@ -3593,10 +3561,6 @@ impl ReplLoop {
     /// choice is more specific and must win.
     pub const fn with_explicit_model_override(&mut self, explicit: bool) {
         self.explicit_model_override = explicit;
-    }
-
-    pub fn with_ide(&mut self, ide: Option<String>) {
-        self.ide = ide;
     }
 
     pub const fn with_worktree(&mut self, worktree: bool) {
@@ -3891,15 +3855,6 @@ impl ReplLoop {
             self.session_effects.extra_context.push(context.clone());
         }
 
-        // 11. IDE connection status. The tools themselves were registered by
-        // `with_ide_connection`; the connection failing is handled during
-        // startup, before the REPL is built.
-        if let Some(ref status) = self.ide_status {
-            tracing::info!("{status}");
-        }
-        if let Some(ref ide) = self.ide {
-            tracing::debug!("IDE mode requested: {ide}");
-        }
         if self.tmux_enabled {
             tracing::debug!("tmux session/title was applied before startup");
         }
@@ -10506,9 +10461,7 @@ mod tests {
     /// and must fold a long historical output.
     #[test]
     fn resume_projection_drops_thinking_and_folds_long_tool_output() {
-        use coderex_core::types::{
-            Message, MessageContent, Role, ThinkingBlock, ToolCall, ToolResult,
-        };
+        use coderex_core::types::{MessageContent, Role, ThinkingBlock, ToolCall, ToolResult};
         use coderex_ui::message_list::MessageRole;
 
         let call = ToolCall {
@@ -12908,34 +12861,6 @@ mod tests {
                 .iter()
                 .any(|context| context.contains("the PR")),
             "the fetched PR block never reached the session context"
-        );
-    }
-
-    #[tokio::test]
-    async fn ide_connection_tools_join_the_registry() {
-        let api = ReadThenAnswerApi {
-            call: Arc::new(std::sync::Mutex::new(0)),
-            expected_contents: "unused",
-        };
-        let mut repl = ReplLoop::with_engine(Box::new(api), "/tmp".into(), ModelId::sonnet());
-
-        let manager = Arc::new(coderex_mcp::manager::McpManager::new());
-        manager.register_tool(coderex_mcp::proxy::McpToolInfo {
-            server: "ide".into(),
-            name: "executeCode".into(),
-            description: "Run code in the IDE".into(),
-            input_schema: serde_json::json!({"type": "object"}),
-        });
-
-        repl.with_ide_connection(Arc::clone(&manager), "connected".into());
-
-        let dispatcher = repl.dispatcher.take().unwrap();
-        assert!(
-            dispatcher
-                .registry()
-                .get_tool_arc("mcp__ide__executeCode")
-                .is_some(),
-            "an IDE tool did not reach the registry the model dispatches through"
         );
     }
 

@@ -44,10 +44,10 @@ fn full_registry() -> CommandRegistry {
 #[test]
 fn register_all_commands_populates_registry() {
     let reg = full_registry();
-    // The alignment doc claims 77 commands; pin the number so removing one is
+    // The alignment doc claims 76 commands; pin the number so removing one is
     // a failing test rather than a quiet drift. Adding one is a deliberate
     // change and updates this number with it.
-    assert_eq!(reg.len(), 77, "expected 77 commands, got {}", reg.len());
+    assert_eq!(reg.len(), 76, "expected 76 commands, got {}", reg.len());
 }
 
 #[test]

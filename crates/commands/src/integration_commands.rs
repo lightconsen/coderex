@@ -1,4 +1,4 @@
-//! Integration commands: /ide, /chrome, /desktop, /mobile, /voice, /vim, /remote-env, /remote-setup.
+//! Integration commands: /chrome, /desktop, /mobile, /voice, /vim, /remote-env, /remote-setup.
 
 use crate::registry::{CommandContext, CommandRegistry, CommandResult, SlashCommand};
 use std::fmt::Write as _;
@@ -88,34 +88,6 @@ fn write_remote_env(env: &std::collections::HashMap<String, String>) -> Result<(
 
 /// Register integration commands.
 pub fn register(registry: &mut CommandRegistry) {
-    // /ide — IDE integration
-    registry.register(SlashCommand::local(
-        "ide",
-        "IDE integration connection status",
-        true,
-        true,
-        true,
-        Arc::new(|_ctx: &CommandContext, args: &[String]| {
-            if args.is_empty() {
-                CommandResult::success("IDE: Not connected\nUse /ide connect to link your IDE.")
-            } else {
-                match args[0].as_str() {
-                    "connect" => {
-                        CommandResult::success(
-                            "IDE connection requested.\n(Actual IDE connection is handled by the REPL.)"
-                        ).with_state_change(true)
-                    }
-                    "disconnect" => {
-                        CommandResult::success(
-                            "IDE disconnection requested.\n(Actual IDE connection is handled by the REPL.)"
-                        ).with_state_change(true)
-                    }
-                    _ => CommandResult::error("Usage: /ide [connect|disconnect]"),
-                }
-            }
-        }),
-    ));
-
     // /chrome — Chrome DevTools integration
     registry.register(SlashCommand::local(
         "chrome",
@@ -375,29 +347,6 @@ mod tests {
 
     fn ctx() -> CommandContext {
         CommandContext::new("/src".into(), "s1".into(), "Test".into(), ModelId::sonnet())
-    }
-
-    #[test]
-    fn ide_not_connected() {
-        let reg = {
-            let mut r = CommandRegistry::new();
-            register(&mut r);
-            r
-        };
-        let result = reg.execute("ide", &ctx(), &[]);
-        assert!(result.output.contains("Not connected"));
-    }
-
-    #[test]
-    fn ide_connect() {
-        let reg = {
-            let mut r = CommandRegistry::new();
-            register(&mut r);
-            r
-        };
-        let result = reg.execute("ide", &ctx(), &["connect".into()]);
-        assert!(result.output.contains("IDE connection"));
-        assert!(result.state_changed);
     }
 
     #[test]

@@ -6,6 +6,7 @@
 # Environment:
 #   RUN_COVERAGE=1      run scripts/coverage.sh
 #   RUN_CASSETTES=1     run scripts/record-cassettes.sh --check
+#   RUN_VERIFY=1        run scripts/verify.sh (audit, deny, clippy, rustdoc)
 #   RUN_FUZZ=1          run scripts/fuzz.sh
 #   RUN_SOAK=1          run a 200-turn soak
 #   RUN_RACE_SOAK=1     run the symlink/rename adversarial soak
@@ -27,6 +28,7 @@ cd "$(dirname "$0")/.."
 
 run_coverage="${RUN_COVERAGE:-1}"
 run_cassettes="${RUN_CASSETTES:-1}"
+run_verify="${RUN_VERIFY:-1}"
 run_fuzz="${RUN_FUZZ:-1}"
 run_soak="${RUN_SOAK:-1}"
 run_race_soak="${RUN_RACE_SOAK:-1}"
@@ -63,6 +65,9 @@ if [[ "$run_coverage" != "0" ]]; then
 fi
 if [[ "$run_cassettes" != "0" ]]; then
     step cassettes ./scripts/record-cassettes.sh --check
+fi
+if [[ "$run_verify" != "0" ]]; then
+    step verify ./scripts/verify.sh
 fi
 if [[ "$run_fuzz" != "0" ]]; then
     step fuzz ./scripts/fuzz.sh "$fuzz_seconds"
