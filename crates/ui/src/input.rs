@@ -315,7 +315,7 @@ impl InputBuffer {
 
     /// Check if buffer is empty.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.text.is_empty()
     }
 
@@ -415,7 +415,7 @@ impl InputBuffer {
     }
 
     /// Move the cursor to the end of the buffer (`G`).
-    pub fn move_to_buffer_end(&mut self) {
+    pub const fn move_to_buffer_end(&mut self) {
         self.cursor = self.text.len();
     }
 

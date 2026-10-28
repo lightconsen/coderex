@@ -3679,7 +3679,7 @@ impl ReplLoop {
                 ) {
                     Ok(count) => tracing::debug!("installed {count} permission rule(s)"),
                     Err(error) => {
-                        tracing::warn!(%error, "permission rules were not installed")
+                        tracing::warn!(%error, "permission rules were not installed");
                     }
                 }
             }
@@ -6840,7 +6840,7 @@ impl ModUiFocus {
     }
 
     /// The number of focusable buttons.
-    fn button_count(&self) -> usize {
+    const fn button_count(&self) -> usize {
         self.button_ids.len()
     }
 
@@ -7216,7 +7216,7 @@ impl ReplLoop {
         self.cleanup_finished_background_tasks();
 
         // Trigger prompt suggestions after the user has sent a few messages
-        if self.history.len() >= 3 && self.history.len() % 5 == 0 {
+        if self.history.len() >= 3 && self.history.len().is_multiple_of(5) {
             let conversation_summary = self
                 .history
                 .iter()
@@ -12554,7 +12554,7 @@ mod tests {
         #[async_trait::async_trait]
         impl ApiClient for FlagTestApi {
             fn clone_box(&self) -> Box<dyn ApiClient> {
-                Box::new(FlagTestApi)
+                Box::new(Self)
             }
 
             async fn create_message(

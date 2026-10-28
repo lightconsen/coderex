@@ -391,7 +391,7 @@ mod tests {
         let factory = default_factory();
         let transport = factory.create("in-process", "test_conn");
         assert!(transport.is_some());
-        assert!(transport.unwrap().connection_id() == "test_conn");
+        assert_eq!(transport.unwrap().connection_id(), "test_conn");
     }
 
     #[test]

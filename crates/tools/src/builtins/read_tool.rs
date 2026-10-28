@@ -386,8 +386,7 @@ mod verified_read_tests {
         let ctx = ctx(dir.path()).with_path_verifier(Arc::new(move |paths| {
             assert!(
                 paths[0].ends_with("first.txt"),
-                "the handle path is the real target: {:?}",
-                paths
+                "the handle path is the real target: {paths:?}"
             );
             // Retarget after the handle was opened and its path reported.
             let _ = std::fs::remove_file(&link_for_hook);

@@ -2223,7 +2223,7 @@ mod tests {
 
     #[test]
     fn trim_lines_to_viewport_scrolls_from_bottom() {
-        let lines = vec![
+        let lines = [
             Line::from("line 1"),
             Line::from("line 2"),
             Line::from("line 3"),

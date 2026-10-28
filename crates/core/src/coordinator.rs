@@ -155,7 +155,7 @@ impl CoordinatorState {
 
     /// Get the number of phases completed so far.
     #[must_use]
-    pub fn phases_completed(&self) -> usize {
+    pub const fn phases_completed(&self) -> usize {
         self.phase_summaries.len()
     }
 }

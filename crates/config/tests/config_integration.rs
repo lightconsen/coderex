@@ -202,7 +202,7 @@ fn settings_json_serde_roundtrip() {
 #[test]
 fn settings_validate_rejects_empty_model() {
     let settings = Settings {
-        model: Some("".into()),
+        model: Some(String::new()),
         ..Default::default()
     };
     let err = settings.validate().unwrap_err();
@@ -239,7 +239,7 @@ fn settings_validate_rejects_invalid_permission_mode() {
 fn config_service_invalid_file_falls_back_to_defaults() {
     // ConfigService::resolve() swallows file-level errors and falls back to defaults
     let settings = Settings {
-        model: Some("".into()),
+        model: Some(String::new()),
         ..Default::default()
     };
     let path = temp_settings_file(&settings);

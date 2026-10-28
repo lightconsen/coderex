@@ -340,7 +340,7 @@ mod tests {
         }
         // Should have 5 distinct days
         let distinct_days: std::collections::HashSet<_> =
-            nexts.iter().map(|dt| dt.date_naive()).collect();
+            nexts.iter().map(chrono::DateTime::date_naive).collect();
         assert!(distinct_days.len() >= 3);
     }
 

@@ -143,7 +143,7 @@ impl BridgeSessionStateMachine {
 
     /// Get the number of state transitions so far.
     #[must_use]
-    pub fn transition_count(&self) -> usize {
+    pub const fn transition_count(&self) -> usize {
         self.history.len()
     }
 }

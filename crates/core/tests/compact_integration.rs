@@ -68,9 +68,9 @@ fn make_long_messages(count: usize) -> Vec<Message> {
     let mut messages = Vec::new();
     messages.push(make_user("initial query"));
     for i in 0..count {
-        messages.push(make_assistant(&format!("response {}", i).repeat(50)));
-        messages.push(make_user(&format!("follow-up {}", i)));
-        messages.push(make_tool_result(&format!("tool output {}", i).repeat(100)));
+        messages.push(make_assistant(&format!("response {i}").repeat(50)));
+        messages.push(make_user(&format!("follow-up {i}")));
+        messages.push(make_tool_result(&format!("tool output {i}").repeat(100)));
     }
     messages
 }
@@ -251,8 +251,8 @@ fn reactive_compact_preserves_first_user_and_recent_turns() {
     let mut messages = Vec::new();
     messages.push(make_user("initial query"));
     for i in 0..10 {
-        messages.push(make_assistant(&format!("response {}", i)));
-        messages.push(make_user(&format!("follow-up {}", i)));
+        messages.push(make_assistant(&format!("response {i}")));
+        messages.push(make_user(&format!("follow-up {i}")));
     }
 
     let result = reactive_compact(&messages, 2);
@@ -360,7 +360,7 @@ fn snip_compact_boundary_inserted_when_gap_exists() {
     let mut messages = Vec::new();
     messages.push(make_user("first"));
     for i in 0..20 {
-        messages.push(make_assistant(&format!("long response {}", i).repeat(50)));
+        messages.push(make_assistant(&format!("long response {i}").repeat(50)));
     }
     messages.push(make_user("last"));
 
@@ -601,7 +601,7 @@ fn compact_pipeline_micro_then_auto() {
             "read",
             &format!("tool output {i}").repeat(2000),
         ));
-        messages.push(make_assistant(&format!("response {}", i).repeat(200)));
+        messages.push(make_assistant(&format!("response {i}").repeat(200)));
     }
     messages.push(make_user("end"));
 

@@ -398,7 +398,7 @@ fn luhn_valid(digits: &str) -> bool {
         sum += value;
         double = !double;
     }
-    sum % 10 == 0
+    sum.is_multiple_of(10)
 }
 
 /// Replace payment card numbers that pass the Luhn checksum.

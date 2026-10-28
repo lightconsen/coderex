@@ -87,7 +87,7 @@ impl McpFormState {
     /// Move focus by `delta`, wrapping around.
     // Field counts are small, so the usize/isize round-trip cannot overflow.
     #[allow(clippy::cast_possible_wrap)]
-    pub fn move_focus(&mut self, delta: isize) {
+    pub const fn move_focus(&mut self, delta: isize) {
         let count = self.form.fields.len();
         if count == 0 {
             return;

@@ -1679,11 +1679,10 @@ mod tests {
 
         let tools = dispatcher.list_tools();
         let schema_of = |name: &str| {
-            tools
-                .iter()
-                .find(|t| t.name == name)
-                .map(|t| t.input_schema.clone())
-                .unwrap_or_else(|| panic!("{name} was not listed"))
+            tools.iter().find(|t| t.name == name).map_or_else(
+                || panic!("{name} was not listed"),
+                |t| t.input_schema.clone(),
+            )
         };
 
         // This one advertises the argument and never reads it, so it is gone.

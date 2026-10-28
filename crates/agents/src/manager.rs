@@ -254,7 +254,7 @@ impl ParentContextSnapshot {
 
     /// Whether there is a conversation prefix worth reusing.
     #[must_use]
-    pub fn has_prefix(&self) -> bool {
+    pub const fn has_prefix(&self) -> bool {
         !self.messages.is_empty()
     }
 }
@@ -375,7 +375,7 @@ impl ForkedContext {
 
     /// Whether this fork actually reuses a parent prefix.
     #[must_use]
-    pub fn reuses_parent_prefix(&self) -> bool {
+    pub const fn reuses_parent_prefix(&self) -> bool {
         !self.conversation_prefix.is_empty()
     }
 

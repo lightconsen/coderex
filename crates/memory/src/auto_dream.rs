@@ -501,9 +501,7 @@ mod tests {
             dream.record_session().unwrap();
             dream.record_session().unwrap();
             let ds = dream.start_dream().unwrap();
-            dream
-                .complete_dream(ds, &format!("Dream {}", i), 3)
-                .unwrap();
+            dream.complete_dream(ds, &format!("Dream {i}"), 3).unwrap();
         }
 
         let history = dream.dream_history();

@@ -268,8 +268,8 @@ mod tests {
 
     #[test]
     fn domain_filtering_logic() {
-        let blocked = vec!["spam.com".to_string(), "ads.net".to_string()];
-        let allowed = vec!["trusted.com".to_string()];
+        let blocked = ["spam.com".to_string(), "ads.net".to_string()];
+        let allowed = ["trusted.com".to_string()];
 
         // Blocked domain should be filtered
         assert!(blocked.iter().any(|d| "spam.com".contains(d.as_str())));

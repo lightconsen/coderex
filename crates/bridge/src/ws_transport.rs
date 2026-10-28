@@ -405,7 +405,7 @@ mod tests {
     #[test]
     fn token_store_upsert_and_validate() {
         let mut store = BridgeTokenStore::default();
-        assert!(store.count() == 0);
+        assert_eq!(store.count(), 0);
 
         store.upsert("prod", "tok_abc123");
         store.upsert("dev", "tok_dev456");

@@ -561,13 +561,13 @@ impl CommandRegistry {
 
     /// Count registered commands.
     #[must_use]
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.commands.len()
     }
 
     /// Check if no commands are registered.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.commands.is_empty()
     }
 

@@ -5599,7 +5599,7 @@ mod tests {
     #[async_trait::async_trait]
     impl ApiClient for MockApiClient {
         fn clone_box(&self) -> Box<dyn ApiClient> {
-            Box::new(MockApiClient)
+            Box::new(Self)
         }
 
         async fn create_message(
@@ -5645,7 +5645,7 @@ mod tests {
     #[async_trait::async_trait]
     impl ApiClient for EmptyStreamingApiClient {
         fn clone_box(&self) -> Box<dyn ApiClient> {
-            Box::new(EmptyStreamingApiClient)
+            Box::new(Self)
         }
 
         async fn create_message(
@@ -6072,7 +6072,7 @@ mod tests {
         #[async_trait::async_trait]
         impl ApiClient for TruncatingMock {
             fn clone_box(&self) -> Box<dyn ApiClient> {
-                Box::new(TruncatingMock)
+                Box::new(Self)
             }
 
             async fn create_message(
@@ -6184,7 +6184,7 @@ mod tests {
         #[async_trait::async_trait]
         impl ApiClient for UnreachableMock {
             fn clone_box(&self) -> Box<dyn ApiClient> {
-                Box::new(UnreachableMock)
+                Box::new(Self)
             }
 
             async fn create_message(
@@ -6310,7 +6310,7 @@ mod tests {
         #[async_trait::async_trait]
         impl ApiClient for FatalMock {
             fn clone_box(&self) -> Box<dyn ApiClient> {
-                Box::new(FatalMock)
+                Box::new(Self)
             }
 
             async fn create_message(
@@ -6365,7 +6365,7 @@ mod tests {
         #[async_trait::async_trait]
         impl ApiClient for UnavailableMock {
             fn clone_box(&self) -> Box<dyn ApiClient> {
-                Box::new(UnavailableMock)
+                Box::new(Self)
             }
 
             async fn create_message(
@@ -6430,7 +6430,7 @@ mod tests {
         #[async_trait::async_trait]
         impl ApiClient for RejectingMock {
             fn clone_box(&self) -> Box<dyn ApiClient> {
-                Box::new(RejectingMock)
+                Box::new(Self)
             }
 
             async fn create_message(
@@ -7264,7 +7264,7 @@ mod tests {
         #[async_trait::async_trait]
         impl ApiClient for FailingMock {
             fn clone_box(&self) -> Box<dyn ApiClient> {
-                Box::new(FailingMock)
+                Box::new(Self)
             }
 
             async fn create_message(
@@ -7913,7 +7913,7 @@ mod tests {
         });
         assert_eq!(completed.len(), 1);
         assert_eq!(completed[0].name, "read");
-        assert_eq!(assembler.has_tool_calls(), true);
+        assert!(assembler.has_tool_calls());
     }
 
     #[test]
@@ -8462,7 +8462,7 @@ mod tests {
         #[async_trait::async_trait]
         impl ApiClient for StatefulMock {
             fn clone_box(&self) -> Box<dyn ApiClient> {
-                Box::new(StatefulMock {
+                Box::new(Self {
                     call_count: Arc::clone(&self.call_count),
                 })
             }
@@ -9863,7 +9863,7 @@ mod tests {
     #[async_trait::async_trait]
     impl ApiClient for StreamingToolCallApi {
         fn clone_box(&self) -> Box<dyn ApiClient> {
-            Box::new(StreamingToolCallApi)
+            Box::new(Self)
         }
 
         async fn create_message(
@@ -9954,7 +9954,7 @@ mod tests {
     #[async_trait::async_trait]
     impl ApiClient for NonRetryableApi {
         fn clone_box(&self) -> Box<dyn ApiClient> {
-            Box::new(NonRetryableApi)
+            Box::new(Self)
         }
 
         async fn create_message(

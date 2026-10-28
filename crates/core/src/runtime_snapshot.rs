@@ -56,7 +56,7 @@ fn linux_process_facts(pid: u32) -> Option<String> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn linux_process_facts(_pid: u32) -> Option<String> {
+const fn linux_process_facts(_pid: u32) -> Option<String> {
     None
 }
 

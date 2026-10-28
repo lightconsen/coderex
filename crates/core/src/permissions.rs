@@ -657,7 +657,7 @@ fn strip_verbatim_prefix(path: std::path::PathBuf) -> std::path::PathBuf {
         return std::path::PathBuf::from(format!(r"\\{rest}"));
     }
     text.strip_prefix(r"\\?\")
-        .map_or(path, |rest| std::path::PathBuf::from(rest))
+        .map_or(path, std::path::PathBuf::from)
 }
 
 /// Whether a command is the configured prefix at a word boundary.
@@ -1483,7 +1483,7 @@ mod tests {
     #[test]
     fn strip_dangerous_tools_removes_blocked() {
         let checker = PermissionChecker::new(PermissionMode::Plan);
-        let tools = vec!["read", "grep", "bash", "write"];
+        let tools = ["read", "grep", "bash", "write"];
         let (allowed, denied) = checker.strip_dangerous_tools(tools.iter().map(|s| *s));
 
         assert_eq!(allowed, vec!["read", "grep"]);
@@ -1710,7 +1710,7 @@ mod tests {
         // This call refuses the allow; the dangerous default decides.
         match checker.check_with_exemptions("bash", None, Some(exemptions)) {
             PermissionResult::Ask { reason } => {
-                assert!(reason.contains("requires approval"), "{reason}")
+                assert!(reason.contains("requires approval"), "{reason}");
             }
             other => panic!("a refused allow rule must not approve the call, got {other:?}"),
         }

@@ -36,7 +36,10 @@ fn dispatcher(cwd: &Path, store: Option<Arc<CheckpointStore>>) -> RegistryToolDi
 }
 
 fn ids(values: &[&str]) -> HashSet<String> {
-    values.iter().map(|value| value.to_string()).collect()
+    values
+        .iter()
+        .map(std::string::ToString::to_string)
+        .collect()
 }
 
 fn store(root: &Path) -> Arc<CheckpointStore> {

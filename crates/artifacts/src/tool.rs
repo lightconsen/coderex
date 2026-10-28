@@ -1573,8 +1573,8 @@ mod tests {
         assert!(error.contains(DATA_TOOL), "{error}");
 
         // The legacy names are not refused: they are forwarded.
-        assert_eq!(resolve_action(ARTIFACT_TOOL, "read_db").legacy, true);
-        assert_eq!(resolve_action(ARTIFACT_TOOL, "publish").legacy, false);
+        assert!(resolve_action(ARTIFACT_TOOL, "read_db").legacy);
+        assert!(!resolve_action(ARTIFACT_TOOL, "publish").legacy);
     }
 
     #[tokio::test]

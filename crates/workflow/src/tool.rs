@@ -437,7 +437,7 @@ impl Tool for WorkflowTool {
 /// Control characters, and the direction and zero-width characters that can
 /// reorder or hide what a person is reading: a script is shown before it runs,
 /// so it must be the script that is shown.
-fn is_hidden(ch: char) -> bool {
+const fn is_hidden(ch: char) -> bool {
     if ch.is_control() && ch != '\n' && ch != '\t' && ch != '\r' {
         return true;
     }

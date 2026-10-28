@@ -525,13 +525,13 @@ impl BridgeWorkPoller {
 
     /// Check if there are pending assignments.
     #[must_use]
-    pub fn has_pending(&self) -> bool {
+    pub const fn has_pending(&self) -> bool {
         !self.pending.is_empty()
     }
 
     /// Number of pending assignments.
     #[must_use]
-    pub fn pending_count(&self) -> usize {
+    pub const fn pending_count(&self) -> usize {
         self.pending.len()
     }
 

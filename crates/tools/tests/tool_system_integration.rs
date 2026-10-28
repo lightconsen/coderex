@@ -34,7 +34,7 @@ fn test_dispatcher(cwd: PathBuf) -> RegistryToolDispatcher {
     dispatcher
 }
 
-fn tool_args(args: serde_json::Value) -> serde_json::Value {
+const fn tool_args(args: serde_json::Value) -> serde_json::Value {
     args
 }
 

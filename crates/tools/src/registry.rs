@@ -578,7 +578,7 @@ mod tests {
             .unwrap();
         match result {
             PermissionResult::Deny { reason } => {
-                assert!(reason.contains("no writes here"), "{reason}")
+                assert!(reason.contains("no writes here"), "{reason}");
             }
             other => panic!("deny must win over the exemption, got {other:?}"),
         }

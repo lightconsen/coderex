@@ -370,7 +370,7 @@ impl ElicitationManager {
 
     /// Number of pending requests.
     #[must_use]
-    pub fn pending_count(&self) -> usize {
+    pub const fn pending_count(&self) -> usize {
         self.pending.len()
     }
 

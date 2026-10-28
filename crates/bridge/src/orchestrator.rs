@@ -887,7 +887,7 @@ impl Bridge {
 
     /// Get the poller's pending assignment count.
     #[must_use]
-    pub fn pending_assignment_count(&self) -> usize {
+    pub const fn pending_assignment_count(&self) -> usize {
         self.poller.pending_count()
     }
 

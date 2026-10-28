@@ -93,19 +93,19 @@ impl OverlayStack {
 
     /// Check if any overlay is active.
     #[must_use]
-    pub fn is_active(&self) -> bool {
+    pub const fn is_active(&self) -> bool {
         !self.overlays.is_empty()
     }
 
     /// Count active overlays.
     #[must_use]
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.overlays.len()
     }
 
     /// Check if there are no active overlays.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.overlays.is_empty()
     }
 

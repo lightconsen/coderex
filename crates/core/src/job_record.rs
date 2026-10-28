@@ -292,7 +292,7 @@ pub struct AdoptOutcome {
 impl AdoptOutcome {
     /// Total number of records classified.
     #[must_use]
-    pub fn total(&self) -> usize {
+    pub const fn total(&self) -> usize {
         self.resumable.len()
             + self.interrupted.len()
             + self.stale.len()

@@ -357,7 +357,7 @@ impl TelemetryUploader {
 
     /// Override the resolved modes in tests without touching the environment.
     #[cfg(test)]
-    fn with_mode_for_test(mut self, verbose: bool, strict: bool) -> Self {
+    const fn with_mode_for_test(mut self, verbose: bool, strict: bool) -> Self {
         self.verbose = verbose;
         self.strict = strict;
         self

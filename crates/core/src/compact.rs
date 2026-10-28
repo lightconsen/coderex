@@ -1550,7 +1550,7 @@ mod tests {
         messages.push(make_user_text("start"));
         for i in 0..20 {
             messages.push(make_assistant_text(
-                &format!("long response {}", i).repeat(50),
+                &format!("long response {i}").repeat(50),
             ));
         }
         messages.push(make_user_text("final"));
@@ -2187,7 +2187,7 @@ mod tests {
     fn truncate_middle_keeps_head_and_tail() {
         let long = "a".repeat(500) + "MIDDLE_MARKER" + &"z".repeat(500);
         let out = truncate_middle(&long, 100);
-        assert!(out.contains("MIDDLE_MARKER") == false);
+        assert_eq!(out.contains("MIDDLE_MARKER"), false);
         assert!(out.starts_with('a'));
         assert!(out.ends_with('z'));
         assert!(out.contains("chars elided"));
@@ -2304,7 +2304,7 @@ mod tests {
         // A long TTL: 90% is earlier than TTL − 30s, so 90% wins.
         assert_eq!(
             cache_ttl_wake_after(Duration::from_secs(3600), Duration::from_secs(30)),
-            Duration::from_secs(3240)
+            Duration::from_mins(54)
         );
         // A TTL shorter than the early exit falls back to 90% rather than
         // waking at zero, which would call every request cold.

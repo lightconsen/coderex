@@ -53,7 +53,7 @@ impl WebFetchTool {
 
     /// Skip the SSRF guard so a test can talk to a loopback server.
     #[cfg(test)]
-    fn without_ssrf_guard(mut self) -> Self {
+    const fn without_ssrf_guard(mut self) -> Self {
         self.enforce_ssrf = false;
         self
     }

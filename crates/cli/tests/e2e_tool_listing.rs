@@ -152,11 +152,10 @@ async fn tool_names(args: &[&str]) -> Vec<String> {
 async fn backgrounding_tools_advertise_run_in_background() {
     let tools = tool_definitions(&["--dangerously-skip-permissions"]).await;
     let property = |name: &str| {
-        tools
-            .iter()
-            .find(|tool| tool["name"] == name)
-            .map(|tool| tool["input_schema"]["properties"]["run_in_background"].clone())
-            .unwrap_or_else(|| panic!("{name} is not advertised: {tools:?}"))
+        tools.iter().find(|tool| tool["name"] == name).map_or_else(
+            || panic!("{name} is not advertised: {tools:?}"),
+            |tool| tool["input_schema"]["properties"]["run_in_background"].clone(),
+        )
     };
 
     for name in ["Bash", "Agent"] {

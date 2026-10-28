@@ -82,7 +82,7 @@ impl SearchState {
     }
 
     /// Go to the next match.
-    pub fn next(&mut self) {
+    pub const fn next(&mut self) {
         if self.matches.is_empty() {
             return;
         }
@@ -90,7 +90,7 @@ impl SearchState {
     }
 
     /// Go to the previous match.
-    pub fn prev(&mut self) {
+    pub const fn prev(&mut self) {
         if self.matches.is_empty() {
             return;
         }
@@ -109,7 +109,7 @@ impl SearchState {
 
     /// Total match count.
     #[must_use]
-    pub fn match_count(&self) -> usize {
+    pub const fn match_count(&self) -> usize {
         self.matches.len()
     }
 
@@ -123,7 +123,7 @@ impl SearchState {
 
     /// Check if currently searching.
     #[must_use]
-    pub fn is_active(&self) -> bool {
+    pub const fn is_active(&self) -> bool {
         !self.matches.is_empty()
     }
 }

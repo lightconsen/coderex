@@ -283,7 +283,7 @@ impl CostTracker {
 
     /// Get the number of turns so far.
     #[must_use]
-    pub fn turn_count(&self) -> usize {
+    pub const fn turn_count(&self) -> usize {
         self.turn_history.len()
     }
 

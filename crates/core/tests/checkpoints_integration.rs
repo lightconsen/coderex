@@ -7,7 +7,10 @@ use std::collections::HashSet;
 use coderex_core::checkpoints::CheckpointStore;
 
 fn ids(values: &[&str]) -> HashSet<String> {
-    values.iter().map(|value| value.to_string()).collect()
+    values
+        .iter()
+        .map(std::string::ToString::to_string)
+        .collect()
 }
 
 #[test]

@@ -1931,7 +1931,7 @@ fn optional_path(arg: Option<PathBuf>, env: Option<String>) -> Option<PathBuf> {
     arg.or_else(|| optional_string(None, env).map(PathBuf::from))
 }
 
-fn is_websocket(transport: &str) -> bool {
+const fn is_websocket(transport: &str) -> bool {
     transport.eq_ignore_ascii_case("websocket") || transport.eq_ignore_ascii_case("ws")
 }
 

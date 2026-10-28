@@ -74,13 +74,13 @@ impl McpResourceRegistry {
 
     /// Number of resources.
     #[must_use]
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.resources.len()
     }
 
     /// Check if empty.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.resources.is_empty()
     }
 }

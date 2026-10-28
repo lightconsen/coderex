@@ -126,7 +126,7 @@ pub struct ConfigDiff {
 impl ConfigDiff {
     /// Check if there are any changes from defaults.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.changes.is_empty()
     }
 
@@ -1529,7 +1529,7 @@ mod tests {
     #[test]
     fn settings_validate_empty_model_fails() {
         let settings = Settings {
-            model: Some("".into()),
+            model: Some(String::new()),
             ..Default::default()
         };
         let err = settings.validate().unwrap_err();
@@ -2720,7 +2720,7 @@ mod tests {
                 models: HashMap::from([
                     ("valid".into(), 128_000),
                     ("zero".into(), 0),
-                    ("".into(), 64_000),
+                    (String::new(), 64_000),
                 ]),
             }),
             ..Default::default()

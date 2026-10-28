@@ -3532,7 +3532,7 @@ fn matcher_matches(matcher: &str, input: &str) -> bool {
     })
 }
 
-pub fn is_gating_event(event: &str) -> bool {
+pub const fn is_gating_event(event: &str) -> bool {
     use coderex_core::hook_events::{PRE_TOOL_USE, USER_PROMPT_SUBMIT};
     event.eq_ignore_ascii_case(PRE_TOOL_USE) || event.eq_ignore_ascii_case(USER_PROMPT_SUBMIT)
 }

@@ -172,7 +172,7 @@ fn normalize_base64(data: &str) -> Option<String> {
     if without_padding.len() % 4 == 1 {
         return None;
     }
-    while cleaned.len() % 4 != 0 {
+    while !cleaned.len().is_multiple_of(4) {
         cleaned.push('=');
     }
     Some(cleaned)

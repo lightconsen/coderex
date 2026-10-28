@@ -124,7 +124,7 @@ impl MessageView {
     }
 
     /// Update the visible count (e.g., after resize).
-    pub fn set_visible_count(&mut self, count: usize) {
+    pub const fn set_visible_count(&mut self, count: usize) {
         self.visible_count = count;
         // Keep start valid
         let max_start = self.messages.len().saturating_sub(self.visible_count);

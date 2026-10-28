@@ -64,7 +64,7 @@ impl MessageSelector {
 
     /// Number of selected messages.
     #[must_use]
-    pub fn count(&self) -> usize {
+    pub const fn count(&self) -> usize {
         self.selected.len()
     }
 

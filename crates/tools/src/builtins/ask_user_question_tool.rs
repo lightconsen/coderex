@@ -181,7 +181,7 @@ mod tests {
             .send(serde_json::json!({ "answer": "A" }));
 
         let output = handle.await.unwrap().unwrap();
-        assert!(output.output.contains("A"));
+        assert!(output.output.contains('A'));
     }
 
     #[tokio::test]

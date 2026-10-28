@@ -76,7 +76,7 @@ impl MockServer {
 
     /// Get call count.
     #[must_use]
-    pub fn call_count(&self) -> usize {
+    pub const fn call_count(&self) -> usize {
         self.call_history.len()
     }
 

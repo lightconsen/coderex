@@ -102,7 +102,7 @@ async fn capture_single_request(
 
         captured
     });
-    (format!("http://{}", addr), handle)
+    (format!("http://{addr}"), handle)
 }
 
 async fn capture_requests_with_raw_responses(
@@ -125,7 +125,7 @@ async fn capture_requests_with_raw_responses(
         }
         captured
     });
-    (format!("http://{}", addr), handle)
+    (format!("http://{addr}"), handle)
 }
 
 struct MockProvider {
@@ -155,7 +155,7 @@ impl MockProvider {
     }
 
     fn with_models(mut self, models: Vec<&str>) -> Self {
-        self.supported_models = models.into_iter().map(|s| s.into()).collect();
+        self.supported_models = models.into_iter().map(std::convert::Into::into).collect();
         self
     }
 
@@ -761,7 +761,7 @@ fn custom_pricing_override() {
 async fn anthropic_client_sends_coderex_identity_headers_and_metadata() {
     let _guard = env_lock()
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (base_url, handle) = capture_single_request(serde_json::json!({
         "content": [{"type": "text", "text": "ok"}],
         "usage": {"input_tokens": 1, "output_tokens": 1},
@@ -848,7 +848,7 @@ async fn anthropic_client_parses_thinking_block_with_signature() {
 async fn anthropic_compatible_profile_forwards_structured_tools() {
     let _guard = env_lock()
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (base_url, handle) = capture_single_request(serde_json::json!({
         "content": [{"type": "text", "text": "ok"}],
         "usage": {"input_tokens": 1, "output_tokens": 1},
@@ -888,7 +888,7 @@ async fn anthropic_compatible_profile_forwards_structured_tools() {
 async fn openai_provider_sends_coderex_identity_headers_and_metadata() {
     let _guard = env_lock()
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (base_url, handle) = capture_single_request(serde_json::json!({
         "choices": [{
             "message": {"content": "ok"},
@@ -968,7 +968,7 @@ async fn openai_provider_sends_coderex_identity_headers_and_metadata() {
 async fn openai_provider_streaming_emits_text_tool_and_usage_events() {
     let _guard = env_lock()
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let sse = concat!(
         "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"I will \",\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"Read\",\"arguments\":\"{\\\"file\\\":\\\"src/\"}}]},\"finish_reason\":null}]}\n\n",
         "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"check it\",\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"lib.rs\\\"}\"}}]},\"finish_reason\":null}]}\n\n",
@@ -977,8 +977,7 @@ async fn openai_provider_streaming_emits_text_tool_and_usage_events() {
         "data: [DONE]\n\n"
     );
     let raw_response = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{}",
-        sse
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{sse}"
     );
     let (base_url, handle) = capture_requests_with_raw_responses(vec![raw_response]).await;
 
@@ -1035,7 +1034,7 @@ async fn openai_provider_streaming_emits_text_tool_and_usage_events() {
 async fn openai_provider_streaming_falls_back_to_non_streaming_request() {
     let _guard = env_lock()
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let stream_failure = "HTTP/1.1 500 Internal Server Error\r\nContent-Type: text/plain\r\nContent-Length: 4\r\nConnection: close\r\n\r\noops".to_string();
     let json_body = serde_json::json!({
         "choices": [{
@@ -1076,7 +1075,7 @@ async fn openai_provider_streaming_falls_back_to_non_streaming_request() {
 async fn openai_responses_provider_uses_responses_payload_shape() {
     let _guard = env_lock()
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (base_url, handle) = capture_single_request(serde_json::json!({
         "status": "completed",
         "output": [
@@ -1137,7 +1136,7 @@ async fn openai_responses_provider_uses_responses_payload_shape() {
 async fn provider_router_forwards_request_context_to_provider_headers() {
     let _guard = env_lock()
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (base_url, handle) = capture_single_request(serde_json::json!({
         "choices": [{
             "message": {"content": "ok"},
@@ -1189,7 +1188,7 @@ async fn provider_router_forwards_request_context_to_provider_headers() {
 async fn provider_errors_surface_request_diagnostics() {
     let _guard = env_lock()
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let raw_response = "HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\nContent-Length: 34\r\nx-request-id: srv-123\r\nConnection: close\r\n\r\nonly available for Coding Agents".to_string();
     let (base_url, _handle) = capture_requests_with_raw_responses(vec![raw_response]).await;
 

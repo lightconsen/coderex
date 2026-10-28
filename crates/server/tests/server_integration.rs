@@ -16,7 +16,7 @@ struct ScriptedModel(&'static str);
 #[async_trait::async_trait]
 impl coderex_core::api_client::ApiClient for ScriptedModel {
     fn clone_box(&self) -> Box<dyn coderex_core::api_client::ApiClient> {
-        Box::new(ScriptedModel(self.0))
+        Box::new(Self(self.0))
     }
 
     async fn create_message(
@@ -123,7 +123,7 @@ struct SlowScriptedModel {
 #[async_trait::async_trait]
 impl coderex_core::api_client::ApiClient for SlowScriptedModel {
     fn clone_box(&self) -> Box<dyn coderex_core::api_client::ApiClient> {
-        Box::new(SlowScriptedModel {
+        Box::new(Self {
             answer: self.answer,
             delay: self.delay,
         })
@@ -458,7 +458,7 @@ async fn a_session_reuses_its_history_and_a_new_session_starts_clean() {
     #[async_trait::async_trait]
     impl coderex_core::api_client::ApiClient for HistoryEcho {
         fn clone_box(&self) -> Box<dyn coderex_core::api_client::ApiClient> {
-            Box::new(HistoryEcho)
+            Box::new(Self)
         }
 
         async fn create_message(
@@ -605,7 +605,7 @@ async fn a_disconnect_stops_the_query_that_was_running() {
 
     // Wait for the query to start, then leave.
     let mut waited = 0;
-    while handles.lock().map(|held| held.is_empty()).unwrap_or(true) && waited < 100 {
+    while handles.lock().map_or(true, |held| held.is_empty()) && waited < 100 {
         tokio::time::sleep(Duration::from_millis(50)).await;
         waited += 1;
     }

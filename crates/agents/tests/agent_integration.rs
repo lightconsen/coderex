@@ -489,7 +489,7 @@ async fn agent_multiple_agents_tracked_independently() {
     for i in 0..5 {
         mgr.spawn_agent(
             AgentType::GeneralPurpose,
-            &format!("task {}", i),
+            &format!("task {i}"),
             SpawnOptions::default(),
             "sess_multi",
             tmp.path().to_str().unwrap(),

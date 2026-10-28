@@ -330,7 +330,7 @@ mod tests {
         };
         let result = reg.execute("copy", &ctx(), &["3".into(), "5".into()]);
         // May succeed or fail depending on platform clipboard, but output mentions the messages
-        assert!(result.output.contains("3") && result.output.contains("5"));
+        assert!(result.output.contains('3') && result.output.contains('5'));
     }
 
     #[test]

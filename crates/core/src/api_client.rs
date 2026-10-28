@@ -3131,8 +3131,7 @@ data: {"type":"message_stop"}
     async fn parse_sse_stream_stress_large_payload() {
         let large_text = "x".repeat(100_000);
         let sse = format!(
-            "event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"{}\"}}}}\n\nevent: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n",
-            large_text
+            "event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"{large_text}\"}}}}\n\nevent: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n"
         );
 
         let stream = futures::stream::iter(vec![Ok(bytes::Bytes::from(sse))]);

@@ -401,7 +401,7 @@ mod tests {
         let attacker = std::thread::spawn(move || {
             let mut index = 0_u64;
             while !attacker_stop.load(Ordering::Relaxed) {
-                let target = if index % 2 == 0 {
+                let target = if index.is_multiple_of(2) {
                     attacker_base.join("outside")
                 } else {
                     attacker_base.join("inside")

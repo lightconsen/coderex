@@ -387,7 +387,7 @@ impl SessionRecoveryState {
 
     /// Check if there are pending tool calls.
     #[must_use]
-    pub fn has_pending_tools(&self) -> bool {
+    pub const fn has_pending_tools(&self) -> bool {
         !self.pending_tool_calls.is_empty()
     }
 

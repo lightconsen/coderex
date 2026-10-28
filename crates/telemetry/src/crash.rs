@@ -1388,14 +1388,12 @@ mod tests {
     }
 
     fn pending_json_files(dir: &Path) -> usize {
-        std::fs::read_dir(dir)
-            .map(|entries| {
-                entries
-                    .flatten()
-                    .filter(|entry| is_pending_crash_file(&entry.path()))
-                    .count()
-            })
-            .unwrap_or(0)
+        std::fs::read_dir(dir).map_or(0, |entries| {
+            entries
+                .flatten()
+                .filter(|entry| is_pending_crash_file(&entry.path()))
+                .count()
+        })
     }
 
     /// Panic hooks are process-global; serialize the tests that install one.
@@ -1748,7 +1746,7 @@ mod tests {
         assert!(crash.panic_message_len.unwrap() > 0);
         assert_eq!(crash.panic_message_sha256.as_deref().unwrap().len(), 64);
         let symbols = crash.backtrace_symbols.unwrap();
-        assert!(!symbols.contains("/"));
+        assert!(!symbols.contains('/'));
         assert!(!symbols.contains("somebody"));
 
         // The local summary may keep a (now user-redacted) absolute path; the
@@ -1966,7 +1964,7 @@ mod tests {
     fn capture_disabled_writes_no_pending_file() {
         let _guard = PANIC_HOOK_TEST_LOCK
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = crash_dir("capture_disabled");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -1994,7 +1992,7 @@ mod tests {
     fn capture_enabled_writes_a_pending_file() {
         let _guard = PANIC_HOOK_TEST_LOCK
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = crash_dir("capture_enabled");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -2035,7 +2033,7 @@ mod tests {
         for path in [&old, &fresh, &not_a_crash] {
             std::fs::write(path, "{}").unwrap();
         }
-        let day = std::time::Duration::from_secs(24 * 60 * 60);
+        let day = std::time::Duration::from_hours(24);
         let file = std::fs::OpenOptions::new().write(true).open(&old).unwrap();
         file.set_modified(now - 10 * day).unwrap();
         drop(file);

@@ -226,7 +226,7 @@ mod tests {
 
     #[test]
     fn a_session_is_read_into_counts() {
-        let messages = vec![
+        let messages = [
             Message::user("  fix   the parser\nplease  "),
             Message {
                 role: Role::Assistant,

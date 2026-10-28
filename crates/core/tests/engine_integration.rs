@@ -38,7 +38,7 @@ fn make_engine(
     (engine, rx)
 }
 
-fn usage(output_tokens: usize) -> UsageSummary {
+const fn usage(output_tokens: usize) -> UsageSummary {
     UsageSummary {
         input_tokens: 10,
         output_tokens,
@@ -117,7 +117,7 @@ impl TextMock {
 #[async_trait]
 impl ApiClient for TextMock {
     fn clone_box(&self) -> Box<dyn ApiClient> {
-        Box::new(TextMock {
+        Box::new(Self {
             response: self.response.clone(),
         })
     }
@@ -172,7 +172,7 @@ impl SequenceMock {
 #[async_trait]
 impl ApiClient for SequenceMock {
     fn clone_box(&self) -> Box<dyn ApiClient> {
-        Box::new(SequenceMock {
+        Box::new(Self {
             responses: self.responses.clone(),
             call_count: std::sync::Arc::clone(&self.call_count),
         })
@@ -221,7 +221,7 @@ struct ThinkingToolMock {
 #[async_trait]
 impl ApiClient for ThinkingToolMock {
     fn clone_box(&self) -> Box<dyn ApiClient> {
-        Box::new(ThinkingToolMock {
+        Box::new(Self {
             calls: std::sync::Arc::clone(&self.calls),
             requests: std::sync::Arc::clone(&self.requests),
         })
@@ -281,7 +281,7 @@ struct StreamingMock {
 #[async_trait]
 impl ApiClient for StreamingMock {
     fn clone_box(&self) -> Box<dyn ApiClient> {
-        Box::new(StreamingMock {
+        Box::new(Self {
             deltas: self.deltas.clone(),
         })
     }
@@ -589,7 +589,7 @@ struct StreamingToolMock {
 #[async_trait]
 impl ApiClient for StreamingToolMock {
     fn clone_box(&self) -> Box<dyn ApiClient> {
-        Box::new(StreamingToolMock {
+        Box::new(Self {
             calls: std::sync::Arc::clone(&self.calls),
         })
     }
@@ -753,7 +753,7 @@ fn parity_tool_call() -> ToolCall {
 #[async_trait]
 impl ApiClient for BothPathsMock {
     fn clone_box(&self) -> Box<dyn ApiClient> {
-        Box::new(BothPathsMock {
+        Box::new(Self {
             calls: std::sync::Arc::clone(&self.calls),
         })
     }
@@ -1044,7 +1044,7 @@ async fn termination_budget_exhausted() {
     #[async_trait]
     impl ApiClient for HighUsageMock {
         fn clone_box(&self) -> Box<dyn ApiClient> {
-            Box::new(HighUsageMock)
+            Box::new(Self)
         }
         async fn create_message(
             &self,
@@ -1102,7 +1102,7 @@ struct CountingMock {
 #[async_trait]
 impl ApiClient for CountingMock {
     fn clone_box(&self) -> Box<dyn ApiClient> {
-        Box::new(CountingMock {
+        Box::new(Self {
             count: AtomicUsize::new(self.count.load(Ordering::SeqCst)),
         })
     }

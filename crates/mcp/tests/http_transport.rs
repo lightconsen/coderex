@@ -1887,10 +1887,7 @@ fn spawn_legacy_sse_server() -> (SocketAddr, Arc<std::sync::Mutex<Vec<String>>>)
                     return;
                 }
 
-                let body = request
-                    .split_once("\r\n\r\n")
-                    .map(|(_, body)| body)
-                    .unwrap_or("");
+                let body = request.split_once("\r\n\r\n").map_or("", |(_, body)| body);
                 let message: serde_json::Value =
                     serde_json::from_str(body).unwrap_or(serde_json::Value::Null);
                 let method = message

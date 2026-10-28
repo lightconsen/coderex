@@ -259,7 +259,7 @@ pub struct VerifyReport {
 impl VerifyReport {
     /// Whether the page is intact.
     #[must_use]
-    pub fn is_intact(&self) -> bool {
+    pub const fn is_intact(&self) -> bool {
         self.problems.is_empty()
     }
 }

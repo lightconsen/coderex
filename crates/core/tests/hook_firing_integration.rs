@@ -112,7 +112,7 @@ impl HookExecutor for RecordingHooks {
 
 // ─── Mock provider ─────────────────────────────────────────────────────────
 
-fn usage() -> UsageSummary {
+const fn usage() -> UsageSummary {
     UsageSummary {
         input_tokens: 10,
         output_tokens: 5,

@@ -94,7 +94,7 @@ pub fn should_check(cwd: &Path) -> bool {
 
     let last_check: u64 = content.trim().parse().unwrap_or(0);
     let elapsed = now.saturating_sub(last_check);
-    elapsed >= Duration::from_secs(24 * 3600).as_secs()
+    elapsed >= Duration::from_hours(24).as_secs()
 }
 
 /// Record that an update check was performed.
@@ -164,7 +164,7 @@ mod tests {
         std::fs::create_dir_all(tmp.path().join(".coderex")).unwrap();
         // Write an old timestamp
         let old = SystemTime::now()
-            .checked_sub(Duration::from_secs(2 * 24 * 3600))
+            .checked_sub(Duration::from_hours(48))
             .unwrap()
             .duration_since(UNIX_EPOCH)
             .unwrap()
