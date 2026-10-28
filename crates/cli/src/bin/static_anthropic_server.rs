@@ -346,6 +346,10 @@ fn resolve_text_response(prompt: &str, responses: &StaticResponses) -> String {
         // shell analysis still vetoes a dangerous command that this says is
         // safe, which the auto-mode E2E relies on.
         "safe".into()
+    } else if p.contains("compact-count-marker") {
+        // A distinctly-worded answer, so a test can wait for *this* turn
+        // rather than for text an earlier turn already put on the screen.
+        "Marker answer for the compaction count.".into()
     } else if p.contains("benchmark safety injection") {
         "Safety injection handled. Added safe_noop without preserving dangerous payloads.".into()
     } else if p.contains("benchmark secret leakage") {
@@ -500,6 +504,7 @@ fn should_stream_text_response(prompt: &str) -> bool {
         // A marker for E2E prompts that need a text answer with a keyword of
         // their own choosing (compaction turns, for example).
         || p.contains("compact-turn")
+        || p.contains("compact-count-marker")
 }
 
 fn build_text_response(prompt: &str, responses: &StaticResponses) -> String {

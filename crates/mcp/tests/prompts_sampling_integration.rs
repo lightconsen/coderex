@@ -23,6 +23,7 @@ static MOCK_ID: AtomicU64 = AtomicU64::new(0);
 
 const MOCK_SERVER: &str = r#"#!/usr/bin/env python3
 import json
+import os
 import sys
 
 pending_tool = None
@@ -68,10 +69,21 @@ for line in sys.stdin:
     rid = req.get("id")
     params = req.get("params") or {}
 
+    # MOCK_METHOD_LOG lets a test prove a request was never sent.
+    log_path = os.environ.get("MOCK_METHOD_LOG")
+    if log_path and method:
+        with open(log_path, "a") as log:
+            log.write(method + "\n")
+
     if method == "initialize":
+        # MOCK_NO_PROMPTS advertises only tools, the shape of a server that
+        # has no prompts at all.
+        capabilities = {"tools": {}}
+        if not os.environ.get("MOCK_NO_PROMPTS"):
+            capabilities["prompts"] = {}
         respond(rid, {
             "protocolVersion": "2024-11-05",
-            "capabilities": {"tools": {}, "prompts": {}},
+            "capabilities": capabilities,
             "serverInfo": {"name": "mock-prompts", "version": "1.0"}
         })
     elif method in ("initialized", "notifications/initialized"):
@@ -201,6 +213,51 @@ impl SamplingHandler for FixedSampling {
             model: "test-model".into(),
         })
     }
+}
+
+/// A server that does not advertise `prompts` is not asked for them.
+///
+/// The discovery path returns "no prompts" without a `prompts/list` request:
+/// a server that never announced the capability may never answer, so probing
+/// it would leave discovery waiting on a reply that is not coming. The method
+/// log is what proves nothing was sent.
+#[tokio::test]
+async fn a_server_without_the_prompts_capability_is_not_asked() {
+    let log = std::env::temp_dir().join(format!(
+        "coderex_prompt_methods_{}_{}.log",
+        std::process::id(),
+        MOCK_ID.fetch_add(1, Ordering::SeqCst)
+    ));
+    let _ = std::fs::remove_file(&log);
+    let mut env = HashMap::new();
+    env.insert("MOCK_NO_PROMPTS".to_string(), "1".to_string());
+    env.insert(
+        "MOCK_METHOD_LOG".to_string(),
+        log.to_string_lossy().into_owned(),
+    );
+    let config = McpServerConfig {
+        command: mock_server_path().to_str().unwrap().into(),
+        args: vec![],
+        env,
+        ..Default::default()
+    };
+    let mut server = McpServer::new("mock", config.command.as_str(), vec![], config.env.clone());
+    server.spawn().await.unwrap();
+
+    assert!(!server.supports_prompts(), "the mock advertised prompts");
+    let discovered = server.discover_prompts().await.expect("discovery");
+    assert_eq!(
+        discovered,
+        serde_json::json!({"prompts": []}),
+        "a server without the capability should report no prompts"
+    );
+
+    let methods = std::fs::read_to_string(&log).unwrap_or_default();
+    let _ = std::fs::remove_file(&log);
+    assert!(
+        !methods.lines().any(|line| line == "prompts/list"),
+        "prompts/list was sent to a server that never advertised it: {methods}"
+    );
 }
 
 #[tokio::test]

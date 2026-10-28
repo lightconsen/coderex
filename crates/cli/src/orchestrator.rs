@@ -1242,34 +1242,7 @@ impl StartupOrchestrator {
         // session with no sub-config still gets a working uploader with the
         // built-in defaults; otherwise `telemetry_enabled = true` would only
         // write to the local database.
-        let telemetry_config = {
-            let api_key = settings
-                .api_key
-                .as_ref()
-                .map(|k| coderex_config::resolve_api_key(k));
-            let defaults = coderex_telemetry::TelemetryConfig::default();
-            let t = settings.telemetry.as_ref();
-            Some(coderex_telemetry::TelemetryConfig {
-                // No destination ships with the project: an opted-in session
-                // with no endpoint configured records locally only.
-                endpoint: t.and_then(|t| t.endpoint.clone()).unwrap_or_default(),
-                crash_endpoint: t.and_then(|t| t.crash_endpoint.clone()),
-                api_key,
-                batch_size: t.and_then(|t| t.batch_size).unwrap_or(defaults.batch_size),
-                upload_interval_secs: t
-                    .and_then(|t| t.upload_interval_secs)
-                    .unwrap_or(defaults.upload_interval_secs),
-                enabled: true,
-                sample_rate: t
-                    .and_then(|t| t.sample_rate)
-                    .unwrap_or(defaults.sample_rate),
-                pinned_cert_pem: t.and_then(|t| t.pinned_cert_pem.clone()),
-                // Settings are a second trigger for the strict mode; the
-                // uploader ORs this with `CODEREX_HIPAA`, so neither source
-                // can turn the stricter redaction off.
-                strict: t.and_then(|t| t.strict).unwrap_or(false),
-            })
-        };
+        let telemetry_config = Some(Self::telemetry_config_from_settings(settings));
 
         // `TelemetryUploader::new` derives channels from the environment; the
         // settings file is the host's own configuration and must be able to
@@ -1777,6 +1750,41 @@ impl StartupOrchestrator {
             }
         }
         self.ctx.settings = Some(settings);
+    }
+
+    /// The telemetry configuration this session's uploader is built from.
+    ///
+    /// A pure function of the settings so the seam can be tested: the strict
+    /// flag it carries is what makes the uploader redact, and a test that
+    /// builds the uploader from this value exercises the same path a session
+    /// does.
+    fn telemetry_config_from_settings(settings: &Settings) -> coderex_telemetry::TelemetryConfig {
+        let api_key = settings
+            .api_key
+            .as_ref()
+            .map(|k| coderex_config::resolve_api_key(k));
+        let defaults = coderex_telemetry::TelemetryConfig::default();
+        let t = settings.telemetry.as_ref();
+        coderex_telemetry::TelemetryConfig {
+            // No destination ships with the project: an opted-in session with
+            // no endpoint configured records locally only.
+            endpoint: t.and_then(|t| t.endpoint.clone()).unwrap_or_default(),
+            crash_endpoint: t.and_then(|t| t.crash_endpoint.clone()),
+            api_key,
+            batch_size: t.and_then(|t| t.batch_size).unwrap_or(defaults.batch_size),
+            upload_interval_secs: t
+                .and_then(|t| t.upload_interval_secs)
+                .unwrap_or(defaults.upload_interval_secs),
+            enabled: true,
+            sample_rate: t
+                .and_then(|t| t.sample_rate)
+                .unwrap_or(defaults.sample_rate),
+            pinned_cert_pem: t.and_then(|t| t.pinned_cert_pem.clone()),
+            // Settings are a second trigger for the strict mode; the uploader
+            // ORs this with `CODEREX_HIPAA`, so neither source can turn the
+            // stricter redaction off.
+            strict: t.and_then(|t| t.strict).unwrap_or(false),
+        }
     }
 
     /// The redaction modes the uploader would resolve for this session.
@@ -4910,6 +4918,66 @@ mod tests {
         );
         assert_eq!(channels.datadog_api_key.as_deref(), Some("dd-key"));
         assert_eq!(channels.datadog_site, "datadoghq.eu");
+    }
+
+    /// The strict setting reaches the payload the uploader would send.
+    ///
+    /// Settings and the uploader each had a test; the seam between them — does
+    /// `telemetry.strict` actually change what leaves the machine — did not.
+    /// Both payloads come from the same uploader constructor a session uses.
+    #[test]
+    fn the_strict_setting_changes_the_uploaded_crash_payload() {
+        let crash = coderex_telemetry::PendingCrash {
+            id: 1,
+            panic_info: r#"{"panic_type":"test","panic_location":"src/lib.rs:1"}"#.into(),
+            backtrace: None,
+            created_at: "2026-10-29T00:00:00Z".into(),
+            panic_template: None,
+            panic_fields: None,
+            panic_message_len: Some(4),
+            panic_message_sha256: Some("a".repeat(64)),
+            backtrace_symbols: Some(
+                serde_json::json!(["core::panicking::panic", "test::boom"]).to_string(),
+            ),
+            backtrace_frame_count: Some(2),
+            backtrace_symbols_len: Some(2),
+            backtrace_symbols_sha256: Some("b".repeat(64)),
+        };
+
+        let payload_for = |strict: bool| {
+            let settings = Settings {
+                telemetry: Some(coderex_config::settings::TelemetrySubConfig {
+                    strict: Some(strict),
+                    ..Default::default()
+                }),
+                ..Settings::defaults()
+            };
+            let config = StartupOrchestrator::telemetry_config_from_settings(&settings);
+            assert_eq!(
+                config.strict, strict,
+                "the setting did not reach the config"
+            );
+            let dir = tempfile::tempdir().unwrap();
+            let uploader =
+                coderex_telemetry::TelemetryUploader::new(dir.path().join("telemetry.db"), config);
+            uploader.preview_crash_payload(&crash)
+        };
+
+        let relaxed = payload_for(false);
+        assert!(
+            relaxed.get("backtrace_frames").is_some(),
+            "a non-strict payload should carry the symbol frames: {relaxed}"
+        );
+
+        let strict = payload_for(true);
+        assert!(
+            strict.get("backtrace_frames").is_none(),
+            "strict mode still uploaded symbol frames: {strict}"
+        );
+        assert!(
+            strict.get("panic_info").is_none(),
+            "strict mode still uploaded free-form text: {strict}"
+        );
     }
 
     #[tokio::test]

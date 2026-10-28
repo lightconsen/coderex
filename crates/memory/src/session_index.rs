@@ -627,4 +627,96 @@ mod tests {
         let results = index.search_semantic("", 5).unwrap();
         assert!(results.is_empty());
     }
+
+    /// A database file that is not a database is an error, not a panic.
+    ///
+    /// Every caller treats an index failure as "fall back to transcripts", and
+    /// that only works if opening a damaged file returns `Err` rather than
+    /// unwinding through the session.
+    #[test]
+    fn a_corrupt_database_file_is_an_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("sessions.db");
+        std::fs::write(&path, b"this is not a sqlite database").unwrap();
+
+        let error = SessionIndex::open(&path).expect_err("a corrupt file must not open");
+        assert!(matches!(error, SessionIndexError::Database(_)), "{error:?}");
+    }
+
+    /// A write against a database another connection holds locked reports the
+    /// failure instead of hanging the session.
+    ///
+    /// The index has no busy timeout, so SQLite returns `SQLITE_BUSY` at once;
+    /// the caller logs it and continues without an index, which is the
+    /// documented contract for every index write.
+    #[test]
+    fn a_locked_database_reports_busy_instead_of_waiting() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("sessions.db");
+        let index = SessionIndex::open(&path).unwrap();
+        index.create(&test_meta("before")).unwrap();
+
+        // Take the write lock from a second connection and keep it.
+        let other = Connection::open(&path).unwrap();
+        other.execute_batch("BEGIN EXCLUSIVE").unwrap();
+
+        let error = index
+            .upsert_with_content(&test_meta("blocked"), None)
+            .expect_err("a locked database must not accept the write");
+        assert!(matches!(error, SessionIndexError::Database(_)), "{error:?}");
+
+        other.execute_batch("ROLLBACK").unwrap();
+        // The connection is still usable once the lock is released.
+        index.create(&test_meta("after")).unwrap();
+        assert!(index.get("after").unwrap().is_some());
+    }
+
+    /// Concurrent writers through the shared handle serialize on its mutex:
+    /// every session lands, and searching still works afterwards.
+    #[test]
+    fn concurrent_writers_through_the_shared_index_all_land() {
+        use crate::concurrent::SharedSessionIndex;
+        use std::sync::Arc;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("sessions.db");
+        let index: SharedSessionIndex =
+            Arc::new(parking_lot::Mutex::new(SessionIndex::open(&path).unwrap()));
+
+        let mut handles = Vec::new();
+        for worker in 0..4 {
+            let index = Arc::clone(&index);
+            handles.push(std::thread::spawn(move || {
+                for item in 0..10 {
+                    let id = format!("w{worker}_{item}");
+                    let meta = SessionMeta {
+                        session_id: id.clone(),
+                        project_path: "/test/project".into(),
+                        ai_title: Some(format!("worker {worker} item {item}")),
+                        tag: None,
+                        pr_url: None,
+                        created_at: Utc::now(),
+                        last_active_at: Utc::now(),
+                        total_cost_usd: 0.0,
+                        total_tokens: 0,
+                    };
+                    index
+                        .lock()
+                        .upsert_with_content(&meta, Some(&format!("content {worker} {item}")))
+                        .unwrap();
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let rows = index.lock().list_by_project("/test/project").unwrap();
+        assert_eq!(rows.len(), 40, "a concurrent write was lost");
+        assert_eq!(
+            index.lock().search("content*", 100).unwrap().len(),
+            40,
+            "the full-text entries did not all land"
+        );
+    }
 }

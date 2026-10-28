@@ -2405,8 +2405,53 @@ fn compact_after_history_keeps_session_usable() {
     session.wait_for_any_text(&["Hello!", "happy to help"], SCREEN_TIMEOUT);
     session.send_line("long response");
     session.wait_for_text("TAIL: final sentence visible.", SCREEN_TIMEOUT);
+    // Five user turns: `reactive_compact` keeps the first prompt and the last
+    // three turns, so there is a middle to drop. Four turns leave an empty
+    // range and the command reports "already compact" instead. Each prompt
+    // has its own answer, so the wait cannot be satisfied by an older turn.
+    for (prompt, answer) in [
+        ("show your tools", "Available tools:"),
+        ("show your skills", "Available skills:"),
+        (
+            "compact-count-marker",
+            "Marker answer for the compaction count.",
+        ),
+    ] {
+        session.send_line(prompt);
+        session.wait_for_text(answer, SCREEN_TIMEOUT);
+    }
     session.send_line("/compact");
-    session.wait_for_any_text(&["Context compacted", "already compact"], SCREEN_TIMEOUT);
+    let screen =
+        session.wait_for_any_text(&["Context compacted", "already compact"], SCREEN_TIMEOUT);
+    // The report is the only place the numbers are shown: a compaction that
+    // reports neither would leave the person unable to tell it ran.
+    let report = screen
+        .lines()
+        .find(|line| line.contains("Context compacted"))
+        .unwrap_or_else(|| panic!("no compaction report:\n{screen}"))
+        .to_string();
+    let tokens_removed = report
+        .split("tokens removed")
+        .next()
+        .and_then(|prefix| prefix.split_whitespace().last())
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or_else(|| panic!("no token count in the report: {report}"));
+    let remaining = report
+        .split("messages remaining")
+        .next()
+        .and_then(|prefix| prefix.split_whitespace().last())
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or_else(|| panic!("no message count in the report: {report}"));
+    // Five user turns plus five answers went in; the kept tail is three turns
+    // plus the preserved first prompt, so fewer than ten may remain.
+    assert!(
+        tokens_removed > 0,
+        "the report claims nothing was removed: {report}"
+    );
+    assert!(
+        remaining > 0 && remaining < 10,
+        "the message count after compaction looks wrong ({remaining}): {report}"
+    );
     session.send_line("/status");
     let screen = session.wait_for_text("System Status", SCREEN_TIMEOUT);
     assert!(screen.contains("System Status"));

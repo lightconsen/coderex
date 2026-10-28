@@ -398,31 +398,97 @@ fn registry_tools_have_valid_descriptors() {
     }
 }
 
+/// Every builtin tool's three capability flags, in one table.
+///
+/// The flags decide real behaviour: `is_read_only` gates plan mode,
+/// `is_concurrency_safe` decides whether two calls may overlap, and
+/// `requires_approval` decides whether a call is asked about at all. They used
+/// to be asserted for a handful of tools; a tool whose descriptor drifts goes
+/// unnoticed. The table also fails when a registered tool is missing from it,
+/// so adding a tool means deciding its three flags.
 #[test]
-fn read_only_tools_marked_correctly() {
-    let registry = test_registry();
-    let read_only_tools = ["Read", "Glob", "Grep", "WebFetch", "WebSearch"];
+fn every_builtin_tool_declares_its_attributes() {
+    // name, is_read_only, is_concurrency_safe, requires_approval
+    const MATRIX: &[(&str, bool, bool, bool)] = &[
+        ("Agent", false, false, false),
+        ("AskUserQuestion", true, false, false),
+        ("Bash", false, true, false),
+        ("Brief", true, true, false),
+        ("Config", false, false, false),
+        ("CronCreate", false, false, false),
+        ("CronDelete", false, false, false),
+        ("CronList", true, true, false),
+        ("CurrentDir", true, true, false),
+        ("Edit", false, false, false),
+        ("EnterPlanMode", true, true, false),
+        ("EnterWorktree", false, false, true),
+        ("ExitPlanMode", true, true, false),
+        ("ExitWorktree", false, false, true),
+        ("GetMcpPrompt", true, true, false),
+        ("Glob", true, true, false),
+        ("Grep", true, true, false),
+        ("LSP", true, false, false),
+        ("ListDir", true, true, false),
+        ("ListMcpPrompts", true, true, false),
+        ("ListMcpResources", true, true, false),
+        ("McpAuth", false, false, false),
+        ("NotebookEdit", false, false, false),
+        ("REPL", true, true, false),
+        ("Read", true, true, false),
+        ("ReadMcpResource", true, true, false),
+        ("RemoteTrigger", false, false, false),
+        ("SendMessage", false, false, false),
+        ("Skill", true, true, false),
+        ("Sleep", false, true, false),
+        ("StructuredOutput", true, true, false),
+        ("SyntheticOutput", true, true, false),
+        ("TaskCreate", false, false, false),
+        ("TaskGet", true, true, false),
+        ("TaskList", true, true, false),
+        ("TaskOutput", true, true, false),
+        ("TaskStop", false, false, false),
+        ("TaskUpdate", false, false, false),
+        ("TeamCreate", false, false, false),
+        ("TeamDelete", false, false, true),
+        ("TodoWrite", false, false, false),
+        ("ToolSearch", true, true, false),
+        ("WebFetch", true, true, false),
+        ("WebSearch", true, true, false),
+        ("Write", false, false, false),
+        ("chrome_execute_js", false, false, true),
+        ("chrome_get_content", true, false, false),
+        ("chrome_list_tabs", true, true, false),
+        ("chrome_navigate", false, false, false),
+        ("chrome_screenshot", true, false, false),
+        ("echo", false, true, false),
+        ("noop", true, true, false),
+    ];
 
-    for name in &read_only_tools {
-        let tool = registry
-            .get_tool_arc(name)
-            .unwrap_or_else(|| panic!("{name} not found"));
-        let desc = tool.descriptor();
-        assert!(desc.is_read_only, "{name} should be read-only");
+    let registry = test_registry();
+    let descriptors = registry.all_descriptors();
+    let mut seen: Vec<&str> = Vec::new();
+    for (name, read_only, concurrency_safe, requires_approval) in MATRIX {
+        let desc = descriptors
+            .iter()
+            .find(|desc| desc.name == *name)
+            .unwrap_or_else(|| panic!("{name} is registered but not in the matrix"));
+        assert_eq!(desc.is_read_only, *read_only, "{name}: is_read_only");
+        assert_eq!(
+            desc.is_concurrency_safe, *concurrency_safe,
+            "{name}: is_concurrency_safe"
+        );
+        assert_eq!(
+            desc.requires_approval, *requires_approval,
+            "{name}: requires_approval"
+        );
+        seen.push(name);
     }
-}
-
-#[test]
-fn dangerous_tools_not_read_only() {
-    let registry = test_registry();
-    let dangerous = ["Write", "Edit", "Bash"];
-
-    for name in &dangerous {
-        let tool = registry
-            .get_tool_arc(name)
-            .unwrap_or_else(|| panic!("{name} not found"));
-        let desc = tool.descriptor();
-        assert!(!desc.is_read_only, "{name} should not be read-only");
+    for desc in &descriptors {
+        assert!(
+            seen.contains(&desc.name.as_str()),
+            "{} is registered but missing from the attribute matrix",
+            desc.name
+        );
     }
 }
 
