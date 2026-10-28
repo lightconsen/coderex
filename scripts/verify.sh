@@ -7,6 +7,7 @@
 # Checks:
 #   audit     cargo audit with .cargo/audit.toml (reviewed ignores)
 #   deny      cargo deny check (advisories, bans, licenses, sources)
+#   licenses  list dependencies whose licence policy needs a decision (MPL-2.0)
 #   clippy    cargo clippy --workspace --all-targets, warning count
 #   rustdoc   cargo doc --workspace --no-deps, warning count
 #   all       every check above (default)
@@ -31,7 +32,7 @@ fi
 if [[ $# -gt 0 ]]; then
     checks=("$@")
 else
-    checks=(audit deny clippy rustdoc)
+    checks=(audit deny licenses clippy rustdoc)
 fi
 
 out="target/verify"
@@ -43,7 +44,7 @@ declare -a results=()
 expanded=()
 for check in "${checks[@]}"; do
     if [[ "$check" == "all" ]]; then
-        expanded+=(audit deny clippy rustdoc)
+        expanded+=(audit deny licenses clippy rustdoc)
     else
         expanded+=("$check")
     fi
@@ -112,6 +113,28 @@ run_deny() {
     fi
 }
 
+run_licenses() {
+    cargo deny check licenses > "$out/licenses.log" 2>&1
+    local code=$?
+    # `MPL-2.0` is allowed in deny.toml only for nucleo-matcher (a file-level
+    # weak copyleft). Print every crate that resolves to it so the policy
+    # decision is visible instead of buried in a config file.
+    local mpl
+    mpl=$(grep -c "MPL-2.0" "$out/licenses.log" 2>/dev/null || true)
+    echo "   licence check exit $code"
+    if cargo tree --workspace 2>/dev/null | grep -q "nucleo-matcher"; then
+        echo "   MPL-2.0 dependency: nucleo-matcher (see deny.toml)"
+    fi
+    if [[ $code -eq 0 ]]; then
+        results+=("ok   licenses")
+    else
+        echo "   failed:$code — see $out/licenses.log"
+        grep -E "^(error|unlicensed|license-not-encountered)" "$out/licenses.log" | head -10
+        results+=("fail licenses (exit $code)")
+        status=1
+    fi
+}
+
 run_clippy() {
     cargo clippy --workspace --all-targets > "$out/clippy.log" 2>&1
     local code=$?
@@ -160,6 +183,11 @@ for check in "${checks[@]}"; do
             echo "== deny"
             run_deny
             ;;
+        licenses)
+            need cargo-deny "cargo install cargo-deny --locked" || continue
+            echo "== licenses"
+            run_licenses
+            ;;
         clippy)
             echo "== clippy"
             run_clippy
@@ -173,7 +201,7 @@ for check in "${checks[@]}"; do
             # already handled.
             ;;
         *)
-            echo "unknown check: $check (audit deny clippy rustdoc all)" >&2
+            echo "unknown check: $check (audit deny licenses clippy rustdoc all)" >&2
             exit 2
             ;;
     esac
