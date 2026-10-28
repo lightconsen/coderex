@@ -635,7 +635,7 @@ impl Scrubber {
     ///
     /// The named patterns run first (so labelled credentials report their
     /// specific placeholder), then any remaining long high-entropy run is
-    /// replaced with [`SECRET_PLACEHOLDER`].
+    /// replaced with `SECRET_PLACEHOLDER`.
     pub fn scrub(&self, text: &str) -> String {
         let mut result = text.to_string();
         for (re, replacement) in &self.patterns {
@@ -651,9 +651,9 @@ impl Scrubber {
 
     /// Recursively scrub a JSON value in place.
     ///
-    /// Model-name fields (see [`is_model_key`]) are redacted to
-    /// [`CONFIDENTIAL_MODEL`] first. Then strings go through the same pattern
-    /// set as [`Self::scrub`], and object keys on the [`EXCLUDED_FIELDS`] list
+    /// Model-name fields (see `is_model_key`) are redacted to
+    /// `CONFIDENTIAL_MODEL` first. Then strings go through the same pattern
+    /// set as [`Self::scrub`], and object keys on the `EXCLUDED_FIELDS` list
     /// are *removed* (not blanked), so the field never reaches the wire even if
     /// it slipped through event-level scrubbing.
     pub fn scrub_json(&self, value: &mut serde_json::Value) {
@@ -684,7 +684,7 @@ impl Scrubber {
         }
     }
 
-    /// Scrub a [`TelemetryEvent`] in place.
+    /// Scrub a `TelemetryEvent` in place.
     pub fn scrub_event(&self, event: &mut crate::TelemetryEvent) {
         use crate::TelemetryEvent;
         match event {

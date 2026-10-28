@@ -7,7 +7,7 @@
 //!
 //! - [`TelemetryHandle`] — `Clone` + `Send` handle for recording events from
 //!   any thread or async task.
-//! - [`TelemetryTask`] — background task that batches events and forwards
+//! - `TelemetryTask` — background task that batches events and forwards
 //!   them to a dedicated SQLite worker thread (because `rusqlite::Connection`
 //!   is not `Send`).
 //! - [`TelemetryUploader`] — async task that periodically uploads pending

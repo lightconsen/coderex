@@ -1,7 +1,7 @@
 //! Anthropic API provider.
 //!
-//! Wraps the existing [`AnthropicApiClient`](crate::api_client::AnthropicApiClient)
-//! logic in the [`Provider`](crate::provider::Provider) trait.
+//! Wraps the existing [`AnthropicApiClient`]
+//! logic in the [`Provider`] trait.
 
 use crate::api_client::{
     AnthropicApiClient, ApiClient, ApiConfig, ApiResponse, RequestContext, StreamEvent,

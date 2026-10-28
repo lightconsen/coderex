@@ -41,7 +41,7 @@ impl OpenAiCompatibleProvider {
     ///
     /// # Arguments
     /// * `name` — Provider display name (e.g., "openai", "groq").
-    /// * `base_url` — API base URL (e.g., "https://api.openai.com").
+    /// * `base_url` — API base URL (e.g., "<https://api.openai.com>").
     /// * `api_key` — API key for authentication.
     #[must_use]
     pub fn new(

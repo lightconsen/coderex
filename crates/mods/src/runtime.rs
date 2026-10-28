@@ -241,7 +241,7 @@ pub struct ModLimits {
     /// Enforced by `JS_SetMaxStackSize`; a runaway recursion throws a
     /// `RangeError` instead of overflowing the native stack. One `next(e)`
     /// level uses roughly four JavaScript frames, so this must leave room for
-    /// [`MAX_CHAIN_DEPTH`] levels. Clamped to 256 KiB..=8 MiB; the worker
+    /// `MAX_CHAIN_DEPTH` levels. Clamped to 256 KiB..=8 MiB; the worker
     /// thread's native stack is 16 MiB.
     pub max_stack_size: usize,
     /// Heap growth between automatic garbage collections.

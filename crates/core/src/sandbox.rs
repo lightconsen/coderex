@@ -514,7 +514,7 @@ pub(crate) fn attempt_memory_limit(darwin: bool, bytes: u64) -> Result<(), i32> 
 /// best-effort by design: modern Darwin (Monterey and later, including Sonoma
 /// and the macOS 15 line) returns `EINVAL` for every useful finite value, just
 /// as it does for `RLIMIT_AS`. The call therefore reports whether the kernel
-/// accepted the limit (via [`attempt_memory_limit`]) instead of turning an
+/// accepted the limit (via `attempt_memory_limit`) instead of turning an
 /// unsupported limit into a spawn failure. Callers install it from `pre_exec`,
 /// where it is inherited by the sandbox wrapper and the program it execs.
 ///
@@ -866,7 +866,7 @@ pub const LANDLOCK_SYSTEM_EXEC_PATHS: &[&str] = &[
 /// The path rules Landlock would install for a config.
 ///
 /// Pure, so the policy is compiled and tested on every platform; only the
-/// syscall layer in [`linux_impl`] is Linux-only. Paths are de-duplicated and
+/// syscall layer in `linux_impl` is Linux-only. Paths are de-duplicated and
 /// kept in a stable order. Whether a path exists is decided when the ruleset
 /// is built, not here.
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -69,7 +69,7 @@ pub enum RedactedEvent {
     SessionEnd,
 }
 
-/// A redacted version of [`ToolResult`] for snapshotting.
+/// A redacted version of `ToolResult` for snapshotting.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RedactedToolResult {
     /// Tool call ID.

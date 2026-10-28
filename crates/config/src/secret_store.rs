@@ -27,7 +27,7 @@
 //!   rather than persisting a credential under an inherited ACL. This path uses
 //!   the native security APIs (`windows-sys`) and is compiled but has not been
 //!   executed on a Windows host in this tree; see the module comments on
-//!   [`tighten_to_owner_only`].
+//!   `tighten_to_owner_only`.
 //!
 //! A plaintext file left behind by an older version is migrated on the next
 //! successful keychain read or write: it is removed, or tightened to `0600` if

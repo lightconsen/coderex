@@ -626,7 +626,7 @@ impl PermissionHook for BackgroundAgentDenyHook {
 
 /// A hook that uses a lightweight AI query to classify permission risk in Auto mode.
 ///
-/// Only activates when the permission mode is [`PermissionMode::Auto`].
+/// Only activates when the permission mode is `PermissionMode::Auto`.
 /// Sends the tool name and arguments to a lightweight model and classifies
 /// the operation as "safe", "caution", or "dangerous".
 ///

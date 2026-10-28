@@ -2112,7 +2112,7 @@ impl QueryEngine {
     /// Set the team context for multi-agent collaboration.
     ///
     /// Installed by the CLI when `team_collaboration` is on. The engine reads
-    /// the context in [`Self::build_context`] and injects its shared notes,
+    /// the context in `Self::build_context` and injects its shared notes,
     /// in-progress work and recent activity into the request each turn.
     pub fn set_team_context(
         &mut self,
@@ -2493,7 +2493,7 @@ impl QueryEngine {
     /// know the hook's `watchPaths` before that turn starts — the headless
     /// `FileChanged` watcher — calls this explicitly; the lazy call then
     /// becomes a no-op. Firing twice is not observable because of the
-    /// [`session_started`](Self::session_started) latch.
+    /// `session_started` latch.
     pub async fn ensure_session_started(&mut self) {
         self.fire_session_start_hook().await;
     }
@@ -4210,9 +4210,9 @@ impl QueryEngine {
     /// session that never sends another request never reaches that check —
     /// this is the path that reaches it anyway.
     ///
-    /// The engine starts it on the session's first turn (see
-    /// [`ensure_cache_ttl_timer`](Self::ensure_cache_ttl_timer)), so a session
-    /// that runs one turn and then sits idle is covered.
+    /// The engine starts it on the session's first turn (in
+    /// `ensure_cache_ttl_timer`), so a session that runs one turn and then
+    /// sits idle is covered.
     ///
     /// The timer cannot compact by itself: compaction rewrites the live
     /// conversation and needs `&mut self`. What it can do is *request* it, by

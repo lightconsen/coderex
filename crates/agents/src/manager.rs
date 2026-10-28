@@ -1531,7 +1531,7 @@ const ISOLATION_WORKTREE: &str = "worktree";
 
 /// Directory where per-agent NDJSON event logs are written.
 ///
-/// The writer in [`run_agent_task`] and the reader [`read_agent_log`] share
+/// The writer in `run_agent_task` and the reader [`read_agent_log`] share
 /// this one definition, so a log written by a session is always found by a
 /// reader in a later one.
 #[must_use]

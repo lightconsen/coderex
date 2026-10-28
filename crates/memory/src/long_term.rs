@@ -230,7 +230,7 @@ impl LongTermStore {
     /// List all hierarchical keys in the store.
     ///
     /// Only returns keys for entries that were stored with an explicit
-    /// hierarchical key via [`write_with_key`]. Flat topic entries are
+    /// hierarchical key via `write_with_key`. Flat topic entries are
     /// not included.
     pub fn list_keys(&self) -> std::io::Result<Vec<MemoryKey>> {
         let mut keys = Vec::new();

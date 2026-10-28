@@ -12,11 +12,11 @@
 //! - [`TranscriptEntry::Message`] — a conversation message, written exactly as
 //!   before (`{"role": …, "content": …}`), so every transcript on disk still
 //!   reads.
-//! - [`TranscriptEntry::CompactBoundary`] — where context was compacted. The
+//! - `TranscriptEntry::CompactBoundary` — where context was compacted. The
 //!   engine already emits this as a system message carrying
 //!   [`COMPACT_BOUNDARY_MARKER`]; here it is a type rather than a string a
 //!   reader has to know to look for.
-//! - [`TranscriptEntry::SessionMeta`] — a header naming the session, its
+//! - `TranscriptEntry::SessionMeta` — a header naming the session, its
 //!   working directory, and its model, so a transcript can be understood on
 //!   its own after the file is moved.
 //!

@@ -1,7 +1,7 @@
 //! Model router — priority-based routing with fallback chains.
 //!
-//! The [`ModelRouter`] implements [`ApiClient`](crate::api_client::ApiClient) and
-//! routes requests through a chain of [`Provider`](crate::provider::Provider)s.
+//! The [`ModelRouter`] implements [`ApiClient`] and
+//! routes requests through a chain of [`Provider`]s.
 //! When a provider fails with a fallback-eligible error, the router tries the
 //! next provider in the chain.
 //!

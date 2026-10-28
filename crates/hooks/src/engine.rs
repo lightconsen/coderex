@@ -180,7 +180,7 @@ pub struct HookConfig {
     ///
     /// `None` for a `prompt` hook means "the session's default". An `agent`
     /// hook always carries one — the loader fills in
-    /// [`AGENT_DEFAULT_MODEL`](crate::action::AGENT_DEFAULT_MODEL) when the
+    /// [`AGENT_DEFAULT_MODEL`] when the
     /// configuration names none.
     #[serde(default)]
     pub model: Option<String>,
@@ -1152,15 +1152,13 @@ impl HookRegistry {
     /// policy.
     ///
     /// Entry-level errors do not even reach this point: individual malformed
-    /// entries within a source are skipped by [`parse_settings_hooks`], so the
+    /// entries within a source are skipped by `parse_settings_hooks`, so the
     /// valid entries in that same source still load. The `Result` return is
     /// kept for compatibility, but per-source structural errors are isolated
     /// here and logged rather than returned.
     ///
     /// The resulting registry sorts by tier first, then priority, exactly like
     /// one built with [`register`](Self::register).
-    ///
-    /// [`parse_settings_hooks`]: Self::parse_settings_hooks
     pub fn from_settings_sources<'a, I>(sources: I) -> Result<Self, HookError>
     where
         I: IntoIterator<Item = (HookTier, &'a serde_json::Value)>,

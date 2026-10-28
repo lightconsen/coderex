@@ -2,9 +2,9 @@
 //!
 //! A **surface** is the product a session is presented in: the terminal, an
 //! IDE panel, a desktop window, a web page, a chat product. The engine and the
-//! mod runtime know nothing about rendering. They emit [`EngineEvent`]s (see
+//! mod runtime know nothing about rendering. They emit `EngineEvent`s (see
 //! [`crate::types::EngineEvent`]) and, for mods, host-owned
-//! [`UiElement`](crate::ui_protocol::UiElement) trees. A surface names itself
+//! [`UiElement`] trees. A surface names itself
 //! and knows how to present those trees.
 //!
 //! The abstraction is deliberately small:
@@ -41,7 +41,7 @@ pub enum SurfaceError {
     /// The id was empty.
     #[error("a surface id must not be empty")]
     Empty,
-    /// The id was longer than [`MAX_SURFACE_ID_LEN`].
+    /// The id was longer than `MAX_SURFACE_ID_LEN`.
     #[error("a surface id may be at most {MAX_SURFACE_ID_LEN} characters")]
     TooLong,
     /// The id contains a character outside `[a-z0-9_-]`.

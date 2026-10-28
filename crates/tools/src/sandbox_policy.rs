@@ -15,7 +15,7 @@
 
 use std::path::Path;
 
-/// Build a [`SandboxConfig`] for the given tool name and working directory.
+/// Build a `SandboxConfig` for the given tool name and working directory.
 ///
 /// Returns `None` for tools that don't spawn subprocesses or access the
 /// filesystem, so they run without sandbox overhead.
@@ -94,7 +94,7 @@ fn system_exec_paths() -> Vec<std::path::PathBuf> {
 
 /// Check whether a resolved path is inside any of the allowed paths.
 ///
-/// Used by [`EditTool`] and [`WriteTool`] to enforce sandbox boundaries
+/// Used by `EditTool` and `WriteTool` to enforce sandbox boundaries
 /// even when the platform sandbox doesn't restrict file ops at the
 /// syscall level (e.g. macOS sandbox-exec allows broad reads).
 #[must_use]

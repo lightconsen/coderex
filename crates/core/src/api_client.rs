@@ -509,7 +509,7 @@ pub fn prompt_caching_enabled(settings_value: Option<bool>, env_value: Option<&s
 pub struct ApiConfig {
     /// Anthropic API key.
     pub api_key: String,
-    /// Base URL for the API (default: https://api.anthropic.com).
+    /// Base URL for the API (default: <https://api.anthropic.com>).
     pub base_url: String,
     /// Set when this endpoint is a cloud provider rather than Anthropic's own
     /// API: it decides the request path, the body, and the authentication.

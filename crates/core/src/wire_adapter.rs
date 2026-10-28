@@ -161,7 +161,7 @@ pub async fn bridge_engine_to_wire<T: WireTransport>(
 /// A wrapper around [`mpsc::UnboundedSender<EngineEvent>`] that also
 /// forwards to a [`WireTransport`].
 ///
-/// This allows the [`QueryEngine`] to emit to both the existing
+/// This allows the `QueryEngine` to emit to both the existing
 /// mpsc channel (for the REPL UI) and the wire transport (for
 /// headless consumers) simultaneously.
 #[allow(missing_debug_implementations)]

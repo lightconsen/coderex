@@ -62,7 +62,7 @@ pub enum ConfigError {
 ///
 /// A settings file is loaded on every startup and parsed eagerly; an
 /// unbounded file is a cheap way to make the CLI hang or exhaust memory.
-/// Files larger than this are skipped whole (see [`load_settings_file`]).
+/// Files larger than this are skipped whole (see `load_settings_file`).
 pub const MAX_SETTINGS_FILE_BYTES: u64 = 2 * 1024 * 1024;
 
 /// The set of keys a settings file may contain.
@@ -303,7 +303,7 @@ pub struct HookLayers {
 /// once for every CodeRex invocation. The block is only honoured from the
 /// **user** and **managed** layers: a repository-controlled
 /// `.coderex/settings.json` must not be able to point the session's API key at
-/// an endpoint it controls (see [`Settings::resolve`]).
+/// an endpoint it controls (see `Settings::resolve`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct ProviderSettings {
     /// Base URL for the Anthropic-protocol endpoint. `None` uses the

@@ -296,7 +296,7 @@ impl FeatureFlags {
     /// changes no behavior. They are reported here so tooling and tests can
     /// distinguish a flag that is merely stored from one that does something,
     /// without removing the names from configuration files that mention them.
-    /// The list is currently empty; see [`INERT_FLAGS`] for the history.
+    /// The list is currently empty; see `INERT_FLAGS` for the history.
     #[must_use]
     pub fn inert_flags(&self) -> Vec<&'static str> {
         INERT_FLAGS

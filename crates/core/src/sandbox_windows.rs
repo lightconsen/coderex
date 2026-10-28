@@ -12,7 +12,7 @@
 //!    granted access.
 //! 2. The container SID is granted read/execute on the configured read and
 //!    execute paths and read/write on the configured write paths with
-//!    [`SetEntriesInAclW`] + [`SetNamedSecurityInfoW`]. System roots are granted
+//!    `SetEntriesInAclW` + `SetNamedSecurityInfoW`. System roots are granted
 //!    best-effort; they normally already include `ALL APPLICATION PACKAGES`.
 //! 3. No capabilities are placed in the token unless `allow_network` is set.
 //!    Without the `internetClient` capability an AppContainer has no network
@@ -23,14 +23,14 @@
 //! The documented Windows way to start a process in an AppContainer is a
 //! `STARTUPINFOEX` carrying `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES` and
 //! `CreateProcessW(..., EXTENDED_STARTUPINFO_PRESENT, ...)`. It is implemented
-//! by [`AppContainer::spawn`], which is **test-only**: the stable-Rust
+//! by `AppContainer::spawn`, which is **test-only**: the stable-Rust
 //! `std::process::Command` cannot pass a process attribute list, so no
 //! production caller can use it. The Windows test calls it to exercise the
 //! documented primitive.
 //!
 //! Production instead creates the child with `CREATE_SUSPENDED`, then
-//! [`AppContainer::restrict_suspended`] replaces its primary token with an
-//! AppContainer token before the first thread runs, and [`AppContainer::resume`]
+//! `AppContainer::restrict_suspended` replaces its primary token with an
+//! AppContainer token before the first thread runs, and `AppContainer::resume`
 //! lets it go. The token is created with the undocumented-but-long-standing
 //! `CreateAppContainerToken` export from `kernelbase.dll`; the call is resolved
 //! dynamically and the sandbox reports itself unavailable when it is missing.
@@ -41,8 +41,8 @@
 //!
 //! ## What is pure and what is Windows-only
 //!
-//! [`acl_plan`], [`capability_names`], [`quote_windows_arg`] and
-//! [`build_command_line`] are deliberately platform-independent: they encode
+//! `acl_plan`, `capability_names`, `quote_windows_arg` and
+//! `build_command_line` are deliberately platform-independent: they encode
 //! the policy and are unit-tested on macOS and Linux as well. Every Win32 call
 //! is behind `cfg(windows)`.
 //!

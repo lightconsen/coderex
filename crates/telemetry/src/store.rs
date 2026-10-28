@@ -179,7 +179,7 @@ impl TelemetryStore {
     ///
     /// This legacy entry point stores free-form text as given and leaves the
     /// structured columns empty. The ingestion path uses
-    /// [`Self::insert_crash_record`].
+    /// `Self::insert_crash_record`.
     pub fn insert_crash(
         &self,
         panic_info: &str,

@@ -580,7 +580,7 @@ pub struct CrashReport {
     ///
     /// In verbose mode this is the free-form `format!("{info}")` text, which may
     /// contain whatever the panicking code carried — a *local* copy only. In
-    /// every other mode it is a [`CRASH_SUMMARY_PREFIX`] summary.
+    /// every other mode it is a `CRASH_SUMMARY_PREFIX` summary.
     pub panic_info: String,
     /// Raw backtrace at time of panic.
     ///

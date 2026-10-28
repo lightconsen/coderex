@@ -826,7 +826,7 @@ impl Tool for ArtifactTool {
         }
     }
 
-    /// The flags are per action, not per tool — see [`is_mutating`]. The action
+    /// The flags are per action, not per tool — see `is_mutating`. The action
     /// is resolved first, so a legacy spelling (`write_db`, `preview`) answers
     /// for the action it now names.
     fn rule_exemptions_for(&self, input: &Value) -> ToolRuleExemptions {

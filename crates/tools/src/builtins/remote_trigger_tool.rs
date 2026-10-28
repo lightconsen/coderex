@@ -7,7 +7,7 @@ use async_trait::async_trait;
 /// Trigger remote Bridge work assignment.
 #[derive(Debug)]
 pub struct RemoteTriggerTool {
-    /// Base URL of the Bridge control plane (e.g. "https://bridge.example.com").
+    /// Base URL of the Bridge control plane (e.g. "<https://bridge.example.com>").
     pub bridge_url: String,
 }
 
