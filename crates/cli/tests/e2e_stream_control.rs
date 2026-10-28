@@ -252,6 +252,15 @@ fn an_elevation_request_can_be_approved_or_denied() {
         "an approved elevation was denied: {:?}",
         approved.tool_result
     );
+    // The decision has to reach the call: the command ran, which it could not
+    // have while the elevation was still pending. The marker is what proves
+    // the retry happened rather than the tool being reported as approved and
+    // then skipped.
+    assert!(
+        approved.tool_result.contains("elevation-marker"),
+        "the approved command was not retried: {:?}",
+        approved.tool_result
+    );
 
     let denied = {
         let dir = tempfile::tempdir().expect("workspace");
@@ -266,6 +275,18 @@ fn an_elevation_request_can_be_approved_or_denied() {
     assert!(
         denied.tool_result.contains("elevation denied"),
         "a denied elevation reported something else: {:?}",
+        denied.tool_result
+    );
+    assert!(
+        !denied.tool_result.contains("elevation-marker"),
+        "a denied elevation still ran the command: {:?}",
+        denied.tool_result
+    );
+    // A refusal by a person is the one case that may say so.
+    assert!(
+        denied.tool_result.contains("denied by user")
+            || denied.tool_result.contains("elevation denied"),
+        "the refusal did not name the decision: {:?}",
         denied.tool_result
     );
 }

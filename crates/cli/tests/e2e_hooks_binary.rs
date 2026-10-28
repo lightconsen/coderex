@@ -995,3 +995,129 @@ fn tool_and_subagent_hooks_reach_their_configured_commands() {
         );
     }
 }
+
+/// The events that only a real failure or a compaction produces: a denied
+/// tool, a provider outage, and the two ends of a compaction.
+///
+/// These four names existed in the engine's vocabulary with no binary
+/// evidence. `PermissionDenied` in particular is easy to confuse with
+/// `PostToolUseFailure` — a rule refusal fires both, and only the former names
+/// the rule.
+#[test]
+fn failure_and_compaction_events_reach_their_hooks() {
+    fn recorder(dir: &Path, marker: &Path) -> PathBuf {
+        let body = concat!(
+            "input=$(cat)\n",
+            "printf '%s\\n' \"$input\" | sed -n 's/.*\"event\":\"\\([^\"]*\\)\".*/\\1/p' >> ",
+            "MARKER",
+            "\n",
+            "echo '{\"action\":\"continue\"}'\n",
+        )
+        .replace("MARKER", &marker.display().to_string());
+        script(dir, "record-event.sh", &body)
+    }
+
+    fn recorded(marker: &Path) -> Vec<String> {
+        std::fs::read_to_string(marker)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    // 1. A deny rule refuses the tool: PermissionDenied fires with the rule's
+    //    reason, and PostToolUseFailure fires because the call failed.
+    let denied_dir = tempfile::tempdir().expect("denied workspace");
+    std::fs::create_dir_all(denied_dir.path().join(".coderex")).unwrap();
+    let denied_marker = denied_dir.path().join("events");
+    let hook = recorder(denied_dir.path(), &denied_marker);
+    std::fs::write(
+        denied_dir.path().join(".coderex/settings.json"),
+        serde_json::json!({
+            "permissions": {"deny": ["Bash(echo:*)"]},
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let home = seed_config(&serde_json::json!({
+        "hooks": [{
+            "event": "*",
+            "command": hook.display().to_string(),
+            "timeout_ms": 10000,
+            "sandbox": {"enabled": false}
+        }]
+    }));
+    let api = start_static_provider();
+    let output = run(
+        denied_dir.path(),
+        home.path(),
+        &api.1,
+        "run a safe echo",
+        &[],
+    );
+    let _ = api.0;
+    assert!(
+        output.status.success(),
+        "coderex failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let events = recorded(&denied_marker);
+    for expected in ["PermissionDenied", "PostToolUseFailure"] {
+        assert!(
+            events.iter().any(|event| event == expected),
+            "the {expected} hook never fired; saw {events:?}"
+        );
+    }
+
+    // 2. The Notification hook is not exercised here: it is fired by the
+    //    engine's retry-exhausted path, which the streaming submission the
+    //    CLI uses cannot reach (`send_request_streaming` turns a failed stream
+    //    into `TurnError::Fatal` instead of an `ApiError`). It is covered at
+    //    the engine level, where the blocking client's `RetryExhausted` is
+    //    reachable.
+
+    // 3. A compaction is bracketed by PreCompact/PostCompact. The tiny window
+    //    makes the first request over the compaction line.
+    let compact_dir = tempfile::tempdir().expect("compact workspace");
+    let compact_marker = compact_dir.path().join("events");
+    let hook = recorder(compact_dir.path(), &compact_marker);
+    let home = seed_config(&serde_json::json!({
+        "hooks": [{
+            "event": "*",
+            "command": hook.display().to_string(),
+            "timeout_ms": 10000,
+            "sandbox": {"enabled": false}
+        }]
+    }));
+    let api = start_static_provider();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_coderex"))
+        .args(["-p", "--dangerously-skip-permissions"])
+        .current_dir(compact_dir.path())
+        .env("ANTHROPIC_API_KEY", "mock")
+        .env("ANTHROPIC_BASE_URL", &api.1)
+        .env("ANTHROPIC_MODEL", "claude-sonnet-4-6")
+        .env("CLAUDE_CONFIG_DIR", home.path())
+        .env("CODEREX_LOG", "off")
+        .env("CODEREX_CONTEXT_WINDOW", "1000")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn coderex");
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(b"hello\n")
+        .expect("write prompt");
+    let output = child.wait_with_output().expect("wait");
+    let _ = api.0;
+    let _ = output;
+    let events = recorded(&compact_marker);
+    for expected in ["PreCompact", "PostCompact"] {
+        assert!(
+            events.iter().any(|event| event == expected),
+            "the {expected} hook never fired; saw {events:?}"
+        );
+    }
+}

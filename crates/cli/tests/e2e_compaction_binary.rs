@@ -204,3 +204,109 @@ async fn a_tiny_context_window_refuses_the_request_with_a_reason() {
         "the refusal did not explain itself: {tiny_stdout}"
     );
 }
+
+// ── Summary request and its fallback ───────────────────────────────────────
+
+/// A provider that records every request body and answers with a summary or an
+/// error, decided by the caller.
+#[allow(clippy::too_many_arguments)]
+async fn run_compaction_case(
+    window: &str,
+    prompt: &str,
+    summary_answer: Option<&'static str>,
+) -> (Vec<serde_json::Value>, String) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let base_url = format!("http://{}", listener.local_addr().expect("addr"));
+    let bodies = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+    let seen = Arc::clone(&bodies);
+    let server = tokio::spawn(async move {
+        loop {
+            let Ok(Ok((mut socket, _))) =
+                tokio::time::timeout(Duration::from_secs(10), listener.accept()).await
+            else {
+                break;
+            };
+            let body = read_body(&mut socket).await;
+            // The summarizer's own request. Everything else is the turn.
+            let is_summary = body["system"]
+                .to_string()
+                .contains("handoff summary for another LLM");
+            seen.lock().unwrap().push(body);
+            let response = if is_summary {
+                match summary_answer {
+                    Some(text) => format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        sse_text(text).len(),
+                        sse_text(text)
+                    ),
+                    None => {
+                        "HTTP/1.1 400 Bad Request\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                            .to_string()
+                    }
+                }
+            } else {
+                let sse = sse_text("ok");
+                format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{sse}",
+                    sse.len()
+                )
+            };
+            let _ = socket.write_all(response.as_bytes()).await;
+            let _ = socket.shutdown().await;
+        }
+    });
+
+    let dir = tempfile::tempdir().expect("workspace");
+    let home = tempfile::tempdir().expect("home");
+    std::fs::write(
+        home.path().join("settings.json"),
+        r#"{"config_version": 4, "telemetry_enabled": false}"#,
+    )
+    .expect("settings");
+    let cwd = dir.path().to_path_buf();
+    let home_path = home.path().to_path_buf();
+    let base = base_url.clone();
+    let window = window.to_string();
+    let prompt = prompt.to_string();
+    let output =
+        tokio::task::spawn_blocking(move || run(&cwd, &home_path, &base, Some(&window), &prompt))
+            .await
+            .expect("join");
+    server.abort();
+    let _ = server.await;
+    let bodies = bodies.lock().unwrap().clone();
+    (bodies, String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// The system prompt reaches the provider as a block array with at most one
+/// breakpoint — the shape the API accepts — and the turn's own text is not
+/// mixed into the summary request's system prompt.
+#[tokio::test]
+async fn the_system_prompt_is_one_marked_text_block() {
+    let (bodies, _stdout) = run_compaction_case("200000", "hello", Some("unused")).await;
+    let turn = bodies
+        .iter()
+        .find(|body| {
+            body["tools"]
+                .as_array()
+                .is_some_and(|tools| !tools.is_empty())
+        })
+        .expect("no turn request");
+    let system = &turn["system"];
+    let blocks = system
+        .as_array()
+        .unwrap_or_else(|| panic!("system is not a block array: {system}"));
+    assert!(!blocks.is_empty(), "empty system array");
+    for block in blocks {
+        assert_eq!(
+            block["type"].as_str(),
+            Some("text"),
+            "a non-text system block: {block}"
+        );
+    }
+    let marked = blocks
+        .iter()
+        .filter(|block| block.get("cache_control").is_some())
+        .count();
+    assert_eq!(marked, 1, "the system prompt got {marked} breakpoints");
+}

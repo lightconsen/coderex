@@ -313,6 +313,55 @@ mod tests {
         );
     }
 
+    /// The other half of the contract: a concurrency-safe tool is not locked,
+    /// so two calls overlap. Only the serial direction was asserted before,
+    /// which left "safe tools may run in parallel" as a claim no test made.
+    #[tokio::test]
+    async fn execute_single_runs_concurrency_safe_tools_in_parallel() {
+        let executor = ToolExecutor::new(ExecutionConfig::default());
+        let inside = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+
+        // Same tool name on purpose: two calls to one safe tool must not be
+        // serialized by the per-name lock the non-safe path takes.
+        let first = probe("read", true, &inside, &peak);
+        let second = probe("read", true, &inside, &peak);
+        let (a, b) = tokio::join!(
+            executor.execute_single(first.as_ref(), test_input("a"), test_ctx()),
+            executor.execute_single(second.as_ref(), test_input("b"), test_ctx()),
+        );
+
+        assert!(a.is_ok() && b.is_ok());
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            2,
+            "two concurrency-safe calls did not overlap"
+        );
+    }
+
+    /// Different non-safe tools are not serialized against each other: the
+    /// lock is per tool name, so a slow `edit` must not block a `write`.
+    #[tokio::test]
+    async fn different_non_safe_tools_do_not_block_each_other() {
+        let executor = ToolExecutor::new(ExecutionConfig::default());
+        let inside = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+
+        let edit = probe("edit", false, &inside, &peak);
+        let write = probe("write", false, &inside, &peak);
+        let (a, b) = tokio::join!(
+            executor.execute_single(edit.as_ref(), test_input("a"), test_ctx()),
+            executor.execute_single(write.as_ref(), test_input("b"), test_ctx()),
+        );
+
+        assert!(a.is_ok() && b.is_ok());
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            2,
+            "different non-safe tools were serialized together"
+        );
+    }
+
     /// Returns whatever it is told to, so a cap can be observed on the way out.
     struct CappedTool {
         caps: ToolCapabilities,

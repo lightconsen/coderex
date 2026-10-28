@@ -4329,6 +4329,103 @@ mod tests {
         }
     }
 
+    /// The CLI's retry loop is what turns a recovered manifest into a running
+    /// plugin: `retry_failed_plugins` only says `RestartRequired`, because it
+    /// is synchronous and cannot await `spawn_plugin`. This drives the loop
+    /// against a real process plugin that starts broken and is then fixed.
+    #[tokio::test]
+    async fn the_restart_loop_spawns_a_plugin_that_recovered() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("dir");
+        let plugin_dir = dir.path().join("recovering");
+        std::fs::create_dir_all(plugin_dir.join("bin")).expect("plugin dir");
+        // Start with a plugin that cannot spawn, so it lands in `Error` the
+        // way a crashed runtime does.
+        std::fs::write(
+            plugin_dir.join("plugin.json"),
+            serde_json::json!({
+                "name": "recovering",
+                "version": "1.0.0",
+                "entrypoint": "bin/missing",
+            })
+            .to_string(),
+        )
+        .expect("write manifest");
+
+        let manager = Arc::new(coderex_plugins::plugins::PluginManager::new());
+        let manifest = coderex_plugins::plugins::PluginManifest {
+            name: "recovering".into(),
+            version: "1.0.0".into(),
+            entrypoint: Some("bin/missing".into()),
+            ..Default::default()
+        };
+        manager.load_plugin(manifest, plugin_dir.clone());
+        assert!(
+            manager.spawn_plugin("recovering").await.is_err(),
+            "the broken entrypoint was spawned"
+        );
+        assert!(
+            matches!(
+                manager.get_plugin("recovering").map(|p| p.state.clone()),
+                Some(coderex_plugins::plugins::PluginState::Error(_))
+            ),
+            "the failed spawn did not leave the plugin in Error"
+        );
+
+        // Fix the plugin on disk: a process that answers the JSON-RPC
+        // handshake and then waits for requests.
+        let script = plugin_dir.join("bin/plugin");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\n\
+             while IFS= read -r line; do\n\
+             \tid=$(printf '%s' \"$line\" | sed -n 's/.*\"id\":\\([0-9]*\\).*/\\1/p')\n\
+             \tcase \"$line\" in\n\
+             \t  *commands/list*|*skills/list*)\n\
+             \t    printf '{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":[]}\\n' \"$id\" ;;\n\
+             \t  *)\n\
+             \t    printf '{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{}}\\n' \"$id\" ;;\n\
+             \tesac\n\
+             done\n",
+        )
+        .expect("write plugin script");
+        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions).unwrap();
+        std::fs::write(
+            plugin_dir.join("plugin.json"),
+            serde_json::json!({
+                "name": "recovering",
+                "version": "1.0.0",
+                "entrypoint": "bin/plugin",
+            })
+            .to_string(),
+        )
+        .expect("rewrite manifest");
+
+        let handle = StartupOrchestrator::spawn_plugin_restart_loop(
+            &manager,
+            std::time::Duration::from_millis(50),
+        );
+
+        // The retry pass and the spawn it triggers are both async: poll.
+        let mut state = None;
+        for _ in 0..200 {
+            state = manager.get_plugin("recovering").map(|p| p.state.clone());
+            if matches!(state, Some(coderex_plugins::plugins::PluginState::Active)) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        handle.abort();
+        let _ = manager.stop_plugin("recovering").await;
+        assert!(
+            matches!(state, Some(coderex_plugins::plugins::PluginState::Active)),
+            "the restart loop never spawned the recovered plugin: {state:?}"
+        );
+    }
+
     #[tokio::test]
     async fn load_settings_with_nonexistent_paths_fails_open() {
         let mut orch = StartupOrchestrator::new();

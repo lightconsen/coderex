@@ -2333,6 +2333,50 @@ mod tests {
         assert_eq!(count_cache_markers(&body), 4);
     }
 
+    /// A system prompt already sent as a block array is marked on its last
+    /// block only. The engine joins system messages into one string today, so
+    /// nothing in the binary reaches this branch; it exists because the API
+    /// accepts the array form and a caller that sends one must not get two
+    /// markers.
+    #[test]
+    fn an_array_system_prompt_is_marked_on_its_last_block_only() {
+        let mut body = serde_json::json!({
+            "system": [
+                {"type": "text", "text": "first part"},
+                {"type": "text", "text": "second part"},
+            ],
+            "messages": [{"role": "user", "content": "hi"}],
+        });
+        apply_cache_breakpoints(&mut body);
+
+        let blocks = body["system"].as_array().expect("still an array");
+        assert_eq!(blocks.len(), 2);
+        assert!(blocks[0].get("cache_control").is_none(), "{blocks:?}");
+        assert!(blocks[1]["cache_control"].is_object(), "{blocks:?}");
+    }
+
+    /// An array whose last block has empty text is left unmarked: a marker on
+    /// an empty prefix caches nothing.
+    #[test]
+    fn an_array_ending_in_empty_text_is_not_marked() {
+        let mut body = serde_json::json!({
+            "system": [
+                {"type": "text", "text": "real content"},
+                {"type": "text", "text": "   "},
+            ],
+            "messages": [{"role": "user", "content": "hi"}],
+        });
+        apply_cache_breakpoints(&mut body);
+
+        let blocks = body["system"].as_array().expect("still an array");
+        assert!(
+            blocks
+                .iter()
+                .all(|block| block.get("cache_control").is_none()),
+            "an empty block was marked: {blocks:?}"
+        );
+    }
+
     #[test]
     fn a_one_message_conversation_has_no_second_to_last_breakpoint() {
         let client = AnthropicApiClient::new(ApiConfig::new("k".into()).with_prompt_caching(true));

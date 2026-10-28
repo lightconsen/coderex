@@ -854,8 +854,11 @@ fn select_tools(prompt: &str) -> Vec<Tool> {
             command: "curl -s --max-time 5 https://example.com".into(),
         }]
     } else if p.contains("run a command with sudo") {
+        // The trailing command runs whether or not `sudo -n` succeeds, so a
+        // test can tell "the elevated call was retried" from "it was never
+        // executed" without needing a passwordless sudo on the machine.
         vec![Tool::Bash {
-            command: "sudo -n true".into(),
+            command: "sudo -n true; echo elevation-marker".into(),
         }]
     } else if p.contains("run a wrapped command") {
         vec![Tool::Bash {

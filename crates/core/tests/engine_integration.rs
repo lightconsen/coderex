@@ -1314,6 +1314,10 @@ struct RecordingMock {
     /// When set, `create_message` fails for any request whose serialized
     /// messages contain this substring.
     fail_on_substring: Option<String>,
+    /// Serialized messages of every request the failure rule rejected, so a
+    /// test can tell "the summary was never attempted" from "the summary was
+    /// attempted and failed".
+    failed_requests: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
 }
 
 impl RecordingMock {
@@ -1323,6 +1327,7 @@ impl RecordingMock {
             call_count: std::sync::Arc::new(AtomicUsize::new(0)),
             requests: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             fail_on_substring: None,
+            failed_requests: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
 
@@ -1340,6 +1345,10 @@ impl RecordingMock {
     fn requests_handle(&self) -> std::sync::Arc<std::sync::Mutex<Vec<(u32, String)>>> {
         std::sync::Arc::clone(&self.requests)
     }
+
+    fn failed_requests_handle(&self) -> std::sync::Arc<std::sync::Mutex<Vec<String>>> {
+        std::sync::Arc::clone(&self.failed_requests)
+    }
 }
 
 #[async_trait]
@@ -1350,6 +1359,7 @@ impl ApiClient for RecordingMock {
             call_count: std::sync::Arc::clone(&self.call_count),
             requests: std::sync::Arc::clone(&self.requests),
             fail_on_substring: self.fail_on_substring.clone(),
+            failed_requests: std::sync::Arc::clone(&self.failed_requests),
         })
     }
 
@@ -1362,10 +1372,9 @@ impl ApiClient for RecordingMock {
         _tools: &[ToolInfo],
     ) -> Result<ApiResponse, ApiError> {
         if let Some(needle) = &self.fail_on_substring {
-            if serde_json::to_string(messages)
-                .unwrap_or_default()
-                .contains(needle.as_str())
-            {
+            let serialized = serde_json::to_string(messages).unwrap_or_default();
+            if serialized.contains(needle.as_str()) {
+                self.failed_requests.lock().unwrap().push(serialized);
                 return Err(ApiError::Http("background feature unavailable".into()));
             }
         }
@@ -1704,6 +1713,97 @@ async fn compaction_backend_failure_falls_back_to_local_summary() {
         calls.load(Ordering::SeqCst),
         3,
         "backend failure must fall back to the local LLM summary"
+    );
+}
+
+/// A summarizer that fails is attempted, and the run continues on the
+/// rule-based result. Before this, nothing asserted `SummaryOutcome::Failed`
+/// at all: the fall-through was believed but never observed.
+#[tokio::test]
+async fn a_failed_llm_summary_still_compacts_with_the_local_result() {
+    // A side query (the summarizer) is the one request without tools. Fail
+    // every one of them, including the half-budget retry, and answer the
+    // turn's own requests normally.
+    let mock = RecordingMock::new(vec![budget_trigger_response(), text_response("Done.")])
+        .failing_on("[User]");
+    let failed = mock.failed_requests_handle();
+    let tools = Box::new(EchoToolExecutor);
+    let (mut engine, mut rx) = make_engine(Box::new(mock), tools);
+    engine.set_session(session_with_history());
+
+    let mut options = SubmitOptions::default();
+    options.task_budget_tokens = 1_000;
+    options.handle_elicitation = false;
+
+    let result = engine.submit("finish it".into(), options).await.unwrap();
+    // The turn still ends on its budget, not on a compaction error: the
+    // rule-based fallback did its job.
+    assert_eq!(result, TerminalReason::BudgetExhausted);
+
+    let attempts = failed.lock().unwrap().len();
+    assert!(attempts >= 1, "the LLM summary was never attempted");
+
+    // The fallback ran the rule-based path rather than aborting the turn.
+    // That path is reported on the event stream; which shape it takes depends
+    // on whether the tiny fixture had anything to drop (`NoProgress` here),
+    // so the assertion is that compaction was attempted and the session was
+    // not left in a failed state.
+    let mut attempted = false;
+    while let Ok(event) = rx.try_recv() {
+        if let EngineEvent::Compaction(reported) = event {
+            assert!(
+                !matches!(
+                    reported,
+                    coderex_core::types::CompactionEvent::CircuitBreakerOpen { .. }
+                ),
+                "a single failed summary tripped the circuit breaker"
+            );
+            attempted = true;
+        }
+    }
+    assert!(
+        attempted,
+        "no compaction was reported after the summary failed"
+    );
+}
+
+/// The conversation the summarizer is asked about excludes the preserved head
+/// and recent tail: the summary covers the middle, which is what the rule
+/// would otherwise drop.
+#[tokio::test]
+async fn the_summary_request_covers_the_middle_and_not_the_tail() {
+    let responses = vec![
+        budget_trigger_response(),
+        text_response("Summary: task mid-flight."),
+        text_response("Done."),
+    ];
+    let mock = RecordingMock::new(responses);
+    let requests = mock.requests_handle();
+    let tools = Box::new(EchoToolExecutor);
+    let (mut engine, _rx) = make_engine(Box::new(mock), tools);
+    engine.set_session(session_with_history());
+
+    let mut options = SubmitOptions::default();
+    options.task_budget_tokens = 1_000;
+    options.handle_elicitation = false;
+
+    engine.submit("finish it".into(), options).await.unwrap();
+
+    // The summary request is the one that carries the summary instructions.
+    let requests = requests.lock().unwrap();
+    let summary = requests
+        .iter()
+        .find(|(_, body)| body.contains("Primary Request and Intent"))
+        .unwrap_or_else(|| panic!("no summary request: {requests:?}"));
+    assert!(
+        summary.1.contains("u2"),
+        "the middle turn is missing: {}",
+        summary.1
+    );
+    assert!(
+        !summary.1.contains("u4"),
+        "the preserved recent tail leaked into the summary: {}",
+        summary.1
     );
 }
 

@@ -49,7 +49,18 @@ fn start_static_provider() -> (Child, String) {
 }
 
 fn run_command(cwd: &Path, home: &Path, base_url: &str, name: &str) -> (bool, String) {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_coderex"))
+    run_command_with(cwd, home, base_url, name, &[])
+}
+
+fn run_command_with(
+    cwd: &Path,
+    home: &Path,
+    base_url: &str,
+    name: &str,
+    extra_env: &[(&str, &str)],
+) -> (bool, String) {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_coderex"));
+    command
         .args(["-p", &format!("/{name}")])
         .current_dir(cwd)
         .env("ANTHROPIC_API_KEY", "mock")
@@ -60,9 +71,11 @@ fn run_command(cwd: &Path, home: &Path, base_url: &str, name: &str) -> (bool, St
         .env("CODEREX_DISABLE_ADOPT", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn coderex");
+        .stderr(Stdio::piped());
+    for (key, value) in extra_env {
+        command.env(key, value);
+    }
+    let mut child = command.spawn().expect("spawn coderex");
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
         match child.try_wait().expect("poll coderex") {
@@ -95,7 +108,20 @@ fn every_non_interactive_slash_command_runs() {
         .filter(|command| command.supports_non_interactive)
         .map(|command| command.name.to_string())
         .collect();
-    assert!(names.len() >= 40, "the registry looks empty: {names:?}");
+    // 76 commands, 72 of which declare non-interactive support. Pin both so a
+    // command that loses the flag (or a new one that forgets it) fails here
+    // instead of silently dropping out of the sweep.
+    assert_eq!(
+        names.len(),
+        72,
+        "the sweep no longer covers the registry: {names:?}"
+    );
+    for excluded in ["heapdump", "mock-limits", "voice", "stickers"] {
+        assert!(
+            !names.iter().any(|name| name == excluded),
+            "/{excluded} is interactive-only but was swept"
+        );
+    }
 
     let workspace = tempfile::tempdir().expect("workspace");
     let home = tempfile::tempdir().expect("config home");
@@ -122,4 +148,48 @@ fn every_non_interactive_slash_command_runs() {
         failures.len(),
         failures.join("\n---\n")
     );
+}
+
+/// The four commands that declare no non-interactive support still run through
+/// the binary. They are excluded from the sweep because they exist for an
+/// interactive session, not because they are broken, and nothing else covered
+/// them.
+#[test]
+fn the_interactive_only_commands_still_answer_in_a_headless_run() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let home = tempfile::tempdir().expect("config home");
+    std::fs::write(
+        home.path().join("settings.json"),
+        r#"{"config_version": 4, "telemetry_enabled": false}"#,
+    )
+    .expect("settings");
+    let (mut provider, base_url) = start_static_provider();
+    let flags = [(
+        "CODEREX_FEATURE_FLAGS",
+        "heapdump,mock_limits,stickers,voice_mode",
+    )];
+
+    // Each command has to say something that is neither a crash nor an
+    // "unknown command".
+    for (name, expected) in [
+        ("heapdump", "snapshot"),
+        ("mock-limits", "limit"),
+        ("stickers", "not implemented"),
+        ("voice", "microphone"),
+    ] {
+        let (success, output) =
+            run_command_with(workspace.path(), home.path(), &base_url, name, &flags);
+        assert!(success, "/{name} failed: {output}");
+        assert!(
+            !output.contains("Unknown command"),
+            "/{name} is not registered: {output}"
+        );
+        assert!(
+            output.to_lowercase().contains(expected),
+            "/{name} did not answer as expected ({expected:?}): {output}"
+        );
+    }
+
+    let _ = provider.kill();
+    let _ = provider.wait();
 }

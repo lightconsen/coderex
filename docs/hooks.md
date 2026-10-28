@@ -307,8 +307,13 @@ supplies one wins; hooks without it leave the result unchanged.
 `SessionStart` fires on the first turn the engine runs (`submit` /
 `submit_streaming`), since a session in this engine has no separate begin call.
 `Notification` fires where the engine raises one — a provider error the user is
-told about. `Elicitation` and `ElicitationResult` bracket an elicitation
-request: the ask, then its outcome (`responded`, `cancelled`, or `timed_out`).
+told about. It is reached from the blocking client's `RetryExhausted`; a
+failed *stream* takes the `TurnError::Fatal` path instead, so a CLI session
+(which submits streaming) does not produce it. `Elicitation` and
+`ElicitationResult` bracket an elicitation request: the ask, then its outcome
+(`responded`, `cancelled`, or `timed_out`). The CLI sets
+`handle_elicitation = false` — an assistant's clarifying question stays an
+ordinary message — so those two only fire for an embedder that turns it on.
 
 `Setup` fires once for each successful `/init`: the registry dispatch is
 synchronous, so `sync_command_state` queues the command and the REPL's async
