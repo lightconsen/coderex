@@ -10,6 +10,7 @@ pub mod extract_memories;
 pub mod long_term;
 pub mod prompts;
 pub mod service;
+pub mod session_backfill;
 pub mod session_index;
 pub mod session_memory;
 pub mod session_memory_agent;
@@ -31,6 +32,10 @@ pub use long_term::{LongTermStore, MemoryEntry, MemoryKey};
 pub use service::{
     AllowAllClassifier, MemoryRecord, MemoryService, MemoryServiceError, MemoryStore,
     MemoryWriteClassifier,
+};
+pub use session_backfill::{
+    BackfillReport, MAX_INDEXED_CONTENT_BYTES, backfill, index_transcript, session_content,
+    transcript_dir, transcript_title,
 };
 pub use team_memory::{
     MemoryChecksum, RemoteState, SyncResult, TeamMemoryEntry, TeamMemorySyncService,

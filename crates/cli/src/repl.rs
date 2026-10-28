@@ -2132,6 +2132,12 @@ pub struct ReplLoop {
     /// async entry points (`execute_command`, and `run_tui` after
     /// `process_tui_input`) take and fire it exactly once.
     pending_setup: Option<String>,
+    /// What the last `/backfill-sessions` run did.
+    ///
+    /// The registry's dispatch is synchronous and does not know where the
+    /// index lives, so the report is written here after the write and read
+    /// back by the caller that displayed the command.
+    last_backfill: Option<String>,
     /// The session's file checkpoint store.
     ///
     /// Edit tools snapshot through it before they write; `/rewind` restores
@@ -2593,6 +2599,7 @@ impl ReplLoop {
             #[cfg(feature = "hot-reload")]
             config_changed_rx: None,
             pending_setup: None,
+            last_backfill: None,
             skip_permissions: false,
             permission_mode: None,
             permission_rules: None,
@@ -2997,6 +3004,7 @@ impl ReplLoop {
             #[cfg(feature = "hot-reload")]
             config_changed_rx,
             pending_setup: None,
+            last_backfill: None,
             skip_permissions: false,
             permission_mode: None,
             permission_rules: None,
@@ -7650,6 +7658,12 @@ impl ReplLoop {
             self.pending_setup = Some(format!("/{cmd_name}"));
         }
 
+        // `/backfill-sessions` needs the index handle, which only the CLI
+        // holds. The registry reports the request; the write happens here.
+        if cmd_name == "backfill-sessions" && result.state_changed {
+            self.run_session_backfill();
+        }
+
         if cmd_name == "vim" && result.state_changed {
             self.vim_mode_enabled = !self.vim_mode_enabled;
             return true;
@@ -7663,6 +7677,47 @@ impl ReplLoop {
         }
 
         false
+    }
+
+    /// Write the session index for every transcript in the workspace.
+    ///
+    /// Best-effort like every other index write: a database that cannot be
+    /// opened leaves the transcripts authoritative and the reason is stocked
+    /// for the next status line. The report is what `/backfill-sessions`
+    /// goes on to show.
+    fn run_session_backfill(&mut self) {
+        let transcripts = session_resume::transcript_dir(&self.cwd);
+        let db = session_resume::sessions_db_path(&self.cwd);
+        let report = coderex_memory::session_index::SessionIndex::open(&db)
+            .map_err(|error| error.to_string())
+            .and_then(|index| {
+                coderex_memory::session_backfill::backfill(&index, &self.cwd, &transcripts)
+                    .map_err(|error| error.to_string())
+            });
+        self.last_backfill = Some(match report {
+            Ok(report) => format!(
+                "Indexed {} of {} transcript file(s) ({} skipped).",
+                report.indexed, report.transcripts, report.skipped
+            ),
+            Err(error) => format!(
+                "Could not write the session index at {}: {error}",
+                db.display()
+            ),
+        });
+    }
+
+    /// Append what `/backfill-sessions` actually did to its displayed output.
+    ///
+    /// The registry answered before the write happened, so its own line says
+    /// only that a backfill was requested. Empty for every other command.
+    fn with_backfill_report(&mut self, cmd_name: &str, output: &str) -> String {
+        if cmd_name != "backfill-sessions" {
+            return output.to_string();
+        }
+        match self.last_backfill.take() {
+            Some(report) => format!("{output}\n{report}"),
+            None => output.to_string(),
+        }
     }
 
     /// Whether a command result is the registry's error shape.
@@ -8763,13 +8818,14 @@ impl ReplLoop {
             return;
         }
 
+        let output = self.with_backfill_report(cmd_name, &result.output);
         ui_state.messages.push(coderex_ui::message_list::Message {
             role: if result.scrollable {
                 coderex_ui::message_list::MessageRole::Assistant
             } else {
                 coderex_ui::message_list::MessageRole::System
             },
-            content: result.output.into(),
+            content: output.into(),
             tool_name: None,
             streaming: false,
             folded: false,
@@ -9296,7 +9352,8 @@ impl ReplLoop {
         let ctx = self.build_context();
         let result = self.commands.execute(cmd_name, &ctx, &args);
         self.sync_command_state(cmd_name, &result);
-        writeln!(stdout, "{}", result.output)?;
+        let output = self.with_backfill_report(cmd_name, &result.output);
+        writeln!(stdout, "{output}")?;
         // The registry dispatch is synchronous; fire anything it queued now,
         // while this async entry point owns the engine.
         self.drain_pending_setup_hook().await;
@@ -9346,15 +9403,16 @@ impl ReplLoop {
 
             let result = self.commands.execute(cmd_name, &ctx, &args);
             self.sync_command_state(cmd_name, &result);
+            let output = self.with_backfill_report(cmd_name, &result.output);
 
             // A separator between segments: in a transcript, two commands'
             // output running together reads as one.
             if written_any {
                 writeln!(stdout, "---")?;
             }
-            writeln!(stdout, "{}", result.output)?;
+            writeln!(stdout, "{output}")?;
             written_any = true;
-            pipe_input = Some(result.output);
+            pipe_input = Some(output);
         }
         Ok(())
     }

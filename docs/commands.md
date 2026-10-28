@@ -74,6 +74,16 @@ Implements the `/` slash command system that users type in the REPL. Provides a 
 - `/thinkback-play` reviews the saved transcripts and hands the session a prompt for the
   next turn — the same `extra_context` + `append_system_prompt` mechanism `/advisor` uses.
   With no transcripts it says so instead of promising a turn.
+- `/backfill-sessions` writes the session index for transcripts that predate it. The
+  registry reports the request and the REPL performs the write (it owns the workspace
+  index), so the output says how many rows were written, not just how many files exist.
+- `/voice` reports that this build has no microphone: voice input needs a host that
+  drives the STT state machine, and the terminal host does not. It used to answer
+  "Toggled" while nothing listened.
+- `/desktop` and `/mobile` report the truth about surfaces and remote clients instead of
+  reading `CODEREX_DESKTOP`/`CODEREX_MOBILE` as if they were connections: there is no
+  desktop host, and remote clients attach through `coderex bridge`.
+- `/stickers` says it is not implemented — no CodeRex surface renders image messages.
 - `/heapdump` writes a process snapshot (version, OS, pid, RSS/VSZ/threads, open file
   descriptors) to `/tmp/coderex-heap.prof` and reports the byte count. It is a process
   snapshot, not a heap profile, and the command says so in its output.

@@ -24,8 +24,14 @@ impl VoiceState {
     }
 
     /// Start listening.
+    ///
+    /// A state in `Error` is not a state to start from: recovering from a
+    /// failure is [`VoiceState::retry`], so `start_listening` on an error
+    /// leaves it as it is rather than clearing the reason the user needs to
+    /// see. It used to compare against `Error(String::new())`, which never
+    /// matched a real error and so silently swallowed it.
     pub fn start_listening(&mut self) {
-        if *self == Self::Idle || *self == Self::Error(String::new()) {
+        if *self == Self::Idle {
             *self = Self::Listening;
         }
     }
@@ -146,6 +152,22 @@ mod tests {
         state.begin_transcribing();
         let result = state.finish_transcribing(String::new());
         assert!(result.is_none());
+        assert_eq!(state, VoiceState::Listening);
+    }
+
+    #[test]
+    fn start_listening_does_not_swallow_an_error() {
+        // An error is recovered from with `retry`, never by starting over:
+        // clearing it here hid the failure's reason from the status line.
+        let mut state = VoiceState::new();
+        state.fail("microphone unavailable".into());
+        state.start_listening();
+        assert!(
+            matches!(&state, VoiceState::Error(reason) if reason == "microphone unavailable"),
+            "start_listening cleared the error: {state:?}"
+        );
+        state.retry();
+        state.start_listening();
         assert_eq!(state, VoiceState::Listening);
     }
 

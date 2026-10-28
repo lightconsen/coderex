@@ -126,23 +126,41 @@ chrome_get_content    — Extract page HTML as markdown"
     ));
 
     // /desktop — desktop app integration
+    //
+    // CodeRex ships no desktop host; the surface abstraction has one
+    // implementation, the terminal (`crates/ui/src/surface.rs`). This used to
+    // report "Connected" whenever `CODEREX_DESKTOP` was set, and nothing sets
+    // it, so the only honest answer is that there is no desktop app.
     registry.register(SlashCommand::local(
         "desktop",
-        "Desktop app integration",
+        "Desktop app integration status",
         true,
         true,
         true,
         Arc::new(|_ctx: &CommandContext, _args: &[String]| {
-            let has_desktop = std::env::var("CODEREX_DESKTOP").is_ok_and(|s| !s.is_empty());
-            if has_desktop {
-                CommandResult::success("Desktop App: Connected\nRunning with desktop integration.")
+            let detected = std::env::var("CODEREX_DESKTOP").is_ok_and(|s| !s.is_empty());
+            if detected {
+                // An environment marker is not a connection: say what was
+                // seen rather than claiming an integration exists.
+                CommandResult::success(
+                    "Desktop integration: CODEREX_DESKTOP is set, but this build has no desktop \
+                     host. The session is presented in the terminal surface.",
+                )
             } else {
-                CommandResult::success("Desktop App: Not detected\nRunning in terminal mode.")
+                CommandResult::success(
+                    "Desktop integration: none. CodeRex ships the terminal surface only.",
+                )
             }
         }),
     ));
 
     // /mobile — mobile remote connection
+    //
+    // The same problem as `/desktop`: `CODEREX_MOBILE` was the only evidence
+    // ever consulted, and nothing sets it. Remote clients reach a session
+    // through the bridge's own launcher (`coderex bridge`), not through this
+    // command, so the honest answer names that and the gateway that is not in
+    // this repository.
     registry.register(SlashCommand::local(
         "mobile",
         "Mobile remote connection status",
@@ -150,32 +168,45 @@ chrome_get_content    — Extract page HTML as markdown"
         true,
         true,
         Arc::new(|_ctx: &CommandContext, _args: &[String]| {
-            let has_mobile = std::env::var("CODEREX_MOBILE").is_ok_and(|s| !s.is_empty());
-            if has_mobile {
-                CommandResult::success("Mobile: Active\nMobile client connected via Bridge.")
+            let detected = std::env::var("CODEREX_MOBILE").is_ok_and(|s| !s.is_empty());
+            if detected {
+                CommandResult::success(
+                    "Mobile: CODEREX_MOBILE is set, but this command cannot observe a client. \
+                     Remote clients attach through `coderex bridge` and are approved by the \
+                     gateway, which is not part of this binary.",
+                )
             } else {
                 CommandResult::success(
-                    "Mobile: No active connections\nUse Bridge to connect mobile clients.",
+                    "Mobile: none. Remote clients attach through `coderex bridge`.",
                 )
             }
         }),
     ));
 
-    // /voice — voice mode toggle
+    // /voice — report the voice input state
+    //
+    // The mode is not a toggle this command can flip on its own: the
+    // microphone is owned by whatever host implements `coderex_ui::voice`, and
+    // this build's `voice` cargo feature is not enabled anywhere (the compile
+    // gate in `crates/ui/src/lib.rs`). Before this, the command answered
+    // "Toggled" and nothing was ever listening.
     registry.register(SlashCommand::local(
         "voice",
-        "Toggle voice mode",
+        "Show voice input status",
         false,
         false,
         false,
         Arc::new(|ctx: &CommandContext, _args: &[String]| {
-            if ctx.is_feature_enabled("voice_mode") {
-                CommandResult::success("Voice Mode: Toggled")
-            } else {
-                CommandResult::error(
+            if !ctx.is_feature_enabled("voice_mode") {
+                return CommandResult::error(
                     "Voice mode is not available. Enable the voice_mode feature flag.",
-                )
+                );
             }
+            CommandResult::success(
+                "Voice Mode: enabled in this build, but this host has no microphone.\n\
+                 Voice input needs a host that drives the STT state machine \
+                 (record → transcribe → insert); the terminal host does not.",
+            )
         }),
     ));
 
@@ -368,7 +399,11 @@ mod tests {
             r
         };
         let result = reg.execute("desktop", &ctx(), &[]);
-        assert!(result.output.contains("terminal mode"));
+        assert!(
+            result.output.contains("terminal surface only"),
+            "{}",
+            result.output
+        );
     }
 
     #[test]
@@ -379,7 +414,11 @@ mod tests {
             r
         };
         let result = reg.execute("mobile", &ctx(), &[]);
-        assert!(result.output.contains("No active connections"));
+        assert!(
+            result.output.contains("coderex bridge"),
+            "{}",
+            result.output
+        );
     }
 
     #[test]
@@ -391,6 +430,27 @@ mod tests {
         };
         let result = reg.execute("voice", &ctx(), &[]);
         assert!(result.output.contains("not available"));
+    }
+
+    /// With the flag on, the command reports that this host has no
+    /// microphone. It used to answer "Voice Mode: Toggled" while nothing
+    /// ever listened, which read as a working feature.
+    #[test]
+    fn voice_with_the_flag_on_admits_there_is_no_microphone() {
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
+        let mut c = ctx();
+        c.feature_flags.insert("voice_mode".to_string(), true);
+        let result = reg.execute("voice", &c, &[]);
+        assert!(result.output.contains("no microphone"), "{}", result.output);
+        assert!(
+            !result.output.contains("Toggled"),
+            "the command still claims to toggle: {}",
+            result.output
+        );
     }
 
     #[test]

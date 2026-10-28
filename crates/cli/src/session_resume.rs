@@ -27,8 +27,9 @@
 use anyhow::{Result, bail};
 use chrono::{DateTime, Utc};
 use coderex_config::dirs::DataDirectories;
-use coderex_core::types::{Message, MessageContent, Role};
+use coderex_core::types::Message;
 use coderex_memory::concurrent::SharedSessionIndex;
+use coderex_memory::session_backfill::transcript_title;
 use coderex_memory::session_index::{SessionIndex, SessionMeta};
 use coderex_memory::transcript::TranscriptStore;
 use serde::{Deserialize, Serialize};
@@ -134,9 +135,6 @@ pub fn sessions_db_path(cwd: &str) -> PathBuf {
     DataDirectories::new(Path::new(cwd).join(".coderex")).sessions_db_path()
 }
 
-/// Largest transcript excerpt written into the index for one session.
-const MAX_INDEXED_CONTENT_BYTES: usize = 256 * 1024;
-
 /// Create or update the index row for a saved session.
 ///
 /// Call this after the transcript and interactive snapshot are persisted.
@@ -199,30 +197,9 @@ fn try_index_saved_session(
             sessions_db_path(cwd).display()
         )
     })?;
-    let now = Utc::now();
-    let title = title
-        .map(str::trim)
-        .filter(|title| !title.is_empty())
-        .map(ToString::to_string);
-    let meta = SessionMeta {
-        session_id: session_id.to_string(),
-        project_path: cwd.to_string(),
-        ai_title: title,
-        tag: None,
-        pr_url: None,
-        created_at: now,
-        last_active_at: now,
-        total_cost_usd: 0.0,
-        total_tokens: 0,
-    };
-    let content = messages_content(messages);
     let index = index.lock();
-    index.upsert_with_content(&meta, Some(&content))?;
-    // Also fill the TF-IDF table, so a search with no FTS hit can fall back
-    // to the semantic ranking instead of returning nothing.
-    if !content.is_empty() {
-        index.index_content(session_id, &content)?;
-    }
+    coderex_memory::session_backfill::index_transcript(&index, cwd, session_id, title, messages)
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
     drop(index);
     Ok(())
 }
@@ -366,42 +343,6 @@ fn fts_query(query: &str) -> String {
         .join(" ")
 }
 
-/// Flatten transcript messages into the text stored in the FTS entry.
-fn messages_content(messages: &[Message]) -> String {
-    let mut content = String::new();
-    for message in messages {
-        match &message.content {
-            MessageContent::Text(text) => content.push_str(text),
-            MessageContent::ToolCall(call) => {
-                content.push_str(&call.name);
-                content.push(' ');
-                content.push_str(&call.input.to_string());
-            }
-            MessageContent::ToolResult(result) => content.push_str(&result.output),
-            // `MessageContent` is `#[non_exhaustive]`: a future variant simply
-            // does not contribute text to the index.
-            _ => {}
-        }
-        content.push('\n');
-        if content.len() >= MAX_INDEXED_CONTENT_BYTES {
-            break;
-        }
-    }
-    truncate_at_char_boundary(content, MAX_INDEXED_CONTENT_BYTES)
-}
-
-fn truncate_at_char_boundary(mut text: String, max_bytes: usize) -> String {
-    if text.len() <= max_bytes {
-        return text;
-    }
-    let mut end = max_bytes;
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    text.truncate(end);
-    text
-}
-
 /// Every JSONL transcript in the workspace, newest first.
 fn transcript_files(cwd: &str) -> Vec<(PathBuf, SystemTime)> {
     let Ok(entries) = std::fs::read_dir(transcript_dir(cwd)) else {
@@ -461,34 +402,6 @@ fn meta_from_transcript(cwd: &str, path: &Path, modified: SystemTime) -> Option<
         total_cost_usd: 0.0,
         total_tokens: 0,
     })
-}
-
-fn transcript_title(raw: &str) -> Option<String> {
-    raw.lines().find_map(|line| {
-        let message: Message = serde_json::from_str(line).ok()?;
-        if !matches!(message.role, Role::User) {
-            return None;
-        }
-        let MessageContent::Text(text) = message.content else {
-            return None;
-        };
-        let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
-        if collapsed.is_empty() {
-            None
-        } else {
-            Some(truncate_title(&collapsed))
-        }
-    })
-}
-
-fn truncate_title(title: &str) -> String {
-    const MAX_CHARS: usize = 80;
-    if title.chars().count() <= MAX_CHARS {
-        return title.to_string();
-    }
-    let mut truncated = title.chars().take(MAX_CHARS).collect::<String>();
-    truncated.push('…');
-    truncated
 }
 
 /// Load transcript messages for a resumed session.

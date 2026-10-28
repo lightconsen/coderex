@@ -197,13 +197,29 @@ index via `DataDirectories::new(<cwd>/.coderex).sessions_db_path()` and exposes
 (the REPL call sites are documented in the module header):
 
 - `index_saved_session(cwd, session_id, title, messages)` — called after
-  transcript and interactive-snapshot persistence; formats message text into the
-  FTS entry and upserts atomically, so re-indexing updates rather than duplicates.
+  transcript and interactive-snapshot persistence; delegates to
+  `coderex_memory::session_backfill::index_transcript`, so re-indexing updates
+  rather than duplicates and the backfill writes identical rows.
 - `search_sessions(cwd, query, limit)` — FTS first, then a case-insensitive
   substring scan of `<cwd>/.coderex/transcripts/*.jsonl` for sessions the index
   does not know about.
 - `list_recent_sessions(cwd, limit)` — merges index rows with transcript-only
   sessions, newest first.
+
+### Backfill (`session_backfill.rs`)
+
+- **`backfill(index, cwd, transcripts_dir)`** — writes a row for every
+  `.jsonl` in the workspace's transcript directory, in one implementation shared
+  with the CLI's save path (`index_transcript`). Titles come from the first user
+  prompt, content from the parsed conversation, and a transcript that cannot be
+  read is counted as skipped rather than failing the run.
+- **`BackfillReport`** — transcripts seen / indexed / skipped, so a caller can
+  say what happened.
+
+`/backfill-sessions` is the production caller: the registry reports the
+request, and the REPL performs the write inside `sync_command_state` (the same
+place `/init` queues its hook) because only the CLI holds the workspace index
+location.
 
 Both read paths log a warning and fall back to transcripts when the database is
 corrupt or locked; transcripts remain the source of truth for `/resume`, and the

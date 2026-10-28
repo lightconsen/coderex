@@ -47,15 +47,24 @@ pub fn register(registry: &mut CommandRegistry) {
     ));
 
     // /stickers — stickers/emoji (feature-gated)
+    //
+    // A sticker is an image message, and no CodeRex surface renders one: the
+    // terminal surface reports `images: false` and the only image-carrying
+    // message is a `ToolResult` (a screenshot the model asked for), not a
+    // user-posted sticker. There is nothing to send, so the command says that
+    // instead of printing a placeholder that reads like content.
     registry.register(SlashCommand::local(
         "stickers",
-        "Send stickers or emoji (feature-gated)",
+        "Sticker messages (feature-gated, no surface renders them)",
         false,
         false,
         false,
         Arc::new(|ctx: &CommandContext, _args: &[String]| {
             if ctx.is_feature_enabled("stickers") {
-                CommandResult::success("Stickers: (feature content would appear here)")
+                CommandResult::success(
+                    "Stickers: not implemented. No CodeRex surface renders image messages, so \
+                     there is nothing to send one to.",
+                )
             } else {
                 CommandResult::error("stickers feature is not enabled.")
             }
@@ -303,53 +312,31 @@ pub fn register(registry: &mut CommandRegistry) {
         }),
     ));
 
-    // /backfill-sessions — backfill historical session index
+    // /backfill-sessions — write the session index for transcripts that
+    // predate it. The index belongs to the CLI (it owns the SQLite handle and
+    // the `.coderex` layout), so the registry only reports the request; the
+    // REPL answers it in `sync_command_state`, the same place `/init` queues
+    // its hook. Writing the index from here would mean a second, divergent
+    // implementation of the row shape.
     registry.register(SlashCommand::local(
         "backfill-sessions",
-        "Backfill historical session index",
-        false,
-        false,
-        false,
+        "Backfill the session index from existing transcripts",
+        true,
+        true,
+        true,
         Arc::new(|ctx: &CommandContext, _args: &[String]| {
-            let mut found = 0;
-            let mut total_messages = 0;
-
-            // Scan project transcripts
-            let project_transcripts = std::path::Path::new(&ctx.cwd).join(".coderex/transcripts");
-            if project_transcripts.exists() {
-                if let Ok(entries) = std::fs::read_dir(&project_transcripts) {
-                    for entry in entries.flatten() {
-                        let path = entry.path();
-                        if path.extension().is_some_and(|e| e == "jsonl") {
-                            if let Ok(content) = std::fs::read_to_string(&path) {
-                                let msgs = content.lines().count();
-                                total_messages += msgs;
-                                found += 1;
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Scan global transcripts
-            let global_transcripts = coderex_config::settings::config_home().join("transcripts");
-            if global_transcripts.exists() {
-                if let Ok(entries) = std::fs::read_dir(&global_transcripts) {
-                    for entry in entries.flatten() {
-                        let path = entry.path();
-                        if path.extension().is_some_and(|e| e == "jsonl") {
-                            if let Ok(content) = std::fs::read_to_string(&path) {
-                                let msgs = content.lines().count();
-                                total_messages += msgs;
-                                found += 1;
-                            }
-                        }
-                    }
-                }
-            }
-
+            let transcripts = std::path::Path::new(&ctx.cwd).join(".coderex/transcripts");
+            let found = std::fs::read_dir(&transcripts).map_or(0, |entries| {
+                entries
+                    .flatten()
+                    .filter(|entry| {
+                        entry.path().extension().and_then(|ext| ext.to_str()) == Some("jsonl")
+                    })
+                    .count()
+            });
             CommandResult::success(format!(
-                "Backfilling session index...\nScanned {found} transcript file(s), {total_messages} total message(s)."
+                "Backfilling the session index from {found} transcript file(s) in {}.",
+                transcripts.display()
             ))
             .with_state_change(true)
         }),

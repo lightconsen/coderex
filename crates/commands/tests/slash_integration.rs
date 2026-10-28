@@ -543,6 +543,26 @@ fn stickers_feature_gated() {
     assert!(result.output.contains("not enabled"));
 }
 
+/// With the flag on, `/stickers` says it is not implemented rather than
+/// printing a placeholder that reads like content.
+#[test]
+fn stickers_with_the_flag_on_says_it_is_not_implemented() {
+    let reg = full_registry();
+    let mut ctx = test_ctx();
+    ctx.feature_flags.insert("stickers".to_string(), true);
+    let result = reg.execute("stickers", &ctx, &[]);
+    assert!(
+        result.output.contains("not implemented"),
+        "{}",
+        result.output
+    );
+    assert!(
+        !result.output.contains("would appear here"),
+        "the placeholder is back: {}",
+        result.output
+    );
+}
+
 #[test]
 fn ctx_viz_feature_gated() {
     let reg = full_registry();
