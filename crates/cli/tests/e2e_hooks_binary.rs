@@ -878,3 +878,120 @@ fn the_session_lifecycle_events_reach_their_hooks() {
         "the granted write did not land"
     );
 }
+
+/// Hooks that fire from inside a tool (`TaskCompleted`, `WorktreeCreate`) and
+/// from a sub-agent (`SubagentStart`, `SubagentStop`, `TeammateIdle`) reach
+/// their configured hooks through the real binary.
+///
+/// The engine only fires the hooks it owns. These events are produced by the
+/// tool dispatcher and the agent manager, which each hold their own executor;
+/// when the CLI installed the registry on the engine alone, a hook configured
+/// here loaded, matched, and never ran.
+#[test]
+fn tool_and_subagent_hooks_reach_their_configured_commands() {
+    fn marker_script(dir: &Path, marker: &Path) -> PathBuf {
+        let body = concat!(
+            "input=$(cat)\n",
+            "printf '%s\\n' \"$input\" | sed -n 's/.*\"event\":\"\\([^\"]*\\)\".*/\\1/p' >> ",
+            "MARKER",
+            "\n",
+            "echo '{\"action\":\"continue\"}'\n",
+        )
+        .replace("MARKER", &marker.display().to_string());
+        script(dir, "record-event.sh", &body)
+    }
+
+    fn recorded(marker: &Path) -> Vec<String> {
+        std::fs::read_to_string(marker)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn run_with_marker(prompt: &str, args: &[&str]) -> Vec<String> {
+        let dir = tempfile::tempdir().expect("workspace");
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("src/lib.rs"),
+            "pub fn add(a: i32, b: i32) -> i32 { a + b }\n",
+        )
+        .unwrap();
+        // `EnterWorktree` creates a real git worktree, so the fixture has to
+        // be a repository with at least one commit.
+        for args in [
+            vec!["init", "-q"],
+            vec!["add", "."],
+            vec![
+                "-c",
+                "user.email=test@example.test",
+                "-c",
+                "user.name=Test",
+                "commit",
+                "-qm",
+                "fixture",
+            ],
+        ] {
+            let status = Command::new("git")
+                .args(&args)
+                .current_dir(dir.path())
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .status()
+                .expect("git");
+            assert!(status.success(), "git {args:?} failed");
+        }
+        let marker = dir.path().join("events");
+        let recorder = marker_script(dir.path(), &marker);
+        let home = seed_config(&serde_json::json!({
+            "hooks": [{
+                "event": "*",
+                "command": recorder.display().to_string(),
+                "timeout_ms": 10000,
+                "sandbox": {"enabled": false}
+            }]
+        }));
+        let api = start_static_provider();
+        let output = run(dir.path(), home.path(), &api.1, prompt, args);
+        let _ = api.0;
+        assert!(
+            output.status.success(),
+            "coderex failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        recorded(&marker)
+    }
+
+    let task = run_with_marker(
+        "create a test task and then complete the smoke task",
+        &["--dangerously-skip-permissions"],
+    );
+    assert!(
+        task.iter().any(|event| event == "TaskCompleted"),
+        "TaskCompleted never fired; saw {task:?}"
+    );
+
+    let worktree = run_with_marker("enter a worktree", &["--dangerously-skip-permissions"]);
+    assert!(
+        worktree.iter().any(|event| event == "WorktreeCreate"),
+        "WorktreeCreate never fired; saw {worktree:?}"
+    );
+    // `--worktree` moves the session during startup, before the hooks are
+    // loaded; the CLI replays that one move once they are installed.
+    let moved = run_with_marker("hello", &["--dangerously-skip-permissions", "--worktree"]);
+    assert!(
+        moved.iter().any(|event| event == "CwdChanged"),
+        "CwdChanged never fired for --worktree; saw {moved:?}"
+    );
+
+    let subagent = run_with_marker(
+        "delegate a simple agent",
+        &["--dangerously-skip-permissions"],
+    );
+    for expected in ["SubagentStart", "SubagentStop", "TeammateIdle"] {
+        assert!(
+            subagent.iter().any(|event| event == expected),
+            "the {expected} hook never fired; saw {subagent:?}"
+        );
+    }
+}

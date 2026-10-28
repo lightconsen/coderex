@@ -190,6 +190,31 @@ fn handle_connection(mut stream: TcpStream, responses: &std::sync::Arc<StaticRes
             build_sequence_tool_response(turn_number)
         } else if has_json_schema {
             build_json_sse_response(r#"{"greeting": "Hello!"}"#)
+        } else if p_lower.contains("complete the smoke task") {
+            // Two turns: create, then complete. The second call is what fires
+            // `TaskCompleted`, and the generic branch answers a tool result
+            // with text, so the follow-up tool has to be chosen here.
+            if count_tool_results(&body_str) == 0 {
+                build_single_tool_response(
+                    "TaskCreate",
+                    r#"{"subject":"smoke task","description":"verify TaskCompleted","activeForm":"Creating smoke task"}"#,
+                )
+            } else {
+                build_single_tool_response("TaskUpdate", r#"{"taskId":"1","status":"completed"}"#)
+            }
+        } else if p_lower.contains("pause-turn-once") {
+            // One pause, then an answer. The second request carries the
+            // assistant text the first one produced, which is how the branch
+            // tells a resumed turn from a fresh one.
+            if count_assistant_messages(&body_str) == 0 {
+                sse_text_block_with_stop("Partial answer before the pause.", "pause_turn")
+            } else {
+                sse_text_block_with_stop("Resumed after the provider pause.", "end_turn")
+            }
+        } else if p_lower.contains("run out of output room") {
+            sse_text_block_with_stop("The answer was cut off by the output limit.", "max_tokens")
+        } else if p_lower.contains("decline-this-request") {
+            sse_text_block_with_stop("I can't help with that.", "refusal")
         } else if has_tool_result && body_str.contains("soak turn") {
             // One unique marker per tool round, so the soak driver can wait
             // for the turn to finish instead of sleeping.
@@ -286,6 +311,23 @@ fn count_tool_results(body: &str) -> usize {
                         content.to_string().contains("\"type\":\"tool_result\"")
                     })
                 })
+                .count()
+        })
+}
+
+/// How many assistant messages the conversation already holds.
+///
+/// A paused turn is re-sent with its own answer in the history, so a branch
+/// that answers differently on the second request keys off this count.
+fn count_assistant_messages(body: &str) -> usize {
+    let value: serde_json::Value = serde_json::from_str(body).unwrap_or_default();
+    value
+        .get("messages")
+        .and_then(|m| m.as_array())
+        .map_or(0, |messages| {
+            messages
+                .iter()
+                .filter(|msg| msg.get("role").and_then(|r| r.as_str()) == Some("assistant"))
                 .count()
         })
 }
@@ -407,6 +449,10 @@ fn resolve_text_response(prompt: &str, responses: &StaticResponses) -> String {
         responses.resolve("web_search", "Here are the search results.")
     } else if p.contains("create a test task") {
         "Task flow complete. The smoke task is registered.".into()
+    } else if p.contains("complete the smoke task") {
+        "Task flow complete. The smoke task is closed.".into()
+    } else if p.contains("enter a worktree") {
+        "Worktree flow complete. The session entered its own checkout.".into()
     } else if p.contains("list tracked tasks") {
         "Task list flow complete. The tracked tasks are visible.".into()
     } else if p.contains("schedule a test cron") {
@@ -462,6 +508,13 @@ fn build_text_response(prompt: &str, responses: &StaticResponses) -> String {
 }
 
 fn sse_text_block(text: &str) -> String {
+    sse_text_block_with_stop(text, "end_turn")
+}
+
+/// A text answer that stops for a reason of the test's choosing, so the
+/// engine's stop-reason branches (`pause_turn`, `max_tokens`, `refusal`) run
+/// against the real binary instead of only a mock client.
+fn sse_text_block_with_stop(text: &str, stop_reason: &str) -> String {
     let escaped = json_escape_string(text);
     format!(
         "event: content_block_start\n\
@@ -471,7 +524,7 @@ fn sse_text_block(text: &str) -> String {
          event: content_block_stop\n\
          data: {{\"type\":\"content_block_stop\",\"index\":0}}\n\n\
          event: message_delta\n\
-         data: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"end_turn\"}},\"usage\":{{\"input_tokens\":10,\"output_tokens\":20}}}}\n\n\
+         data: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"{stop_reason}\"}},\"usage\":{{\"input_tokens\":10,\"output_tokens\":20}}}}\n\n\
          event: message_stop\n\
          data: {{\"type\":\"message_stop\"}}\n\n"
     )
@@ -573,6 +626,23 @@ fn build_tool_response(prompt: &str) -> String {
     );
 
     sse
+}
+
+/// One tool call, for a branch that needs a specific follow-up.
+fn build_single_tool_response(name: &str, input_json: &str) -> String {
+    let escaped = json_escape_string(input_json);
+    format!(
+        "event: content_block_start\n\
+         data: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"tool_use\",\"id\":\"tool_single\",\"name\":\"{name}\",\"input\":{{}}}}}}\n\n\
+         event: content_block_delta\n\
+         data: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"input_json_delta\",\"partial_json\":\"{escaped}\"}}}}\n\n\
+         event: content_block_stop\n\
+         data: {{\"type\":\"content_block_stop\",\"index\":0}}\n\n\
+         event: message_delta\n\
+         data: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"tool_use\"}},\"usage\":{{\"input_tokens\":10,\"output_tokens\":20}}}}\n\n\
+         event: message_stop\n\
+         data: {{\"type\":\"message_stop\"}}\n\n"
+    )
 }
 
 fn build_loop_tool_response() -> String {
@@ -828,10 +898,20 @@ fn select_tools(prompt: &str) -> Vec<Tool> {
             name: "TaskCreate".into(),
             input_json: r#"{"subject":"smoke task","description":"verify interactive task tool sequence","activeForm":"Creating smoke task"}"#.into(),
         }]
+    } else if p.contains("complete the smoke task") {
+        vec![Tool::Raw {
+            name: "TaskUpdate".into(),
+            input_json: r#"{"taskId":"1","status":"completed"}"#.into(),
+        }]
     } else if p.contains("list tracked tasks") {
         vec![Tool::Raw {
             name: "TaskList".into(),
             input_json: "{}".into(),
+        }]
+    } else if p.contains("enter a worktree") {
+        vec![Tool::Raw {
+            name: "EnterWorktree".into(),
+            input_json: r#"{"branch":"coderex-hook-smoke"}"#.into(),
         }]
     } else if p.contains("schedule a test cron") {
         vec![Tool::Raw {

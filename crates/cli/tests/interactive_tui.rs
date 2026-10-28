@@ -1309,6 +1309,33 @@ fn the_statusline_shows_model_tokens_cost_and_branch() {
     );
 }
 
+/// The statusline and the permission bar are separate rows: the statusline
+/// carries model/tokens/cost/branch, the bar carries the mode. A PTY assertion
+/// on each row keeps one from silently absorbing the other.
+#[test]
+fn the_statusline_and_permission_bar_keep_their_own_rows() {
+    let dir = setup_git_project_dir();
+    let (_server, mut session) = session_with_static_server(dir.path());
+    session.wait_for_text("CodeRex v", SCREEN_TIMEOUT);
+    let screen = session.wait_for_text("Permissions:", SCREEN_TIMEOUT);
+    let statusline_row = screen
+        .lines()
+        .find(|line| line.contains("tok:0,"))
+        .unwrap_or_else(|| panic!("no statusline row:\n{screen}"));
+    assert!(
+        !statusline_row.contains("Permissions:"),
+        "the permission mode leaked into the statusline: {statusline_row}"
+    );
+    let bar_row = screen
+        .lines()
+        .find(|line| line.contains("Permissions:"))
+        .expect("no permission bar row");
+    assert!(
+        !bar_row.contains("tok:0,"),
+        "the statusline leaked into the permission bar: {bar_row}"
+    );
+}
+
 /// A terminal that speaks the kitty keyboard protocol is asked to disambiguate
 /// keys on entry and restored on exit.
 #[test]
@@ -1326,6 +1353,23 @@ fn a_supported_terminal_gets_the_keyboard_protocol_push_and_pop() {
     assert!(
         session.raw_text().contains("\u{1b}[<1u"),
         "the keyboard protocol was not popped on exit"
+    );
+}
+
+/// A terminal that does not advertise the protocol is recognised but not
+/// asked: pushing it there produces escape sequences the terminal ignores (or
+/// renders). The detection is observable only through the raw stream.
+#[test]
+fn an_unsupported_terminal_is_not_asked_for_the_keyboard_protocol() {
+    let dir = setup_project_dir();
+    let (_server, mut session) =
+        session_with_static_server_envs(dir.path(), &[("TERM_PROGRAM", "Apple_Terminal")]);
+    let _ = session.wait_for_text("CodeRex v", SCREEN_TIMEOUT);
+    session.send_line("hello");
+    let _ = session.wait_for_text("Completed in", SCREEN_TIMEOUT);
+    assert!(
+        !session.raw_text().contains("\u{1b}[>1u"),
+        "an unsupported terminal was asked to push the keyboard protocol"
     );
 }
 
