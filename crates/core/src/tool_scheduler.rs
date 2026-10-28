@@ -606,8 +606,10 @@ mod tests {
             crate::permissions::PermissionMode::BypassPermissions,
         ));
         let mut denied = Vec::new();
-        let mut options = SubmitOptions::default();
-        options.allowed_tools_override = Some(vec!["read".into()]);
+        let options = SubmitOptions {
+            allowed_tools_override: Some(vec!["read".into()]),
+            ..Default::default()
+        };
 
         let calls = vec![
             PendingToolCall {

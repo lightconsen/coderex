@@ -19,8 +19,11 @@ use coderex_tools::{
 fn dispatcher(cwd: &Path, store: Option<Arc<CheckpointStore>>) -> RegistryToolDispatcher {
     let mut registry = ToolRegistry::new();
     register_builtin_tools(&mut registry);
-    let mut config = ExecutionConfig::default();
-    config.sandbox_enabled = false;
+    let config = ExecutionConfig {
+        sandbox_enabled: false,
+        ..Default::default()
+    };
+
     let executor = Arc::new(ToolsExecutor::new(config));
     let mut dispatcher = RegistryToolDispatcher::new(
         Arc::new(registry),

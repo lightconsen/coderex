@@ -2562,8 +2562,11 @@ mod layout_tests {
     fn the_theme_background_covers_the_frame() {
         let mut dark = UiState::default();
         let dark_buffer = render_to_buffer(80, 24, &mut dark);
-        let mut light = UiState::default();
-        light.theme = crate::themes::Theme::light();
+        let mut light = UiState {
+            theme: crate::themes::Theme::light(),
+            ..Default::default()
+        };
+
         let light_buffer = render_to_buffer(80, 24, &mut light);
 
         let dark_bg = crate::themes::Theme::dark().background;

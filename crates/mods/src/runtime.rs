@@ -2005,8 +2005,13 @@ fn load_mod_in_realm(
 
     // Boa evaluated mod files as sloppy-mode scripts (a mod's own
     // `'use strict'` directive still applies); keep that.
+    // `EvalOptions` is `#[non_exhaustive]`, so a struct literal with
+    // `..Default::default()` is rejected by the compiler; the field has to be
+    // assigned after construction.
+    #[allow(clippy::field_reassign_with_default)]
     let mut options = rquickjs::context::EvalOptions::default();
     options.strict = false;
+
     ctx.eval_with_options::<(), _>(source.source.as_str(), options)
         .map_err(|error| format!("could not evaluate the mod: {}", js_error(ctx, error)))?;
 

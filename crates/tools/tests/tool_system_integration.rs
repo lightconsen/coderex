@@ -25,8 +25,11 @@ fn test_registry() -> Arc<ToolRegistry> {
 
 fn test_dispatcher(cwd: PathBuf) -> RegistryToolDispatcher {
     let registry = test_registry();
-    let mut config = ExecutionConfig::default();
-    config.sandbox_enabled = false;
+    let config = ExecutionConfig {
+        sandbox_enabled: false,
+        ..Default::default()
+    };
+
     let executor = Arc::new(ToolsExecutor::new(config));
     let mut dispatcher =
         RegistryToolDispatcher::new(registry, executor, ExecutionContext::Normal, cwd);

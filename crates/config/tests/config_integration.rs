@@ -372,10 +372,12 @@ fn feature_flags_unknown_flag_no_panic() {
 
 #[test]
 fn capability_set_derives_from_flags() {
-    let mut flags = FeatureFlags::default();
-    flags.voice_mode = true;
-    flags.web_browser_tool = true;
-    flags.auto_dream = true;
+    let flags = FeatureFlags {
+        voice_mode: true,
+        web_browser_tool: true,
+        auto_dream: true,
+        ..Default::default()
+    };
 
     let caps = flags.capabilities();
     assert!(caps.contains(CapabilitySet::VOICE));
@@ -442,9 +444,11 @@ fn experiments_override_base_flags() {
 
 #[test]
 fn experiments_merged_with_existing_flags() {
-    let mut flags = FeatureFlags::default();
-    flags.voice_mode = true;
-    flags.coordinator_mode = true;
+    let flags = FeatureFlags {
+        voice_mode: true,
+        coordinator_mode: true,
+        ..Default::default()
+    };
 
     let mut experiments = HashMap::new();
     experiments.insert("coordinator_mode".into(), false);

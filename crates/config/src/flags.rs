@@ -647,9 +647,11 @@ mod tests {
 
     #[test]
     fn apply_comma_list_overlays_existing_flags() {
-        let mut flags = FeatureFlags::default();
-        flags.voice_mode = true;
-        flags.workflow_scripts = true;
+        let mut flags = FeatureFlags {
+            voice_mode: true,
+            workflow_scripts: true,
+            ..Default::default()
+        };
 
         flags
             .apply_comma_list("-voice_mode,+history_snip")
@@ -683,10 +685,12 @@ mod tests {
 
     #[test]
     fn capability_set_derives_correctly_from_flags() {
-        let mut flags = FeatureFlags::default();
-        flags.voice_mode = true;
-        flags.web_browser_tool = true;
-        flags.workflow_scripts = true;
+        let flags = FeatureFlags {
+            voice_mode: true,
+            web_browser_tool: true,
+            workflow_scripts: true,
+            ..Default::default()
+        };
 
         let caps = flags.capabilities();
         assert!(caps.contains(CapabilitySet::VOICE));

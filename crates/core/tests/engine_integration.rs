@@ -333,9 +333,11 @@ async fn single_turn_text_response_completes() {
     let tools = Box::new(EchoToolExecutor);
     let (mut engine, _rx) = make_engine(api, tools);
 
-    let mut options = SubmitOptions::default();
-    options.max_turns = 1;
-    options.handle_elicitation = false;
+    let options = SubmitOptions {
+        max_turns: 1,
+        handle_elicitation: false,
+        ..Default::default()
+    };
 
     let result = engine.submit("hello".into(), options).await;
     assert!(result.is_ok());
@@ -355,8 +357,10 @@ async fn single_turn_no_tool_calls() {
     let tools = Box::new(EchoToolExecutor);
     let (mut engine, mut rx) = make_engine(api, tools);
 
-    let mut options = SubmitOptions::default();
-    options.handle_elicitation = false;
+    let options = SubmitOptions {
+        handle_elicitation: false,
+        ..Default::default()
+    };
 
     let result = engine.submit("count to 3".into(), options).await.unwrap();
     assert_eq!(result, TerminalReason::Completed);
@@ -388,8 +392,10 @@ async fn multi_turn_tool_call_then_text() {
     let tools = Box::new(EchoToolExecutor);
     let (mut engine, mut rx) = make_engine(api, tools);
 
-    let mut options = SubmitOptions::default();
-    options.handle_elicitation = false;
+    let options = SubmitOptions {
+        handle_elicitation: false,
+        ..Default::default()
+    };
 
     let result = engine
         .submit("read test.txt".into(), options)
@@ -425,8 +431,10 @@ async fn multi_turn_context_accumulated() {
     let tools = Box::new(EchoToolExecutor);
     let (mut engine, _rx) = make_engine(api, tools);
 
-    let mut options = SubmitOptions::default();
-    options.handle_elicitation = false;
+    let options = SubmitOptions {
+        handle_elicitation: false,
+        ..Default::default()
+    };
 
     engine.submit("run echo".into(), options).await.unwrap();
 
@@ -467,8 +475,11 @@ async fn a_tool_turn_reports_its_state_sequence() {
         sink.lock().expect("transition log").push((from, to));
     }));
 
-    let mut options = SubmitOptions::default();
-    options.handle_elicitation = false;
+    let options = SubmitOptions {
+        handle_elicitation: false,
+        ..Default::default()
+    };
+
     engine.submit("read a file".into(), options).await.unwrap();
 
     let transitions = observed.lock().expect("transition log").clone();
@@ -512,8 +523,10 @@ async fn streaming_text_deltas_emitted() {
     let tools = Box::new(EchoToolExecutor);
     let (mut engine, mut rx) = make_engine(api, tools);
 
-    let mut options = SubmitOptions::default();
-    options.handle_elicitation = false;
+    let options = SubmitOptions {
+        handle_elicitation: false,
+        ..Default::default()
+    };
 
     let result = engine
         .submit_streaming("say hello".into(), options)
@@ -543,8 +556,10 @@ async fn streaming_no_tool_calls_completes_cleanly() {
     let tools = Box::new(EchoToolExecutor);
     let (mut engine, mut rx) = make_engine(api, tools);
 
-    let mut options = SubmitOptions::default();
-    options.handle_elicitation = false;
+    let options = SubmitOptions {
+        handle_elicitation: false,
+        ..Default::default()
+    };
 
     let result = engine
         .submit_streaming("hello".into(), options)
@@ -568,8 +583,11 @@ async fn three_text_only_turns_are_not_a_loop() {
     let (mut engine, _rx) = make_engine(api, tools);
 
     for _ in 0..3 {
-        let mut options = SubmitOptions::default();
-        options.handle_elicitation = false;
+        let options = SubmitOptions {
+            handle_elicitation: false,
+            ..Default::default()
+        };
+
         let reason = engine.submit("hello".into(), options).await.unwrap();
         assert_eq!(
             reason,
@@ -646,8 +664,11 @@ async fn streaming_tool_calls_persist_the_assistant_tool_use() {
     let tools = Box::new(EchoToolExecutor);
     let (mut engine, _rx) = make_engine(api, tools);
 
-    let mut options = SubmitOptions::default();
-    options.handle_elicitation = false;
+    let options = SubmitOptions {
+        handle_elicitation: false,
+        ..Default::default()
+    };
+
     let reason = engine
         .submit_streaming("use a tool".into(), options)
         .await
@@ -702,8 +723,10 @@ async fn tool_call_loop_executes_and_continues() {
     let tools = Box::new(EchoToolExecutor);
     let (mut engine, _rx) = make_engine(api, tools);
 
-    let mut options = SubmitOptions::default();
-    options.handle_elicitation = false;
+    let options = SubmitOptions {
+        handle_elicitation: false,
+        ..Default::default()
+    };
 
     let result = engine
         .submit("find rust files".into(), options)
@@ -826,8 +849,10 @@ fn messages_json(engine: &QueryEngine) -> String {
 
 #[tokio::test]
 async fn both_submission_paths_finish_a_tool_turn_in_the_same_state() {
-    let mut options = SubmitOptions::default();
-    options.handle_elicitation = false;
+    let options = SubmitOptions {
+        handle_elicitation: false,
+        ..Default::default()
+    };
 
     let (mut immediate, _rx) =
         make_engine(Box::new(BothPathsMock::new()), Box::new(EchoToolExecutor));
@@ -862,8 +887,11 @@ async fn thinking_block_is_round_tripped_in_the_follow_up_request() {
     let tools = Box::new(EchoToolExecutor);
     let (mut engine, _rx) = make_engine(api, tools);
 
-    let mut options = SubmitOptions::default();
-    options.handle_elicitation = false;
+    let options = SubmitOptions {
+        handle_elicitation: false,
+        ..Default::default()
+    };
+
     let reason = engine.submit("read a.txt".into(), options).await.unwrap();
     assert_eq!(reason, TerminalReason::Completed);
 
@@ -921,8 +949,10 @@ async fn tool_call_loop_multiple_tools_in_one_turn() {
     let tools = Box::new(EchoToolExecutor);
     let (mut engine, mut rx) = make_engine(api, tools);
 
-    let mut options = SubmitOptions::default();
-    options.handle_elicitation = false;
+    let options = SubmitOptions {
+        handle_elicitation: false,
+        ..Default::default()
+    };
 
     let result = engine.submit("read both".into(), options).await.unwrap();
     assert_eq!(result, TerminalReason::Completed);
@@ -965,8 +995,10 @@ async fn structured_output_valid_json_passes() {
     });
     engine.set_structured_output_schema(schema);
 
-    let mut options = SubmitOptions::default();
-    options.handle_elicitation = false;
+    let options = SubmitOptions {
+        handle_elicitation: false,
+        ..Default::default()
+    };
 
     let result = engine.submit("give me json".into(), options).await.unwrap();
     assert_eq!(result, TerminalReason::Completed);
@@ -993,8 +1025,10 @@ async fn structured_output_invalid_json_gets_warning() {
     let schema = serde_json::json!({ "type": "object" });
     engine.set_structured_output_schema(schema);
 
-    let mut options = SubmitOptions::default();
-    options.handle_elicitation = false;
+    let options = SubmitOptions {
+        handle_elicitation: false,
+        ..Default::default()
+    };
 
     let result = engine.submit("give me json".into(), options).await.unwrap();
     assert_eq!(result, TerminalReason::Completed);
@@ -1026,9 +1060,11 @@ async fn termination_max_turns_reached() {
     let tools = Box::new(EchoToolExecutor);
     let (mut engine, _rx) = make_engine(api, tools);
 
-    let mut options = SubmitOptions::default();
-    options.max_turns = 1;
-    options.handle_elicitation = false;
+    let options = SubmitOptions {
+        max_turns: 1,
+        handle_elicitation: false,
+        ..Default::default()
+    };
 
     let result = engine
         .submit("read something".into(), options)
@@ -1158,8 +1194,10 @@ async fn termination_loop_detected() {
         tools,
     );
 
-    let mut options = SubmitOptions::default();
-    options.handle_elicitation = false;
+    let options = SubmitOptions {
+        handle_elicitation: false,
+        ..Default::default()
+    };
 
     let result = engine.submit("loop me".into(), options).await.unwrap();
     assert!(
@@ -1206,8 +1244,10 @@ async fn state_machine_turn_counter_increments() {
     let tools = Box::new(EchoToolExecutor);
     let (mut engine, _rx) = make_engine(api, tools);
 
-    let mut options = SubmitOptions::default();
-    options.handle_elicitation = false;
+    let options = SubmitOptions {
+        handle_elicitation: false,
+        ..Default::default()
+    };
 
     assert_eq!(engine.current_turn(), 0);
 
@@ -1228,8 +1268,10 @@ async fn engine_tracks_cost_across_turns() {
     let tools = Box::new(EchoToolExecutor);
     let (mut engine, _rx) = make_engine(api, tools);
 
-    let mut options = SubmitOptions::default();
-    options.handle_elicitation = false;
+    let options = SubmitOptions {
+        handle_elicitation: false,
+        ..Default::default()
+    };
 
     // Two separate submit calls
     engine
@@ -1248,9 +1290,11 @@ async fn engine_custom_system_prompt_appended() {
     let tools = Box::new(EchoToolExecutor);
     let (mut engine, _rx) = make_engine(api, tools);
 
-    let mut options = SubmitOptions::default();
-    options.custom_system_prompt = Some("You are a helpful test assistant.".into());
-    options.handle_elicitation = false;
+    let options = SubmitOptions {
+        custom_system_prompt: Some("You are a helpful test assistant.".into()),
+        handle_elicitation: false,
+        ..Default::default()
+    };
 
     let result = engine.submit("hello".into(), options).await.unwrap();
     assert_eq!(result, TerminalReason::Completed);
@@ -1273,9 +1317,11 @@ async fn engine_allowed_tools_override_blocks_unlisted() {
     let tools = Box::new(EchoToolExecutor);
     let (mut engine, mut rx) = make_engine(api, tools);
 
-    let mut options = SubmitOptions::default();
-    options.allowed_tools_override = Some(vec!["read".into()]);
-    options.handle_elicitation = false;
+    let options = SubmitOptions {
+        allowed_tools_override: Some(vec!["read".into()]),
+        handle_elicitation: false,
+        ..Default::default()
+    };
 
     let result = engine
         .submit("write something".into(), options)
@@ -1488,9 +1534,11 @@ async fn compact_recovery_injects_session_memory() {
     let backend_dyn: std::sync::Arc<dyn SessionMemoryBackend> = backend;
     engine.set_session_memory(backend_dyn);
 
-    let mut options = SubmitOptions::default();
-    options.task_budget_tokens = 1_000;
-    options.handle_elicitation = false;
+    let options = SubmitOptions {
+        task_budget_tokens: 1_000,
+        handle_elicitation: false,
+        ..Default::default()
+    };
 
     // The engine does not reset turn_tokens after compaction, so a
     // compaction triggered by budget exhaustion ends the turn exhausted.
@@ -1532,9 +1580,11 @@ async fn compact_recovery_survives_memory_update_failure() {
     let backend_dyn: std::sync::Arc<dyn SessionMemoryBackend> = backend;
     engine.set_session_memory(backend_dyn);
 
-    let mut options = SubmitOptions::default();
-    options.task_budget_tokens = 1_000;
-    options.handle_elicitation = false;
+    let options = SubmitOptions {
+        task_budget_tokens: 1_000,
+        handle_elicitation: false,
+        ..Default::default()
+    };
 
     // Compaction (and the whole turn) still succeeds.
     // The engine does not reset turn_tokens after compaction, so a
@@ -1566,9 +1616,11 @@ async fn compact_recovery_no_extra_llm_call_without_backend() {
     let (mut engine, _rx) = make_engine(Box::new(mock), tools);
     engine.set_session(session_with_history());
 
-    let mut options = SubmitOptions::default();
-    options.task_budget_tokens = 1_000;
-    options.handle_elicitation = false;
+    let options = SubmitOptions {
+        task_budget_tokens: 1_000,
+        handle_elicitation: false,
+        ..Default::default()
+    };
 
     // The engine does not reset turn_tokens after compaction, so a
     // compaction triggered by budget exhaustion ends the turn exhausted.
@@ -1656,9 +1708,11 @@ async fn compaction_backend_serves_summary_before_local_path() {
     let backend_dyn: std::sync::Arc<dyn CompactionBackend> = backend;
     engine.set_compaction_backend(backend_dyn);
 
-    let mut options = SubmitOptions::default();
-    options.task_budget_tokens = 1_000;
-    options.handle_elicitation = false;
+    let options = SubmitOptions {
+        task_budget_tokens: 1_000,
+        handle_elicitation: false,
+        ..Default::default()
+    };
 
     // The engine does not reset turn_tokens after compaction, so a
     // compaction triggered by budget exhaustion ends the turn exhausted.
@@ -1699,9 +1753,11 @@ async fn compaction_backend_failure_falls_back_to_local_summary() {
     let backend_dyn: std::sync::Arc<dyn CompactionBackend> = backend;
     engine.set_compaction_backend(backend_dyn);
 
-    let mut options = SubmitOptions::default();
-    options.task_budget_tokens = 1_000;
-    options.handle_elicitation = false;
+    let options = SubmitOptions {
+        task_budget_tokens: 1_000,
+        handle_elicitation: false,
+        ..Default::default()
+    };
 
     let result = engine.submit("finish it".into(), options).await.unwrap();
     assert_eq!(result, TerminalReason::BudgetExhausted);
@@ -1731,9 +1787,11 @@ async fn a_failed_llm_summary_still_compacts_with_the_local_result() {
     let (mut engine, mut rx) = make_engine(Box::new(mock), tools);
     engine.set_session(session_with_history());
 
-    let mut options = SubmitOptions::default();
-    options.task_budget_tokens = 1_000;
-    options.handle_elicitation = false;
+    let options = SubmitOptions {
+        task_budget_tokens: 1_000,
+        handle_elicitation: false,
+        ..Default::default()
+    };
 
     let result = engine.submit("finish it".into(), options).await.unwrap();
     // The turn still ends on its budget, not on a compaction error: the
@@ -1783,9 +1841,11 @@ async fn the_summary_request_covers_the_middle_and_not_the_tail() {
     let (mut engine, _rx) = make_engine(Box::new(mock), tools);
     engine.set_session(session_with_history());
 
-    let mut options = SubmitOptions::default();
-    options.task_budget_tokens = 1_000;
-    options.handle_elicitation = false;
+    let options = SubmitOptions {
+        task_budget_tokens: 1_000,
+        handle_elicitation: false,
+        ..Default::default()
+    };
 
     engine.submit("finish it".into(), options).await.unwrap();
 
@@ -1821,9 +1881,11 @@ async fn compaction_without_backend_uses_local_path_unchanged() {
     let (mut engine, _rx) = make_engine(Box::new(mock), tools);
     engine.set_session(session_with_history());
 
-    let mut options = SubmitOptions::default();
-    options.task_budget_tokens = 1_000;
-    options.handle_elicitation = false;
+    let options = SubmitOptions {
+        task_budget_tokens: 1_000,
+        handle_elicitation: false,
+        ..Default::default()
+    };
 
     let result = engine.submit("finish it".into(), options).await.unwrap();
     assert_eq!(result, TerminalReason::BudgetExhausted);

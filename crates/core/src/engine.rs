@@ -7311,8 +7311,10 @@ mod tests {
         );
         engine.set_tool_executor(Box::new(StubOkToolExecutor));
 
-        let mut options = SubmitOptions::default();
-        options.handle_elicitation = false;
+        let options = SubmitOptions {
+            handle_elicitation: false,
+            ..Default::default()
+        };
 
         let result = engine.submit("hello".into(), options).await;
 
@@ -8552,8 +8554,10 @@ mod tests {
 
         let budget = TokenBudget::with_defaults();
         let mut turn = TurnRuntime::new(budget);
-        let mut options = SubmitOptions::default();
-        options.handle_elicitation = true;
+        let options = SubmitOptions {
+            handle_elicitation: true,
+            ..Default::default()
+        };
 
         let reason = engine.execute_turn(&mut turn, &options, 1).await.unwrap();
 
