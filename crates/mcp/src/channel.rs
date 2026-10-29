@@ -1016,7 +1016,8 @@ mod tests {
     }
 
     /// Feed `lines` through a channel's stdout, so `read_response` can be
-    /// exercised without a real MCP server.
+    /// exercised without a real MCP server. Unix only: the line source is `sh`.
+    #[cfg(unix)]
     fn channel_reading(lines: &str) -> JsonRpcChannel {
         let mut child = Command::new("sh")
             .arg("-c")
@@ -1033,12 +1034,14 @@ mod tests {
     }
 
     /// A single-quoted shell word, so the JSON lines survive the shell.
+    #[cfg(unix)]
     fn shell_quote(text: &str) -> String {
         format!("'{}'", text.replace('\'', "'\\''"))
     }
 
     /// A message that is neither a response nor a request is reported rather
     /// than read past.
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_message_that_is_neither_a_response_nor_a_request_is_logged() {
         let capture = coderex_test_utils::capture_logs();
@@ -1056,6 +1059,7 @@ mod tests {
 
     /// An answer to a request nothing is waiting on (a retry, a late
     /// timeout) is skipped, but not silently.
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_response_for_a_forgotten_request_is_logged() {
         let capture = coderex_test_utils::capture_logs();
