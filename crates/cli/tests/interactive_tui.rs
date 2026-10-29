@@ -15,7 +15,10 @@ const COLS: u16 = 120;
 // 30s, not 15s: this is a real PTY plus a real binary, and the whole file's
 // tests run in parallel. A 15s budget timed out under workspace load even
 // though the session was healthy.
-const SCREEN_TIMEOUT: Duration = Duration::from_secs(60);
+// Generous on purpose: the suite also runs under coverage instrumentation on
+// a shared CI runner, where a PTY session that normally renders in a second
+// can take tens of seconds to produce its first frame.
+const SCREEN_TIMEOUT: Duration = Duration::from_secs(120);
 const LIVE_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// Only one PTY test at a time.

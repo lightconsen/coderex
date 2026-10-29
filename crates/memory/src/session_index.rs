@@ -694,10 +694,9 @@ mod tests {
         // reported instead of failing the busy-database contract.
         match index.create(&test_meta("after")) {
             Ok(()) => assert!(index.get("after").unwrap().is_some()),
-            Err(SessionIndexError::Database(rusqlite::Error::SqliteFailure(
-                error,
-                _,
-            ))) if error.code == rusqlite::ErrorCode::ReadOnly => {
+            Err(SessionIndexError::Database(rusqlite::Error::SqliteFailure(error, _)))
+                if error.code == rusqlite::ErrorCode::ReadOnly =>
+            {
                 eprintln!(
                     "skipping the post-rollback write: this environment reports the database \
                      as read-only ({:?}), which is a filesystem condition, not a lock",

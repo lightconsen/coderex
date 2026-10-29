@@ -160,6 +160,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y openssh-server
           sudo mkdir -p /run/sshd
+          # The hosted runner's account is locked (`!` in shadow), and sshd
+          # refuses a locked account even for key auth. Give it a password
+          # nobody knows; PasswordAuthentication stays off.
+          echo "runner:$(openssl rand -hex 16)" | sudo chpasswd
           ssh-keygen -q -t ed25519 -N '' -f /tmp/ssh_host_key
           ssh-keygen -q -t ed25519 -N '' -f /tmp/ssh_client_key
           cp /tmp/ssh_client_key.pub /tmp/authorized_keys
