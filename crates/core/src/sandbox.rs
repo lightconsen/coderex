@@ -4214,7 +4214,7 @@ mod tests {
             }
         };
 
-        let mut child = std::process::Command::new("python3")
+        let child = std::process::Command::new("python3")
             .arg("-I")
             .arg("-c")
             .arg("a=[]\nwhile True:\n a.append(bytearray(8*1024*1024))")

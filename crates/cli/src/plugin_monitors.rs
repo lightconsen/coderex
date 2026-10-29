@@ -490,15 +490,15 @@ fn spawn_monitor(spec: MonitorSpec, cwd: &Path) -> std::io::Result<MonitorTask> 
         )));
     }
     #[cfg(target_os = "linux")]
-    if let Some(cgroup) = &cgroup {
-        if let Err(error) = cgroup.attach(pid) {
-            tracing::debug!(
-                monitor = %spec.name,
-                %error,
-                "could not add the plugin monitor to its cgroup; a `setsid()` escape \
-                 would not be caught"
-            );
-        }
+    if let Some(cgroup) = &cgroup
+        && let Err(error) = cgroup.attach(pid)
+    {
+        tracing::debug!(
+            monitor = %spec.name,
+            %error,
+            "could not add the plugin monitor to its cgroup; a `setsid()` escape \
+             would not be caught"
+        );
     }
 
     let ownership = Arc::new(MonitorOwnership {
