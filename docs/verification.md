@@ -31,8 +31,9 @@ this table is what they check):
 |---|---|
 | `fmt` | `cargo fmt --all --check` |
 | `cassettes` | `python3 scripts/cassette_tool.py check --strict` (metadata, size, staleness, credentials; runs in seconds) |
+| `ssh-integration` | a throwaway `sshd` on a high port, then `cargo test -p coderex-bridge --test ssh_spawn` — the SSH spawn path against a real server |
 | `clippy` | `cargo clippy --workspace --all-targets -- -D warnings` (the backlog is zero, so a warning fails) |
-| `test` | `cargo nextest run --workspace --no-fail-fast` on Linux; the macOS plist carrier and the live benchmark replay run in `test-macos`, and the Windows runtime sandbox tests in `test-windows` |
+| `test` | `cargo nextest run --workspace --no-fail-fast` on Linux; the macOS plist carrier and the live benchmark replay run in `test-macos`, the Windows runtime sandbox tests in `test-windows`, and the SSH spawn path in `ssh-integration` |
 | `coverage` | `scripts/coverage.sh`; fails below an 85% workspace floor, uploads `coverage-lcov`, and comments the total and delta on pull requests |
 | `doc` | `cargo doc` with `RUSTDOCFLAGS="-D warnings"` |
 | `audit` / `deny` | `cargo audit`, `cargo deny check licenses bans sources` |
