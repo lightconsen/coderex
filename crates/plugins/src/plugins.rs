@@ -4467,6 +4467,10 @@ impl PluginManager {
         install_dir: &Path,
     ) -> Result<PathBuf, String> {
         validate_git_url(url)?;
+        // Refuse a path that cannot be inside the clone before cloning it:
+        // the check needs no repository, and an invalid path should not cost
+        // a clone (or hand the caller a git error instead of the reason).
+        Self::validate_subdir_path(path)?;
         let rev = checkout_rev(rev, sha)?;
 
         let clone_dir = Self::staging_dir(install_dir, &format!("{url}#{path}"));
@@ -4535,6 +4539,25 @@ impl PluginManager {
     /// rejected for the reason they are dangerous, and afterwards by
     /// canonicalising, so a symlink pointing out of the checkout is caught too.
     fn resolve_subdir(clone_root: &Path, path: &str) -> Result<PathBuf, String> {
+        Self::validate_subdir_path(path)?;
+
+        let root = clone_root
+            .canonicalize()
+            .map_err(|e| format!("failed to resolve {}: {e}", clone_root.display()))?;
+        let resolved = clone_root.join(path).canonicalize().map_err(|_| {
+            format!("git-subdir path '{path}' is not a directory in the repository")
+        })?;
+        if !resolved.starts_with(&root) || !resolved.is_dir() {
+            return Err(format!(
+                "refusing git-subdir path '{path}': it does not resolve inside the repository"
+            ));
+        }
+        Ok(resolved)
+    }
+
+    /// The syntactic half of [`Self::resolve_subdir`]: empty, absolute and
+    /// `..`-traversing paths are refused without touching a clone.
+    fn validate_subdir_path(path: &str) -> Result<(), String> {
         if path.trim().is_empty() {
             return Err("git-subdir source has an empty path".to_string());
         }
@@ -4551,19 +4574,7 @@ impl PluginManager {
                 _ => {}
             }
         }
-
-        let root = clone_root
-            .canonicalize()
-            .map_err(|e| format!("failed to resolve {}: {e}", clone_root.display()))?;
-        let resolved = clone_root.join(path).canonicalize().map_err(|_| {
-            format!("git-subdir path '{path}' is not a directory in the repository")
-        })?;
-        if !resolved.starts_with(&root) || !resolved.is_dir() {
-            return Err(format!(
-                "refusing git-subdir path '{path}': it does not resolve inside the repository"
-            ));
-        }
-        Ok(resolved)
+        Ok(())
     }
 
     /// Clone a repository into `dest` and report the commit that landed there.

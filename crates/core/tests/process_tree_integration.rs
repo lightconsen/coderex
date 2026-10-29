@@ -72,6 +72,9 @@ fn ownership_ends_without_terminate_only_when_disarmed() {
     // unarmed leaves the processes alone, which is why `HookTree` calls
     // `terminate` from its own `Drop`.
     let (tree, mut child, grandchild) = spawn_shell_with_grandchild();
+    // On Linux `ProcessTree` has no `Drop` (its owner calls `terminate`), so
+    // clippy sees a no-op here; the move is still what the test is about.
+    #[allow(clippy::drop_non_drop)]
     drop(tree);
     let _ = child.kill();
     let _ = child.wait();

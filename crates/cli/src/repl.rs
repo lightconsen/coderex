@@ -6060,26 +6060,36 @@ impl ReplLoop {
                             }
                         }
                         EngineEvent::PermissionExplanation { tool, explanation } => {
-                            if let Some(detail) = ui_state.permission_detail.as_mut()
-                                && detail.tool.eq_ignore_ascii_case(&tool) {
+                            // The Risk line carries the deterministic shell
+                            // analysis when there is one ("Dangerous: rm -rf
+                            // ..."). The explanation is model prose and arrives
+                            // on its own schedule; replacing the analysis with
+                            // it left the user approving a dangerous command
+                            // whose danger was no longer on screen. It fills
+                            // the line only when nothing else does.
+                            let has_analysis =
+                                ui_state.permission_detail.as_ref().is_some_and(|detail| {
+                                    detail.tool.eq_ignore_ascii_case(&tool)
+                                        && !matches!(
+                                            detail.risk_summary.trim(),
+                                            "" | "Awaiting approval"
+                                        )
+                                });
+                            if !has_analysis {
+                                if let Some(detail) = ui_state.permission_detail.as_mut()
+                                    && detail.tool.eq_ignore_ascii_case(&tool)
+                                {
                                     detail.risk_summary.clone_from(&explanation);
                                 }
-                            if matches!(
-                                ui_state.overlays.top(),
-                                Some(Overlay::PermissionDialog { .. })
-                            ) {
-                                let args = ui_state
-                                    .permission_detail
-                                    .as_ref()
-                                    .map(|detail| detail.args.clone())
-                                    .unwrap_or_default();
-                                sync_permission_overlay(
-                                    &mut ui_state,
-                                    &tool,
-                                    &args,
-                                    &explanation,
-                                    true,
-                                );
+                                if let Some(Overlay::PermissionDialog {
+                                    tool: open_tool,
+                                    risk_summary,
+                                    ..
+                                }) = ui_state.overlays.top_mut()
+                                    && open_tool.eq_ignore_ascii_case(&tool)
+                                {
+                                    risk_summary.clone_from(&explanation);
+                                }
                             }
                             self.persist_interactive_snapshot(&ui_state);
                         }

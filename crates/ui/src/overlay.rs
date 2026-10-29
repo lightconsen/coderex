@@ -91,6 +91,11 @@ impl OverlayStack {
         self.overlays.last()
     }
 
+    /// The top overlay, mutably, for updating a dialog in place.
+    pub fn top_mut(&mut self) -> Option<&mut Overlay> {
+        self.overlays.last_mut()
+    }
+
     /// Check if any overlay is active.
     #[must_use]
     pub const fn is_active(&self) -> bool {

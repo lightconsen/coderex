@@ -142,7 +142,16 @@ pub fn sanitize_shell_env(cmd: &mut Command, cwd: &std::path::Path) {
     // the home directory — `PATH=~/.cargo/bin` must keep working when the
     // session runs from home.
     let home = home::home_dir();
-    let safe_path: Vec<std::path::PathBuf> = std::env::var_os("PATH")
+    // The command's own PATH wins when it has one: a caller that configured
+    // the search path (a sandbox adding toolchain directories, say) wants that
+    // path sanitized, not silently replaced by the host's.
+    let configured_path = cmd
+        .as_std()
+        .get_envs()
+        .find(|(key, _)| key.eq_ignore_ascii_case("PATH"))
+        .and_then(|(_, value)| value.map(std::ffi::OsStr::to_os_string))
+        .or_else(|| std::env::var_os("PATH"));
+    let safe_path: Vec<std::path::PathBuf> = configured_path
         .map(|path| {
             std::env::split_paths(&path)
                 .filter(|entry| {
@@ -362,14 +371,26 @@ mod sanitize_tests {
 
     #[tokio::test]
     async fn shell_startup_hooks_and_relative_path_entries_are_removed() {
-        let cwd = std::path::Path::new("/work/repo");
+        // Real absolute paths: a POSIX-shaped literal is not absolute on
+        // Windows, so the test would be asserting the fallback there rather
+        // than the filter.
+        let cwd = tempfile::tempdir().unwrap();
+        let system = tempfile::tempdir().unwrap();
+        let inside = cwd.path().join("bin");
+        let path_with_junk = std::env::join_paths([
+            system.path(),
+            std::path::Path::new("."),
+            std::path::Path::new(""),
+            inside.as_path(),
+        ])
+        .expect("join a test PATH");
         let mut cmd = Command::new("sh");
         cmd.env("BASH_ENV", "/tmp/hook.sh")
             .env("ENV", "/tmp/hook.sh")
             .env("LD_PRELOAD", "/tmp/x.so")
             .env("BASH_FUNC_evil%%", "() { rm -rf /; }")
-            .env("PATH", "/usr/bin:.:/work/repo/bin:/bin");
-        sanitize_shell_env(&mut cmd, cwd);
+            .env("PATH", path_with_junk);
+        sanitize_shell_env(&mut cmd, cwd.path());
 
         let envs: std::collections::HashMap<_, _> = cmd
             .as_std()
@@ -388,13 +409,18 @@ mod sanitize_tests {
             .get("PATH")
             .and_then(|value| value.as_deref())
             .expect("PATH is set");
+        let kept: Vec<std::path::PathBuf> = std::env::split_paths(path).collect();
         assert!(
-            !path
-                .split(':')
-                .any(|entry| entry == "." || entry.is_empty()),
-            "{path}"
+            kept.contains(&system.path().to_path_buf()),
+            "the system entry should survive: {path}"
         );
-        assert!(!path.contains("/work/repo"), "{path}");
-        assert!(path.contains("/usr/bin"), "{path}");
+        assert!(
+            !kept.iter().any(|entry| entry == &inside),
+            "an entry inside the workspace should be dropped: {path}"
+        );
+        assert!(
+            kept.iter().all(|entry| entry.is_absolute()),
+            "relative and empty entries should be dropped: {path}"
+        );
     }
 }
