@@ -7,12 +7,14 @@
 #![warn(missing_docs)]
 
 pub mod eval;
+pub mod logs;
 pub mod mock_api;
 pub mod rig;
 pub mod snapshot;
 pub mod wire_client;
 
 pub use eval::{AssertionResult, EvalAssertion, EvalResult, EvalScenario, EventType, run_eval};
+pub use logs::{LogCapture, LogEvent, capture_logs, capture_logs_async};
 pub use mock_api::{
     MockApiClient, MockResponseType, mock_response, mock_response_with_tool_calls,
     mock_streaming_response,

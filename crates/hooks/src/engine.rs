@@ -2352,6 +2352,145 @@ impl<'a> HookMatcher<'a> {
 mod tests {
     use super::*;
 
+    /// A non-string entry in a path-typed field rejects the whole field, and
+    /// says why: the field is all-or-nothing, so silently keeping the strings
+    /// would hide that the hook's intent was half-understood.
+    #[test]
+    fn a_non_string_path_entry_is_logged() {
+        let capture = coderex_test_utils::capture_logs();
+        let paths = parse_absolute_paths(&serde_json::json!(["/tmp/a", 7]), "watch");
+        assert!(paths.is_empty());
+        assert!(
+            capture.contains("must contain only path strings"),
+            "{:?}",
+            capture.messages()
+        );
+    }
+
+    /// A relative watch path is useless (it resolves against whatever working
+    /// directory the watcher happens to hold), so the field is dropped loudly.
+    #[test]
+    fn a_relative_path_entry_is_logged() {
+        let capture = coderex_test_utils::capture_logs();
+        let paths = parse_absolute_paths(&serde_json::json!(["relative/dir"]), "watch");
+        assert!(paths.is_empty());
+        assert!(
+            capture.contains("contains a relative path"),
+            "{:?}",
+            capture.messages()
+        );
+    }
+
+    /// A hook on an event nothing fires runs never; that is indistinguishable
+    /// from a working hook unless it is said at load.
+    #[test]
+    fn an_inert_hook_is_announced() {
+        let capture = coderex_test_utils::capture_logs();
+        let entry = HookEntry {
+            config: tiered("NoSuchEvent", "echo hi", HookTier::Core, 0),
+            modifiers: HookModifiers::default(),
+        };
+        HookRegistry::warn_about_inert_hooks(std::slice::from_ref(&entry));
+        assert!(
+            capture.contains("unknown event") && capture.contains("will never run"),
+            "{:?}",
+            capture.messages()
+        );
+    }
+
+    /// `statusMessage` is the hook's own line in the transcript feed; a hook
+    /// that carries one has it announced with the event it is running for.
+    #[test]
+    fn a_status_message_is_announced() {
+        let capture = coderex_test_utils::capture_logs();
+        let entry = HookEntry {
+            config: tiered("PreToolUse", "echo hi", HookTier::Core, 0),
+            modifiers: HookModifiers {
+                status_message: Some("checking the diff".into()),
+                ..HookModifiers::default()
+            },
+        };
+        HookRegistry::announce_status(&entry, "PreToolUse");
+        assert!(
+            capture.contains("checking the diff"),
+            "{:?}",
+            capture.messages()
+        );
+    }
+
+    /// A dry-run hook says it would have run, with its event, and does not.
+    #[tokio::test]
+    async fn a_dry_run_hook_is_announced() {
+        let capture = coderex_test_utils::capture_logs();
+        let mut hook = tiered("SessionStart", "echo hi", HookTier::Core, 0);
+        hook.dry_run = true;
+        let input = HookInput {
+            event: "SessionStart".to_string(),
+            session_id: None,
+            input: None,
+            context: None,
+        };
+        let _ = execute_hook_with_timeout(&hook, &input, None, None).await;
+        assert!(
+            capture.contains("Hook would execute (dry-run)"),
+            "{:?}",
+            capture.messages()
+        );
+    }
+
+    /// A hook that exits non-zero did not answer, and its stderr explains why;
+    /// the excerpt is what makes the failure actionable.
+    #[tokio::test]
+    async fn a_nonzero_exit_logs_the_stderr_excerpt() {
+        let capture = coderex_test_utils::capture_logs();
+        let hook = tiered(
+            "SessionStart",
+            "printf 'boom\n' >&2; exit 3",
+            HookTier::Core,
+            0,
+        );
+        let input = HookInput {
+            event: "SessionStart".to_string(),
+            session_id: None,
+            input: None,
+            context: None,
+        };
+        let result = execute_hook_with_timeout(&hook, &input, None, None).await;
+        assert!(result.is_err(), "a failing hook must not report success");
+        assert!(
+            capture.contains("hook exited non-zero") && capture.contains("boom"),
+            "{:?}",
+            capture.messages()
+        );
+    }
+
+    /// A streaming hook's `log` message is a note for the operator; a hook
+    /// that only logs is a valid hook, and the note must reach the log.
+    #[tokio::test]
+    async fn a_streaming_hook_log_line_is_captured() {
+        let capture = coderex_test_utils::capture_logs();
+        let mut hook = tiered(
+            "SessionStart",
+            r#"echo '{"type":"log","message":"working on it"}'; echo '{"action":"continue"}'"#,
+            HookTier::Core,
+            0,
+        );
+        hook.stream = true;
+        let input = HookInput {
+            event: "SessionStart".to_string(),
+            session_id: None,
+            input: None,
+            context: None,
+        };
+        let result = execute_hook_with_timeout(&hook, &input, None, None).await;
+        assert!(result.is_ok(), "{result:?}");
+        assert!(
+            capture.contains("hook log: working on it"),
+            "{:?}",
+            capture.messages()
+        );
+    }
+
     #[test]
     fn hook_registry_starts_empty() {
         let registry = HookRegistry::new();

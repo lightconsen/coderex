@@ -1189,6 +1189,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "coderex-core",
+ "coderex-test-utils",
  "libc",
  "reqwest",
  "serde",
@@ -1222,6 +1223,7 @@ dependencies = [
  "chrono",
  "coderex-config",
  "coderex-core",
+ "coderex-test-utils",
  "coderex-tools",
  "dashmap",
  "oauth2",
@@ -1384,6 +1386,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 

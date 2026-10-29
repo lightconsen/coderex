@@ -41,6 +41,9 @@ SUITES: dict[str, list[tuple[str, str | None]]] = {
     "interactive_tui_live": [("interactive_tui", "interactive_live")],
 }
 
+# The digest the recorder writes into metadata: lowercase SHA-256 hex.
+DIGEST_PATTERN = re.compile(r"[0-9a-f]{64}")
+
 SECRET_PATTERNS = [
     re.compile(r"sk-ant-[A-Za-z0-9_\-]{10,}"),
     re.compile(r"sk-[A-Za-z0-9]{20,}"),
@@ -84,6 +87,8 @@ def check(args: argparse.Namespace) -> int:
     stale: list[tuple[Path, int]] = []
     missing_endpoint: list[Path] = []
     missing_test: list[Path] = []
+    missing_digest: list[Path] = []
+    bad_digest: list[Path] = []
     backfilled = 0
     malformed: list[Path] = []
     markers: list[Path] = []
@@ -125,6 +130,11 @@ def check(args: argparse.Namespace) -> int:
             missing_endpoint.append(path)
         if not metadata.get("test"):
             missing_test.append(path)
+        digest = metadata.get("system_sha256")
+        if digest is None:
+            missing_digest.append(path)
+        elif not DIGEST_PATTERN.fullmatch(str(digest)):
+            bad_digest.append(path)
 
     print(f"cassettes: {len(files)} files, {human_size(total_size)}, {len(suite_sizes)} suites")
     if backfilled:
@@ -157,6 +167,15 @@ def check(args: argparse.Namespace) -> int:
         warnings.append(
             f"{len(stale)} recordings are older than {max_age} days; oldest "
             f"{max(age for _, age in stale)} days"
+        )
+    if missing_digest:
+        warnings.append(
+            f"{len(missing_digest)} recordings predate the system-prompt digest; "
+            "replay cannot detect prompt drift for them until they are re-recorded"
+        )
+    if bad_digest:
+        errors.append(
+            f"{len(bad_digest)} recordings have a malformed system_sha256"
         )
     if malformed:
         errors.append(f"{len(malformed)} malformed cassette files")

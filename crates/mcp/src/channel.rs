@@ -1000,6 +1000,77 @@ impl JsonRpcChannel {
 mod tests {
     use super::*;
 
+    /// A notification with nowhere to go is said out loud: a server that
+    /// announces `tools/list_changed` while no handler listens would
+    /// otherwise leave its tool list stale with no trace of why.
+    #[test]
+    fn a_notification_with_no_handler_is_logged() {
+        let capture = coderex_test_utils::capture_logs();
+        let channel = JsonRpcChannel::new("echo", vec![], HashMap::new());
+        channel.dispatch_notification("notifications/tools/list_changed", None);
+        assert!(
+            capture.contains("ignoring a notification"),
+            "{:?}",
+            capture.messages()
+        );
+    }
+
+    /// Feed `lines` through a channel's stdout, so `read_response` can be
+    /// exercised without a real MCP server.
+    fn channel_reading(lines: &str) -> JsonRpcChannel {
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg(format!("printf '%s' {}", shell_quote(lines)))
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn the line source");
+        let stdout = child.stdout.take().expect("stdout");
+        let mut channel = JsonRpcChannel::new("sh", vec![], HashMap::new());
+        channel.stdout = Some(BufReader::new(stdout));
+        // Keep the child alive for the duration of the read.
+        channel.process = Some(child);
+        channel
+    }
+
+    /// A single-quoted shell word, so the JSON lines survive the shell.
+    fn shell_quote(text: &str) -> String {
+        format!("'{}'", text.replace('\'', "'\\''"))
+    }
+
+    /// A message that is neither a response nor a request is reported rather
+    /// than read past.
+    #[tokio::test]
+    async fn a_message_that_is_neither_a_response_nor_a_request_is_logged() {
+        let capture = coderex_test_utils::capture_logs();
+        let mut channel = channel_reading(
+            "{\"jsonrpc\":\"2.0\",\"something\":true}\n{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}\n",
+        );
+        let result = channel.read_response(1).await.expect("the answer");
+        assert_eq!(result["ok"], true);
+        assert!(
+            capture.contains("neither a response nor a request"),
+            "{:?}",
+            capture.messages()
+        );
+    }
+
+    /// An answer to a request nothing is waiting on (a retry, a late
+    /// timeout) is skipped, but not silently.
+    #[tokio::test]
+    async fn a_response_for_a_forgotten_request_is_logged() {
+        let capture = coderex_test_utils::capture_logs();
+        let mut channel = channel_reading(
+            "{\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{}}\n{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}\n",
+        );
+        let result = channel.read_response(1).await.expect("the answer");
+        assert_eq!(result["ok"], true);
+        assert!(
+            capture.contains("nothing is waiting on"),
+            "{:?}",
+            capture.messages()
+        );
+    }
+
     #[tokio::test]
     async fn new_channel_not_initialized() {
         let channel = JsonRpcChannel::new("echo", vec![], HashMap::new());

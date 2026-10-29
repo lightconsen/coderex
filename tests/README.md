@@ -84,13 +84,27 @@ Every recording carries a `metadata` object:
   "suite": "e2e_equivalence",
   "test": "tool_write_new_file",
   "endpoint_host": "api.example.com",
-  "model": "deepseek-flash"
+  "model": "deepseek-flash",
+  "system_sha256": "9f2c…"
 }
 ```
 
 `endpoint_host` is the host only — never the base URL, query or key. `test`
 comes from the Rust test thread name; older or in-process test harnesses may
-leave it empty. Recordings made before the field existed can be backfilled:
+leave it empty.
+
+`system_sha256` is the SHA-256 of the normalized system prompt (temp paths,
+timestamps and UUIDs removed, the same normalization the key uses). The replay
+key deliberately replaces the system prompt with a placeholder, so without this
+digest a prompt change does not change the key and replay would answer the new
+prompt with a recording made for the old one. A replay whose request carries a
+different digest gets HTTP 409 `cassette_stale` (naming the key and suite)
+instead of the recording, which fails the test with that reason. Recordings
+made before the digest existed have none and replay unchecked; `check` warns
+about them unless they are backfilled, and `record-cassettes.sh --fresh` gives
+them one.
+
+Recordings made before the field existed can be backfilled:
 
 ```bash
 scripts/record-cassettes.sh --backfill

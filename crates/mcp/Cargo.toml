@@ -35,3 +35,4 @@ tokio-util.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+coderex-test-utils = { path = "../test-utils" }

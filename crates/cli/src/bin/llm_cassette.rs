@@ -65,6 +65,14 @@ struct CassetteMetadata {
     /// recorder itself. `endpoint_host` and `test` may be absent in that case.
     #[serde(default, skip_serializing_if = "is_false")]
     backfilled: bool,
+    /// SHA-256 of the normalized system prompt that produced this recording.
+    ///
+    /// The canonical key deliberately replaces the system prompt with a
+    /// placeholder, so a prompt change does not change the key and replay would
+    /// otherwise serve a recording made against different instructions. Absent
+    /// on recordings made before the field existed; those replay unchecked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    system_sha256: Option<String>,
 }
 
 #[allow(clippy::trivially_copy_pass_by_ref)]
@@ -256,6 +264,9 @@ async fn handle(
     };
 
     let json = serde_json::from_slice::<serde_json::Value>(&body).unwrap_or_default();
+    // The digest has to be taken before canonicalization, which replaces the
+    // system prompt with a placeholder.
+    let incoming_system = system_digest(json.get("system"));
     let canonical = canonicalize(&json);
     let key = fingerprint(&path, &canonical);
     let cwd = headers
@@ -273,9 +284,20 @@ async fn handle(
 
     let recorded = if mode == Mode::Replay {
         let guard = cassettes.lock().await;
-        guard
-            .get(&key)
-            .and_then(|cassette| cassette.responses.first().cloned())
+        let stale = guard.get(&key).and_then(|cassette| {
+            stale_system_prompt(&cassette.metadata, incoming_system.as_deref())
+        });
+        match stale {
+            Some(reason) => {
+                drop(guard);
+                eprintln!("llm-cassette: {reason} (key {key}, suite {suite})");
+                write_error(&mut socket, 409, "Conflict", &stale_body(&reason)).await?;
+                return Ok(());
+            }
+            None => guard
+                .get(&key)
+                .and_then(|cassette| cassette.responses.first().cloned()),
+        }
     } else {
         None
     };
@@ -400,7 +422,7 @@ async fn handle(
         body: String::from_utf8_lossy(&body_bytes).into_owned(),
     };
     let mut guard = cassettes.lock().await;
-    let metadata = recording_metadata(suite, test, upstream, model);
+    let metadata = recording_metadata(suite, test, upstream, model, incoming_system.clone());
     let entry = guard.entry(key.clone()).or_insert_with(|| CassetteFile {
         key: key.clone(),
         responses: Vec::new(),
@@ -410,6 +432,12 @@ async fn handle(
     let filled_metadata = entry.metadata.recorded_at.is_none();
     if filled_metadata {
         entry.metadata = metadata;
+    } else if entry.metadata.system_sha256.is_none()
+        && let Some(digest) = incoming_system.clone()
+    {
+        // A recording made before the digest existed learns it the next time
+        // the same request is recorded again.
+        entry.metadata.system_sha256 = Some(digest);
     }
     if !entry
         .responses
@@ -431,8 +459,10 @@ fn recording_metadata(
     test: Option<&str>,
     upstream: &str,
     model: &str,
+    system_sha256: Option<String>,
 ) -> CassetteMetadata {
     CassetteMetadata {
+        system_sha256,
         recorded_at: Some(chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
         suite: (!suite.trim().is_empty()).then(|| suite.trim().to_string()),
         test: test.map(str::to_string),
@@ -442,6 +472,73 @@ fn recording_metadata(
         model: (!model.trim().is_empty()).then(|| model.trim().to_string()),
         backfilled: false,
     }
+}
+
+/// SHA-256 of the request's system prompt, normalized the same way the key is
+/// (temp paths, timestamps and UUIDs removed), so the digest is stable across
+/// runs on the same prompt.
+fn system_digest(system: Option<&serde_json::Value>) -> Option<String> {
+    use sha2::Digest as _;
+    let system = system?;
+    if system.is_null() {
+        return None;
+    }
+    let normalized = normalize_value(system, Some("system"));
+    let text = serde_json::to_string(&normalized).unwrap_or_default();
+    Some(hex::encode(sha2::Sha256::digest(text.as_bytes())))
+}
+
+/// Why a recording cannot answer this request, when it was made against a
+/// different system prompt.
+///
+/// Recordings without the digest predate the field; they are served as before,
+/// because refusing them would break every cassette recorded so far.
+fn stale_system_prompt(recorded: &CassetteMetadata, incoming: Option<&str>) -> Option<String> {
+    let recorded = recorded.system_sha256.as_deref()?;
+    match incoming {
+        Some(incoming) if incoming == recorded => None,
+        Some(_) => Some(
+            "the system prompt changed since this cassette was recorded; re-record the suite \
+             with scripts/record-cassettes.sh --fresh"
+                .to_string(),
+        ),
+        None => Some(
+            "the request has no system prompt, but the recording was made with one; re-record \
+             the suite with scripts/record-cassettes.sh --fresh"
+                .to_string(),
+        ),
+    }
+}
+
+/// The JSON body of the `cassette_stale` refusal.
+fn stale_body(reason: &str) -> String {
+    serde_json::json!({
+        "type": "error",
+        "error": {"type": "cassette_stale", "message": reason},
+    })
+    .to_string()
+}
+
+/// Write a non-recording response (an error of our own).
+async fn write_error(
+    socket: &mut TcpStream,
+    status: u16,
+    name: &str,
+    body: &str,
+) -> Result<(), String> {
+    let head = format!(
+        "HTTP/1.1 {status} {name}\r\ncontent-type: application/json\r\ncontent-length: {length}\r\nconnection: close\r\n\r\n",
+        length = body.len()
+    );
+    socket
+        .write_all(head.as_bytes())
+        .await
+        .map_err(|error| error.to_string())?;
+    socket
+        .write_all(body.as_bytes())
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(())
 }
 
 fn persist(dir: &Path, cassette: &CassetteFile) -> Result<(), String> {
@@ -999,6 +1096,53 @@ fn is_uuid(bytes: &[u8]) -> Option<usize> {
 mod tests {
     use super::*;
 
+    fn metadata_with_digest(digest: Option<&str>) -> CassetteMetadata {
+        CassetteMetadata {
+            system_sha256: digest.map(str::to_string),
+            ..CassetteMetadata::default()
+        }
+    }
+
+    /// The digest ignores what the key already ignores: a temp directory in the
+    /// prompt must not look like a prompt change.
+    #[test]
+    fn the_system_digest_is_stable_across_temp_directories() {
+        let one = serde_json::json!("You are CodeRex in /tmp/.tmpAAA/workspace");
+        let two = serde_json::json!("You are CodeRex in /tmp/.tmpBBB/workspace");
+        assert_eq!(system_digest(Some(&one)), system_digest(Some(&two)));
+    }
+
+    #[test]
+    fn a_changed_system_prompt_changes_the_digest() {
+        let one = serde_json::json!("You are CodeRex.");
+        let two = serde_json::json!("You are CodeRex. Always answer in French.");
+        assert_ne!(system_digest(Some(&one)), system_digest(Some(&two)));
+    }
+
+    #[test]
+    fn an_absent_system_prompt_has_no_digest() {
+        assert_eq!(system_digest(None), None);
+        assert_eq!(system_digest(Some(&serde_json::Value::Null)), None);
+    }
+
+    #[test]
+    fn a_recording_with_a_different_system_prompt_is_refused() {
+        let metadata = metadata_with_digest(Some("aaaa"));
+        let reason = stale_system_prompt(&metadata, Some("bbbb")).expect("refused");
+        assert!(reason.contains("system prompt changed"), "{reason}");
+        assert!(stale_system_prompt(&metadata, Some("aaaa")).is_none());
+        assert!(stale_system_prompt(&metadata, None).is_some());
+    }
+
+    /// Recordings made before the field existed replay as they always did:
+    /// refusing them would break every cassette in the tree.
+    #[test]
+    fn an_old_cassette_without_a_digest_still_replays() {
+        let metadata = metadata_with_digest(None);
+        assert!(stale_system_prompt(&metadata, Some("anything")).is_none());
+        assert!(stale_system_prompt(&metadata, None).is_none());
+    }
+
     #[test]
     fn temp_roots_find_test_directories_only() {
         let text = "cd /private/var/folders/41/xx/T/.tmpAbC && cargo test";
@@ -1056,7 +1200,9 @@ data: {"type":"content_block_stop","index":1}
             Some("basic_chat_responds"),
             "https://user:secret@example.test:8443/v1?token=hidden",
             "test-model",
+            Some("deadbeef".to_string()),
         );
+        assert_eq!(metadata.system_sha256.as_deref(), Some("deadbeef"));
         assert_eq!(metadata.endpoint_host.as_deref(), Some("example.test"));
         assert_eq!(metadata.model.as_deref(), Some("test-model"));
         assert_eq!(metadata.test.as_deref(), Some("basic_chat_responds"));
