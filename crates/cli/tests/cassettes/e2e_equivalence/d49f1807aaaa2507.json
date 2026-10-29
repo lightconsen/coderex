@@ -46,6 +46,7 @@
   "metadata": {
     "recorded_at": "2026-10-26T00:00:00Z",
     "suite": "e2e_equivalence",
-    "backfilled": true
+    "backfilled": true,
+    "system_sha256": "519854bc8e22c0f7fc4f7774c800c0302cbab7522658f734b8eadf580af773a0"
   }
 }

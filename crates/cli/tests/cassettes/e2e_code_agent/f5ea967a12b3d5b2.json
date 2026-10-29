@@ -1472,6 +1472,7 @@
   "metadata": {
     "recorded_at": "2026-10-26T00:00:00Z",
     "suite": "e2e_code_agent",
-    "backfilled": true
+    "backfilled": true,
+    "system_sha256": "9e0d9b85ca4ab58d05f3da1cbdca802a9cac537a90d31e47171121404198fad4"
   }
 }

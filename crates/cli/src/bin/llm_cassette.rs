@@ -279,14 +279,21 @@ async fn handle(
         .map(|(_, value)| value.trim())
         .filter(|value| !value.is_empty());
     trace(&format!(
-        "{mode:?} {method} {path} key={key} test={test:?} cwd={cwd:?}"
+        "{mode:?} {method} {path} key={key} test={test:?} cwd={cwd:?} digest={}",
+        incoming_system.as_deref().unwrap_or("none")
     ));
 
     let recorded = if mode == Mode::Replay {
         let guard = cassettes.lock().await;
-        let stale = guard.get(&key).and_then(|cassette| {
-            stale_system_prompt(&cassette.metadata, incoming_system.as_deref())
-        });
+        // `scripts/cassette_tool.py backfill --digest` rewrites every digest;
+        // while it runs, the old digest is expected to disagree.
+        let stale = if digest_backfill_enabled() {
+            None
+        } else {
+            guard.get(&key).and_then(|cassette| {
+                stale_system_prompt(&cassette.metadata, incoming_system.as_deref())
+            })
+        };
         match stale {
             Some(reason) => {
                 drop(guard);
@@ -479,13 +486,64 @@ fn recording_metadata(
 /// runs on the same prompt.
 fn system_digest(system: Option<&serde_json::Value>) -> Option<String> {
     use sha2::Digest as _;
-    let system = system?;
+    let system = strip_system_context(system?);
     if system.is_null() {
         return None;
     }
-    let normalized = normalize_value(system, Some("system"));
+    let normalized = normalize_value(&system, Some("system"));
     let text = serde_json::to_string(&normalized).unwrap_or_default();
     Some(hex::encode(sha2::Sha256::digest(text.as_bytes())))
+}
+
+/// Drop the trailing `## System Context` section from a system prompt.
+///
+/// The context section is branch and `git status` state, rendered into the
+/// prompt for every request. It changes as work happens — an untracked file
+/// appearing between two turns is enough — and a recording is not made for a
+/// particular working tree, so it must not be part of the digest: otherwise
+/// every replay of a session that touched the tree would look stale.
+///
+/// What remains is the instruction text: the static and dynamic blocks. A
+/// change there does change the digest, which is the change worth refusing.
+fn strip_system_context(system: &serde_json::Value) -> serde_json::Value {
+    const MARKER: &str = "\n\n## System Context\n\n";
+    let truncate = |text: &str| text.split(MARKER).next().unwrap_or(text).to_string();
+    match system {
+        serde_json::Value::String(text) => serde_json::Value::String(truncate(text)),
+        serde_json::Value::Array(items) => {
+            let mut out = items.clone();
+            // The context is appended to the prompt, so only the last text
+            // block can carry it.
+            for item in out.iter_mut().rev() {
+                let Some(text) = item
+                    .get("text")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+                else {
+                    continue;
+                };
+                let truncated = truncate(&text);
+                if truncated.len() != text.len() {
+                    item["text"] = serde_json::Value::String(truncated);
+                }
+                break;
+            }
+            serde_json::Value::Array(out)
+        }
+        other => serde_json::Value::clone(other),
+    }
+}
+
+/// Whether the digest is being rewritten by `scripts/cassette_tool.py
+/// backfill --digest`, in which case a mismatch is expected rather than a
+/// reason to refuse the recording.
+fn digest_backfill_enabled() -> bool {
+    std::env::var("CODEREX_CASSETTE_DIGEST_BACKFILL").is_ok_and(|value| {
+        !matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "no"
+        )
+    })
 }
 
 /// Why a recording cannot answer this request, when it was made against a
@@ -1110,6 +1168,43 @@ mod tests {
         let one = serde_json::json!("You are CodeRex in /tmp/.tmpAAA/workspace");
         let two = serde_json::json!("You are CodeRex in /tmp/.tmpBBB/workspace");
         assert_eq!(system_digest(Some(&one)), system_digest(Some(&two)));
+    }
+
+    /// The `## System Context` tail is branch and `git status` state. It
+    /// changes as work happens, and a recording is not made for a working
+    /// tree, so it must not make a recording look stale.
+    #[test]
+    fn the_system_digest_ignores_the_working_tree_state() {
+        let clean = serde_json::json!([{
+            "type": "text",
+            "text": "You are CodeRex.\n\n## System Context\n\nCurrent branch: `main`\n\nGit status:\n```\n\n```\n"
+        }]);
+        let dirty = serde_json::json!([{
+            "type": "text",
+            "text": "You are CodeRex.\n\n## System Context\n\nCurrent branch: `feature`\n\nGit status:\n```\nM src/lib.rs\n?? .coderex/\n```\n"
+        }]);
+        assert_eq!(system_digest(Some(&clean)), system_digest(Some(&dirty)));
+
+        let changed_instructions = serde_json::json!([{
+            "type": "text",
+            "text": "You are CodeRex. Answer in French.\n\n## System Context\n\nCurrent branch: `main`\n"
+        }]);
+        assert_ne!(
+            system_digest(Some(&clean)),
+            system_digest(Some(&changed_instructions))
+        );
+    }
+
+    /// A plain-string system prompt is truncated the same way.
+    #[test]
+    fn a_string_system_prompt_loses_its_context_section_too() {
+        let with_context =
+            serde_json::json!("Instructions.\n\n## System Context\n\nCurrent branch: `main`\n");
+        let without = serde_json::json!("Instructions.");
+        assert_eq!(
+            system_digest(Some(&with_context)),
+            system_digest(Some(&without))
+        );
     }
 
     #[test]

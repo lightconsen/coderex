@@ -1413,6 +1413,7 @@
   "metadata": {
     "recorded_at": "2026-10-26T00:00:00Z",
     "suite": "e2e_equivalence",
-    "backfilled": true
+    "backfilled": true,
+    "system_sha256": "669697befc8b784472f56b58216e10326523386dea9c2997c76bcd429bcbec83"
   }
 }

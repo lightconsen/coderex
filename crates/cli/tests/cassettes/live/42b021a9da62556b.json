@@ -1154,6 +1154,7 @@
   "metadata": {
     "recorded_at": "2026-10-26T00:00:00Z",
     "suite": "live",
-    "backfilled": true
+    "backfilled": true,
+    "system_sha256": "f85253c976cfc818df2bb3b01e8bea23a5d69ec10b42e99b6e01c4ab2aeb03b7"
   }
 }

@@ -211,6 +211,8 @@ def git_date(path: Path) -> str | None:
 
 
 def backfill(args: argparse.Namespace) -> int:
+    if getattr(args, "digest", False):
+        return backfill_digests()
     files = cassette_files()
     changed = 0
     for path in files:
@@ -255,10 +257,63 @@ def backfill(args: argparse.Namespace) -> int:
     return 0
 
 
-def run_suite(suite: str, trace: Path) -> bool:
+def backfill_digests() -> int:
+    """Replay every suite and record each request's system-prompt digest.
+
+    The digest cannot be recomputed from a cassette: canonicalization replaced
+    the system prompt with a placeholder before the request was stored. It can
+    be observed during replay, which is what this does — no provider calls.
+    """
+    updated = 0
+    for suite in sorted(SUITES):
+        directory = CASSETTES / suite
+        if not directory.is_dir():
+            continue
+        print(f"tracing {suite}")
+        with tempfile.NamedTemporaryFile("w+", suffix=".trace", delete=False) as handle:
+            trace = Path(handle.name)
+        try:
+            if not run_suite(suite, trace, rewriting_digests=True):
+                print(
+                    f"warning: {suite} did not replay cleanly; digests not recorded for it",
+                    file=sys.stderr,
+                )
+                continue
+            text = trace.read_text(encoding="utf-8", errors="replace")
+        finally:
+            trace.unlink(missing_ok=True)
+        digests: dict[str, str] = {}
+        for line in text.splitlines():
+            key = re.search(r"key=([0-9a-fA-F]+)", line)
+            digest = re.search(r"digest=([0-9a-f]{64})", line)
+            if key and digest:
+                digests[key.group(1)] = digest.group(1)
+        for path in sorted(directory.glob("*.json")):
+            if path.name.startswith("_missing_"):
+                continue
+            digest = digests.get(path.stem)
+            if digest is None:
+                continue
+            document = json.loads(path.read_text(encoding="utf-8"))
+            if metadata_of(document).get("system_sha256") == digest:
+                continue
+            document.setdefault("metadata", {})["system_sha256"] = digest
+            path.write_text(
+                json.dumps(document, indent=2, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+            updated += 1
+    print(f"recorded the system-prompt digest for {updated} cassette files")
+    return 0
+
+
+def run_suite(suite: str, trace: Path, rewriting_digests: bool = False) -> bool:
     environment = dict(os.environ)
     environment.pop("CODEREX_CASSETTE_MODE", None)
     environment["CODEREX_CASSETTE_TRACE"] = str(trace)
+    if rewriting_digests:
+        # The old digest is expected to disagree while every one is rewritten.
+        environment["CODEREX_CASSETTE_DIGEST_BACKFILL"] = "1"
     for binary, name_filter in SUITES[suite]:
         command = ["cargo", "test", "-p", "coderex-cli", "--test", binary]
         if name_filter:
@@ -355,6 +410,12 @@ def main() -> int:
         "--no-git-date",
         action="store_true",
         help="use file mtime instead of the file's most recent git commit date",
+    )
+    backfill_parser.add_argument(
+        "--digest",
+        action="store_true",
+        help="replay the suites and record the system-prompt digest of each request "
+        "(recordings made before the field existed get it without a re-record)",
     )
     backfill_parser.set_defaults(func=backfill)
 
