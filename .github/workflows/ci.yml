@@ -216,6 +216,13 @@ jobs:
         if: always()
         timeout-minutes: 15
         run: cargo test --no-fail-fast -p coderex-tools sandbox -- --nocapture
+      # `fd_path` (GetFinalPathNameByHandleW) is the Windows half of the
+      # verified-file story; macOS has F_GETPATH and a test, Windows had
+      # neither until this step.
+      - name: Verified file-access tests
+        if: always()
+        timeout-minutes: 10
+        run: cargo test --no-fail-fast -p coderex-tools --lib verified_fs -- --nocapture
       - name: Hooks sandbox tests
         if: always()
         timeout-minutes: 10

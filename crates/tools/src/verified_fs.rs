@@ -350,6 +350,31 @@ mod tests {
         );
     }
 
+    /// The Windows handle path is the file's final path with the verbatim
+    /// prefix removed — the same guarantee macOS gets from `F_GETPATH`, and
+    /// the one the Windows runtime job had no test for.
+    #[cfg(windows)]
+    #[test]
+    fn the_windows_handle_path_is_the_final_path_without_the_verbatim_prefix() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("real.txt");
+        std::fs::write(&file, "content").unwrap();
+        let handle = std::fs::File::open(&file).unwrap();
+
+        let seen = fd_path(&handle).expect("a handle path");
+        let expected = std::fs::canonicalize(&file)
+            .unwrap()
+            .to_string_lossy()
+            .trim_start_matches(r"\\?\")
+            .to_string();
+        assert_eq!(seen.to_string_lossy(), expected);
+        assert!(
+            !seen.to_string_lossy().starts_with(r"\\?\"),
+            "the verbatim prefix leaked into {}",
+            seen.display()
+        );
+    }
+
     #[test]
     fn a_rejected_new_file_is_removed_through_the_parent_capability() {
         let root = tempfile::tempdir().unwrap();
