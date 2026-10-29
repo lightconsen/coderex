@@ -35,7 +35,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.99.1
         with:
           targets: ${{ matrix.target }}
 
@@ -70,9 +70,37 @@ jobs:
             coderex-*.tar.gz
             coderex-*.zip
 
+  # Smoke the artifacts before they are published: a release whose tarball
+  # unpacks to a binary that does not run is worse than a failed build.
+  smoke:
+    name: Smoke the artifacts
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: The Linux binaries run
+        run: |
+          set -euo pipefail
+          for target in x86_64-unknown-linux-gnu x86_64-unknown-linux-musl; do
+            archive="artifacts/coderex-${target}.tar.gz"
+            test -f "$archive"
+            tar tzf "$archive" | grep -qx "coderex-${target}"
+            mkdir -p "unpacked/${target}"
+            tar xzf "$archive" -C "unpacked/${target}"
+            "unpacked/${target}/coderex-${target}" --version
+          done
+
+      - name: Every archive contains its binary
+        run: python3 scripts/check-release-archives.py artifacts
+
   # Create the GitHub Release and attach all artifacts
   release:
-    needs: build
+    needs: [build, smoke]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

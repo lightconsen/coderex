@@ -23,10 +23,22 @@ counted); treat the numbers as a relative signal, not an absolute one.
 
 ## Targets
 
-Advisory targets: **80% lines** for `core`, `cli` and `tools`, and **65% lines**
-for the other workspace crates. The script prints a warning for every crate
-below its target but always exits 0, so coverage does not block local work.
-CI integration and PR diffs are not enabled yet.
+Advisory per-crate targets: **80% lines** for `core`, `cli` and `tools`, and
+**65% lines** for the other workspace crates. The script prints a warning for
+every crate below its target but always exits 0, so coverage does not block
+local work.
+
+CI runs the same script on every push and pull request (job `Coverage`):
+
+- the workspace total is compared with the baseline recorded in this file, and
+  a drop below `COVERAGE_MIN` (85%) fails the job;
+- the `lcov.info` and the summary are uploaded as the `coverage-lcov`
+  artifact;
+- on a pull request from this repository, a sticky comment reports the total,
+  the baseline and the delta, with the per-crate table.
+
+Update the baseline below whenever the figure moves, so the delta on the next
+pull request is meaningful.
 
 ## Baseline — 2026-10-27
 

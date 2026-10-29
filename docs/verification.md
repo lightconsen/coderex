@@ -21,6 +21,27 @@ scripts/verify.sh --lenient       # report clippy/rustdoc counts without failing
 Logs and a summary go to `target/verify/`. `scripts/nightly.sh` runs
 `verify` by default (`RUN_VERIFY=0` disables it).
 
+## The CI gate
+
+`.github/workflows/ci.yml` runs the same checks on every push and pull
+request (branch protection decides which of them must pass before a merge;
+this table is what they check):
+
+| Job | What it enforces |
+|---|---|
+| `fmt` | `cargo fmt --all --check` |
+| `clippy` | `cargo clippy --workspace --all-targets -- -D warnings` (the backlog is zero, so a warning fails) |
+| `test` | `cargo nextest run --workspace` on Linux; the macOS plist carrier and the Windows runtime sandbox tests run in their own jobs |
+| `coverage` | `scripts/coverage.sh`; fails below an 85% workspace floor, uploads `coverage-lcov`, and comments the total and delta on pull requests |
+| `doc` | `cargo doc` with `RUSTDOCFLAGS="-D warnings"` |
+| `audit` / `deny` | `cargo audit`, `cargo deny check licenses bans sources` |
+| `Nightly Soak & Fuzz` | scheduled: `scripts/soak.py`, both race soaks, `scripts/fuzz.sh` |
+| `Release` workflow `smoke` | the published archives unpack to a binary that runs (`--version`) and contain the file they are named for |
+
+The toolchain is pinned in `rust-toolchain.toml` and named in the workflow
+files. Bump both together: a floating stable would let a new release's lints
+fail a pull request for reasons unrelated to the change.
+
 ## Advisories
 
 `.cargo/audit.toml` (cargo-audit's fixed location) and `deny.toml` carry the

@@ -1,3 +1,8 @@
 [toolchain]
-channel = "stable"
+# Pinned, not "stable": clippy and rustdoc run with `-D warnings` in CI, so a
+# new stable release that adds a lint would fail the build for a reason that
+# has nothing to do with the change under review. Bump this together with
+# `.github/workflows/*.yml` (which name the same version) and fix any new
+# lints in the same commit.
+channel = "1.99.1"
 profile = "default"

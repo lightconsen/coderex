@@ -42,6 +42,9 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
@@ -57,7 +60,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.99.1
       - run: cargo fmt --all --check
 
   clippy:
@@ -67,15 +70,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.99.1
         with:
           components: clippy
       - uses: ./.github/actions/linux-deps
-      # Warn, do not fail: the workspace has a backlog of pre-existing lints
-      # (collapsible_if, chunks_exact, pedantic/nursery style) that predates
-      # this pipeline. Clippy's real errors still fail the step. Restore
-      # `-- -D warnings` once the backlog is cleared.
-      - run: cargo clippy --workspace
+      # The backlog is empty (see docs/verification.md), so a warning is a
+      # regression. `--all-targets` includes test and bench code; the toolchain
+      # is pinned in rust-toolchain.toml so a new stable release cannot add a
+      # lint that fails a build for reasons unrelated to the change.
+      - run: cargo clippy --workspace --all-targets -- -D warnings
       # The jobs build default features. `keyring`, `hot-reload` and
       # `wasm-runtime` are optional and are upgraded independently, so compile
       # one workspace with every feature enabled as well.
@@ -92,7 +95,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.99.1
       - uses: ./.github/actions/linux-deps
       - uses: taiki-e/install-action@nextest
       - run: cargo nextest run --workspace
@@ -107,7 +110,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.99.1
       - run: cargo test -p coderex-config
 
   # Compilation and linking for Windows are required, and are checked from
@@ -123,7 +126,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.99.1
         with:
           targets: x86_64-pc-windows-gnu
       - name: Install mingw-w64
@@ -162,7 +165,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.99.1
       - name: Core sandbox tests (AppContainer)
         timeout-minutes: 20
         run: >
@@ -216,6 +219,96 @@ jobs:
         timeout-minutes: 20
         run: cargo test --no-fail-fast -p coderex-cli --lib -- --nocapture
 
+  # Line coverage, uploaded as an artifact and reported on pull requests.
+  #
+  # The number is compared with the baseline recorded in docs/coverage.md
+  # (updated when the figure moves) so a PR sees "87.0% -> 86.4%". A drop
+  # below COVERAGE_MIN fails the job; a downward drift above it is reported
+  # rather than failed, because a refactor can legitimately move coverage
+  # around. The comment is posted only for pull requests from this repository:
+  # a fork's pull request has a read-only token.
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      pull-requests: write
+    env:
+      CARGO_BUILD_JOBS: '2'
+      COVERAGE_MIN: '85'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@1.99.1
+      - uses: ./.github/actions/linux-deps
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Measure
+        run: scripts/coverage.sh
+      - name: Compare with the baseline
+        id: compare
+        run: |
+          total=$(awk -F'\t' '{hit += $2; lines += $3} END {printf "%.1f", 100 * hit / lines}' \
+            target/coverage/coverage.tsv)
+          baseline=$(sed -n 's/.*= \([0-9][0-9.]*\)%.*/\1/p' docs/coverage.md | head -1)
+          baseline="${baseline:-0}"
+          delta=$(awk -v t="$total" -v b="$baseline" 'BEGIN {printf "%+.1f", t - b}')
+          echo "total=$total" >> "$GITHUB_OUTPUT"
+          echo "baseline=$baseline" >> "$GITHUB_OUTPUT"
+          echo "delta=$delta" >> "$GITHUB_OUTPUT"
+          echo "workspace coverage: ${total}% (baseline ${baseline}%, ${delta} points)"
+          {
+            echo "<!-- coderex-coverage -->"
+            echo "### Coverage"
+            echo
+            echo "Workspace line coverage: **${total}%** (baseline \`${baseline}%\`, ${delta} points)."
+            echo
+            echo "<details><summary>Per crate</summary>"
+            echo
+            cat target/coverage/summary.md
+            echo
+            echo "</details>"
+            echo
+            echo "The lcov report is attached to this run as \`coverage-lcov\`."
+          } > target/coverage/comment.md
+      - name: Enforce the floor
+        run: |
+          total="${{ steps.compare.outputs.total }}"
+          min="$COVERAGE_MIN"
+          if awk -v t="$total" -v m="$min" 'BEGIN {exit !(t < m)}'; then
+            echo "coverage ${total}% is below the ${min}% floor" >&2
+            exit 1
+          fi
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-lcov
+          path: |
+            target/coverage/lcov.info
+            target/coverage/summary.md
+            target/coverage/comment.md
+          if-no-files-found: warn
+      - name: Comment on the pull request
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const body = fs.readFileSync('target/coverage/comment.md', 'utf8');
+            const marker = '<!-- coderex-coverage -->';
+            const { owner, repo } = context.repo;
+            const issue_number = context.issue.number;
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner, repo, issue_number, per_page: 100,
+            });
+            const existing = comments.find((comment) => comment.body?.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body });
+            }
+
   code-agent-benchmark:
     name: Code Agent Benchmark
     runs-on: ubuntu-latest
@@ -223,7 +316,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.99.1
       - uses: ./.github/actions/linux-deps
       - run: scripts/test-code-agent-benchmark.sh mock
 
@@ -234,7 +327,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.99.1
       - uses: ./.github/actions/linux-deps
       - name: Build eval fixtures
         run: cargo build -p coderex-cli --bin coderex --bin static-anthropic-server
@@ -263,10 +356,50 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.99.1
       - uses: ./.github/actions/linux-deps
       - run: scripts/test-interactive-mock.sh full
       - run: cargo test -p coderex-cli --test e2e_stress -- --nocapture
+
+  # Soak and fuzz: long-running checks that are pointless on every push but
+  # catch the failures a unit test cannot — a session that leaks descriptors
+  # over many turns, a parser that panics on a crafted input. Schedule and
+  # manual dispatch only.
+  nightly-soak-and-fuzz:
+    name: Nightly Soak & Fuzz
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      CARGO_BUILD_JOBS: '2'
+      SOAK_TURNS: '50'
+      SOAK_OUTPUT_DIR: target/soak
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@1.99.1
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt
+      - uses: ./.github/actions/linux-deps
+      - name: Soak a long session
+        run: python3 scripts/soak.py
+      - name: Symlink/rename churn (single process)
+        run: scripts/race-soak.sh 5000
+      - name: Symlink/rename churn (four processes)
+        run: scripts/race-soak-multi.sh 4 5000 2
+      - uses: taiki-e/install-action@cargo-fuzz
+      - name: Fuzz the parsers
+        run: scripts/fuzz.sh 120
+      - name: Upload soak and fuzz reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-soak-and-fuzz
+          path: |
+            target/soak
+            fuzz/artifacts
+          if-no-files-found: warn
 
   live-provider-smoke:
     name: Live Provider Smoke
@@ -281,7 +414,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.99.1
       - uses: ./.github/actions/linux-deps
       - run: scripts/test-interactive-live.sh "${{ inputs.live_provider }}" smoke
       - run: scripts/test-code-agent-benchmark.sh live "${{ inputs.live_provider }}"
@@ -325,7 +458,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.99.1
       - uses: ./.github/actions/linux-deps
       - name: Run the live-provider eval flow
         run: scripts/test-live-eval.sh
@@ -346,13 +479,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.99.1
       - uses: ./.github/actions/linux-deps
-      # Warn, do not fail: the workspace has pre-existing rustdoc warnings
-      # (links to private items, a few unresolved links) that predate this
-      # pipeline. Real rustdoc failures still fail the step. Restore
-      # `RUSTDOCFLAGS: "-D warnings"` once they are cleared.
+      # The rustdoc backlog is empty; a warning is a regression.
       - run: cargo doc --workspace --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
 
   audit:
     name: Security Audit
@@ -361,7 +493,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.99.1
       - uses: taiki-e/install-action@cargo-audit
       - run: cargo audit
 
@@ -372,7 +504,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.99.1
       - uses: taiki-e/install-action@cargo-deny
       - run: cargo deny check licenses bans sources
 
@@ -396,7 +528,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.99.1
       - if: runner.os == 'Linux'
         uses: ./.github/actions/linux-deps
       - run: cargo build --workspace --release
