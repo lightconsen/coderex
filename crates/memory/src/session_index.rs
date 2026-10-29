@@ -657,8 +657,29 @@ mod tests {
         index.create(&test_meta("before")).unwrap();
 
         // Take the write lock from a second connection and keep it.
+        //
+        // The lock itself is scaffolding, not the subject: on a busy runner
+        // the second connection can momentarily fail to roll back a journal
+        // the first one is still finishing ("attempt to write a readonly
+        // database"), so retry briefly rather than reporting the runner's
+        // filesystem as a busy-database bug.
         let other = Connection::open(&path).unwrap();
-        other.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        let mut locked = Ok(());
+        for attempt in 0..20 {
+            match other.execute_batch("BEGIN EXCLUSIVE") {
+                Ok(()) => {
+                    locked = Ok(());
+                    break;
+                }
+                Err(error) => {
+                    locked = Err(error);
+                    std::thread::sleep(std::time::Duration::from_millis(25 * (attempt + 1)));
+                }
+            }
+        }
+        if let Err(error) = locked {
+            panic!("could not take the write lock: {error}");
+        }
 
         let error = index
             .upsert_with_content(&test_meta("blocked"), None)
