@@ -106,6 +106,8 @@ main() → parse_args() → StartupOrchestrator::run()
 | `serve [--port PORT]` | Start WebSocket daemon server |
 | `serve-stop` | Stop the running daemon |
 | `serve-status` | Show daemon status |
+| `gateway [--port PORT]` | Run the bridge gateway: control plane, work submission and the permission-frame relay a remote operator answers through. See `docs/bridge.md`. |
+| `teleport-service [--port PORT] [--ttl-secs N]` | Run the teleport rendezvous service that `/teleport --share` uploads to and other machines join from. See `docs/teleport.md`. |
 | `agents [--detailed]` | List available agents |
 | `auth` | Check authentication status |
 | `doctor` | Run diagnostics |

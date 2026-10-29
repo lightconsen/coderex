@@ -225,6 +225,21 @@ pub enum Command {
     },
     /// Stop a running daemon server.
     ServeStop,
+    /// Run the bridge gateway: control plane, work submission and frame relay.
+    Gateway {
+        /// Port to listen on.
+        #[arg(long, default_value = "8788")]
+        port: u16,
+    },
+    /// Run the teleport rendezvous service (session sharing between machines).
+    TeleportService {
+        /// Port to listen on.
+        #[arg(long, default_value = "8787")]
+        port: u16,
+        /// How long a share stays readable, in seconds (default one week).
+        #[arg(long, default_value = "604800")]
+        ttl_secs: u64,
+    },
     /// Show status of a running daemon server.
     ServeStatus,
     /// List available agents (built-in and custom).

@@ -994,6 +994,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "coderex-core",
+ "coderex-server",
  "futures-util",
  "home",
  "openssh",

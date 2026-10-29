@@ -511,6 +511,39 @@ Control Plane                      Bridge                          Remote/Local
 - **Event bus** — `tokio::sync::broadcast` channel (256 slots) for real-time event streaming to observers.
 - **Control plane HTTP API** — Raw HTTP/1.1 server in `coderex-server` serving register, assignments, claim, capacity, and list endpoints.
 
+## The gateway process
+
+`coderex gateway --port 8788` is the process a worker and an operator meet at.
+It serves two surfaces from one listener:
+
+| Surface | Endpoints |
+|---|---|
+| Control plane | `POST /api/environments/register`, `GET /api/environments/<env>/assignments`, `POST /api/environments/<env>/assignments/<id>/claim`, `POST /api/environments/<env>/capacity`, `GET /api/environments` |
+| Work submission | `POST /api/environments/<env>/assignments` — accepts an `AssignmentEntry`; a missing `assigned_to` becomes the environment in the path, and a missing `assignment_id`/`session_id` is refused |
+| Frame relay | `POST /api/environments/<env>/frames?to=host|worker`, `GET /api/environments/<env>/frames?for=host|worker&after=N&wait=S` |
+
+Frames are the `TransportMessage` values the worker already produces. The
+gateway stores each under a per-mailbox sequence number; it does not parse the
+payload, decide anything, or rewrite it. A worker sends `session_output`,
+`session_state` and `permission_request` frames to `host`; an operator reads
+them and answers with `permission_response` to `worker`. The worker's own
+`PermissionFrameRelay` is what makes an answer resolve exactly once.
+
+`GET .../frames` does not consume: `after` is the client's cursor, so a
+cancelled or timed-out read returns the same frames next time. Each mailbox
+holds at most 4096 unread frames and then answers `429` rather than growing
+without bound.
+
+`HttpPollTransport` (`crates/bridge/src/http_transport.rs`) implements
+`Transport` over this mailbox, for workers that can only make outbound HTTP
+requests; `HttpControlPlaneClient` (`poller.rs`) is the matching control-plane
+client. `crates/bridge/tests/gateway_round_trip.rs` starts the gateway and
+drives both: register, submit, fetch, claim, and a permission request/answer
+round trip between two transports.
+
+The gateway is plain HTTP with no accounts of its own: put it behind the
+deployment's TLS and authentication.
+
 ## Deliberately not built
 
 - **An HTTP relay endpoint.** The reference exposes the relay over HTTP with

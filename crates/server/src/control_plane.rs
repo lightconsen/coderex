@@ -73,6 +73,7 @@ pub struct AssignmentEntry {
     /// Target environment ID (None = unassigned).
     pub assigned_to: Option<String>,
     /// Whether this assignment has been claimed.
+    #[serde(default)]
     pub claimed: bool,
 }
 
@@ -294,7 +295,10 @@ async fn handle_request(
 }
 
 /// Route a request to the appropriate handler.
-async fn route(
+///
+/// Shared with the gateway, which serves these routes and adds frame relay
+/// beside them.
+pub(crate) async fn route(
     method: &str,
     path: &str,
     body: &str,
@@ -323,6 +327,15 @@ async fn route(
         if let Some(after) = rest[idx + "/assignments/".len()..].strip_suffix("/claim") {
             return handle_claim(env_id, after, state).await;
         }
+    }
+
+    // POST /api/environments/{env_id}/assignments  (submit work)
+    if method == "POST"
+        && let Some(env_id) = path
+            .strip_prefix("/api/environments/")
+            .and_then(|p| p.strip_suffix("/assignments"))
+    {
+        return handle_submit_assignment(env_id, body, state).await;
     }
 
     // POST /api/environments/{env_id}/capacity
@@ -414,6 +427,44 @@ async fn handle_claim(
             }),
         )
     }
+}
+
+/// POST /api/environments/{env_id}/assignments
+///
+/// Enqueues work for an environment. The body is an [`AssignmentEntry`]; a
+/// missing `assigned_to` is filled with the environment in the path (a task
+/// submitted *to* an environment is meant for it), and a missing
+/// `assignment_id` or `session_id` is refused rather than invented — the
+/// worker's reply is keyed by both.
+async fn handle_submit_assignment(
+    env_id: &str,
+    body: &str,
+    state: &Arc<Mutex<ControlPlaneState>>,
+) -> (u16, serde_json::Value) {
+    let mut entry: AssignmentEntry = match serde_json::from_str(body) {
+        Ok(entry) => entry,
+        Err(error) => {
+            return (
+                400,
+                serde_json::json!({"error": format!("invalid assignment: {error}")}),
+            );
+        }
+    };
+    if entry.assignment_id.trim().is_empty() || entry.session_id.trim().is_empty() {
+        return (
+            400,
+            serde_json::json!({"error": "the assignment needs assignment_id and session_id"}),
+        );
+    }
+    if entry.assigned_to.is_none() {
+        entry.assigned_to = Some(env_id.to_string());
+    }
+    let assignment_id = entry.assignment_id.clone();
+    state.lock().await.add_assignment(entry);
+    (
+        201,
+        serde_json::json!({"ok": true, "assignment_id": assignment_id}),
+    )
 }
 
 /// POST /api/environments/{env_id}/capacity

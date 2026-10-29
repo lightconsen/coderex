@@ -7,6 +7,7 @@ pub mod delta_sync;
 pub mod epoch;
 pub mod gateway;
 pub mod heartbeat;
+pub mod http_transport;
 pub mod orchestrator;
 pub mod permission;
 pub mod poller;

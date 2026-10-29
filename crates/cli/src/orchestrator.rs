@@ -904,6 +904,10 @@ impl StartupOrchestrator {
                 crate::cli::Command::Auth => self.run_auth().await,
                 crate::cli::Command::Doctor => self.run_doctor().await,
                 crate::cli::Command::Update { check } => self.run_update(check).await,
+                crate::cli::Command::TeleportService { port, ttl_secs } => {
+                    run_teleport_service(port, ttl_secs).await
+                }
+                crate::cli::Command::Gateway { port } => run_gateway(port).await,
                 crate::cli::Command::Mcp { action } => self.run_mcp(action).await,
                 crate::cli::Command::Plugin { action } => self.run_plugin(action).await,
                 crate::cli::Command::AutoMode => self.run_auto_mode().await,
@@ -3811,6 +3815,40 @@ impl StartupOrchestrator {
     fn find_latest_session(&self) -> Option<String> {
         session_resume::latest_session_id(&self.ctx.cwd)
     }
+}
+
+/// Run the teleport rendezvous service until the process is stopped.
+///
+/// A session shared with `/teleport --share` is uploaded here, and any machine
+/// pointed at this service with `CODEREX_TELEPORT_URL` can join it. The
+/// service keeps no history: a share lives until it is revoked or its time to
+/// live runs out.
+async fn run_teleport_service(port: u16, ttl_secs: u64) -> Result<()> {
+    let ttl = std::time::Duration::from_secs(ttl_secs);
+    let service = coderex_server::teleport::TeleportService::with_ttl(port, ttl);
+    println!(
+        "Serving teleport shares on http://0.0.0.0:{port}/teleport/shares (ttl {ttl_secs}s). \
+         Point clients at it with CODEREX_TELEPORT_URL."
+    );
+    service.run().await.map_err(|error| anyhow::anyhow!(error))
+}
+
+/// Run the bridge gateway until the process is stopped.
+///
+/// One process serves the control plane a worker registers with and pulls
+/// assignments from, the endpoint an operator submits work to, and the
+/// per-environment frame mailbox that carries session output and permission
+/// requests to that operator (and the answers back).
+async fn run_gateway(port: u16) -> Result<()> {
+    println!(
+        "Serving the bridge gateway on http://0.0.0.0:{port} \
+         (/api/environments/register, /api/environments/<env>/assignments, \
+         /api/environments/<env>/frames)."
+    );
+    coderex_server::gateway::GatewayServer::new(port)
+        .run()
+        .await
+        .map_err(|error| anyhow::anyhow!(error))
 }
 
 #[cfg(test)]
