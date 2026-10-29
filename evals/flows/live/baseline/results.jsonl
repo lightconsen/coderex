@@ -1,0 +1,2 @@
+{"case_id":"live-read-tool-turn","variant":"baseline","rep":0,"passed":true,"graded":true,"exit_code":0,"duration_ms":5693,"failures":[],"output_tail":"I'll read the file first.live-tool-ok\n"}
+{"case_id":"live-text-turn","variant":"baseline","rep":0,"passed":true,"graded":true,"exit_code":0,"duration_ms":4359,"failures":[],"output_tail":"live-eval-ok\n"}

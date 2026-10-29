@@ -1,5 +1,7 @@
-# Run output, not harness.
-/baseline/
+# Run output, not harness. The results file is committed: it is the record of
+# what a real provider answered, and docs/evals.md points at it.
+/baseline/*
+!/baseline/results.jsonl
 /ref/
 /v*/
 /_state.json

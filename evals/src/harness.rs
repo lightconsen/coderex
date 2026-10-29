@@ -245,7 +245,13 @@ fn collect(
                 continue;
             }
             collect(root, &path, files)?;
-        } else if name != STATE_FILE && name != RESULTS_FILE && name != REPORT_FILE {
+        } else if name != STATE_FILE
+            && name != RESULTS_FILE
+            && name != REPORT_FILE
+            // `.gitignore` says what this checkout tracks, not what a run
+            // executes; changing it must not force a re-approval.
+            && name != ".gitignore"
+        {
             let contents = std::fs::read(&path).map_err(|error| HarnessError::Read {
                 path: path.display().to_string(),
                 message: error.to_string(),

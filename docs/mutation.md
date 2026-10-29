@@ -36,8 +36,15 @@ failing the run unless `MUTATION_STRICT=1`.
 | `core/src/permission_engine.rs` | 66 | 47 | 5 | 14 | 0 | **100%** |
 | `core/src/compact.rs` | 173 | 144 | 0 | 16 | 13 | **91.7%** |
 | `tools/src/sandbox_shell.rs` | 10 | 7 | 0 | 2 | 1 | **87.5%** |
-| `hooks/src/engine.rs` | 212 | 148 | 3 | 25 | 36 | **80.7%** |
-| `mcp/src/channel.rs` | 51 | 36 | 8 | 4 | 3 | **93.6%** |
+| `hooks/src/engine.rs` | 216 | 151 | 3 | 30 | 32 | **82.8%** |
+| `mcp/src/channel.rs` | 53 | 37 | 7 | 6 | 3 | **93.6%** |
+
+Baseline re-measured 2026-10-29 after `coderex_test_utils::capture_logs` made
+log-only behaviour assertable. hooks: 32 missed, down from 36 (new tests cover
+`parse_absolute_paths`, `warn_about_inert_hooks`, `announce_status`, dry-run,
+the non-zero-exit stderr excerpt and streaming `log` lines). mcp: 3 missed,
+unchanged — the remaining ones live in `stop_event_stream`, `initialize` and
+`event_stream_active`, which the log lines do not reach.
 
 Effective kill counts caught and timeout as detected. A timeout means the
 mutant made the tests hang rather than fail; it is still a detection, but those

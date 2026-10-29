@@ -172,6 +172,15 @@ Inputs (environment):
 | `ANTHROPIC_BASE_URL` | no | Anthropic-compatible endpoint. If unset, the CLI uses its own default; the script prints a note. |
 | `ANTHROPIC_MODEL` | no | Passed to the CLI as `--model`. If unset, the CLI's configured default is used. |
 | `CODEREX_BIN` | no | An already-built binary; otherwise the script builds `coderex` in debug mode. |
+| `CODEREX_LIVE_EVAL_FROM_SETTINGS` | no | `1` takes base URL, key and model from the settings file and ignores an inherited `ANTHROPIC_*` environment. Use it when the shell already exports another harness's provider: a base URL and a key from different providers cannot be mixed, and the failure looks like the provider's 400, not like a misconfiguration. |
+| `CODEREX_SETTINGS` | no | Settings file to read in that mode. Defaults to `~/.coderex/settings.json`, then `~/.claude/settings.ds.json`. |
+
+Without `CODEREX_LIVE_EVAL_FROM_SETTINGS`, a missing `ANTHROPIC_API_KEY` is
+filled from the same settings files (key from `api_key` /
+`env.ANTHROPIC_API_KEY` / `env.ANTHROPIC_AUTH_TOKEN`, base from
+`provider.base_url` / `env.ANTHROPIC_BASE_URL`, model from `model` /
+`env.ANTHROPIC_MODEL` / `env.ANTHROPIC_DEFAULT_SONNET_MODEL`). The key is
+never printed.
 
 The flow has two cases, each with `reps: 1` and `concurrency: 1`:
 
@@ -190,17 +199,20 @@ Outputs:
 | Path | Meaning |
 |------|---------|
 | `evals/flows/live/_state.json` | Approved harness hash (the script passes `--approve-harness`). |
-| `evals/flows/live/baseline/results.jsonl` | One record per case run, appended. |
+| `evals/flows/live/baseline/results.jsonl` | One record per case run, appended. The file from the documented run is committed (`report.html` and `_state.json` are not). |
 | `evals/flows/live/report.html` | Rendered pass/fail report. |
 
 The script exits non-zero when any case fails. Extra arguments are forwarded to
 `run-eval`, so `--case live-text-turn`, `--reps`, and `--timeout-s` work as
 usual.
 
-**This flow has not been run from this host.** No live provider credentials
-were configured during development, and adding the flow was verified only by
-building and inspecting it; the first real execution must come from a
-machine or workflow with credentials.
+**Run 2026-10-29** against an Anthropic-compatible endpoint
+(`api.deepseek.com/anthropic`, model `deepseek-flash`): 2 of 2 cases passed,
+and `evals/flows/live/baseline/results.jsonl` is the committed record of that
+run (it holds only the pass/fail record and the model's output tail — no
+credential). Earlier attempts that pointed at a different gateway in the
+same shell failed with that gateway's own 400, which is what
+`CODEREX_LIVE_EVAL_FROM_SETTINGS=1` exists to avoid.
 
 In CI it is the `live-provider-eval` job (plus the
 `live-provider-eval-preflight` credential check) in

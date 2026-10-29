@@ -50,11 +50,19 @@ scripts/build.sh
 (Linux x86_64 gnu/musl, macOS x86_64/aarch64, Windows x86_64).
 
 **With the install script** (Linux/macOS; installs to `~/.local/bin` or
-`/usr/local/bin`):
+`/usr/local/bin`). It verifies the download against the release's
+`SHA256SUMS` and refuses to install when the file is missing or does not
+match:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/lightconsen/coderex/main/scripts/install.sh | sh
 ```
+
+**Keeping it current:** `coderex update --check` reports whether a newer
+release exists; `coderex update` downloads it, verifies it the same way, and
+replaces the binary atomically. Installations owned by Homebrew, Nix or
+`cargo install` are refused with the command that upgrades them instead. See
+[`docs/self-update.md`](docs/self-update.md).
 
 **With Cargo:**
 
