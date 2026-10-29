@@ -487,6 +487,11 @@ mod tests {
         assert!(successes > 0, "the gate was never observed pointing inside");
     }
 
+    /// Unix only: the test renames the directory the capability holds open,
+    /// and Windows refuses to rename a directory with an open handle
+    /// (ERROR_SHARING_VIOLATION) — there is no way to observe the behaviour
+    /// there, so the test would assert on the operating system, not the code.
+    #[cfg(unix)]
     #[test]
     fn the_capability_keeps_walking_after_the_root_is_renamed() {
         let parent = tempfile::tempdir().unwrap();
