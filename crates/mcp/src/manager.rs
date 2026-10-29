@@ -475,7 +475,14 @@ impl McpManager {
             let Some((_, mut server)) = self.servers.remove(&name) else {
                 continue;
             };
-            let _ = server.spawn().await;
+            // A server that cannot start is not fatal — the session keeps
+            // every other tool — but staying silent left the user with a
+            // server that is configured, listed, and simply absent from the
+            // tool list. The reason (missing binary, a command the sandbox
+            // refuses, a failed handshake) belongs in the log.
+            if let Err(error) = server.spawn().await {
+                tracing::warn!(server = %name, %error, "MCP server did not start");
+            }
             self.servers.insert(name, server);
         }
         self.discover_all().await;

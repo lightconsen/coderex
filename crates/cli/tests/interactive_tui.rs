@@ -1576,6 +1576,90 @@ fn bash_action_denial_keeps_session_usable() {
     assert!(session.raw_text().contains("❯"));
 }
 
+/// A command that runs as another user is an elevation question in the TUI as
+/// well as on the control channel. Approving it must retry the command with
+/// privilege — the marker in the tool result is the proof it ran — and denying
+/// it must leave the command unexecuted.
+#[test]
+fn an_elevation_prompt_is_approved_and_retried_in_the_tui() {
+    let dir = setup_project_dir();
+    let (_server, mut session) = session_with_static_server(dir.path());
+    session.wait_for_text("CodeRex v", SCREEN_TIMEOUT);
+    session.send_line("run a command with sudo");
+    approve_permission(&mut session, "Waitingforpermission");
+    let raw = session.wait_for_raw_text("elevation-marker", SCREEN_TIMEOUT);
+    assert!(
+        !raw.contains("elevation denied"),
+        "an approved elevation was reported as denied:\n{raw}"
+    );
+    session.wait_for_text("Completed in", SCREEN_TIMEOUT);
+}
+
+#[test]
+fn an_elevation_prompt_is_denied_in_the_tui() {
+    let dir = setup_project_dir();
+    let (_server, mut session) = session_with_static_server(dir.path());
+    session.wait_for_text("CodeRex v", SCREEN_TIMEOUT);
+    session.send_line("run a command with sudo");
+    deny_permission(&mut session, "Waitingforpermission");
+    let raw = session.wait_for_raw_text("elevation denied", SCREEN_TIMEOUT);
+    assert!(
+        !raw.contains("elevation-marker"),
+        "a denied elevation still ran the command:\n{raw}"
+    );
+    session.wait_for_text("Completed in", SCREEN_TIMEOUT);
+}
+
+/// `su` is the other way to become another user, and it takes the elevation
+/// path rather than the ordinary approval one. Denying it must leave the
+/// command unexecuted; the password prompt is never reached.
+#[test]
+fn a_su_command_is_an_elevation_and_can_be_denied() {
+    let dir = setup_project_dir();
+    let (_server, mut session) = session_with_static_server(dir.path());
+    session.wait_for_text("CodeRex v", SCREEN_TIMEOUT);
+    session.send_line("run a command with su");
+    let screen = session.wait_for_text("Permission Request", SCREEN_TIMEOUT);
+    assert!(
+        screen.contains("another user"),
+        "the prompt did not explain that `su` runs as another user"
+    );
+    session.send_text("d");
+    let raw = session.wait_for_raw_text("elevation denied", SCREEN_TIMEOUT);
+    assert!(
+        !raw.contains("password"),
+        "a denied elevation still tried to run `su`:\n{raw}"
+    );
+    session.wait_for_text("Completed in", SCREEN_TIMEOUT);
+}
+
+/// The approval prompt names the shell analysis' finding, not just the tool:
+/// "Dangerous" plus the command that made it dangerous. That summary is why a
+/// person can tell a `rm -rf` from an `ls` without decoding the tool name.
+#[test]
+fn the_permission_prompt_shows_the_shell_analysis_reason() {
+    let dir = setup_project_dir();
+    let (_server, mut session) = session_with_static_server(dir.path());
+    session.wait_for_text("CodeRex v", SCREEN_TIMEOUT);
+    session.send_line("benchmark malicious shell");
+    session.wait_for_text("Permission Request", SCREEN_TIMEOUT);
+    let screen = session.wait_for_text("Dangerous", SCREEN_TIMEOUT);
+    assert!(
+        screen.contains("rm -rf /tmp/coderex-benchmark-should-not-run")
+            || screen.contains("rm-rf/tmp/coderex-benchmark-should-not-run"),
+        "the prompt did not name the command that was dangerous:\n{screen}"
+    );
+    session.send_text("d");
+    session.wait_for_raw_text("denied", SCREEN_TIMEOUT);
+    session.wait_for_text("Completed in", SCREEN_TIMEOUT);
+    assert!(
+        !std::path::Path::new("/tmp/coderex-benchmark-should-not-run").exists(),
+        "the denied command ran"
+    );
+    // The reason the prompt showed is what made the refusal sensible.
+    assert!(screen.contains("Dangerous") || screen.contains("dangerous"));
+}
+
 #[test]
 fn slash_palette_filters_selects_and_dismisses() {
     let dir = setup_project_dir();

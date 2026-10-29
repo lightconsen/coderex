@@ -395,25 +395,36 @@ mod tests {
             .and_then(|value| value.parse().ok())
             .unwrap_or(2_000);
         let stop = Arc::new(AtomicBool::new(false));
-        let attacker_stop = Arc::clone(&stop);
-        let attacker_base = base.path().to_path_buf();
-        let attacker_gate = gate.clone();
-        let attacker = std::thread::spawn(move || {
-            let mut index = 0_u64;
-            while !attacker_stop.load(Ordering::Relaxed) {
-                let target = if index.is_multiple_of(2) {
-                    attacker_base.join("outside")
-                } else {
-                    attacker_base.join("inside")
-                };
-                let temporary = attacker_base.join(format!("link-{index}"));
-                let _ = std::fs::remove_file(&temporary);
-                if std::os::unix::fs::symlink(&target, &temporary).is_ok() {
-                    let _ = std::fs::rename(&temporary, &attacker_gate);
+        // More than one attacker thread widens the window between the check
+        // and the open: one thread is a narrow race, several keep the gate
+        // flipping while the reader works.
+        let attackers: usize = std::env::var("RACE_SOAK_ATTACKERS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .filter(|count| *count > 0)
+            .unwrap_or(1);
+        let mut threads = Vec::with_capacity(attackers);
+        for attacker_index in 0..attackers {
+            let attacker_stop = Arc::clone(&stop);
+            let attacker_base = base.path().to_path_buf();
+            let attacker_gate = gate.clone();
+            threads.push(std::thread::spawn(move || {
+                let mut index = 0_u64;
+                while !attacker_stop.load(Ordering::Relaxed) {
+                    let target = if index.is_multiple_of(2) {
+                        attacker_base.join("outside")
+                    } else {
+                        attacker_base.join("inside")
+                    };
+                    let temporary = attacker_base.join(format!("link-{attacker_index}-{index}"));
+                    let _ = std::fs::remove_file(&temporary);
+                    if std::os::unix::fs::symlink(&target, &temporary).is_ok() {
+                        let _ = std::fs::rename(&temporary, &attacker_gate);
+                    }
+                    index += 1;
                 }
-                index += 1;
-            }
-        });
+            }));
+        }
 
         let mut successes = 0_usize;
         for _ in 0..iterations {
@@ -443,7 +454,9 @@ mod tests {
             }
         }
         stop.store(true, Ordering::Relaxed);
-        attacker.join().unwrap();
+        for thread in threads {
+            thread.join().unwrap();
+        }
         assert!(successes > 0, "the gate was never observed pointing inside");
     }
 

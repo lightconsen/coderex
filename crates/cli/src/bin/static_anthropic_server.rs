@@ -860,9 +860,19 @@ fn select_tools(prompt: &str) -> Vec<Tool> {
     } else if p.contains("run a command with sudo") {
         // The trailing command runs whether or not `sudo -n` succeeds, so a
         // test can tell "the elevated call was retried" from "it was never
-        // executed" without needing a passwordless sudo on the machine.
+        // executed" without needing a passwordless sudo on the machine. The
+        // marker is produced by a substitution so the *command text* does not
+        // contain it: a test looking for the marker in a terminal transcript
+        // then only matches the output.
         vec![Tool::Bash {
-            command: "sudo -n true; echo elevation-marker".into(),
+            command: "sudo -n true; echo elevation-$(echo marker)".into(),
+        }]
+    } else if p.contains("run a command with su") {
+        // `su` is the other way to run as another user. The password prompt
+        // fails on a test machine; the point is that it is classified as an
+        // elevation, not that it succeeds.
+        vec![Tool::Bash {
+            command: "/usr/bin/su -c true".into(),
         }]
     } else if p.contains("run a wrapped command") {
         vec![Tool::Bash {

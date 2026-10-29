@@ -187,3 +187,107 @@ async fn serve_authenticates_and_answers_a_query() {
     let _ = provider.kill();
     let _ = provider.wait();
 }
+
+/// Start a daemon with a session store and return the child plus its port.
+fn spawn_serve(
+    workspace: &std::path::Path,
+    home: &std::path::Path,
+    base_url: &str,
+    port: u16,
+    persist_path: &std::path::Path,
+) -> Child {
+    Command::new(env!("CARGO_BIN_EXE_coderex"))
+        .args(["serve", "--port", &port.to_string()])
+        .current_dir(workspace)
+        .env("ANTHROPIC_API_KEY", "mock")
+        .env("ANTHROPIC_BASE_URL", base_url)
+        .env("ANTHROPIC_MODEL", "claude-sonnet-4-6")
+        .env("CLAUDE_CONFIG_DIR", home)
+        .env("CODEREX_API_KEYS", "test-key")
+        .env("CODEREX_SERVER_PERSIST_PATH", persist_path)
+        .env("CODEREX_LOG", "off")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn coderex serve")
+}
+
+async fn authenticate(
+    port: u16,
+) -> (
+    tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+    String,
+) {
+    let mut ws = connect(port).await;
+    ws.send(Message::Text(
+        serde_json::json!({"token": "test-key"}).to_string().into(),
+    ))
+    .await
+    .expect("auth send");
+    let auth: serde_json::Value =
+        serde_json::from_str(&recv_text(&mut ws).await).expect("auth json");
+    let session_id = auth["session_id"].as_str().expect("session id").to_string();
+    let ready: serde_json::Value =
+        serde_json::from_str(&recv_text(&mut ws).await).expect("ready json");
+    assert_eq!(ready["event"], "session_ready");
+    (ws, session_id)
+}
+
+/// Sessions survive a restart, and the restarted server does not reuse a
+/// restored session id.
+///
+/// The daemon persists each session when it is created. On the next start it
+/// restores them and resumes its id counter past the highest restored id —
+/// without that, the first client of the new process would be handed
+/// `sess_1` and silently take over the earlier session.
+#[tokio::test]
+async fn sessions_survive_a_restart_without_reusing_an_id() {
+    let (mut provider, base_url) = start_static_provider();
+    let config_home = tempfile::tempdir().expect("config home");
+    std::fs::write(
+        config_home.path().join("settings.json"),
+        r#"{"config_version": 4, "telemetry_enabled": false}"#,
+    )
+    .expect("seed config");
+    let workspace = tempfile::tempdir().expect("workspace");
+    let store = config_home.path().join("server-sessions.db");
+
+    let first_port = free_port();
+    let mut first = spawn_serve(
+        workspace.path(),
+        config_home.path(),
+        &base_url,
+        first_port,
+        &store,
+    );
+    let (ws, first_session) = authenticate(first_port).await;
+    assert_eq!(first_session, "sess_1", "the first session id changed");
+    drop(ws);
+    let _ = first.kill();
+    let _ = first.wait();
+    assert!(store.exists(), "the daemon wrote no session store");
+
+    let second_port = free_port();
+    let mut second = spawn_serve(
+        workspace.path(),
+        config_home.path(),
+        &base_url,
+        second_port,
+        &store,
+    );
+    let (_ws, second_session) = authenticate(second_port).await;
+    assert_ne!(
+        second_session, first_session,
+        "the restarted server reused a restored session id"
+    );
+    assert_eq!(
+        second_session, "sess_2",
+        "the id counter did not resume past the restored session"
+    );
+
+    let _ = second.kill();
+    let _ = second.wait();
+    let _ = provider.kill();
+    let _ = provider.wait();
+}

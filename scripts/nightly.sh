@@ -77,6 +77,7 @@ if [[ "$run_soak" != "0" ]]; then
 fi
 if [[ "$run_race_soak" != "0" ]]; then
     step race-soak ./scripts/race-soak.sh "$race_iterations"
+    step race-soak-multi ./scripts/race-soak-multi.sh 4 "$race_iterations" 2
 fi
 if [[ "$run_mutation" != "0" ]]; then
     echo "== mutation ($mutation_scope)"

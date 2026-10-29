@@ -3001,6 +3001,100 @@ printf 'ECHO:%s\n' "$line""#;
         assert!(result.is_ok());
     }
 
+    /// Capacity is enforced, not just reported: with one slot and two queued
+    /// assignments, the second is not claimed until the first finishes.
+    ///
+    /// The poller's `take_assignment` refuses to hand out more work than
+    /// `max_concurrent` allows. Without this the worker would claim an
+    /// assignment, leave it unspawned, and report capacity it does not have.
+    #[tokio::test]
+    async fn a_full_worker_does_not_claim_a_second_assignment() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = worker_config(tmp.path());
+        config.max_concurrent = 1;
+        let session_base = config.session_base.clone();
+
+        let mut first = sample_assignment(&session_base);
+        first.assignment_id = "a1".into();
+        first.session_id = "s1".into();
+        let mut second = sample_assignment(&session_base);
+        second.assignment_id = "a2".into();
+        second.session_id = "s2".into();
+
+        let control_plane = Arc::new(FakeControlPlane::default());
+        control_plane
+            .assignments
+            .lock()
+            .unwrap()
+            .extend([first, second]);
+        // The runner finishes as soon as it is started, so the slot frees and
+        // the second assignment can be taken on a later tick.
+        let runner = Arc::new(FixedRunner::succeeding());
+        let worker_runner = Arc::clone(&runner);
+        let observed = Arc::clone(&control_plane);
+
+        let (bridge_transport, mut remote) =
+            InProcessTransport::create_pair("bridge-env".into(), "gateway".into());
+        remote.connect().await.unwrap();
+
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let running = tokio::spawn(async move {
+            run_with_control_plane(
+                config,
+                Box::new(bridge_transport),
+                control_plane,
+                worker_runner,
+                async move {
+                    let _ = shutdown_rx.await;
+                },
+            )
+            .await
+        });
+
+        wait_until(
+            || !observed.claimed().is_empty(),
+            "the first assignment to be claimed",
+        )
+        .await;
+        wait_until(
+            || {
+                observed
+                    .capacities
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|report| report.active_sessions == 1)
+            },
+            "the active capacity report",
+        )
+        .await;
+        // While the first session runs, the worker must not have claimed the
+        // second: one slot, one assignment.
+        let claims_while_full = observed.claimed();
+        assert_eq!(
+            claims_while_full.len(),
+            1,
+            "a full worker claimed more than its slots: {claims_while_full:?}"
+        );
+        assert_eq!(claims_while_full[0].1, "a1");
+
+        // Once the first finishes, the slot frees and the second is taken.
+        wait_until(
+            || observed.claimed().len() == 2,
+            "the second assignment after the slot freed",
+        )
+        .await;
+        assert_eq!(observed.claimed()[1].1, "a2");
+        assert_eq!(
+            runner.runs.lock().unwrap().len(),
+            2,
+            "both sessions should have run"
+        );
+
+        shutdown_tx.send(()).unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(1), running).await;
+    }
+
     /// Session output is not only written locally: each line reaches the
     /// gateway as a `session_output` frame on the active transport.
     #[tokio::test]

@@ -543,3 +543,70 @@ fn an_mcp_prompt_is_fetched_and_shown_to_the_model() {
         "the MCP prompt never reached the transcript:\n{stdout}"
     );
 }
+
+/// A stdio server whose command lives in the checkout is refused.
+///
+/// The command line for a project's MCP servers comes from `.mcp.json`, which
+/// a cloned repository controls. Running a binary the checkout supplied would
+/// let the repository decide what the client executes before any tool call is
+/// approved, so the spawn is refused with a message naming the path.
+#[test]
+fn a_server_command_inside_the_workspace_is_refused() {
+    let dir = tempfile::tempdir().expect("workspace");
+    let script = dir.path().join("local-server.sh");
+    std::fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions).unwrap();
+    }
+    std::fs::write(
+        dir.path().join(".mcp.json"),
+        serde_json::json!({
+            "mcpServers": {"local": {"command": "./local-server.sh", "args": []}}
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let (mut provider, base_url) = start_static_provider();
+
+    let config_home = tempfile::tempdir().expect("config home");
+    std::fs::write(
+        config_home.path().join("settings.json"),
+        r#"{"config_version": 4, "telemetry_enabled": false}"#,
+    )
+    .expect("seed config");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_coderex"))
+        .args(["-p", "--dangerously-skip-permissions"])
+        .current_dir(dir.path())
+        .env("ANTHROPIC_API_KEY", "mock")
+        .env("ANTHROPIC_BASE_URL", &base_url)
+        .env("ANTHROPIC_MODEL", "claude-sonnet-4-6")
+        .env("CLAUDE_CONFIG_DIR", config_home.path())
+        .env("CODEREX_LOG", "warn")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn coderex");
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(b"call the mock mcp tool\n")
+        .expect("write prompt");
+    let output = child.wait_with_output().expect("wait");
+    let _ = provider.kill();
+    let _ = provider.wait();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("refusing to spawn") && stderr.contains("working directory"),
+        "the refusal did not explain itself:\n{stderr}"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains("mcp-echo:"),
+        "the refused server still ran:\n{stdout}"
+    );
+}
