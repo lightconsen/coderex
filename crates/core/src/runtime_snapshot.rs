@@ -43,21 +43,22 @@ pub fn capture() -> String {
 /// `/proc/<pid>` facts on Linux: the cheapest and most precise source.
 #[cfg(target_os = "linux")]
 fn linux_process_facts(pid: u32) -> Option<String> {
+    use std::fmt::Write as _;
+
     let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
     let mut out = String::new();
     for line in status.lines() {
         if let Some(rest) = line.strip_prefix("VmRSS:") {
-            out.push_str(&format!("rss: {}\n", rest.trim()));
+            let _ = writeln!(out, "rss: {}", rest.trim());
         } else if let Some(rest) = line.strip_prefix("VmSize:") {
-            out.push_str(&format!("virtual: {}\n", rest.trim()));
+            let _ = writeln!(out, "virtual: {}", rest.trim());
         } else if let Some(rest) = line.strip_prefix("Threads:") {
-            out.push_str(&format!("threads: {}\n", rest.trim()));
+            let _ = writeln!(out, "threads: {}", rest.trim());
         }
     }
-    let fds = std::fs::read_dir(format!("/proc/{pid}/fd"))
-        .map(|entries| entries.flatten().count())
-        .unwrap_or(0);
-    out.push_str(&format!("open_files: {fds}\n"));
+    let fds =
+        std::fs::read_dir(format!("/proc/{pid}/fd")).map_or(0, |entries| entries.flatten().count());
+    let _ = writeln!(out, "open_files: {fds}");
     Some(out)
 }
 

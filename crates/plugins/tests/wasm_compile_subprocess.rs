@@ -403,6 +403,9 @@ fn prescan_rejects_pathological_module_before_compiling() {
 /// The compiler child gets a minimal environment: the host's variables — an
 /// API key, say — do not leak into it. The wrapper dumps what it actually
 /// received, then runs the real helper so the compile still succeeds.
+///
+/// Unix-only: the wrapper is a `sh` script made executable with `set_mode`.
+#[cfg(unix)]
 #[test]
 fn the_compiler_child_does_not_inherit_host_secrets() {
     let _guard = env_guard();

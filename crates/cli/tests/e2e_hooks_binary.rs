@@ -4,6 +4,10 @@
 //! these prove what a user gets from `coderex -p`: a failed gating hook denies
 //! the tool, a Stop hook runs after a completed turn, and a PostToolUse rewrite
 //! reaches the model's tool result.
+//!
+//! The hooks are `sh` scripts, so the file is Unix-only.
+
+#![cfg(unix)]
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};

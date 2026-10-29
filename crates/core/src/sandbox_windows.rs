@@ -757,6 +757,8 @@ mod imp {
                     continue;
                 }
 
+                #[cfg(test)]
+                #[cfg(test)]
                 let started = std::time::Instant::now();
                 let result = set_grant(&grant.path, self.sid, grant.access).and_then(|()| {
                     if grant.access == AclAccess::Modify {
@@ -801,6 +803,8 @@ mod imp {
                 }
 
                 if grant.recursive {
+                    #[cfg(test)]
+                    #[cfg(test)]
                     let walked = std::time::Instant::now();
                     walk_and_grant(&grant.path, self.sid, grant.access);
                     #[cfg(test)]
@@ -1155,6 +1159,7 @@ mod imp {
         let wide_path = wide_os(path.as_os_str());
         let mut old_dacl: *mut ACL = ptr::null_mut();
         let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
+        #[cfg(test)]
         let read_started = std::time::Instant::now();
         // SAFETY: the path is NUL-terminated and every out pointer is valid.
         let err = unsafe {
@@ -1231,6 +1236,7 @@ mod imp {
             return Err(win32_error("SetEntriesInAclW", err));
         }
 
+        #[cfg(test)]
         let write_started = std::time::Instant::now();
         // SAFETY: both ACLs are live and correctly sized for the calls.
         let err = unsafe {
@@ -1699,6 +1705,8 @@ pub(crate) use imp::app_container_available;
 ///
 /// Windows only: the values it reports do not exist elsewhere.
 #[cfg(target_os = "windows")]
+/// Only the confinement tests call this (via `PlatformSandbox::diagnose`).
+#[cfg(test)]
 pub(crate) use imp::diagnose_path;
 
 #[cfg(test)]

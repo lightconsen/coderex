@@ -550,6 +550,7 @@ fn an_mcp_prompt_is_fetched_and_shown_to_the_model() {
 /// a cloned repository controls. Running a binary the checkout supplied would
 /// let the repository decide what the client executes before any tool call is
 /// approved, so the spawn is refused with a message naming the path.
+#[cfg(unix)]
 #[test]
 fn a_server_command_inside_the_workspace_is_refused() {
     let dir = tempfile::tempdir().expect("workspace");

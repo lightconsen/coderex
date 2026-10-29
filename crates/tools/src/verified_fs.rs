@@ -290,7 +290,9 @@ fn fd_path(file: &File) -> Option<PathBuf> {
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Storage::FileSystem::GetFinalPathNameByHandleW;
 
-    let handle = file.as_raw_handle() as isize;
+    // `windows-sys` 0.59 spells `HANDLE` as `*mut c_void`, so the raw handle
+    // is passed through as-is; casting it to `isize` no longer compiles.
+    let handle = file.as_raw_handle();
     let mut buffer = vec![0_u16; 32_768];
     // SAFETY: the handle is valid and `buffer` is a writable UTF-16 buffer of
     // the declared length.

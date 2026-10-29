@@ -111,7 +111,13 @@ jobs:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
       - uses: dtolnay/rust-toolchain@1.99.1
+        with:
+          components: clippy
       - run: cargo test -p coderex-config
+      # macOS-only code (sandbox-exec, F_GETPATH, the plist carrier) is not
+      # compiled on Linux, so the main clippy job never sees it.
+      - name: Clippy (macOS)
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
   # Compilation and linking for Windows are required, and are checked from
   # ubuntu-latest with the mingw-w64 toolchain below. This matters because the
@@ -166,6 +172,13 @@ jobs:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
       - uses: dtolnay/rust-toolchain@1.99.1
+        with:
+          components: clippy
+      # Production Windows code (the AppContainer paths) is not compiled on
+      # Linux either. `--all-targets` is deliberately omitted: the CLI
+      # integration tests are POSIX-shell fixtures and are not built here.
+      - name: Clippy (Windows)
+        run: cargo clippy --workspace -- -D warnings
       - name: Core sandbox tests (AppContainer)
         timeout-minutes: 20
         run: >

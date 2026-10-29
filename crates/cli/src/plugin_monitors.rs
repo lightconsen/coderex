@@ -662,6 +662,8 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::sync::{Mutex, MutexGuard};
+    // The waits that use it are Unix-only (they watch a shell monitor).
+    #[cfg(unix)]
     use std::time::Duration;
 
     /// Tests share one global PID registry, so a test that kills every

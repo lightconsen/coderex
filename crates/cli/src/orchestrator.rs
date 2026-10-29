@@ -4339,6 +4339,9 @@ mod tests {
     /// plugin: `retry_failed_plugins` only says `RestartRequired`, because it
     /// is synchronous and cannot await `spawn_plugin`. This drives the loop
     /// against a real process plugin that starts broken and is then fixed.
+    ///
+    /// Unix-only: the plugin is a `sh` script made executable with `set_mode`.
+    #[cfg(unix)]
     #[tokio::test]
     async fn the_restart_loop_spawns_a_plugin_that_recovered() {
         use std::os::unix::fs::PermissionsExt;

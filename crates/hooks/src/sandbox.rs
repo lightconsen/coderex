@@ -384,6 +384,10 @@ fn workspace_dir(hook: &HookConfig) -> PathBuf {
 }
 
 /// The user's home directory, if the platform names one.
+///
+/// Windows does not grant the profile recursively (see the read-path note
+/// above), so only the other platforms have a caller.
+#[cfg(not(target_os = "windows"))]
 fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))

@@ -1949,7 +1949,6 @@ mod tests {
     use coderex_bridge::transport::{InProcessTransport, TransportMessage};
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::time::Duration;
     use tokio::sync::oneshot;
 
     /// In-memory control plane used to exercise the worker without a server.
@@ -3001,6 +3000,54 @@ printf 'ECHO:%s\n' "$line""#;
         assert!(result.is_ok());
     }
 
+    /// A runner that starts, then waits for the test to release it.
+    ///
+    /// The capacity test needs the first session to *stay* running while the
+    /// worker polls again; a runner that finishes immediately can free the
+    /// slot before the assertion reads the claim list.
+    #[derive(Debug)]
+    struct GatedRunner {
+        gate: tokio::sync::Semaphore,
+        started: Mutex<Vec<String>>,
+    }
+
+    impl GatedRunner {
+        fn new() -> Self {
+            Self {
+                gate: tokio::sync::Semaphore::new(0),
+                started: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn release(&self) {
+            self.gate.add_permits(1);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl SessionRunner for GatedRunner {
+        async fn run(
+            &self,
+            context: &SessionContext<'_>,
+            _stop: SessionStop,
+        ) -> Result<SessionOutput, String> {
+            self.started
+                .lock()
+                .unwrap()
+                .push(context.session_id.to_string());
+            let permit = self
+                .gate
+                .acquire()
+                .await
+                .map_err(|_| "the gate closed".to_string())?;
+            permit.forget();
+            Ok(SessionOutput {
+                transcript: "{\"type\":\"result\",\"subtype\":\"success\"}\n".into(),
+                usage: UsageStats::default(),
+            })
+        }
+    }
+
     /// Capacity is enforced, not just reported: with one slot and two queued
     /// assignments, the second is not claimed until the first finishes.
     ///
@@ -3027,9 +3074,7 @@ printf 'ECHO:%s\n' "$line""#;
             .lock()
             .unwrap()
             .extend([first, second]);
-        // The runner finishes as soon as it is started, so the slot frees and
-        // the second assignment can be taken on a later tick.
-        let runner = Arc::new(FixedRunner::succeeding());
+        let runner = Arc::new(GatedRunner::new());
         let worker_runner = Arc::clone(&runner);
         let observed = Arc::clone(&control_plane);
 
@@ -3051,45 +3096,29 @@ printf 'ECHO:%s\n' "$line""#;
             .await
         });
 
+        // The first session is running and holds the only slot. Give the
+        // worker a few poll intervals to (incorrectly) claim the second one.
         wait_until(
-            || !observed.claimed().is_empty(),
-            "the first assignment to be claimed",
+            || runner.started.lock().unwrap().len() == 1,
+            "the first session to start",
         )
         .await;
-        wait_until(
-            || {
-                observed
-                    .capacities
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .any(|report| report.active_sessions == 1)
-            },
-            "the active capacity report",
-        )
-        .await;
-        // While the first session runs, the worker must not have claimed the
-        // second: one slot, one assignment.
+        tokio::time::sleep(Duration::from_millis(100)).await;
         let claims_while_full = observed.claimed();
         assert_eq!(
-            claims_while_full.len(),
-            1,
-            "a full worker claimed more than its slots: {claims_while_full:?}"
+            claims_while_full,
+            vec![("env-test".to_string(), "a1".to_string())],
+            "a full worker claimed more than its slots"
         );
-        assert_eq!(claims_while_full[0].1, "a1");
 
-        // Once the first finishes, the slot frees and the second is taken.
+        // Release the first session: the slot frees and the second is taken.
+        runner.release();
         wait_until(
-            || observed.claimed().len() == 2,
-            "the second assignment after the slot freed",
+            || runner.started.lock().unwrap().len() == 2,
+            "the second session after the slot freed",
         )
         .await;
         assert_eq!(observed.claimed()[1].1, "a2");
-        assert_eq!(
-            runner.runs.lock().unwrap().len(),
-            2,
-            "both sessions should have run"
-        );
 
         shutdown_tx.send(()).unwrap();
         let _ = tokio::time::timeout(Duration::from_secs(1), running).await;

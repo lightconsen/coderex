@@ -2,6 +2,9 @@
 //!
 //! Both flags shell out to an external program (`gh`, `tmux`), so the test
 //! supplies a fake one on `PATH` and asserts what the binary did with it.
+//! The fakes are `sh` scripts, so the file is Unix-only.
+
+#![cfg(unix)]
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;

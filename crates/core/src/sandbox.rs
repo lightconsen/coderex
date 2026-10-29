@@ -465,7 +465,10 @@ pub(crate) const fn memory_limit_resource(darwin: bool) -> RlimitResource {
 #[cfg(target_os = "linux")]
 pub(crate) type RlimitResource = libc::__rlimit_resource_t;
 /// See [`RlimitResource`].
-#[cfg(not(target_os = "linux"))]
+///
+/// Unix only: on Windows nothing in this module takes an rlimit, so the alias
+/// would be dead code there.
+#[cfg(all(unix, not(target_os = "linux")))]
 pub(crate) type RlimitResource = libc::c_int;
 
 /// Apply `cur`/`max` to `resource`, returning the kernel's errno on rejection.
@@ -1296,16 +1299,16 @@ pub mod cgroup {
         let mount = Path::new("/sys/fs/cgroup");
         let mut parents = Vec::new();
 
-        if let Ok(content) = std::fs::read_to_string("/proc/self/cgroup") {
-            if let Some(relative) = current_cgroup_from_proc(&content) {
-                let path = if relative == "/" {
-                    mount.to_path_buf()
-                } else {
-                    mount.join(relative.trim_start_matches('/'))
-                };
-                if path.exists() {
-                    parents.push(path);
-                }
+        if let Ok(content) = std::fs::read_to_string("/proc/self/cgroup")
+            && let Some(relative) = current_cgroup_from_proc(&content)
+        {
+            let path = if relative == "/" {
+                mount.to_path_buf()
+            } else {
+                mount.join(relative.trim_start_matches('/'))
+            };
+            if path.exists() {
+                parents.push(path);
             }
         }
         if !parents.iter().any(|path| path == mount) {
@@ -2919,6 +2922,9 @@ mod windows_impl {
         /// failing confinement assertion includes this string: it separates a
         /// DACL that was never applied from a Low-integrity token blocked by a
         /// Medium-integrity label.
+        /// Only the confinement tests call this, so it is compiled for them
+        /// alone rather than shipping in a release build.
+        #[cfg(test)]
         pub fn diagnose(&self, path: &std::path::Path) -> String {
             match &self.container {
                 Some(container) => crate::sandbox_windows::diagnose_path(path, container.sid()),
