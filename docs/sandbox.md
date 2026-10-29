@@ -138,6 +138,14 @@ When both backends are unavailable — no `bwrap`, `CODEREX_LANDLOCK=0` set or a
 kernel without Landlock — `filesystem_isolation()` reports `None` and a gating
 hook is denied rather than run unconfined. Nothing silently claims otherwise.
 
+The shell tools still run in that state, with seccomp and rlimits only, and log
+a warning saying so. Set `CODEREX_REQUIRE_SANDBOX=1` to make that a refusal
+instead: `SandboxHandle::create` then fails with `IsolationUnavailable` and the
+command is not started (`crates/cli/tests/e2e_sandbox_binary.rs` proves both the
+refusal and the unset control). The switch only changes the case where the
+backend is missing — macOS always reports kernel isolation, and Windows already
+fails closed when the AppContainer runtime is absent.
+
 **cgroup v2 memory limits.** When `max_memory_bytes` is configured, Linux also
 creates a `coderex-<pid>-<id>` cgroup under the process's own cgroup (or
 `$CODEREX_CGROUP_ROOT`, or `/sys/fs/cgroup`), sets `memory.max`, `pids.max`

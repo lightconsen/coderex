@@ -853,6 +853,12 @@ fn select_tools(prompt: &str) -> Vec<Tool> {
             name: "memory_read".into(),
             input_json: r#"{"store":"project","key":"e2e-memory"}"#.into(),
         }]
+    } else if p.contains("write a sandbox marker") {
+        // A command with no side effect outside the workspace, so a test can
+        // tell "the sandbox refused" from "the command never ran".
+        vec![Tool::Bash {
+            command: "echo ran > sandbox-marker.txt".into(),
+        }]
     } else if p.contains("try a network request") {
         vec![Tool::Bash {
             command: "curl -sS --max-time 5 https://example.com".into(),

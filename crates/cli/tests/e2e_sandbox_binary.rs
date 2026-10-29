@@ -49,6 +49,21 @@ fn start_static_provider() -> (Child, String) {
 }
 
 fn run(cwd: &Path, base_url: &str, prompt: &str, api_key: &str) -> std::process::Output {
+    run_with_env(cwd, base_url, prompt, api_key, &[])
+}
+
+/// Run the binary with extra environment variables.
+///
+/// The sandbox switches (`CODEREX_REQUIRE_SANDBOX`, `CODEREX_BWRAP`,
+/// `CODEREX_LANDLOCK`) are environment-only, so a binary-level test is the
+/// only way to exercise them without changing the host's installation.
+fn run_with_env(
+    cwd: &Path,
+    base_url: &str,
+    prompt: &str,
+    api_key: &str,
+    extra: &[(&str, &str)],
+) -> std::process::Output {
     let config_home = tempfile::tempdir().expect("config home");
     std::fs::write(
         config_home.path().join("settings.json"),
@@ -69,6 +84,7 @@ fn run(cwd: &Path, base_url: &str, prompt: &str, api_key: &str) -> std::process:
         .env("ANTHROPIC_MODEL", "claude-sonnet-4-6")
         .env("CLAUDE_CONFIG_DIR", config_home.path())
         .env("CODEREX_LOG", "off")
+        .envs(extra.iter().copied())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -196,5 +212,77 @@ fn the_sandbox_denies_network_access_for_shell_commands() {
             || tool_result.contains("[Exit code: 7]")
             || tool_result.contains("[Exit code: 43]"),
         "unexpected network result: {tool_result}"
+    );
+}
+
+/// Requiring a sandbox turns "no backend" into a refusal instead of a quiet
+/// downgrade to seccomp and rlimits.
+///
+/// Linux only: macOS always reports kernel isolation, and this platform's
+/// switches are the ones that can make the backend disappear.
+#[cfg(target_os = "linux")]
+#[test]
+fn requiring_a_sandbox_refuses_to_run_when_no_backend_is_available() {
+    let dir = tempfile::tempdir().expect("workspace");
+    let marker = dir.path().join("sandbox-marker.txt");
+    let (mut provider, base_url) = start_static_provider();
+
+    let output = run_with_env(
+        dir.path(),
+        &base_url,
+        "write a sandbox marker",
+        "mock-e2e-key",
+        &[
+            ("CODEREX_REQUIRE_SANDBOX", "1"),
+            ("CODEREX_BWRAP", "0"),
+            ("CODEREX_LANDLOCK", "0"),
+        ],
+    );
+
+    let _ = provider.kill();
+    let _ = provider.wait();
+    assert!(
+        output.status.success(),
+        "coderex failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !marker.exists(),
+        "the shell ran even though isolation was required:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("CODEREX_REQUIRE_SANDBOX") || stdout.contains("refusing to run unconfined"),
+        "the refusal did not name its reason:\n{stdout}"
+    );
+}
+
+/// The control: without the requirement, the same command runs.
+#[cfg(target_os = "linux")]
+#[test]
+fn without_the_requirement_the_same_command_runs() {
+    let dir = tempfile::tempdir().expect("workspace");
+    let marker = dir.path().join("sandbox-marker.txt");
+    let (mut provider, base_url) = start_static_provider();
+
+    let output = run_with_env(
+        dir.path(),
+        &base_url,
+        "write a sandbox marker",
+        "mock-e2e-key",
+        &[("CODEREX_BWRAP", "0"), ("CODEREX_LANDLOCK", "0")],
+    );
+
+    let _ = provider.kill();
+    let _ = provider.wait();
+    assert!(
+        output.status.success(),
+        "coderex failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        marker.exists(),
+        "the command did not run without the requirement:\n{}",
+        String::from_utf8_lossy(&output.stdout)
     );
 }

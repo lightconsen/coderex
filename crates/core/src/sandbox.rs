@@ -284,6 +284,56 @@ pub fn filesystem_isolation() -> FilesystemIsolation {
     }
 }
 
+/// Set this to refuse to run a command when no filesystem-isolation backend is
+/// available.
+///
+/// Without it, Linux with neither bubblewrap nor Landlock proceeds with
+/// seccomp and rlimits only (and says so in a warning). With it, that is an
+/// error: a caller that asked for confinement gets confinement or a refusal,
+/// never a quietly weaker boundary.
+pub const REQUIRE_SANDBOX_ENV: &str = "CODEREX_REQUIRE_SANDBOX";
+
+/// Whether the requirement in [`REQUIRE_SANDBOX_ENV`] is on.
+///
+/// Pure reader over the environment; the truthiness rule lives in
+/// [`truthy_env`] so it can be tested without touching a process-wide
+/// variable.
+#[must_use]
+pub fn require_sandbox() -> bool {
+    truthy_env(std::env::var(REQUIRE_SANDBOX_ENV).ok().as_deref())
+}
+
+/// The usual `1`/`true`/`yes`/`on` spelling of an on switch.
+#[must_use]
+pub fn truthy_env(value: Option<&str>) -> bool {
+    value.is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
+/// Whether a required sandbox must refuse with this platform's isolation.
+///
+/// Pure: `required` is the switch, `isolation` is what
+/// [`filesystem_isolation`] reported.
+#[must_use]
+pub const fn isolation_refused(required: bool, isolation: FilesystemIsolation) -> bool {
+    required && matches!(isolation, FilesystemIsolation::None)
+}
+
+/// Refuse when isolation is required and this platform has none.
+pub fn ensure_isolation_available() -> Result<(), SandboxError> {
+    if isolation_refused(require_sandbox(), filesystem_isolation()) {
+        return Err(SandboxError::IsolationUnavailable(format!(
+            "{REQUIRE_SANDBOX_ENV} is set, and this platform has no filesystem-isolation \
+             backend available; refusing to run unconfined"
+        )));
+    }
+    Ok(())
+}
+
 /// Whether the Windows AppContainer runtime is present.
 ///
 /// Always `false` off Windows. Callers use it to decide whether a missing
@@ -1388,6 +1438,7 @@ impl SandboxHandle {
     /// limits-only, because that would be a boundary the caller did not get.
     /// On unsupported platforms: returns a warning but proceeds.
     pub fn create(config: SandboxConfig) -> Result<Self, SandboxError> {
+        ensure_isolation_available()?;
         let inner = PlatformSandbox::create(config)?;
         Ok(Self { inner })
     }
@@ -1400,6 +1451,7 @@ impl SandboxHandle {
     /// confined: on Windows this handle does not confine paths or network.
     /// Other platforms create their normal backend.
     pub fn create_limits_only(config: SandboxConfig) -> Result<Self, SandboxError> {
+        ensure_isolation_available()?;
         let inner = PlatformSandbox::create_limits_only(config)?;
         Ok(Self { inner })
     }
@@ -3098,6 +3150,26 @@ impl SandboxBackend for NoOpSandbox {
 
 #[cfg(test)]
 mod tests {
+
+    /// A required sandbox refuses exactly when the platform offers none.
+    #[test]
+    fn requiring_isolation_refuses_only_without_a_backend() {
+        assert!(isolation_refused(true, FilesystemIsolation::None));
+        assert!(!isolation_refused(true, FilesystemIsolation::Kernel));
+        assert!(!isolation_refused(false, FilesystemIsolation::None));
+    }
+
+    /// The requirement switch uses the same truthiness as the other switches.
+    #[test]
+    fn the_requirement_switch_accepts_the_usual_truthy_values() {
+        for value in ["1", "true", "YES", " on "] {
+            assert!(truthy_env(Some(value)), "{value}");
+        }
+        for value in ["0", "false", "no", ""] {
+            assert!(!truthy_env(Some(value)), "{value}");
+        }
+        assert!(!truthy_env(None));
+    }
     use super::*;
 
     /// Whether the CI job requires a real AppContainer runtime.
