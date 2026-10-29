@@ -15,6 +15,7 @@ pub mod orchestrator;
 pub mod plugin_monitors;
 pub mod recovery;
 pub mod repl;
+pub mod self_update;
 pub mod session_resume;
 pub mod tmux;
 pub mod tracing_setup;

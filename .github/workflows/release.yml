@@ -34,6 +34,10 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          # A manual dispatch names a tag in its input; without this the build
+          # would package the default branch and publish it under that tag.
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
 
       - uses: dtolnay/rust-toolchain@1.99.1
         with:
@@ -61,6 +65,9 @@ jobs:
           New-Item -ItemType Directory -Force -Path dist
           Copy-Item target/${{ matrix.target }}/release/coderex.exe dist/coderex-${{ matrix.target }}.exe
           Compress-Archive -Path dist/coderex-${{ matrix.target }}.exe -DestinationPath coderex-${{ matrix.target }}.zip
+          # The zip is for people installing by hand; `coderex update` downloads
+          # the bare executable so it does not need a zip decoder.
+          Copy-Item dist/coderex-${{ matrix.target }}.exe coderex-${{ matrix.target }}.exe
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -69,12 +76,38 @@ jobs:
           path: |
             coderex-*.tar.gz
             coderex-*.zip
+            coderex-*.exe
+
+  # One `SHA256SUMS` for the whole release: `install.sh`, `coderex update`
+  # and anyone running `sha256sum -c` all check the same file.
+  checksums:
+    name: Publish checksums
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Generate SHA256SUMS
+        run: |
+          set -euo pipefail
+          cd artifacts
+          sha256sum coderex-*.tar.gz coderex-*.zip coderex-*.exe | LC_ALL=C sort -k2 > SHA256SUMS
+          cat SHA256SUMS
+          sha256sum --check SHA256SUMS
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: checksums
+          path: artifacts/SHA256SUMS
 
   # Smoke the artifacts before they are published: a release whose tarball
   # unpacks to a binary that does not run is worse than a failed build.
   smoke:
     name: Smoke the artifacts
-    needs: build
+    needs: [build, checksums]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -98,9 +131,15 @@ jobs:
       - name: Every archive contains its binary
         run: python3 scripts/check-release-archives.py artifacts
 
+      - name: Every artifact matches SHA256SUMS
+        run: |
+          set -euo pipefail
+          cd artifacts
+          sha256sum --check --strict SHA256SUMS
+
   # Create the GitHub Release and attach all artifacts
   release:
-    needs: [build, smoke]
+    needs: [build, smoke, checksums]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

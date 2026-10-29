@@ -63,6 +63,17 @@ cp "$binary" "$release/coderex-$target"
 tar czf "$release/coderex-$target.tar.gz" -C "$release" "coderex-$target"
 printf '{"tag_name":"%s"}\n' "$version" > "$tmp/releases/latest"
 
+sha256_of() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | awk '{print $1}'
+    else
+        shasum -a 256 "$1" | awk '{print $1}'
+    fi
+}
+digest=$(sha256_of "$release/coderex-$target.tar.gz")
+printf '%s  %s\n' "$digest" "coderex-$target.tar.gz" > "$release/SHA256SUMS"
+cp "$release/SHA256SUMS" "$tmp/good-sums"
+
 port=$(python3 - <<'PY'
 import socket
 with socket.socket() as sock:
@@ -94,5 +105,26 @@ CODEREX_RELEASE_BASE_URL="$base/releases/download" \
     INSTALL_DIR="$tmp/bin" \
     sh scripts/install.sh >/dev/null
 "$tmp/bin/coderex" --version | grep -qi coderex
+
+echo "== missing checksums"
+rm -f "$tmp/bin/coderex" "$release/SHA256SUMS"
+if CODEREX_RELEASE_BASE_URL="$base/releases/download" \
+    INSTALL_DIR="$tmp/bin" \
+    sh scripts/install.sh "$version" >/dev/null 2>&1; then
+    echo "install.sh installed a release with no SHA256SUMS" >&2
+    exit 1
+fi
+test ! -e "$tmp/bin/coderex"
+
+echo "== checksum mismatch"
+printf '%064d  %s\n' 0 "coderex-$target.tar.gz" > "$release/SHA256SUMS"
+if CODEREX_RELEASE_BASE_URL="$base/releases/download" \
+    INSTALL_DIR="$tmp/bin" \
+    sh scripts/install.sh "$version" >/dev/null 2>&1; then
+    echo "install.sh installed a release with a wrong checksum" >&2
+    exit 1
+fi
+test ! -e "$tmp/bin/coderex"
+cp "$tmp/good-sums" "$release/SHA256SUMS"
 
 echo "install smoke: ok"

@@ -27,7 +27,7 @@ main() → parse_args() → StartupOrchestrator::run()
     Command::Agents       → list available agents
     Command::Auth         → show API provider status
     Command::Doctor       → run diagnostics
-    Command::Update       → check for updates
+    Command::Update       → install the latest release (`--check` only reports)
     Command::Mcp          → manage MCP servers
     Command::Plugin       → manage plugins
     Command::AutoMode     → show auto-mode settings
@@ -109,7 +109,7 @@ main() → parse_args() → StartupOrchestrator::run()
 | `agents [--detailed]` | List available agents |
 | `auth` | Check authentication status |
 | `doctor` | Run diagnostics |
-| `update` | Check for updates |
+| `update [--check]` | Install the latest release, or report whether one exists. See `docs/self-update.md`. |
 | `mcp list` | List configured MCP servers |
 | `mcp add NAME COMMAND` | Add an MCP server |
 | `mcp remove NAME` | Remove an MCP server |
@@ -283,7 +283,7 @@ CLI flags are parsed by clap, stored in `SessionContext` during `StartupOrchestr
 - **Crash recovery** — Session state snapshot (`.coderex/recovery.json`) written periodically, restored via `/recover`.
 - **Daemon management** — PID file (`~/.coderex/daemon.pid`) with `serve-stop`/`serve-status` subcommands.
 - **Config hot-reload** — the REPL's `HookFileWatcher` (default `hot-reload` feature) reports the changed settings-file paths and the event kind; the TUI loop and the headless watcher fire the `FileChanged` hook.
-- **Update check** — GitHub Releases API comparison with `CARGO_PKG_VERSION`, 24h cadence, `/update-check` command.
+- **Update check** — GitHub Releases API comparison with `CARGO_PKG_VERSION`, 24h cadence, `/update-check` command. `coderex update` downloads the archive for this platform, verifies it against the release's `SHA256SUMS`, and replaces the binary atomically; `--check` only reports. See `docs/self-update.md`.
 
 ## Implemented Features
 
@@ -304,7 +304,7 @@ CLI flags are parsed by clap, stored in `SessionContext` during `StartupOrchestr
 - Crash recovery: `.coderex/recovery.json` snapshot, `/recover` command.
 - Config hot-reload: `HookFileWatcher` is behind the default `hot-reload` feature (`default = ["core", "hot-reload"]`). The TUI loop fires `FileChanged` from it; a headless run installs its own watcher task and joins it on exit. `coderex-config` no longer ships a watcher of its own — the REPL one is the only consumer.
 - Multi-workspace: `/workspace [path]` switches CWD, validates directory.
-- Update check: non-blocking GitHub release comparison on startup, `/update-check` command.
+- Update check: non-blocking GitHub release comparison on startup, `/update-check` command; `coderex update` installs a verified release.
 - Signal handling: SIGTERM (graceful shutdown, cleanup PID/recovery), SIGHUP (config reload trigger).
 - Auto-dream: background session consolidation (`/auto-dream enable|disable|status`).
 - Team memory sync: cross-repo memory sharing (`/team-memory upsert|read|list|delete|sync`).

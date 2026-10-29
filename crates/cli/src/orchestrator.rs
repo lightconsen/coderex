@@ -903,7 +903,7 @@ impl StartupOrchestrator {
                 crate::cli::Command::Agents { detailed } => self.run_agents(detailed).await,
                 crate::cli::Command::Auth => self.run_auth().await,
                 crate::cli::Command::Doctor => self.run_doctor().await,
-                crate::cli::Command::Update => self.run_update().await,
+                crate::cli::Command::Update { check } => self.run_update(check).await,
                 crate::cli::Command::Mcp { action } => self.run_mcp(action).await,
                 crate::cli::Command::Plugin { action } => self.run_plugin(action).await,
                 crate::cli::Command::AutoMode => self.run_auto_mode().await,
@@ -3308,15 +3308,34 @@ impl StartupOrchestrator {
         Ok(())
     }
 
-    #[allow(clippy::unused_async)]
-    async fn run_update(&self) -> Result<()> {
-        use crate::version;
-        let cwd = std::env::current_dir().unwrap_or_default();
-        match version::check_for_updates().await {
-            Some(msg) => println!("{msg}"),
-            None => println!("CodeRex is up to date."),
+    async fn run_update(&self, check: bool) -> Result<()> {
+        use crate::{self_update, version};
+        let cwd = self.ctx.cwd.clone();
+        let report =
+            match self_update::update(self_update::UpdateOptions { check_only: check }).await {
+                Ok(report) => report,
+                Err(error) => {
+                    eprintln!("Update failed: {error}");
+                    std::process::exit(1);
+                }
+            };
+        match &report.installed {
+            Some(path) => println!(
+                "Updated {} -> {} at {}",
+                report.current,
+                report.latest.as_deref().unwrap_or("the latest release"),
+                path.display()
+            ),
+            None => match &report.latest {
+                Some(latest) if check => println!(
+                    "New version available: {latest} (current: {}). Run `coderex update` to install it.",
+                    report.current
+                ),
+                Some(latest) => println!("CodeRex is up to date ({latest})."),
+                None => println!("CodeRex is up to date."),
+            },
         }
-        version::record_check_time(&cwd);
+        version::record_check_time(std::path::Path::new(&cwd));
         Ok(())
     }
 

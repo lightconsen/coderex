@@ -237,8 +237,12 @@ pub enum Command {
     Auth,
     /// Run diagnostics and report issues.
     Doctor,
-    /// Check for updates.
-    Update,
+    /// Install the latest release, or report whether one exists.
+    Update {
+        /// Report whether a newer release exists without downloading it.
+        #[arg(long)]
+        check: bool,
+    },
     /// Manage MCP servers.
     Mcp {
         #[command(subcommand)]

@@ -59,11 +59,42 @@ fi
 echo "Installing $BINARY $VERSION for $TARGET..."
 
 # Download URL
-URL="$RELEASE_BASE_URL/$VERSION/${BINARY}-${TARGET}.tar.gz"
+ARCHIVE="${BINARY}-${TARGET}.tar.gz"
+URL="$RELEASE_BASE_URL/$VERSION/$ARCHIVE"
 TMPDIR=$(mktemp -d)
 trap 'rm -rf "$TMPDIR"' EXIT
 
+# SHA-256 of a file, whichever tool this machine has.
+sha256_of() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | awk '{print $1}'
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$1" | awk '{print $1}'
+    else
+        openssl dgst -sha256 -r "$1" | awk '{print $1}'
+    fi
+}
+
 curl -fsSL "$URL" -o "$TMPDIR/${BINARY}.tar.gz"
+
+# The release publishes one SHA256SUMS for every asset. A missing file, a
+# missing entry or a mismatch stops the install: an unverified download is a
+# download from whatever answered the request.
+if ! curl -fsSL "$RELEASE_BASE_URL/$VERSION/SHA256SUMS" -o "$TMPDIR/SHA256SUMS"; then
+    echo "Could not download SHA256SUMS for $VERSION; refusing to install an unverified download" >&2
+    exit 1
+fi
+EXPECTED=$(awk -v name="$ARCHIVE" '$2 == name { print $1; exit }' "$TMPDIR/SHA256SUMS")
+if [ -z "$EXPECTED" ]; then
+    echo "SHA256SUMS has no entry for $ARCHIVE; refusing to install" >&2
+    exit 1
+fi
+ACTUAL=$(sha256_of "$TMPDIR/${BINARY}.tar.gz")
+if [ "$ACTUAL" != "$EXPECTED" ]; then
+    echo "Checksum mismatch for $ARCHIVE: expected $EXPECTED, got $ACTUAL" >&2
+    exit 1
+fi
+
 tar xzf "$TMPDIR/${BINARY}.tar.gz" -C "$TMPDIR"
 
 # Install to ~/.local/bin or /usr/local/bin

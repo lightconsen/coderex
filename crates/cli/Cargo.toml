@@ -69,6 +69,12 @@ libc.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 reqwest.workspace = true
+sha2.workspace = true
+hex.workspace = true
+tar.workspace = true
+flate2.workspace = true
+semver.workspace = true
+tempfile.workspace = true
 async-trait.workspace = true
 crossterm.workspace = true
 compact_str.workspace = true

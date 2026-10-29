@@ -21,6 +21,12 @@ async fn main() -> Result<()> {
     // binary with `--internal-wasm-compile`. No sibling helper is required.
     coderex_cli::cli::install_wasm_compiler()?;
 
+    // A Windows update leaves the previous binary behind as `coderex.exe.old`;
+    // it is removed on the next launch, when nothing has it mapped any more.
+    if let Ok(exe) = std::env::current_exe() {
+        coderex_cli::self_update::cleanup_after_update(&exe);
+    }
+
     let args = parse_args();
     let mut orchestrator = orchestrator::StartupOrchestrator::new();
 
