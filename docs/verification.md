@@ -31,7 +31,7 @@ this table is what they check):
 |---|---|
 | `fmt` | `cargo fmt --all --check` |
 | `clippy` | `cargo clippy --workspace --all-targets -- -D warnings` (the backlog is zero, so a warning fails) |
-| `test` | `cargo nextest run --workspace` on Linux; the macOS plist carrier and the Windows runtime sandbox tests run in their own jobs |
+| `test` | `cargo nextest run --workspace --no-fail-fast` on Linux; the macOS plist carrier and the live benchmark replay run in `test-macos`, and the Windows runtime sandbox tests in `test-windows` |
 | `coverage` | `scripts/coverage.sh`; fails below an 85% workspace floor, uploads `coverage-lcov`, and comments the total and delta on pull requests |
 | `doc` | `cargo doc` with `RUSTDOCFLAGS="-D warnings"` |
 | `audit` / `deny` | `cargo audit`, `cargo deny check licenses bans sources` |
