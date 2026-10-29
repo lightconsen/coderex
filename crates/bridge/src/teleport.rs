@@ -125,6 +125,180 @@ pub enum TeleportError {
     /// Invalid token.
     #[error("invalid share token: {0}")]
     InvalidToken(String),
+    /// The rendezvous service refused or could not be reached.
+    #[error("teleport service: {0}")]
+    Service(String),
+}
+
+/// One share as `list` reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShareSummary {
+    /// The token another machine joins with.
+    pub token: String,
+    /// The shared session, when the service knows it (the local directory
+    /// layout encodes only the token).
+    pub session_id: Option<String>,
+    /// When it was shared, when the service reports it.
+    pub created_at: Option<String>,
+}
+
+/// The rendezvous service that lets two machines meet.
+///
+/// Without one, `share_session` writes a snapshot into a local directory and
+/// the token is only meaningful on this machine. With one, the snapshot is
+/// uploaded under a token the service generates, and any machine pointed at
+/// the same service can join it.
+#[derive(Debug, Clone)]
+pub struct TeleportRendezvous {
+    base_url: String,
+    client: reqwest::Client,
+}
+
+impl TeleportRendezvous {
+    /// The environment variable that configures a rendezvous service.
+    pub const ENV: &'static str = "CODEREX_TELEPORT_URL";
+
+    /// Point at a rendezvous service.
+    #[must_use]
+    pub fn new(base_url: impl Into<String>) -> Self {
+        Self {
+            base_url: base_url.into().trim_end_matches('/').to_string(),
+            client: reqwest::Client::new(),
+        }
+    }
+
+    /// The service configured in [`Self::ENV`], when one is.
+    #[must_use]
+    pub fn from_env() -> Option<Self> {
+        std::env::var(Self::ENV)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .map(Self::new)
+    }
+
+    /// The service's base URL.
+    #[must_use]
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
+    fn shares_url(&self) -> String {
+        format!("{}/teleport/shares", self.base_url)
+    }
+
+    /// Upload a snapshot and return the token the service assigned.
+    pub async fn share(&self, snapshot: &TeleportSnapshot) -> Result<String, TeleportError> {
+        let body = serde_json::json!({ "snapshot": snapshot });
+        let response = self
+            .client
+            .post(self.shares_url())
+            .json(&body)
+            .send()
+            .await
+            .map_err(|error| TeleportError::Service(error.to_string()))?;
+        let status = response.status();
+        let value: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|error| TeleportError::Service(error.to_string()))?;
+        if !status.is_success() {
+            return Err(TeleportError::Service(format!(
+                "sharing failed ({status}): {}",
+                value
+                    .get("error")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("no reason given")
+            )));
+        }
+        value
+            .get("token")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| TeleportError::Service("the service returned no token".to_string()))
+    }
+
+    /// Fetch the snapshot behind `token`.
+    pub async fn join(&self, token: &str) -> Result<TeleportSnapshot, TeleportError> {
+        let response = self
+            .client
+            .get(format!("{}/{token}", self.shares_url()))
+            .send()
+            .await
+            .map_err(|error| TeleportError::Service(error.to_string()))?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Err(TeleportError::SessionNotFound(token.to_string()));
+        }
+        if !response.status().is_success() {
+            return Err(TeleportError::Service(format!(
+                "joining failed ({})",
+                response.status()
+            )));
+        }
+        response
+            .json::<TeleportSnapshot>()
+            .await
+            .map_err(|error| TeleportError::Deserialize(error.to_string()))
+    }
+
+    /// The shares the service is holding.
+    pub async fn list(&self) -> Result<Vec<ShareSummary>, TeleportError> {
+        #[derive(serde::Deserialize)]
+        struct Entry {
+            token: String,
+            #[serde(default)]
+            session_id: Option<String>,
+            #[serde(default)]
+            created_at: Option<String>,
+        }
+        #[derive(serde::Deserialize)]
+        struct Listing {
+            #[serde(default)]
+            shares: Vec<Entry>,
+        }
+        let response = self
+            .client
+            .get(self.shares_url())
+            .send()
+            .await
+            .map_err(|error| TeleportError::Service(error.to_string()))?;
+        if !response.status().is_success() {
+            return Err(TeleportError::Service(format!(
+                "listing failed ({})",
+                response.status()
+            )));
+        }
+        let listing: Listing = response
+            .json()
+            .await
+            .map_err(|error| TeleportError::Deserialize(error.to_string()))?;
+        Ok(listing
+            .shares
+            .into_iter()
+            .map(|entry| ShareSummary {
+                token: entry.token,
+                session_id: entry.session_id,
+                created_at: entry.created_at,
+            })
+            .collect())
+    }
+
+    /// Revoke a share. `false` means the service did not have it.
+    pub async fn revoke(&self, token: &str) -> Result<bool, TeleportError> {
+        let response = self
+            .client
+            .delete(format!("{}/{token}", self.shares_url()))
+            .send()
+            .await
+            .map_err(|error| TeleportError::Service(error.to_string()))?;
+        match response.status() {
+            status if status.is_success() => Ok(true),
+            reqwest::StatusCode::NOT_FOUND => Ok(false),
+            status => Err(TeleportError::Service(format!(
+                "revoking failed ({status})"
+            ))),
+        }
+    }
 }
 
 /// Manager for session teleportation and sharing.
@@ -132,6 +306,8 @@ pub enum TeleportError {
 pub struct TeleportManager {
     /// Base directory for shared session storage.
     share_base: PathBuf,
+    /// The service to use instead of the local directory, when configured.
+    rendezvous: Option<TeleportRendezvous>,
 }
 
 impl TeleportManager {
@@ -143,13 +319,88 @@ impl TeleportManager {
             .join(".coderex")
             .join("teleport")
             .join("shared");
-        Self { share_base }
+        Self {
+            share_base,
+            rendezvous: None,
+        }
     }
 
     /// Create a manager with a custom share base.
     #[must_use]
     pub const fn with_share_base(share_base: PathBuf) -> Self {
-        Self { share_base }
+        Self {
+            share_base,
+            rendezvous: None,
+        }
+    }
+
+    /// Use a rendezvous service for share/join/list/revoke.
+    #[must_use]
+    pub fn with_rendezvous(mut self, rendezvous: TeleportRendezvous) -> Self {
+        self.rendezvous = Some(rendezvous);
+        self
+    }
+
+    /// A manager configured from the environment: a rendezvous service when
+    /// [`TeleportRendezvous::ENV`] is set, the local directory otherwise.
+    #[must_use]
+    pub fn from_env() -> Self {
+        match TeleportRendezvous::from_env() {
+            Some(rendezvous) => Self::new().with_rendezvous(rendezvous),
+            None => Self::new(),
+        }
+    }
+
+    /// The rendezvous service in use, when there is one.
+    #[must_use]
+    pub const fn rendezvous(&self) -> Option<&TeleportRendezvous> {
+        self.rendezvous.as_ref()
+    }
+
+    /// Share a session: through the rendezvous service when one is configured,
+    /// into the local directory otherwise.
+    pub async fn share(&self, state: &SessionState) -> Result<String, TeleportError> {
+        match &self.rendezvous {
+            Some(rendezvous) => {
+                rendezvous
+                    .share(&TeleportSnapshot::from_session(state))
+                    .await
+            }
+            None => self.share_session(state),
+        }
+    }
+
+    /// Join a shared session: through the rendezvous service when one is
+    /// configured, from the local directory otherwise.
+    pub async fn join(&self, token: &str) -> Result<SessionState, TeleportError> {
+        match &self.rendezvous {
+            Some(rendezvous) => Ok(rendezvous.join(token).await?.to_session_state()),
+            None => self.join_session(token),
+        }
+    }
+
+    /// The live shares, from the service or the local directory.
+    pub async fn list(&self) -> Result<Vec<ShareSummary>, TeleportError> {
+        match &self.rendezvous {
+            Some(rendezvous) => rendezvous.list().await,
+            None => Ok(self
+                .list_shares()
+                .into_iter()
+                .map(|token| ShareSummary {
+                    token,
+                    session_id: None,
+                    created_at: None,
+                })
+                .collect()),
+        }
+    }
+
+    /// Revoke a share, from the service or the local directory.
+    pub async fn revoke(&self, token: &str) -> Result<bool, TeleportError> {
+        match &self.rendezvous {
+            Some(rendezvous) => rendezvous.revoke(token).await,
+            None => self.revoke_share(token),
+        }
     }
 
     /// Path to the teleport state file inside a directory.

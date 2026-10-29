@@ -2593,7 +2593,7 @@ impl ReplLoop {
             pending_mcp_form: None,
             confirmation_bus: None,
             cron_rx: None,
-            teleport_manager: Some(coderex_bridge::teleport::TeleportManager::new()),
+            teleport_manager: Some(coderex_bridge::teleport::TeleportManager::from_env()),
             #[cfg(feature = "hot-reload")]
             config_watcher: None,
             #[cfg(feature = "hot-reload")]
@@ -2998,7 +2998,7 @@ impl ReplLoop {
             pending_mcp_form: None,
             confirmation_bus: Some(confirmation_bus),
             cron_rx: Some(cron_rx),
-            teleport_manager: Some(coderex_bridge::teleport::TeleportManager::new()),
+            teleport_manager: Some(coderex_bridge::teleport::TeleportManager::from_env()),
             #[cfg(feature = "hot-reload")]
             config_watcher,
             #[cfg(feature = "hot-reload")]
@@ -9184,7 +9184,7 @@ impl ReplLoop {
                     return Ok(());
                 }
                 "teleport" => {
-                    let msg = self.handle_teleport_command(&args);
+                    let msg = self.handle_teleport_command(&args).await;
                     writeln!(stdout, "{msg}")?;
                     return Ok(());
                 }
@@ -9795,7 +9795,11 @@ impl ReplLoop {
     }
 
     /// Handle the /teleport command: directory switching, share, join, list, revoke.
-    fn handle_teleport_command(&mut self, args: &[String]) -> String {
+    ///
+    /// Share/join/list/revoke go through the configured rendezvous service when
+    /// `CODEREX_TELEPORT_URL` names one, and through the local share directory
+    /// otherwise.
+    async fn handle_teleport_command(&mut self, args: &[String]) -> String {
         let mgr = match self.teleport_manager {
             Some(ref mgr) => mgr.clone(),
             None => return "Teleport manager not initialized.".into(),
@@ -9807,21 +9811,28 @@ impl ReplLoop {
 
         match args[0].as_str() {
             "--share" => {
-                let session = self.engine.as_ref().map(|e| e.session().clone());
-                session.map_or_else(
-                    || "No active session to share.".into(),
-                    |session| match mgr.share_session(&session) {
-                        Ok(token) => format!("Share token: {token}"),
-                        Err(e) => format!("Failed to share session: {e}"),
+                let Some(session) = self.engine.as_ref().map(|e| e.session().clone()) else {
+                    return "No active session to share.".into();
+                };
+                match mgr.share(&session).await {
+                    Ok(token) => match mgr.rendezvous() {
+                        Some(rendezvous) => {
+                            format!(
+                                "Share token: {token}\nJoin it from another machine with: \n  CODEREX_TELEPORT_URL={} coderex, then /teleport --join {token}",
+                                rendezvous.base_url()
+                            )
+                        }
+                        None => format!("Share token: {token}"),
                     },
-                )
+                    Err(e) => format!("Failed to share session: {e}"),
+                }
             }
             "--join" => {
                 if args.len() < 2 {
                     return "Usage: /teleport --join <token>".into();
                 }
                 let token = &args[1];
-                match mgr.join_session(token) {
+                match mgr.join(token).await {
                     Ok(state) => {
                         let new_cwd = state.cwd.to_string_lossy().to_string();
                         self.cwd.clone_from(&new_cwd);
@@ -9834,20 +9845,26 @@ impl ReplLoop {
                     Err(e) => format!("Failed to join session: {e}"),
                 }
             }
-            "--list" => {
-                let shares = mgr.list_shares();
-                if shares.is_empty() {
-                    "No active shares.".into()
-                } else {
-                    format!("Active shares: {}", shares.join(", "))
+            "--list" => match mgr.list().await {
+                Ok(shares) if shares.is_empty() => "No active shares.".into(),
+                Ok(shares) => {
+                    let listed: Vec<String> = shares
+                        .iter()
+                        .map(|share| match &share.session_id {
+                            Some(session) => format!("{} ({session})", share.token),
+                            None => share.token.clone(),
+                        })
+                        .collect();
+                    format!("Active shares: {}", listed.join(", "))
                 }
-            }
+                Err(e) => format!("Failed to list shares: {e}"),
+            },
             "--revoke" => {
                 if args.len() < 2 {
                     return "Usage: /teleport --revoke <token>".into();
                 }
                 let token = &args[1];
-                match mgr.revoke_share(token) {
+                match mgr.revoke(token).await {
                     Ok(true) => format!("Revoked share: {token}"),
                     Ok(false) => format!("Share not found: {token}"),
                     Err(e) => format!("Failed to revoke share: {e}"),
