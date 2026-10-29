@@ -183,13 +183,18 @@ fn the_sandbox_denies_network_access_for_shell_commands() {
         !tool_result.contains("Example Domain"),
         "the sandbox let the network request through: {tool_result}"
     );
+    // No fetched content plus a failed curl is the assertion. The exact exit
+    // depends on where the sandbox stops the request: the resolver (6), the
+    // connect (7), or libcurl reporting the denied syscall as a bad argument
+    // (43) when bubblewrap's namespace is in force.
     assert!(
         tool_result.contains("Operation not permitted")
             || tool_result.contains("Could not resolve")
             || tool_result.contains("Network is unreachable")
             || tool_result.contains("Connection refused")
             || tool_result.contains("[Exit code: 6]")
-            || tool_result.contains("[Exit code: 7]"),
+            || tool_result.contains("[Exit code: 7]")
+            || tool_result.contains("[Exit code: 43]"),
         "unexpected network result: {tool_result}"
     );
 }

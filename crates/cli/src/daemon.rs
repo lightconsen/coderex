@@ -61,7 +61,7 @@ pub fn is_process_running(pid: u32) -> bool {
 }
 
 #[cfg(not(unix))]
-pub fn is_process_running(_pid: u32) -> bool {
+pub const fn is_process_running(_pid: u32) -> bool {
     // On Windows, no reliable way without WinAPI; assume running if file exists
     true
 }
@@ -90,7 +90,7 @@ pub fn stop_daemon() -> Result<String, String> {
 
     #[cfg(not(unix))]
     {
-        return Err("Stopping daemon is only supported on Unix systems".to_string());
+        Err("Stopping daemon is only supported on Unix systems".to_string())
     }
 
     #[cfg(unix)]

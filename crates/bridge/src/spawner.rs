@@ -199,6 +199,7 @@ impl BridgeSessionSpawner {
     /// the bridge (and the whole workspace) compiling and buildable on
     /// Windows while making the unsupported transport explicit.
     #[cfg(not(unix))]
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)] // mirrors the Unix signature
     async fn spawn_ssh(
         &self,
         _config: SpawnConfig,

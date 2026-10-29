@@ -573,7 +573,7 @@ mod windows_acl {
             )
         };
         if status != ERROR_SUCCESS {
-            return Err(io::Error::from_raw_os_error(status as i32));
+            return Err(io::Error::from_raw_os_error(status.cast_signed()));
         }
 
         verify(&wide, sid)
@@ -587,7 +587,7 @@ mod windows_acl {
         // SAFETY: pseudo-handle for the current process; the returned token
         // handle is closed below on every path.
         let mut token = std::ptr::null_mut();
-        if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+        if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw mut token) } == 0 {
             return Err(io::Error::last_os_error());
         }
         let result = (|| {
@@ -595,7 +595,7 @@ mod windows_acl {
             // The first call is expected to fail with ERROR_INSUFFICIENT_BUFFER
             // and report the required size.
             unsafe {
-                GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut needed);
+                GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &raw mut needed);
             }
             if needed == 0 {
                 return Err(io::Error::last_os_error());
@@ -608,7 +608,7 @@ mod windows_acl {
                     TokenUser,
                     buffer.as_mut_ptr().cast(),
                     needed,
-                    &mut needed,
+                    &raw mut needed,
                 )
             };
             if ok == 0 {
@@ -630,7 +630,7 @@ mod windows_acl {
     ///
     /// `buffer` must contain a `TOKEN_USER` at offset zero and stay alive for
     /// as long as the returned pointer is used.
-    unsafe fn sid_from_token_buffer(buffer: &[u64]) -> PSID {
+    const unsafe fn sid_from_token_buffer(buffer: &[u64]) -> PSID {
         let token_user = unsafe { &*buffer.as_ptr().cast::<TOKEN_USER>() };
         token_user.User.Sid
     }
@@ -648,13 +648,13 @@ mod windows_acl {
                 DACL_SECURITY_INFORMATION,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
-                &mut dacl,
+                &raw mut dacl,
                 std::ptr::null_mut(),
-                &mut descriptor,
+                &raw mut descriptor,
             )
         };
         if status != ERROR_SUCCESS {
-            return Err(io::Error::from_raw_os_error(status as i32));
+            return Err(io::Error::from_raw_os_error(status.cast_signed()));
         }
         // SAFETY: `dacl` points into `descriptor` and is non-NULL on success.
         let verified = !dacl.is_null() && unsafe { dacl_grants_only(dacl, expected_sid) };
@@ -678,6 +678,8 @@ mod windows_acl {
     ///
     /// `dacl` must be a valid ACL and `expected_sid` a valid SID.
     unsafe fn dacl_grants_only(dacl: *const ACL, expected_sid: PSID) -> bool {
+        // `ACCESS_ALLOWED_ACE_TYPE` is 0; compare the byte-sized field.
+        const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
         let mut info: ACL_SIZE_INFORMATION = unsafe { std::mem::zeroed() };
         let ok = unsafe {
             GetAclInformation(
@@ -692,12 +694,10 @@ mod windows_acl {
         }
 
         let mut ace: *mut core::ffi::c_void = std::ptr::null_mut();
-        if unsafe { GetAce(dacl, 0, &mut ace) } == 0 || ace.is_null() {
+        if unsafe { GetAce(dacl, 0, &raw mut ace) } == 0 || ace.is_null() {
             return false;
         }
         let ace = unsafe { &*ace.cast::<ACCESS_ALLOWED_ACE>() };
-        // `ACCESS_ALLOWED_ACE_TYPE` is 0; compare the byte-sized field.
-        const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
         if ace.Header.AceType != ACCESS_ALLOWED_ACE_TYPE {
             return false;
         }

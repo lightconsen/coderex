@@ -855,7 +855,7 @@ fn select_tools(prompt: &str) -> Vec<Tool> {
         }]
     } else if p.contains("try a network request") {
         vec![Tool::Bash {
-            command: "curl -s --max-time 5 https://example.com".into(),
+            command: "curl -sS --max-time 5 https://example.com".into(),
         }]
     } else if p.contains("run a command with sudo") {
         // The trailing command runs whether or not `sudo -n` succeeds, so a

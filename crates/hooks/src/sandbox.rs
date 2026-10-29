@@ -158,6 +158,9 @@ pub fn enforce(plan: SandboxPlan, gating: bool) -> Result<Option<SandboxHandle>,
 /// capability, but the wrapper still has to be present: a missing
 /// `sandbox-exec` or `bwrap` would otherwise turn every hook into a spawn
 /// failure rather than a clear policy decision.
+// Windows has no wrapper to look for, so this cannot fail there; the
+// signature is shared with the platforms that check for one.
+#[allow(clippy::missing_const_for_fn, clippy::unnecessary_wraps)]
 fn confinement_availability() -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
@@ -347,15 +350,16 @@ pub fn sandboxed_command(command: &str, sandbox: Option<&SandboxHandle>) -> Comm
     {
         use std::os::windows::process::CommandExt as _;
 
-        let shell = std::env::var_os("COMSPEC")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| {
+        let shell = std::env::var_os("COMSPEC").map_or_else(
+            || {
                 std::path::PathBuf::from(
                     std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into()),
                 )
                 .join("System32")
                 .join("cmd.exe")
-            });
+            },
+            std::path::PathBuf::from,
+        );
         let mut direct = Command::new(shell);
         direct.args(["/D", "/S", "/C"]);
         // `raw_arg`, not `arg`: Rust would quote the command and escape its
@@ -364,7 +368,7 @@ pub fn sandboxed_command(command: &str, sandbox: Option<&SandboxHandle>) -> Comm
         // "The filename, directory name, or volume label syntax is incorrect".
         // cmd must receive the command text verbatim and parse it itself.
         direct.as_std_mut().raw_arg(command);
-        return direct;
+        direct
     }
 
     #[cfg(not(target_os = "windows"))]
@@ -417,6 +421,7 @@ fn path_exec_dirs() -> Vec<PathBuf> {
 }
 
 /// Common locations a hook may execute programs from.
+#[allow(clippy::missing_const_for_fn)] // the macOS/Linux arms build non-const values
 fn system_exec_paths() -> Vec<PathBuf> {
     #[cfg(target_os = "macos")]
     {
@@ -543,6 +548,7 @@ impl HookSandboxConfig {
 ///
 /// On Linux a cgroup with `memory.max` is applied after spawn in addition to
 /// these limits — see [`prepare_cgroup_limits`] and [`attach_cgroup_limits`].
+#[allow(clippy::missing_const_for_fn)] // the unix body calls non-const helpers
 pub fn apply_resource_limits(command: &mut Command, config: &HookConfig) {
     #[cfg(unix)]
     {
@@ -711,7 +717,8 @@ pub fn attach_cgroup_limits(
 /// Any failure terminates the child. A gating hook that cannot be confined is
 /// a refusal, not a hook that runs unconfined.
 #[cfg(target_os = "windows")]
-pub(crate) async fn finish_windows_spawn(
+#[allow(clippy::unused_async)] // awaited by one caller for every platform
+pub async fn finish_windows_spawn(
     sandbox: Option<&coderex_core::sandbox::SandboxHandle>,
     child: &mut tokio::process::Child,
 ) -> Result<(), crate::HookError> {

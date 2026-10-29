@@ -383,6 +383,7 @@ fn ensure_crash_columns(conn: &Connection) -> Result<(), TelemetryError> {
 }
 
 /// Restrict the database and its SQLite sidecars to the current user.
+#[allow(clippy::missing_const_for_fn)] // the unix body performs I/O, so it cannot be const there
 fn restrict_db_permissions(path: &Path) {
     #[cfg(unix)]
     {

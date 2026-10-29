@@ -214,6 +214,9 @@ fn create_with(
 /// macOS the wrapper program has to exist. Windows always reports available and
 /// lets [`SandboxHandle::create`] fail closed when the AppContainer runtime is
 /// missing, which keeps that decision in one place.
+// Windows has no wrapper to look for, so this cannot fail there; the
+// signature is shared with the platforms that check for one.
+#[allow(clippy::missing_const_for_fn, clippy::unnecessary_wraps)]
 fn confinement_availability() -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
@@ -317,9 +320,8 @@ fn platform_covers(path: &Path) -> bool {
         if roots.into_iter().any(|root| path.starts_with(root)) {
             return true;
         }
-        return std::env::var_os("PATH").is_some_and(|entries| {
-            std::env::split_paths(&entries).any(|dir| path.starts_with(dir))
-        });
+        std::env::var_os("PATH")
+            .is_some_and(|entries| std::env::split_paths(&entries).any(|dir| path.starts_with(dir)))
     }
     #[cfg(not(target_os = "windows"))]
     {

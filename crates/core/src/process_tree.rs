@@ -438,7 +438,7 @@ mod imp {
             if let Some(cpu) = limits.max_cpu_seconds {
                 // 100-nanosecond ticks; the field is an `i64` rather than a
                 // `LARGE_INTEGER` in windows-sys.
-                basic.PerJobUserTimeLimit = (cpu * 10_000_000) as i64;
+                basic.PerJobUserTimeLimit = (cpu * 10_000_000).cast_signed();
                 flags |= JOB_OBJECT_LIMIT_JOB_TIME;
             }
             if limits.max_memory_bytes.is_some() {

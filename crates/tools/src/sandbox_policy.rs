@@ -65,6 +65,7 @@ pub fn default_sandbox_config(
 
 /// Common system executable paths allowed in sandboxed shells.
 #[must_use]
+#[allow(clippy::missing_const_for_fn)] // the macOS/Linux arms build non-const values
 fn system_exec_paths() -> Vec<std::path::PathBuf> {
     #[cfg(target_os = "macos")]
     {

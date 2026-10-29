@@ -1155,6 +1155,12 @@ fn benchmark_scenario_manifest_matches_hard_assert_suite() {
     }
 }
 
+/// macOS only: the recorded session repairs the fixture with BSD
+/// `sed -i '' 's/my_crate::/bench_fixture::/g'`, which GNU sed reads as a
+/// script argument (so the file is left broken when the recording is replayed
+/// on Linux). Replaying it elsewhere would test the recording's platform, not
+/// the agent, so the case runs where it was recorded.
+#[cfg(target_os = "macos")]
 #[test]
 fn live_hard_assert_generates_code_that_compiles_and_passes_tests() {
     let dir = tempfile::tempdir().expect("tempdir");

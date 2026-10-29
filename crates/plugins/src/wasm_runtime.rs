@@ -543,10 +543,10 @@ fn user_cache_root() -> Option<PathBuf> {
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
-        if let Some(xdg) = std::env::var_os("XDG_CACHE_HOME") {
-            if !xdg.is_empty() {
-                return Some(PathBuf::from(xdg).join("coderex"));
-            }
+        if let Some(xdg) = std::env::var_os("XDG_CACHE_HOME")
+            && !xdg.is_empty()
+        {
+            return Some(PathBuf::from(xdg).join("coderex"));
         }
         if let Some(home) = home::home_dir() {
             return Some(home.join(".cache/coderex"));
@@ -591,15 +591,15 @@ fn staging_root(cache_root: &std::path::Path) -> PathBuf {
             std::fs::canonicalize(cache_root).unwrap_or_else(|_| cache_root.to_path_buf());
         let system_temp =
             std::fs::canonicalize(std::env::temp_dir()).unwrap_or_else(|_| std::env::temp_dir());
-        if resolved.starts_with(&system_temp) {
-            if let Some(root) = user_cache_root() {
-                let fallback = root.join("wasm-staging");
-                // Only relocate to a root that actually exists after creating
-                // it; a read-only or missing home keeps the old behaviour
-                // rather than failing the compilation.
-                if std::fs::create_dir_all(&fallback).is_ok() {
-                    return fallback;
-                }
+        if resolved.starts_with(&system_temp)
+            && let Some(root) = user_cache_root()
+        {
+            let fallback = root.join("wasm-staging");
+            // Only relocate to a root that actually exists after creating it;
+            // a read-only or missing home keeps the old behaviour rather than
+            // failing the compilation.
+            if std::fs::create_dir_all(&fallback).is_ok() {
+                return fallback;
             }
         }
     }
@@ -725,10 +725,10 @@ fn config_root() -> Option<PathBuf> {
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
-        if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
-            if !xdg.is_empty() {
-                return Some(PathBuf::from(xdg).join("coderex"));
-            }
+        if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME")
+            && !xdg.is_empty()
+        {
+            return Some(PathBuf::from(xdg).join("coderex"));
         }
         if let Some(home) = home::home_dir() {
             return Some(home.join(".config/coderex"));
@@ -1325,10 +1325,10 @@ fn run_compile_helper(
             "CODEREX_WASM_COMPILE_TEST_COUNT_FILE",
             "CODEREX_WASM_COMPILE_TEST_CHILD_PID_FILE",
         ] {
-            if let Some(path) = std::env::var_os(key) {
-                if let Some(parent) = std::path::Path::new(&path).parent() {
-                    write.push(parent.to_path_buf());
-                }
+            if let Some(path) = std::env::var_os(key)
+                && let Some(parent) = std::path::Path::new(&path).parent()
+            {
+                write.push(parent.to_path_buf());
             }
         }
 
@@ -1336,7 +1336,7 @@ fn run_compile_helper(
             allowed_read_paths: read,
             allowed_write_paths: write,
             allowed_exec_paths: exec,
-            additional_working_dirs: vec![work_dir.clone()],
+            additional_working_dirs: vec![work_dir],
             max_open_files: None,
             max_memory_bytes: Some(WASM_COMPILE_MEMORY_BYTES),
             max_cpu_seconds: Some(WASM_COMPILE_CPU_SECONDS),
@@ -1476,6 +1476,14 @@ fn wrap_with_bubblewrap(
     work_dir: &std::path::Path,
 ) -> bool {
     use coderex_core::sandbox::{SandboxConfig, bubblewrap_program};
+
+    // Test hook, matching the macOS wrapper: the scoping test runs a shell
+    // script that writes into the test's own directory, which is outside the
+    // sandbox's writable set (and under the `/tmp` tmpfs bubblewrap installs).
+    #[cfg(debug_assertions)]
+    if std::env::var_os("CODEREX_WASM_COMPILE_TEST_NO_SANDBOX").is_some() {
+        return false;
+    }
 
     // `bubblewrap_args` replaces `/tmp` with a fresh tmpfs. A staging
     // directory under `/tmp` would then resolve inside that empty tmpfs and
@@ -1625,6 +1633,12 @@ fn wrap_with_landlock(
 ) -> Option<coderex_core::sandbox::LandlockRuleset> {
     use coderex_core::sandbox::{landlock_restrict, landlock_ruleset};
     use std::os::unix::process::CommandExt;
+
+    // Test hook, as in `wrap_with_bubblewrap`.
+    #[cfg(debug_assertions)]
+    if std::env::var_os("CODEREX_WASM_COMPILE_TEST_NO_SANDBOX").is_some() {
+        return None;
+    }
 
     let config = compile_sandbox_config(work_dir, compiler);
     let Some(ruleset) = landlock_ruleset(&config) else {

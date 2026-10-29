@@ -1594,7 +1594,7 @@ impl PlatformSandbox {
     fn post_spawn_raw(&self, handle: std::os::windows::io::RawHandle) -> Result<(), SandboxError> {
         match self {
             Self::Windows(s) => s.post_spawn_raw(handle),
-            _ => Ok(()),
+            Self::Unsupported => Ok(()),
         }
     }
 
@@ -1612,6 +1612,7 @@ impl PlatformSandbox {
         }
     }
 
+    #[allow(clippy::missing_const_for_fn)] // const on Windows only; macOS arms call non-const fns
     fn sandboxed_program(&self) -> Option<(&str, Vec<String>)> {
         match self {
             #[cfg(target_os = "macos")]
@@ -2903,6 +2904,11 @@ mod windows_impl {
 
         /// Ask `std::process::Command` to stop the child before its first
         /// instruction, so the AppContainer token can be attached.
+        ///
+        /// The signature is the common backend one: the Windows path cannot
+        /// fail, but the other backends' `prepare` can and the caller handles
+        /// one shape.
+        #[allow(clippy::unnecessary_wraps)]
         pub fn prepare(&self, cmd: &mut std::process::Command) -> Result<(), SandboxError> {
             if self.container.is_some() {
                 cmd.creation_flags(CREATE_SUSPENDED);
@@ -2969,10 +2975,10 @@ mod windows_impl {
 
         /// Resume a child whose token was replaced by [`Self::attach_container`].
         fn resume_child(&self, handle: HANDLE) -> Result<(), SandboxError> {
-            let Some(container) = &self.container else {
+            if self.container.is_none() {
                 return Ok(());
-            };
-            if let Err(error) = container.resume(handle) {
+            }
+            if let Err(error) = AppContainer::resume(handle) {
                 unsafe { TerminateProcess(handle, 1) };
                 return Err(error);
             }
@@ -3016,8 +3022,7 @@ mod windows_impl {
     fn create_private_temp_dir() -> Result<Option<PathBuf>, SandboxError> {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let base = std::env::var_os("LOCALAPPDATA")
-            .map(PathBuf::from)
-            .unwrap_or_else(std::env::temp_dir)
+            .map_or_else(std::env::temp_dir, PathBuf::from)
             .join("coderex")
             .join("sandbox-tmp");
         let unique = format!(

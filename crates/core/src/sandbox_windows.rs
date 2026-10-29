@@ -489,7 +489,7 @@ mod imp {
     /// API (`kernelbase!CreateAppContainerToken`) have to be present. The
     /// answer is cached; it cannot change within a process.
     #[must_use]
-    pub(crate) fn app_container_available() -> bool {
+    pub fn app_container_available() -> bool {
         *AVAILABLE.get_or_init(|| {
             let userenv = load_module("userenv.dll");
             let kernelbase = load_module("kernelbase.dll");
@@ -527,7 +527,7 @@ mod imp {
     }
 
     /// A live AppContainer profile and its SID.
-    pub(crate) struct AppContainer {
+    pub struct AppContainer {
         /// The stable profile name. The two profiles (network and no network)
         /// have different SIDs, so ACL grants have to be keyed by this and not
         /// just by path.
@@ -538,6 +538,7 @@ mod imp {
 
     // SAFETY: the SID is allocated by the OS and only read/owned by this
     // handle; moving the handle between threads does not create aliasing.
+    #[allow(clippy::non_send_fields_in_send_ty)] // the raw SID is the reason the impl is manual
     unsafe impl Send for AppContainer {}
     // SAFETY: as above; the ACL/profile APIs are called with a stable SID.
     unsafe impl Sync for AppContainer {}
@@ -572,7 +573,7 @@ mod imp {
                         WinCapabilityInternetClientSid,
                         ptr::null_mut(),
                         buffer.as_mut_ptr().cast(),
-                        &mut size,
+                        &raw mut size,
                     )
                 };
                 if ok == 0 {
@@ -591,7 +592,7 @@ mod imp {
             })
         }
 
-        fn as_ptr(&self) -> *const SID_AND_ATTRIBUTES {
+        const fn as_ptr(&self) -> *const SID_AND_ATTRIBUTES {
             if self.attributes.is_empty() {
                 ptr::null()
             } else {
@@ -660,18 +661,21 @@ mod imp {
                         description_wide.as_ptr(),
                         capabilities.as_ptr(),
                         capabilities.len(),
-                        &mut sid,
+                        &raw mut sid,
                     )
                 };
                 if hr < 0 {
                     // The profile from an earlier CodeRex process is reused,
                     // which is exactly what the stable DACL design needs.
                     let derived = unsafe {
-                        DeriveAppContainerSidFromAppContainerName(profile_wide.as_ptr(), &mut sid)
+                        DeriveAppContainerSidFromAppContainerName(
+                            profile_wide.as_ptr(),
+                            &raw mut sid,
+                        )
                     };
                     if derived < 0 {
-                        let already = (hr as u32 & 0xffff_0000) == 0x8007_0000
-                            && (hr as u32 & 0xffff) == ERROR_ALREADY_EXISTS;
+                        let already = (hr.cast_unsigned() & 0xffff_0000) == 0x8007_0000
+                            && (hr.cast_unsigned() & 0xffff) == ERROR_ALREADY_EXISTS;
                         let detail = if already {
                             format!(
                                 "DeriveAppContainerSidFromAppContainerName failed: 0x{derived:08X}"
@@ -732,7 +736,7 @@ mod imp {
             let applied = GRANTED_ROOTS.get_or_init(|| Mutex::new(Vec::new()));
             let mut applied = applied
                 .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
 
             for grant in &plan {
                 // Keyed by profile: the two stable profiles have different
@@ -839,7 +843,7 @@ mod imp {
                 OpenProcessToken(
                     GetCurrentProcess(),
                     TOKEN_DUPLICATE | TOKEN_QUERY,
-                    &mut base_token,
+                    &raw mut base_token,
                 )
             };
             if ok == 0 {
@@ -850,7 +854,7 @@ mod imp {
             let mut token: HANDLE = ptr::null_mut();
             // SAFETY: the base token is valid and `capabilities` (including the
             // SID and capability buffers) outlives the call.
-            let hr = unsafe { create_token(base_token, &capabilities, &mut token) };
+            let hr = unsafe { create_token(base_token, &raw const capabilities, &raw mut token) };
             unsafe { CloseHandle(base_token) };
             // `CreateAppContainerToken` returns an HRESULT: zero is success.
             if hr < 0 {
@@ -884,7 +888,7 @@ mod imp {
         }
 
         /// Resume a child suspended by `CREATE_SUSPENDED`.
-        pub(crate) fn resume(&self, process: HANDLE) -> Result<(), SandboxError> {
+        pub(crate) fn resume(process: HANDLE) -> Result<(), SandboxError> {
             // SAFETY: `process` is a live process handle owned by the caller.
             let status = unsafe { NtResumeProcess(process) };
             if status < 0 {
@@ -927,14 +931,14 @@ mod imp {
             // Size the attribute list, then allocate and initialize it.
             let mut size = 0usize;
             unsafe {
-                InitializeProcThreadAttributeList(ptr::null_mut(), 1, 0, &mut size);
+                InitializeProcThreadAttributeList(ptr::null_mut(), 1, 0, &raw mut size);
             }
             if size == 0 {
                 return Err(last_error("InitializeProcThreadAttributeList(size)"));
             }
             let mut buffer = vec![0u8; size];
             let list: LPPROC_THREAD_ATTRIBUTE_LIST = buffer.as_mut_ptr().cast();
-            let ok = unsafe { InitializeProcThreadAttributeList(list, 1, 0, &mut size) };
+            let ok = unsafe { InitializeProcThreadAttributeList(list, 1, 0, &raw mut size) };
             if ok == 0 {
                 return Err(last_error("InitializeProcThreadAttributeList"));
             }
@@ -984,9 +988,9 @@ mod imp {
                     0,
                     EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
                     ptr::null(),
-                    cwd_wide.as_ref().map_or(ptr::null(), |wide| wide.as_ptr()),
-                    &startup.StartupInfo,
-                    &mut process_info,
+                    cwd_wide.as_ref().map_or(ptr::null(), std::vec::Vec::as_ptr),
+                    &raw const startup.StartupInfo,
+                    &raw mut process_info,
                 )
             };
             unsafe { DeleteProcThreadAttributeList(list) };
@@ -1003,7 +1007,7 @@ mod imp {
         /// The profile SID, for the Windows test and diagnostics.
         #[must_use]
         #[allow(dead_code)] // test-only: read by the Windows confinement tests
-        pub(crate) fn sid(&self) -> PSID {
+        pub(crate) const fn sid(&self) -> PSID {
             self.sid
         }
     }
@@ -1020,7 +1024,7 @@ mod imp {
 
     /// A process started by the test-only [`AppContainer::spawn`] path.
     #[allow(dead_code)] // test-only: constructed only by `spawn`
-    pub(crate) struct ContainedChild {
+    pub struct ContainedChild {
         process: HANDLE,
         thread: HANDLE,
     }
@@ -1050,7 +1054,7 @@ mod imp {
             }
             let mut code = 0u32;
             // SAFETY: `code` is a valid out pointer.
-            let ok = unsafe { GetExitCodeProcess(self.process, &mut code) };
+            let ok = unsafe { GetExitCodeProcess(self.process, &raw mut code) };
             if ok == 0 {
                 return Err(last_error("GetExitCodeProcess"));
             }
@@ -1098,7 +1102,7 @@ mod imp {
                     WinBuiltinAnyPackageSid,
                     ptr::null_mut(),
                     buffer.as_mut_ptr().cast(),
-                    &mut size,
+                    &raw mut size,
                 )
             };
             if ok == 0 {
@@ -1132,7 +1136,7 @@ mod imp {
         for index in 0..size.AceCount {
             let mut ace: *mut c_void = ptr::null_mut();
             // SAFETY: `index` is below the ACE count just read.
-            if unsafe { GetAce(dacl, index, &mut ace) } == 0 || ace.is_null() {
+            if unsafe { GetAce(dacl, index, &raw mut ace) } == 0 || ace.is_null() {
                 continue;
             }
             // SAFETY: the header precedes every ACE body.
@@ -1142,7 +1146,9 @@ mod imp {
                 continue;
             }
             let allowed = unsafe { &*(ace.cast::<ACCESS_ALLOWED_ACE>()) };
-            let ace_sid = std::ptr::from_ref(&allowed.SidStart).cast::<c_void>() as PSID;
+            let ace_sid = std::ptr::from_ref(&allowed.SidStart)
+                .cast::<c_void>()
+                .cast_mut();
             let any_package = any_package_sid();
             // SAFETY: all three are valid SIDs for the duration of the calls.
             let grants_us = unsafe { EqualSid(ace_sid, sid) } != 0
@@ -1169,9 +1175,9 @@ mod imp {
                 DACL_SECURITY_INFORMATION,
                 ptr::null_mut(),
                 ptr::null_mut(),
-                &mut old_dacl,
+                &raw mut old_dacl,
                 ptr::null_mut(),
-                &mut descriptor,
+                &raw mut descriptor,
             )
         };
         #[cfg(test)]
@@ -1230,7 +1236,7 @@ mod imp {
         let mut new_dacl: *mut ACL = ptr::null_mut();
         // SAFETY: `entry` is initialized, `old_dacl` lives in `descriptor`,
         // and `new_dacl` is a valid out pointer.
-        let err = unsafe { SetEntriesInAclW(1, &entry, old_dacl, &mut new_dacl) };
+        let err = unsafe { SetEntriesInAclW(1, &raw const entry, old_dacl, &raw mut new_dacl) };
         if err != windows_sys::Win32::Foundation::ERROR_SUCCESS {
             unsafe { LocalFree(descriptor as HLOCAL) };
             return Err(win32_error("SetEntriesInAclW", err));
@@ -1278,7 +1284,7 @@ mod imp {
     /// access the policy did not name.
     fn walk_and_grant(root: &Path, sid: PSID, access: AclAccess) {
         let mut seen = 0usize;
-        for entry in walkdir::WalkDir::new(root).follow_links(false).into_iter() {
+        for entry in walkdir::WalkDir::new(root).follow_links(false) {
             let Ok(entry) = entry else {
                 continue;
             };
@@ -1347,7 +1353,7 @@ mod imp {
             ConvertStringSecurityDescriptorToSecurityDescriptorW(
                 sddl.as_ptr(),
                 SDDL_REVISION_1,
-                &mut descriptor,
+                &raw mut descriptor,
                 ptr::null_mut(),
             )
         };
@@ -1394,13 +1400,13 @@ mod imp {
     ///   is blocked by Mandatory Integrity Control, not by the DACL.
     #[must_use]
     #[allow(dead_code)] // called from the Windows runtime tests
-    pub(crate) fn diagnose_path(path: &Path, sid: PSID) -> String {
-        let scan = ace_for(path, sid, DACL_SECURITY_INFORMATION);
-        let label = mandatory_label_rid(path);
+    pub fn diagnose_path(path: &Path, sid: PSID) -> String {
         // Traverse is `FILE_TRAVERSE | FILE_READ_ATTRIBUTES`; printing the
         // mask (not just presence) distinguishes an ancestor we granted from
         // an unrelated ACE naming the same SID.
         const FILE_TRAVERSE: u32 = 0x20;
+        let scan = ace_for(path, sid, DACL_SECURITY_INFORMATION);
+        let label = mandatory_label_rid(path);
         let ancestors: Vec<String> = path
             .ancestors()
             .skip(1)
@@ -1472,16 +1478,16 @@ mod imp {
                 ptr::null_mut(),
                 ptr::null_mut(),
                 if information == DACL_SECURITY_INFORMATION {
-                    &mut dacl
+                    &raw mut dacl
                 } else {
                     ptr::null_mut()
                 },
                 if information == DACL_SECURITY_INFORMATION {
                     ptr::null_mut()
                 } else {
-                    &mut dacl
+                    &raw mut dacl
                 },
-                &mut descriptor,
+                &raw mut descriptor,
             )
         };
         if error != windows_sys::Win32::Foundation::ERROR_SUCCESS || dacl.is_null() {
@@ -1513,7 +1519,7 @@ mod imp {
             for index in 0..size.AceCount {
                 let mut ace: *mut c_void = ptr::null_mut();
                 // SAFETY: `index` is below the ACE count just read.
-                if unsafe { GetAce(dacl, index, &mut ace) } == 0 || ace.is_null() {
+                if unsafe { GetAce(dacl, index, &raw mut ace) } == 0 || ace.is_null() {
                     continue;
                 }
                 // SAFETY: an access-allowed ACE begins with its header; the
@@ -1525,7 +1531,9 @@ mod imp {
                     continue;
                 }
                 let allowed = unsafe { &*(ace.cast::<ACCESS_ALLOWED_ACE>()) };
-                let ace_sid = std::ptr::from_ref(&allowed.SidStart).cast::<c_void>() as PSID;
+                let ace_sid = std::ptr::from_ref(&allowed.SidStart)
+                    .cast::<c_void>()
+                    .cast_mut();
                 // SAFETY: both are valid SIDs for the duration of the call.
                 if unsafe { EqualSid(ace_sid, sid) } != 0 {
                     let entry = (allowed.Mask, header.AceFlags);
@@ -1560,8 +1568,8 @@ mod imp {
                 ptr::null_mut(),
                 ptr::null_mut(),
                 ptr::null_mut(),
-                &mut sacl,
-                &mut descriptor,
+                &raw mut sacl,
+                &raw mut descriptor,
             )
         };
         if error != windows_sys::Win32::Foundation::ERROR_SUCCESS || sacl.is_null() {
@@ -1587,7 +1595,7 @@ mod imp {
             for index in 0..size.AceCount {
                 let mut ace: *mut c_void = ptr::null_mut();
                 // SAFETY: `index` is below the ACE count just read.
-                if unsafe { GetAce(sacl, index, &mut ace) } == 0 || ace.is_null() {
+                if unsafe { GetAce(sacl, index, &raw mut ace) } == 0 || ace.is_null() {
                     continue;
                 }
                 // SAFETY: the header precedes every ACE body.
@@ -1596,7 +1604,9 @@ mod imp {
                     continue;
                 }
                 let label = unsafe { &*(ace.cast::<SYSTEM_MANDATORY_LABEL_ACE>()) };
-                let label_sid = std::ptr::from_ref(&label.SidStart).cast::<c_void>() as PSID;
+                let label_sid = std::ptr::from_ref(&label.SidStart)
+                    .cast::<c_void>()
+                    .cast_mut();
                 // SAFETY: the SID is part of the ACE; a label SID always has
                 // at least one subauthority.
                 let count = unsafe { *GetSidSubAuthorityCount(label_sid) };
@@ -1619,8 +1629,7 @@ mod imp {
     fn system_roots() -> Vec<PathBuf> {
         let mut roots = Vec::new();
         let system_root = std::env::var_os("SystemRoot")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
+            .map_or_else(|| PathBuf::from(r"C:\Windows"), PathBuf::from);
         roots.push(system_root.clone());
         roots.push(system_root.join("System32"));
         roots.push(system_root.join("SysWOW64"));
@@ -1675,7 +1684,7 @@ mod imp {
     fn win32_error(operation: &str, code: u32) -> SandboxError {
         SandboxError::CreationError(format!(
             "{operation} failed: {}",
-            std::io::Error::from_raw_os_error(code as i32)
+            std::io::Error::from_raw_os_error(code.cast_signed())
         ))
     }
 
@@ -1683,7 +1692,7 @@ mod imp {
         let code = unsafe { windows_sys::Win32::Foundation::RtlNtStatusToDosError(status) };
         SandboxError::CreationError(format!(
             "{operation} failed: NTSTATUS 0x{status:08X} ({})",
-            std::io::Error::from_raw_os_error(code as i32)
+            std::io::Error::from_raw_os_error(code.cast_signed())
         ))
     }
 }

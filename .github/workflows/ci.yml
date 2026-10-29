@@ -61,6 +61,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.99.1
+        with:
+          components: rustfmt
       - run: cargo fmt --all --check
 
   clippy:
@@ -98,7 +100,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.99.1
       - uses: ./.github/actions/linux-deps
       - uses: taiki-e/install-action@nextest
-      - run: cargo nextest run --workspace
+      # `--no-fail-fast` reports every failing test binary instead of stopping
+      # at the first failure; one red run should name all of them.
+      - run: cargo nextest run --workspace --no-fail-fast
 
   # The plist managed-settings carrier is `#[cfg(target_os = "macos")]`, so no
   # Linux or Windows job ever compiles it. Without this job those tests never
@@ -114,6 +118,11 @@ jobs:
         with:
           components: clippy
       - run: cargo test -p coderex-config
+      # The live benchmark cassettes replay sessions recorded on macOS; one of
+      # them repairs its fixture with BSD `sed -i ''`, which GNU sed rejects.
+      # The case is gated to macOS, so it runs here.
+      - name: Live benchmark replay
+        run: cargo test -p coderex-cli --test code_agent_benchmark live_
       # macOS-only code (sandbox-exec, F_GETPATH, the plist carrier) is not
       # compiled on Linux, so the main clippy job never sees it.
       - name: Clippy (macOS)

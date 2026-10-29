@@ -195,22 +195,20 @@ pub fn finish_spawn(
     #[cfg(target_os = "windows")]
     {
         if let Some(handle) = handle {
-            match child.raw_handle() {
-                Some(raw) => handle.post_spawn_raw(raw).map_err(|error| {
-                    ToolError::Io(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        format!("sandbox: {error}"),
-                    ))
-                })?,
+            if let Some(raw) = child.raw_handle() {
+                handle.post_spawn_raw(raw).map_err(|error| {
+                    ToolError::Io(std::io::Error::other(format!("sandbox: {error}")))
+                })?;
+            } else {
                 // The child was created suspended specifically so this path
                 // could attach the container token. Losing the handle means it
                 // cannot be confined, and it must not be reported as if it
                 // were.
-                None => tracing::warn!(
+                tracing::warn!(
                     "the child's process handle was unavailable before the AppContainer \
                      token and Job Object could be attached; this command may have run \
                      without filesystem, network, or resource limits"
-                ),
+                );
             }
         }
     }
