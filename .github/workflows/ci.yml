@@ -163,27 +163,33 @@ jobs:
           ssh-keygen -q -t ed25519 -N '' -f /tmp/ssh_host_key
           ssh-keygen -q -t ed25519 -N '' -f /tmp/ssh_client_key
           cp /tmp/ssh_client_key.pub /tmp/authorized_keys
-          chmod 600 /tmp/authorized_keys
-          sudo /usr/sbin/sshd -D -p 2222 -h /tmp/ssh_host_key \
+          # sshd runs as root and refuses a host key owned by anyone else.
+          sudo chown root:root /tmp/ssh_host_key
+          sudo chmod 600 /tmp/ssh_host_key /tmp/authorized_keys
+          sudo /usr/sbin/sshd -D -e -p 2222 -h /tmp/ssh_host_key \
             -o "AuthorizedKeysFile=/tmp/authorized_keys" \
-            -o "StrictModes=no" -o "PasswordAuthentication=no" -o "UsePAM=no" &
+            -o "StrictModes=no" -o "PasswordAuthentication=no" -o "UsePAM=no" \
+            > /tmp/sshd.log 2>&1 &
           # The spawner verifies the remote has coderex; the check only needs
           # something executable with that name.
           sudo install -m 755 /bin/true /usr/local/bin/coderex
           echo "CODEREX_SSH_TEST_HOST=$(whoami)@localhost:2222" >> "$GITHUB_ENV"
           echo "CODEREX_SSH_TEST_KEY=/tmp/ssh_client_key" >> "$GITHUB_ENV"
           echo "CODEREX_SSH_TEST_PATH=/tmp/coderex-ssh-test" >> "$GITHUB_ENV"
+          : > /tmp/ssh-client.log
           for _ in $(seq 1 30); do
             if ssh -p 2222 -i /tmp/ssh_client_key \
               -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
               -o BatchMode=yes -o ConnectTimeout=2 \
-              "localhost" true 2>/dev/null; then
+              "localhost" true 2>>/tmp/ssh-client.log; then
               echo "sshd is up"
               exit 0
             fi
             sleep 1
           done
-          echo "sshd did not start" >&2
+          echo "sshd did not answer:" >&2
+          cat /tmp/sshd.log >&2 || true
+          tail -30 /tmp/ssh-client.log >&2 || true
           exit 1
 
       - name: Spawn a session over SSH
