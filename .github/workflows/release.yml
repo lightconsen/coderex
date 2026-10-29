@@ -70,7 +70,7 @@ jobs:
           Copy-Item dist/coderex-${{ matrix.target }}.exe coderex-${{ matrix.target }}.exe
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: coderex-${{ matrix.target }}
           path: |
@@ -98,7 +98,7 @@ jobs:
           cat SHA256SUMS
           sha256sum --check SHA256SUMS
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: checksums
           path: artifacts/SHA256SUMS
