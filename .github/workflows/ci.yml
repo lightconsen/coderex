@@ -140,6 +140,55 @@ jobs:
       - name: Clippy (macOS)
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+  # The SSH spawn path talks to a real sshd. Its unit tests cover the mapping
+  # and the command list; only a live server covers the connection, the
+  # identity file and the remote `mkdir`/`which`. The job starts a throwaway
+  # sshd on a high port and points the test at it.
+  ssh-integration:
+    name: SSH spawn (real sshd)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@1.99.1
+      - uses: ./.github/actions/linux-deps
+
+      - name: Start a throwaway sshd
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y openssh-server
+          sudo mkdir -p /run/sshd
+          ssh-keygen -q -t ed25519 -N '' -f /tmp/ssh_host_key
+          ssh-keygen -q -t ed25519 -N '' -f /tmp/ssh_client_key
+          cp /tmp/ssh_client_key.pub /tmp/authorized_keys
+          chmod 600 /tmp/authorized_keys
+          sudo /usr/sbin/sshd -D -p 2222 -h /tmp/ssh_host_key \
+            -o "AuthorizedKeysFile=/tmp/authorized_keys" \
+            -o "StrictModes=no" -o "PasswordAuthentication=no" -o "UsePAM=no" &
+          # The spawner verifies the remote has coderex; the check only needs
+          # something executable with that name.
+          sudo install -m 755 /bin/true /usr/local/bin/coderex
+          echo "CODEREX_SSH_TEST_HOST=$(whoami)@localhost:2222" >> "$GITHUB_ENV"
+          echo "CODEREX_SSH_TEST_KEY=/tmp/ssh_client_key" >> "$GITHUB_ENV"
+          echo "CODEREX_SSH_TEST_PATH=/tmp/coderex-ssh-test" >> "$GITHUB_ENV"
+          for _ in $(seq 1 30); do
+            if ssh -p 2222 -i /tmp/ssh_client_key \
+              -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+              -o BatchMode=yes -o ConnectTimeout=2 \
+              "localhost" true 2>/dev/null; then
+              echo "sshd is up"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "sshd did not start" >&2
+          exit 1
+
+      - name: Spawn a session over SSH
+        run: cargo test -p coderex-bridge --test ssh_spawn -- --nocapture
+
   # Compilation and linking for Windows are required, and are checked from
   # ubuntu-latest with the mingw-w64 toolchain below. This matters because the
   # Unix jobs never compile the `cfg(target_os = "windows")` paths; a break in

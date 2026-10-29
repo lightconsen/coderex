@@ -160,11 +160,18 @@ impl BridgeSessionSpawner {
     ) -> Result<SpawnResult, String> {
         let session_dir = remote_session_dir(remote_path, &config.session_id);
 
+        // `host` may carry a port (`user@host:2222`, `[::1]:2222`), which ssh
+        // otherwise only takes from a config file.
+        let (target, port) = parse_ssh_host(host);
+
         // The identity file is resolved before connecting: naming a key that
         // is not there is an error rather than a silent fall back to the agent.
-        let builder = ssh_builder(identity_file)?;
+        let mut builder = ssh_builder(identity_file)?;
+        if let Some(port) = port {
+            builder.port(port);
+        }
         let session = builder
-            .connect(host)
+            .connect(&target)
             .await
             .map_err(|e| format!("ssh connect failed: {e}"))?;
 
@@ -209,6 +216,42 @@ impl BridgeSessionSpawner {
     ) -> Result<SpawnResult, String> {
         Err("SSH session spawning is not supported on this platform".to_string())
     }
+}
+
+/// Split an optional port off an SSH target.
+///
+/// `user@host:2222` and `[::1]:2222` name a port; a bare `host` and a bare
+/// IPv6 address (several colons, no brackets) do not. The host part keeps the
+/// user prefix, because that is what `ssh` itself expects.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn parse_ssh_host(target: &str) -> (String, Option<u16>) {
+    let (user, rest) = match target.rsplit_once('@') {
+        Some((user, rest)) => (Some(user), rest),
+        None => (None, target),
+    };
+    let with_user = |host: &str| match user {
+        Some(user) => format!("{user}@{host}"),
+        None => host.to_string(),
+    };
+
+    if let Some(bracketed) = rest.strip_prefix('[')
+        && let Some((host, tail)) = bracketed.split_once(']')
+    {
+        let port = tail
+            .strip_prefix(':')
+            .and_then(|port| port.parse::<u16>().ok());
+        return (with_user(&format!("[{host}]")), port);
+    }
+
+    if let Some((host, port)) = rest.rsplit_once(':')
+        && !host.is_empty()
+        && !host.contains(':')
+        && let Ok(port) = port.parse::<u16>()
+    {
+        return (with_user(host), Some(port));
+    }
+
+    (target.to_string(), None)
 }
 
 /// The remote directory a session works in.
@@ -336,6 +379,44 @@ mod tests {
 
         let builder = ssh_builder(Some(key.path().to_str().unwrap()));
         assert!(builder.is_ok(), "{builder:?}");
+    }
+
+    /// A port in the target is split off; everything else is passed to `ssh`
+    /// unchanged.
+    #[test]
+    fn an_ssh_target_may_carry_a_port() {
+        assert_eq!(
+            parse_ssh_host("deploy@example.test:2222"),
+            ("deploy@example.test".to_string(), Some(2222))
+        );
+        assert_eq!(
+            parse_ssh_host("example.test:22"),
+            ("example.test".to_string(), Some(22))
+        );
+        assert_eq!(
+            parse_ssh_host("example.test"),
+            ("example.test".to_string(), None)
+        );
+        assert_eq!(
+            parse_ssh_host("deploy@example.test"),
+            ("deploy@example.test".to_string(), None)
+        );
+    }
+
+    /// Bracketed IPv6 keeps its brackets and may carry a port; a bare IPv6
+    /// address has several colons and is not split.
+    #[test]
+    fn an_ipv6_ssh_target_is_not_mistaken_for_host_and_port() {
+        assert_eq!(
+            parse_ssh_host("[::1]:2222"),
+            ("[::1]".to_string(), Some(2222))
+        );
+        assert_eq!(parse_ssh_host("[::1]"), ("[::1]".to_string(), None));
+        assert_eq!(parse_ssh_host("::1"), ("::1".to_string(), None));
+        assert_eq!(
+            parse_ssh_host("root@[fe80::1]:2200"),
+            ("root@[fe80::1]".to_string(), Some(2200))
+        );
     }
 
     #[cfg(unix)]
