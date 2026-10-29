@@ -1460,7 +1460,11 @@ pub struct QueryEngine {
     /// Usage summary from the most recent model request.
     last_usage: Option<UsageSummary>,
     /// Loop detector for detecting repetitive tool call patterns.
-    loop_detector: Option<LoopDetector>,
+    ///
+    /// Behind a lock so compaction can clear it from the `&self` methods that
+    /// run the compaction path; the detector itself is only touched once per
+    /// turn and once per compaction.
+    loop_detector: std::sync::Mutex<Option<LoopDetector>>,
     /// Last successful response content and usage (for graceful degradation).
     last_successful_response: Option<(String, UsageSummary)>,
     /// Optional team context for multi-agent collaboration.
@@ -1778,7 +1782,7 @@ impl QueryEngine {
             elicitation_handler: Box::new(ReplElicitationHandler::default()),
             transcript_path: None,
             last_usage: None,
-            loop_detector: Some(LoopDetector::new()),
+            loop_detector: std::sync::Mutex::new(Some(LoopDetector::new())),
             last_successful_response: None,
             team_context: None,
             streaming_tool_execution: false,
@@ -1980,7 +1984,10 @@ impl QueryEngine {
     ///
     /// Pass `None` to disable loop detection.
     pub fn set_loop_detector(&mut self, detector: Option<LoopDetector>) {
-        self.loop_detector = detector;
+        *self
+            .loop_detector
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = detector;
     }
 
     /// Set the transcript base path for persisting compact boundaries.
@@ -2249,11 +2256,41 @@ impl QueryEngine {
         }
     }
 
+    /// Forget the turn history the loop detector has seen.
+    ///
+    /// Called after compaction, which replaces the messages the model sees
+    /// with a summary: a repeat judged against turns that are no longer in the
+    /// context is not a loop. The detector then judges the context the model
+    /// actually has.
+    fn reset_loop_history(&self) {
+        let mut guard = self
+            .loop_detector
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(detector) = guard.as_mut() {
+            detector.clear();
+        }
+    }
+
+    /// How many turns the loop detector is holding, for tests.
+    #[cfg(test)]
+    fn loop_history_len(&self) -> Option<usize> {
+        self.loop_detector
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(LoopDetector::len)
+    }
+
     /// Record tool calls from a turn and check for loops.
     ///
     /// Returns `Some(TerminalReason::LoopDetected)` if a loop is detected.
-    fn record_and_check_loop(&mut self, tool_calls: &[PendingToolCall]) -> Option<TerminalReason> {
-        let detector = self.loop_detector.as_mut()?;
+    fn record_and_check_loop(&self, tool_calls: &[PendingToolCall]) -> Option<TerminalReason> {
+        let mut guard = self
+            .loop_detector
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let detector = guard.as_mut()?;
 
         let calls: Vec<ToolCall> = tool_calls
             .iter()
@@ -4049,6 +4086,11 @@ impl QueryEngine {
         let messages_remaining = result.messages.len();
         let strategy = result.strategy;
         turn.messages = result.messages;
+
+        // The detector's history describes turns that are no longer in the
+        // context. Keeping it would let a repeat the model can no longer see
+        // (because the tool result was compacted away) count toward a loop.
+        self.reset_loop_history();
 
         // Persist compact to transcript file on disk
         if let Some(ref base_path) = self.transcript_path {
@@ -9371,6 +9413,45 @@ mod tests {
     }
 
     // ─── Compaction outcomes ───────────────────────────────────────────────
+
+    /// Compaction replaces the messages with a summary, so the turns the loop
+    /// detector judged are no longer in the context. A repeat the model can no
+    /// longer see must not count towards ending the run as a loop.
+    #[tokio::test]
+    async fn compaction_clears_the_loop_history() {
+        let (engine, _rx, _session) = make_test_engine();
+        engine.record_and_check_loop(&[PendingToolCall {
+            id: "call-1".into(),
+            name: "Read".into(),
+            input: serde_json::json!({"file_path": "src/lib.rs"}),
+        }]);
+        assert_eq!(
+            engine.loop_history_len(),
+            Some(1),
+            "the call was not recorded"
+        );
+
+        let mut turn = TurnRuntime::new(TokenBudget::with_defaults());
+        turn.messages = vec![Message::user("hello")];
+        let outcome = engine
+            .run_compact_recovery(
+                &mut turn,
+                &SubmitOptions::default(),
+                1,
+                CompactTrigger::TokenThreshold,
+            )
+            .await;
+
+        assert!(
+            !matches!(outcome, CompactOutcome::CircuitBreakerOpen { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            engine.loop_history_len(),
+            Some(0),
+            "compaction kept the pre-compaction loop history"
+        );
+    }
 
     /// Why compaction did not happen is returned, not only logged.
     #[tokio::test]
