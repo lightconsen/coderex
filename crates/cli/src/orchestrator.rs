@@ -3491,7 +3491,7 @@ impl StartupOrchestrator {
                 for tool in &tools {
                     if tool.description.trim().is_empty() {
                         println!(
-                            "  {} (mcp__{}__{})",
+                            "  {} (server: {}, tool: {})",
                             tool.qualified_name(),
                             tool.server,
                             tool.name

@@ -128,7 +128,7 @@ impl HookActionRunner for SessionHookActionRunner {
     ) -> Result<String, HookError> {
         // The qualified name is what the registry knows the tool by; the server
         // and tool are how the hook's configuration names it.
-        let name = format!("mcp__{server}__{tool}");
+        let name = coderex_mcp::proxy::qualified_tool_name(server, tool);
         self.tools
             .call(&name, input)
             .await

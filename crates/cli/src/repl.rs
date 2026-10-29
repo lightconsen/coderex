@@ -790,15 +790,15 @@ impl coderex_tools::Tool for GetMcpPromptWithState {
     }
 }
 
-/// The slash-command name for a prompt: `mcp__<server>__<prompt>`.
+/// The slash-command name for a prompt: `<prefix><server>__<prompt>`.
 ///
-/// The server and prompt components are sanitised; the raw names stay with the
+/// The server and prompt components are sanitised (the configured MCP prefix
+/// is not: it is validated where it is read); the raw names stay with the
 /// handler and are what `prompts/get` sends.
 fn prompt_command_name(server: &str, prompt: &str) -> String {
-    format!(
-        "mcp__{}__{}",
-        sanitize_prompt_component(server),
-        sanitize_prompt_component(prompt)
+    coderex_mcp::proxy::qualified_tool_name(
+        &sanitize_prompt_component(server),
+        &sanitize_prompt_component(prompt),
     )
 }
 
@@ -13144,6 +13144,21 @@ mod tests {
         );
         assert_eq!(sanitize_prompt_component("a-b c"), "a_b_c");
         assert_eq!(sanitize_prompt_component("keep_1"), "keep_1");
+    }
+
+    /// A configured MCP prefix reaches the prompt slash commands too; without
+    /// the default they would name a tool the registry does not have.
+    #[test]
+    fn a_custom_mcp_prefix_reaches_prompt_commands() {
+        coderex_mcp::proxy::set_mcp_prefix_for_test(Some("custom_"));
+        assert_eq!(
+            prompt_command_name("my server", "review/file"),
+            "custom_my_server__review_file"
+        );
+        coderex_mcp::proxy::set_mcp_prefix_for_test(Some(""));
+        // No prefix: the raw prompt name, matching how tools are exposed.
+        assert_eq!(prompt_command_name("srv", "ask"), "ask");
+        coderex_mcp::proxy::clear_mcp_prefix_override();
     }
 
     fn sample_prompt() -> coderex_mcp::prompts::ServerPrompt {

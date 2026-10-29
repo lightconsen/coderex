@@ -28,7 +28,17 @@ Model Context Protocol (MCP) support — enables CodeRex to act as an MCP client
 
 ### Tool naming
 
-Public names are `mcp__<server>__<tool>`, which is load-bearing: two servers may expose the same raw tool name, and the prefix is what keeps them apart. Setting `CLAUDE_AGENT_SDK_MCP_NO_PREFIX` (to anything but `0`/`false`) addresses tools by their raw server-side name instead — the raw name is what the server expects in `tools/call` either way.
+Public names are `<prefix><server>__<tool>`, where the prefix comes from `CODEREX_MCP_PREFIX`:
+
+| `CODEREX_MCP_PREFIX` | Public name for `filesystem`'s `read_file` |
+|---|---|
+| unset | `mcp__filesystem__read_file` (the default) |
+| `coderex_` | `coderex_filesystem__read_file` |
+| empty string | `read_file` |
+
+The prefix may only contain ASCII letters, digits and `_`; anything else is ignored with a warning and the default is used. A value that is set always wins over the reference SDK's `CLAUDE_AGENT_SDK_MCP_NO_PREFIX` (anything but `0`/`false` still means "no prefix" when `CODEREX_MCP_PREFIX` is unset). The same rule names tools, permission rules, hook `mcp_tool` actions, sub-agent `allowed_tools`, `/mcp` output and the `<prefix><server>__<prompt>` slash commands; the raw name is what the server expects in `tools/call` either way.
+
+The server part is load-bearing: two servers may expose the same raw tool name, and the prefix is what keeps them apart.
 
 Without the prefix a shared raw name cannot address both servers, so the second registration is **refused** rather than allowed to take the name over (which would route its calls to the other server). The refusal is logged and recorded by `McpToolRegistry::conflicts()` and surfaced by `/mcp` alongside the server list; turn the prefix back on to reach that tool. `McpToolInfo::prefixed_name()` always gives the unambiguous spelling.
 
