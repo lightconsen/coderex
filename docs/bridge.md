@@ -354,6 +354,7 @@ ends the worker cleanly.
 | `--heartbeat-lost-threshold N` | `CODEREX_BRIDGE_HEARTBEAT_LOST_THRESHOLD` | `5` | Missed beats before `Lost` |
 | `--poll-interval-secs N` | `CODEREX_BRIDGE_POLL_INTERVAL_SECS` | `5` | Seconds between assignment fetches and capacity reports |
 | `--claim-path PATH` | `CODEREX_BRIDGE_CLAIM_PATH` | `/api/environments/{env_id}/assignments/{assignment_id}/claim` | Claim route template; must contain `{assignment_id}` |
+| — (no flag) | `CODEREX_BRIDGE_SHUTDOWN_GRACE_SECS` | `5` | How long a stopped session gets before its child tree is killed. A child with real cleanup (flushing a transcript, closing a database) needs more; a non-numeric or zero value keeps the default. |
 
 The historical `CODEREX_BRIDGE_URL=ws://host:port` spelling is the transport
 URL, not the control-plane API URL. If the gateway does not share the control
@@ -440,11 +441,15 @@ connection around the relay: authenticating it, fanning frames out to the right
 human client, presenting the approval UI, and deciding what to do about a
 request that is never answered.
 
-The turn's final `result` frame supplies `UsageStats`:
+The turn's final `result` frame supplies `UsageStats` when it carries them:
 `usage.input_tokens`, `usage.output_tokens`,
 `usage.cache_read_input_tokens` (or `cache_read_tokens`),
 `usage.cache_creation_input_tokens` (or `cache_creation_tokens`), and
-`total_cost_usd` (or `cost_usd`). The complete stdout transcript (one JSON
+`total_cost_usd` (or `cost_usd`). A child that reports usage per assistant
+frame instead (or not at all on the result frame) is still accounted for: every
+`assistant` frame's own `usage` is summed, and that sum is what the archive
+records. The result frame's totals win when present — they are the provider's
+own numbers, not a sum. The complete stdout transcript (one JSON
 object per line) is written to `<session-base>/<session-id>/transcript.jsonl`;
 `complete_session` archives the same transcript and the real usage. Exit status
 zero with no error `result` frame is success; a non-zero status, an `is_error`
