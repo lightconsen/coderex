@@ -36,7 +36,7 @@ jobs:
 
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           # A manual dispatch names a tag in its input; without this the build
           # would package the default branch and publish it under that tag.
@@ -130,7 +130,7 @@ jobs:
     steps:
       # `check-release-archives.py` lives in the repository; without a
       # checkout the step that runs it fails and no release is published.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
@@ -162,7 +162,7 @@ jobs:
     needs: [build, smoke, checksums]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Download all artifacts
         uses: actions/download-artifact@v4
