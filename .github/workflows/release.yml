@@ -3,7 +3,10 @@ name: Release
 on:
   push:
     tags:
-      - 'v[0-9]+.*'
+      # GitHub matches these with minimatch, where `+` is a literal character
+      # (only `+(...)` is a quantifier). `v[0-9]+.*` therefore matches nothing
+      # and no tag would ever start a release; `*` is the quantifier here.
+      - 'v[0-9]*.*'
   workflow_dispatch:
     inputs:
       tag:
@@ -94,6 +97,20 @@ jobs:
         run: |
           set -euo pipefail
           cd artifacts
+          # Every target in the matrix must be here, with the name the
+          # updater and install.sh look for. A matrix entry that silently
+          # produced nothing would otherwise publish a release that is missing
+          # a platform.
+          for target in x86_64-unknown-linux-gnu x86_64-unknown-linux-musl \
+                        x86_64-apple-darwin aarch64-apple-darwin \
+                        x86_64-pc-windows-msvc; do
+            if [[ "$target" == *windows* ]]; then
+              test -f "coderex-${target}.zip"
+              test -f "coderex-${target}.exe"
+            else
+              test -f "coderex-${target}.tar.gz"
+            fi
+          done
           sha256sum coderex-*.tar.gz coderex-*.zip coderex-*.exe | LC_ALL=C sort -k2 > SHA256SUMS
           cat SHA256SUMS
           sha256sum --check SHA256SUMS
@@ -111,6 +128,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
+      # `check-release-archives.py` lives in the repository; without a
+      # checkout the step that runs it fails and no release is published.
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
