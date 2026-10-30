@@ -3087,7 +3087,14 @@ printf 'ECHO:%s\n' "$line""#;
         let kill = fake.join("kill");
         std::fs::write(
             &kill,
-            format!("#!/bin/sh\necho \"$@\" >> {}\n", log.display()),
+            // Records the request, then runs the real `kill`: other tests in
+            // this process resolve `kill` from PATH too (`process_is_alive`),
+            // and a stand-in that swallowed the call would make them see a
+            // live process that is gone.
+            format!(
+                "#!/bin/sh\necho \"$@\" >> {}\nexec /bin/kill \"$@\"\n",
+                log.display()
+            ),
         )
         .unwrap();
         {
