@@ -302,17 +302,30 @@ pub fn sandbox_config(hook: &HookConfig) -> SandboxConfig {
         }
     }
 
-    // On Unix the hook's own `max_*` fields are installed by
-    // `apply_resource_limits`; leaving these unset avoids two layers
-    // disagreeing about the same limit. Windows has no pre-exec hook, so the
-    // Job Object created from this config is the only place limits can live.
+    // Linux installs the hook's own `max_*` fields through
+    // `apply_resource_limits` (and, for memory, a cgroup); leaving these unset
+    // avoids two layers disagreeing about the same limit.
+    //
+    // Windows has no pre-exec hook, so the Job Object created from this config
+    // is the only place limits can live.
+    //
+    // macOS is the case that needs both: Darwin rejects `RLIMIT_DATA` with
+    // EINVAL, so the rlimit is best-effort at best. Passing the ceiling here
+    // is what starts the libproc RSS watchdog, which is the only hard memory
+    // stop macOS has.
     #[cfg(target_os = "windows")]
     let (max_memory_bytes, max_cpu_seconds) = (
         hook.max_memory_mb
             .map(|megabytes| megabytes.saturating_mul(1024 * 1024)),
         hook.max_cpu_seconds,
     );
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "macos")]
+    let (max_memory_bytes, max_cpu_seconds) = (
+        hook.max_memory_mb
+            .map(|megabytes| megabytes.saturating_mul(1024 * 1024)),
+        None,
+    );
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     let (max_memory_bytes, max_cpu_seconds) = (None, None);
 
     SandboxConfig {

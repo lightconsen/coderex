@@ -319,7 +319,22 @@ pub fn default_factory() -> TransportFactory {
     factory.register("websocket", websocket_transport);
     // `ws` is the spelling the existing CODEREX_BRIDGE_URL examples use.
     factory.register("ws", websocket_transport);
+    // The gateway's per-environment frame mailbox
+    // (`coderex-server::gateway`). A worker that can only make outbound HTTP
+    // requests — behind a restrictive proxy, or against a plain HTTP gateway —
+    // uses this instead of a socket. The endpoint is the gateway base URL and
+    // the connection id is the environment whose mailbox to read.
+    factory.register("http-poll", http_poll_transport);
+    factory.register("http", http_poll_transport);
     factory
+}
+
+/// Construct an HTTP-polling transport from a factory config.
+fn http_poll_transport(config: &TransportConfig) -> Box<dyn Transport> {
+    Box::new(crate::http_transport::HttpPollTransport::new(
+        config.endpoint.clone(),
+        config.connection_id.clone(),
+    ))
 }
 
 #[cfg(test)]
@@ -406,6 +421,24 @@ mod tests {
         let factory = default_factory();
         assert!(factory.registered_types().contains(&"websocket"));
         assert!(factory.registered_types().contains(&"ws"));
+    }
+
+    /// The in-repo gateway's polling client has to be selectable from the
+    /// factory, or `coderex bridge` cannot use the gateway it ships with.
+    #[test]
+    fn default_factory_registers_the_http_poll_transport() {
+        let factory = default_factory();
+        assert!(factory.registered_types().contains(&"http-poll"));
+        assert!(factory.registered_types().contains(&"http"));
+
+        let config = TransportConfig {
+            kind: "http-poll".into(),
+            endpoint: "http://127.0.0.1:8788".into(),
+            connection_id: "env-a".into(),
+            auth_token: None,
+        };
+        let transport = factory.create_configured(&config).expect("registered");
+        assert_eq!(transport.connection_id(), "http-poll://env-a");
     }
 
     #[test]

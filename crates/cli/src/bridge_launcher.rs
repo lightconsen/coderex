@@ -819,28 +819,18 @@ async fn terminate_child(child: &mut Child, grace: Duration) -> Result<ExitStatu
     #[cfg(unix)]
     {
         if let Some(pid) = child.id() {
-            // The workspace denies `unsafe`, so use the POSIX `kill` utility
-            // rather than `libc::kill`. `-TERM` is the graceful request; the
-            // bounded wait below still falls through to `start_kill`.
-            match Command::new("kill")
-                .arg("-TERM")
-                .arg(pid.to_string())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .await
-            {
-                Ok(status) if status.success() => {}
-                Ok(status) => tracing::warn!(
-                    pid,
-                    status = ?status.code(),
-                    "could not send SIGTERM to the session process"
-                ),
-                Err(err) => tracing::warn!(
-                    pid,
-                    error = %err,
-                    "could not run kill to terminate the session process"
-                ),
+            // The workspace denies `unsafe`, so this goes through the POSIX
+            // `kill` utility rather than `libc::kill`.
+            //
+            // The group is signalled first: a session spawned through
+            // `spawn_registered_child` is its own group leader
+            // (`ProcessTree` calls `process_group(0)`), so `-TERM -<pid>`
+            // reaches the session's own children too instead of leaving them
+            // to die only when the tree is killed. A child that is *not* a
+            // leader — a standalone runner in a test, say — makes that call
+            // fail, and the single-pid signal below is the fallback.
+            if !signal(pid, true).await {
+                signal(pid, false).await;
             }
         }
     }
@@ -859,6 +849,40 @@ async fn terminate_child(child: &mut Child, grace: Duration) -> Result<ExitStatu
             .wait()
             .await
             .map_err(|err| format!("failed to kill the session process: {err}"))
+    }
+}
+
+/// `kill -TERM` the process, or the process group it leads when `group` is
+/// set. Returns whether the signal was delivered.
+#[cfg(unix)]
+async fn signal(pid: u32, group: bool) -> bool {
+    let target = if group {
+        format!("-{pid}")
+    } else {
+        pid.to_string()
+    };
+    match Command::new("kill")
+        .arg("-TERM")
+        .arg(&target)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await
+    {
+        Ok(status) if status.success() => true,
+        Ok(status) => {
+            tracing::debug!(
+                pid,
+                group,
+                status = ?status.code(),
+                "SIGTERM was not delivered"
+            );
+            false
+        }
+        Err(err) => {
+            tracing::warn!(pid, error = %err, "could not run kill to terminate the session process");
+            false
+        }
     }
 }
 
@@ -1405,10 +1429,19 @@ impl BridgeLaunchConfig {
 /// substitutes a no-op transport.
 pub fn create_transport(config: &BridgeLaunchConfig) -> Result<Box<dyn Transport>> {
     let factory = default_factory();
+    // The HTTP-poll transport addresses the gateway's per-environment frame
+    // mailbox, so it needs the environment id. `connection_id` is a free-form
+    // label that `--connection-id` may override; using it here would silently
+    // read another environment's mailbox.
+    let connection_id = if is_polling_transport(&config.transport) {
+        config.env_id.clone()
+    } else {
+        config.connection_id.clone()
+    };
     let transport_config = TransportConfig {
         kind: config.transport.clone(),
         endpoint: config.endpoint().to_string(),
-        connection_id: config.connection_id.clone(),
+        connection_id,
         auth_token: config.auth_token.clone(),
     };
 
@@ -1419,6 +1452,14 @@ pub fn create_transport(config: &BridgeLaunchConfig) -> Result<Box<dyn Transport
             factory.registered_types().join(", ")
         )
     })
+}
+
+/// Whether a transport kind reads the gateway's frame mailbox.
+///
+/// Those address an environment, not a connection label.
+#[must_use]
+fn is_polling_transport(kind: &str) -> bool {
+    matches!(kind, "http-poll" | "http")
 }
 
 /// Resolve the configuration, build the transport, and serve until shutdown.
@@ -3006,6 +3047,63 @@ printf 'ECHO:%s\n' "$line""#;
         assert!(
             marker.exists(),
             "the child should have run its SIGTERM handler"
+        );
+    }
+
+    /// Stopping a session asks its whole process group to exit, so a
+    /// session's own children get the graceful request rather than dying only
+    /// when the tree is killed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shutdown_signals_the_sessions_process_group() {
+        let tmp = tempfile::tempdir().unwrap();
+        let marker = tmp.path().join("child-got-term");
+        // The session is a group leader; its child traps SIGTERM and writes a
+        // marker. Only a group signal reaches the child.
+        let script = format!(
+            "sh -c 'trap \"echo yes > {}\" TERM; while :; do sleep 0.05; done' & echo started; wait",
+            marker.display()
+        );
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg(&script)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        command.process_group(0);
+        let child = command.spawn().unwrap();
+
+        let session_dir = tmp.path().join("session");
+        let stop = SessionStop::new();
+        let task_stop = stop.clone();
+        let handle = tokio::spawn(async move {
+            run_child_streaming(
+                child,
+                "s1",
+                &session_dir,
+                None,
+                None,
+                None,
+                task_stop,
+                Duration::from_millis(500),
+            )
+            .await
+        });
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        stop.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+
+        // The marker is written by the *grandchild*; give it a moment.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while !marker.exists() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(
+            marker.exists(),
+            "the session's child never received SIGTERM; only the direct child was signalled"
         );
     }
 
