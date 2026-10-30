@@ -336,6 +336,9 @@ impl SessionRunner for ProcessSessionRunner {
             decisions,
             stop,
             self.grace,
+            // `spawn_registered_child` put the child in its own process group
+            // (`ProcessTree::prepare`), so a stop can reach its children too.
+            true,
         )
         .await
     }
@@ -436,6 +439,9 @@ async fn run_child_streaming(
     decisions: Option<tokio::sync::mpsc::UnboundedReceiver<ChildPermissionDecision>>,
     stop: SessionStop,
     grace: Duration,
+    // Whether the child leads its own process group, in which case the
+    // graceful stop also reaches the session's own children.
+    group_leader: bool,
 ) -> Result<SessionOutput, String> {
     let stdout = child
         .stdout
@@ -474,7 +480,7 @@ async fn run_child_streaming(
                 false,
             ),
             () = stop.wait() => break (
-                terminate_child(&mut child, grace).await?,
+                terminate_child(&mut child, grace, group_leader).await?,
                 true,
             ),
             decision = decisions.recv(), if decision_channel_open => {
@@ -807,7 +813,12 @@ fn result_error_message(frame: &Value) -> String {
 }
 
 /// Ask the child to exit, wait at most `grace`, then kill it.
-async fn terminate_child(child: &mut Child, grace: Duration) -> Result<ExitStatus, String> {
+async fn terminate_child(
+    child: &mut Child,
+    grace: Duration,
+    // Only read on Unix; Windows has no signals.
+    #[cfg_attr(not(unix), allow(unused_variables))] group_leader: bool,
+) -> Result<ExitStatus, String> {
     // The child may have exited between the stop signal and this point.
     if let Some(status) = child
         .try_wait()
@@ -822,16 +833,14 @@ async fn terminate_child(child: &mut Child, grace: Duration) -> Result<ExitStatu
             // The workspace denies `unsafe`, so this goes through the POSIX
             // `kill` utility rather than `libc::kill`.
             //
-            // The group is signalled first: a session spawned through
-            // `spawn_registered_child` is its own group leader
-            // (`ProcessTree` calls `process_group(0)`), so `-TERM -<pid>`
-            // reaches the session's own children too instead of leaving them
-            // to die only when the tree is killed. A child that is *not* a
-            // leader — a standalone runner in a test, say — makes that call
-            // fail, and the single-pid signal below is the fallback.
-            if !signal(pid, true).await {
-                signal(pid, false).await;
-            }
+            // A session spawned through `spawn_registered_child` is its own
+            // group leader (`ProcessTree` calls `process_group(0)`), so its
+            // group is signalled and the session's own children get the
+            // graceful request too. The caller says whether that is the case:
+            // a pid that is merely *some* group's id would signal an unrelated
+            // group, and guessing by trying the group first did exactly that
+            // in a test harness.
+            signal(pid, group_leader).await;
         }
     }
     #[cfg(not(unix))]
@@ -2809,6 +2818,7 @@ mod tests {
             None,
             SessionStop::new(),
             Duration::from_secs(2),
+            false,
         )
         .await
         .unwrap();
@@ -2844,6 +2854,7 @@ mod tests {
             None,
             SessionStop::new(),
             Duration::from_secs(2),
+            false,
         )
         .await
         .unwrap();
@@ -2879,6 +2890,7 @@ mod tests {
             None,
             SessionStop::new(),
             Duration::from_secs(2),
+            false,
         )
         .await
         .unwrap();
@@ -2951,6 +2963,7 @@ printf 'ECHO:%s\n' "$line""#;
                 Some(decision_rx),
                 SessionStop::new(),
                 Duration::from_secs(5),
+                false,
             )
             .await
         });
@@ -3031,6 +3044,7 @@ printf 'ECHO:%s\n' "$line""#;
                 None,
                 task_stop,
                 Duration::from_secs(2),
+                false,
             )
             .await
         });
@@ -3088,6 +3102,8 @@ printf 'ECHO:%s\n' "$line""#;
                 None,
                 task_stop,
                 Duration::from_millis(500),
+                // The child below is made a group leader explicitly.
+                true,
             )
             .await
         });
@@ -3143,6 +3159,7 @@ printf 'ECHO:%s\n' "$line""#;
                 None,
                 task_stop,
                 Duration::from_millis(200),
+                false,
             )
             .await
         });
@@ -4224,6 +4241,7 @@ printf 'ECHO:%s\n' "$line""#;
                 None,
                 SessionStop::new(),
                 Duration::from_secs(5),
+                false,
             )
             .await
         });
