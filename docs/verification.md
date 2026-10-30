@@ -68,6 +68,10 @@ same reviewed ignore list. Update both together.
 default `cache` feature: CodeRex never configures a wasmtime cache, so the
 dependency was unnecessary.
 
+RUSTSEC-2026-0422/0423/0424 (`wasmtime`, published 2026-10-29) are fixed by
+upgrading wasmtime to 50.0.1 rather than being added to this list — they are
+not ignored.
+
 Both checks fall back to the cached advisory database when GitHub is
 unreachable, and say so in the log; a *finding* still fails the run.
 
