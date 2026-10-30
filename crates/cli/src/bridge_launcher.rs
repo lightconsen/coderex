@@ -3064,62 +3064,64 @@ printf 'ECHO:%s\n' "$line""#;
         );
     }
 
-    /// Stopping a session asks its whole process group to exit, so a
-    /// session's own children get the graceful request rather than dying only
-    /// when the tree is killed.
+    /// A session that leads its own process group is asked to stop through
+    /// that group, so its own children get the graceful request too.
+    ///
+    /// This asserts the request (`kill -TERM -<pid>`) rather than the kernel's
+    /// delivery: whether a grandchild's `trap` runs depends on the shell, and a
+    /// test that depends on that measures `/bin/sh`, not this code. Delivery to
+    /// the direct child is covered by `shutdown_terminates_the_child_gracefully`.
     #[cfg(unix)]
     #[tokio::test]
-    async fn shutdown_signals_the_sessions_process_group() {
+    #[allow(unsafe_code)] // PATH mutation is unsafe in edition 2024; ENV_LOCK guards it.
+    #[allow(clippy::await_holding_lock)] // ENV_LOCK serialises PATH mutation; held across the await on purpose.
+    async fn a_leading_child_is_stopped_through_its_process_group() {
+        let _guard = crate::ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let tmp = tempfile::tempdir().unwrap();
-        let marker = tmp.path().join("child-got-term");
-        // The session is a group leader; its child traps SIGTERM and writes a
-        // marker. Only a group signal reaches the child.
-        let script = format!(
-            "sh -c 'trap \"echo yes > {}\" TERM; while :; do sleep 0.05; done' & echo started; wait",
-            marker.display()
-        );
+        let log = tmp.path().join("kill.log");
+        // A stand-in for `kill` that records the request and exits 0.
+        let fake = tmp.path().join("bin");
+        std::fs::create_dir_all(&fake).unwrap();
+        let kill = fake.join("kill");
+        std::fs::write(
+            &kill,
+            format!("#!/bin/sh\necho \"$@\" >> {}\n", log.display()),
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&kill, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
         let mut command = Command::new("sh");
         command
             .arg("-c")
-            .arg(&script)
+            .arg("sleep 30")
             .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .kill_on_drop(true);
         command.process_group(0);
-        let child = command.spawn().unwrap();
+        let mut child = command.spawn().unwrap();
+        let pid = child.id().expect("child pid");
 
-        let session_dir = tmp.path().join("session");
-        let stop = SessionStop::new();
-        let task_stop = stop.clone();
-        let handle = tokio::spawn(async move {
-            run_child_streaming(
-                child,
-                "s1",
-                &session_dir,
-                None,
-                None,
-                None,
-                task_stop,
-                Duration::from_millis(500),
-                // The child below is made a group leader explicitly.
-                true,
-            )
-            .await
-        });
-
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        stop.cancel();
-        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
-
-        // The marker is written by the *grandchild*; give it a moment.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-        while !marker.exists() && tokio::time::Instant::now() < deadline {
-            tokio::time::sleep(Duration::from_millis(25)).await;
+        let original_path = std::env::var("PATH").unwrap_or_default();
+        // SAFETY: ENV_LOCK above keeps every other environment-touching test
+        // out for the duration.
+        unsafe {
+            std::env::set_var("PATH", format!("{}:{original_path}", fake.display()));
         }
+        let _ = terminate_child(&mut child, Duration::from_millis(100), true).await;
+        unsafe {
+            std::env::set_var("PATH", &original_path);
+        }
+
+        let recorded = std::fs::read_to_string(&log).unwrap_or_default();
         assert!(
-            marker.exists(),
-            "the session's child never received SIGTERM; only the direct child was signalled"
+            recorded.lines().any(|line| line == format!("-TERM -{pid}")),
+            "expected the group to be signalled, kill was asked for: {recorded:?}"
         );
     }
 
