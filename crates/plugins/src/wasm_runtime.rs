@@ -1684,13 +1684,15 @@ enum CompileMemoryRlimit {
 
 /// The type `setrlimit` accepts for its resource argument.
 ///
-/// `c_int` on macOS/BSD and `u32` (`__rlimit_resource_t`) on Linux.
+/// `c_int` on macOS/BSD, `c_uint` (`__rlimit_resource_t`) on glibc, and
+/// `c_int` again on musl — the last being easy to miss because a gnu build
+/// compiles either way.
 #[cfg(all(unix, feature = "wasm-runtime"))]
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
 type RlimitResource = libc::__rlimit_resource_t;
 /// See [`RlimitResource`].
 #[cfg(all(unix, feature = "wasm-runtime"))]
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
 type RlimitResource = libc::c_int;
 
 #[cfg(all(unix, feature = "wasm-runtime"))]

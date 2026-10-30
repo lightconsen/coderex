@@ -509,16 +509,18 @@ pub(crate) const fn memory_limit_resource(darwin: bool) -> RlimitResource {
 
 /// The type `setrlimit` accepts for its resource argument.
 ///
-/// It is `c_int` on macOS/BSD and `u32` (`__rlimit_resource_t`) on Linux; the
-/// helper used to return `c_int` unconditionally, which meant the Linux build
-/// never compiled — the pipeline's clippy job caught it.
-#[cfg(target_os = "linux")]
+/// Three spellings exist, and getting this wrong breaks a target that a
+/// local build never compiles: `c_int` on macOS/BSD, `c_uint`
+/// (`__rlimit_resource_t`) on glibc, and `c_int` again on musl. The musl
+/// release build is where this was found — the gnu build had compiled for
+/// months.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
 pub(crate) type RlimitResource = libc::__rlimit_resource_t;
 /// See [`RlimitResource`].
 ///
 /// Unix only: on Windows nothing in this module takes an rlimit, so the alias
 /// would be dead code there.
-#[cfg(all(unix, not(target_os = "linux")))]
+#[cfg(all(unix, not(all(target_os = "linux", target_env = "gnu"))))]
 pub(crate) type RlimitResource = libc::c_int;
 
 /// Apply `cur`/`max` to `resource`, returning the kernel's errno on rejection.
