@@ -1511,20 +1511,25 @@ dependencies = [
 
 [[package]]
 name = "comrak"
-version = "0.37.0"
+version = "0.57.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2a4f05e73ca9a30af27bebc13600f91fd1651b2ec7d139ca82a89df7ca583af1"
+checksum = "b5ef59c72b988dfc7c73ec58ec0dc50f95dd87d7f1f39f428902bc379cea8507"
 dependencies = [
  "bon",
  "caseless",
  "clap",
+ "emojis",
  "entities",
- "memchr",
+ "finl_unicode",
+ "fmt2io",
+ "memchr-n",
+ "phf 0.14.0",
+ "phf_codegen 0.14.0",
+ "rustc-hash",
  "shell-words",
- "slug",
+ "smallvec",
  "syntect",
  "typed-arena",
- "unicode_categories",
  "xdg",
 ]
 
@@ -2125,12 +2130,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "deunicode"
-version = "1.6.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "abd57806937c9cc163efc8ea3910e00a62e2aeb0b8119f1793a978088f8f6b04"
-
-[[package]]
 name = "difflib"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2258,6 +2257,15 @@ name = "embedded-io"
 version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "edd0f118536f44f5ccd48bcb8b111bdc3de888b58c74639dfb034a357d0f206d"
+
+[[package]]
+name = "emojis"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "589871e639330783bc20ad89d32ac1b049e02c273d96c907ca27478c8bc674a2"
+dependencies = [
+ "phf 0.13.1",
+]
 
 [[package]]
 name = "encode_unicode"
@@ -2424,6 +2432,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
 
 [[package]]
+name = "fearless_simd"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3296eb97d869113eaf148a6bdf01884e90b3828ad7ae2340b0f93362fc158611"
+
+[[package]]
+name = "fearless_simd_macros"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3e91d94c6885390b81782d7ee60fd6583b33907333a8b340de25ccf468353315"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.6",
+]
+
+[[package]]
 name = "fiat-crypto"
 version = "0.2.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2512,6 +2537,12 @@ checksum = "17c704e9dbe1ddd863da1e6ff3567795087b1eb201ce80d8fa81162e1516500d"
 dependencies = [
  "bitflags 1.3.2",
 ]
+
+[[package]]
+name = "fmt2io"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6b6129284da9f7e5296cc22183a63f24300e945e297705dcc0672f7df01d62c8"
 
 [[package]]
 name = "fnv"
@@ -3636,7 +3667,7 @@ checksum = "c7a7213d12e1864c0f002f52c2923d4556935a43dec5e71355c2760e0f6e7a18"
 dependencies = [
  "log",
  "phf 0.11.3",
- "phf_codegen",
+ "phf_codegen 0.11.3",
  "string_cache",
  "string_cache_codegen",
  "tendril",
@@ -3673,6 +3704,16 @@ name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
+
+[[package]]
+name = "memchr-n"
+version = "0.1.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f48c6352cc1185740af256ccc396af598d2366bfd90a34f5afe48744bf06a5b5"
+dependencies = [
+ "fearless_simd",
+ "fearless_simd_macros",
+]
 
 [[package]]
 name = "memfd"
@@ -4633,6 +4674,15 @@ dependencies = [
 
 [[package]]
 name = "phf"
+version = "0.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c1562dc717473dbaa4c1f85a36410e03c047b2e7df7f45ee938fbef64ae7fadf"
+dependencies = [
+ "phf_shared 0.13.1",
+]
+
+[[package]]
+name = "phf"
 version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "010378780309880b08997fae13be7834dba947d36393bd372f2b1556deb2a2f6"
@@ -4650,6 +4700,16 @@ checksum = "aef8048c789fa5e851558d709946d6d79a8ff88c0440c587967f8e94bfb1216a"
 dependencies = [
  "phf_generator 0.11.3",
  "phf_shared 0.11.3",
+]
+
+[[package]]
+name = "phf_codegen"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "41b585a510fb76fdebead6897982ef2a03a21d8e6cbcca904999742a4afc6ffe"
+dependencies = [
+ "phf_generator 0.14.0",
+ "phf_shared 0.14.0",
 ]
 
 [[package]]
@@ -4703,6 +4763,15 @@ name = "phf_shared"
 version = "0.11.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "67eabc2ef2a60eb7faa00097bd1ffdb5bd28e62bf39990626a582201b7a754e5"
+dependencies = [
+ "siphasher",
+]
+
+[[package]]
+name = "phf_shared"
+version = "0.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e57fef6bc5981e38c2ce2d63bfa546861309f875b8a75f092d1d54ae2d64f266"
 dependencies = [
  "siphasher",
 ]
@@ -5875,16 +5944,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 
 [[package]]
-name = "slug"
-version = "0.1.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "882a80f72ee45de3cc9a5afeb2da0331d58df69e4e7d8eeb5d3c7784ae67e724"
-dependencies = [
- "deunicode",
- "wasm-bindgen",
-]
-
-[[package]]
 name = "small_btree"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6230,7 +6289,7 @@ dependencies = [
  "fnv",
  "nom",
  "phf 0.11.3",
- "phf_codegen",
+ "phf_codegen 0.11.3",
 ]
 
 [[package]]
@@ -6784,12 +6843,6 @@ name = "unicode-width"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1fc81956842c57dac11422a97c3b8195a1ff727f06e85c84ed2e8aa277c9a0fd"
-
-[[package]]
-name = "unicode_categories"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "39ec24b3121d976906ece63c9daad25b85969647682eee313cb5779fdd69e14e"
 
 [[package]]
 name = "universal-hash"
@@ -7704,9 +7757,9 @@ dependencies = [
 
 [[package]]
 name = "xdg"
-version = "2.5.2"
+version = "3.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "213b7324336b53d2414b2db8537e56544d981803139155afa84f76eeebb7a546"
+checksum = "2fb433233f2df9344722454bc7e96465c9d03bff9d77c248f9e7523fe79585b5"
 
 [[package]]
 name = "xsum"
