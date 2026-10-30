@@ -112,6 +112,50 @@ fn run_coderex(cwd: &Path, base_url: &str) -> (String, String, i32) {
     (stdout, stderr, status.code().unwrap_or(-1))
 }
 
+/// The answer must reach the host as frames, not only inside `result`.
+///
+/// The engine task hands the engine back the moment it finishes, and events it
+/// sent just before that can still be in the channel. Draining those without
+/// the protocol sink appended their text to the answer and emitted nothing, so
+/// a stream-json host could receive a `result` carrying the whole answer and no
+/// `assistant`/`stream_event` frame at all. That was seen once on a loaded CI
+/// runner and has not been reproduced locally — this stress run documents the
+/// invariant and would catch a gross regression, but it does not force the
+/// race, so passing it is not proof the bug is gone.
+#[test]
+fn every_rep_emits_protocol_frames_before_the_result() {
+    let workspace = tempfile::tempdir().expect("temp workspace");
+    let (mut provider, base_url) = start_static_provider();
+
+    for rep in 0..8 {
+        let (stdout, stderr, code) = run_coderex(workspace.path(), &base_url);
+        assert_eq!(code, 0, "rep {rep}: coderex failed; stderr:\n{stderr}");
+        let frames: Vec<serde_json::Value> = stdout
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| {
+                serde_json::from_str(line).unwrap_or_else(|error| {
+                    panic!("rep {rep}: not one JSON object ({error}): {line}")
+                })
+            })
+            .collect();
+        assert!(
+            frames.iter().any(|frame| {
+                matches!(
+                    frame["type"].as_str(),
+                    Some("assistant" | "stream_event" | "user" | "system")
+                )
+            }),
+            "rep {rep}: the answer arrived only in the result frame; frames: {frames:#?}"
+        );
+        let results = frames.iter().filter(|f| f["type"] == "result").count();
+        assert_eq!(results, 1, "rep {rep}: expected exactly one result");
+    }
+
+    let _ = provider.kill();
+    let _ = provider.wait();
+}
+
 #[test]
 fn stream_json_writes_one_frame_per_line() {
     let workspace = tempfile::tempdir().expect("temp workspace");

@@ -745,7 +745,12 @@ fn assert_raw_absent(session: &PtySession, needles: &[&str]) {
 fn startup_renders_prompt_and_default_regions() {
     let dir = setup_project_dir();
     let session = session_without_engine(dir.path());
-    let screen = session.wait_for_text("CodeRex v", SCREEN_TIMEOUT);
+    // The banner is drawn before the status line under it: waiting for
+    // "CodeRex v" alone reads a screen that is still being painted, and the
+    // last row's assertion then fails on a fast runner rather than a slow one.
+    // Wait for the region that is checked last.
+    let screen = session.wait_for_text("Permissions: default", SCREEN_TIMEOUT);
+    assert!(screen.contains("CodeRex v"), "{screen}");
     assert!(screen.contains("Type /help for commands"));
     assert!(screen.contains("claude-sonnet-4-6"));
     assert!(screen.contains("Permissions: default"));

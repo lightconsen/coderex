@@ -6599,10 +6599,6 @@ impl ReplLoop {
 
     /// Drain pending events from the event channel, appending text deltas to
     /// the output.
-    fn drain_events(&mut self, output: &mut String) {
-        self.drain_events_inner(output, None, "");
-    }
-
     /// Drain events that arrived before the turn, framing them for a host.
     ///
     /// A mod's `SessionStart` UI is emitted before `submit_prompt` reaches its
@@ -6615,6 +6611,11 @@ impl ReplLoop {
         session_id: &str,
     ) {
         self.drain_events_inner(output, protocol.as_mut(), session_id);
+    }
+
+    #[cfg(test)]
+    fn drain_events(&mut self, output: &mut String) {
+        self.drain_events_inner(output, None, "");
     }
 
     fn drain_events_inner(
@@ -8045,7 +8046,14 @@ impl ReplLoop {
             // headless session is resumable even if the process is stopped.
             self.persist_headless_session();
         }
-        self.drain_events(&mut output);
+        // With the sink, not without it: the engine task hands the engine back
+        // the moment it finishes, and events it sent just before that are
+        // still in the channel. Draining them here without the sink appended
+        // their text to the answer but emitted no frame for it, so a
+        // stream-json host could see a `result` carrying the whole answer and
+        // no `assistant`/`stream_event` frame at all — intermittently,
+        // depending on whether the pump had already read them.
+        self.drain_events_with_sink(&mut output, &mut protocol, &session_id);
 
         // One result frame closes the turn: `emit_turn_complete` consumes the
         // turn guard, so a turn cannot report itself finished twice.
