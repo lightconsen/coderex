@@ -167,6 +167,16 @@ pub fn is_windows_target(target: &str) -> bool {
     target.contains("windows")
 }
 
+/// The file inside a target's `.tar.gz`.
+///
+/// The archive is named `coderex-<target>.tar.gz` and holds `coderex-<target>`
+/// — the extension is on the archive, not on the binary. Using the asset name
+/// as the member name makes extraction fail with "holds X, not X.tar.gz".
+#[must_use]
+pub fn archive_member(target: &str) -> String {
+    format!("coderex-{target}")
+}
+
 /// Parse a GitHub release body into the parts the updater needs.
 pub fn parse_release(body: &serde_json::Value) -> Result<Release, String> {
     let tag = body
@@ -626,7 +636,7 @@ pub async fn update(options: UpdateOptions) -> Result<UpdateReport, String> {
     let replacement = if is_windows_target(target) {
         archive_path
     } else {
-        extract_tarball(&archive_path, &name, staging.path())?
+        extract_tarball(&archive_path, &archive_member(target), staging.path())?
     };
 
     replace_binary(&current_exe, &replacement)?;
@@ -678,6 +688,17 @@ mod tests {
             "coderex-x86_64-pc-windows-msvc.exe"
         );
         assert!(!is_windows_target("aarch64-apple-darwin"));
+    }
+
+    /// The archive name carries `.tar.gz`; the file inside it does not.
+    #[test]
+    fn the_archive_member_drops_the_extension() {
+        let target = "x86_64-unknown-linux-gnu";
+        assert_eq!(
+            asset_name(target),
+            "coderex-x86_64-unknown-linux-gnu.tar.gz"
+        );
+        assert_eq!(archive_member(target), "coderex-x86_64-unknown-linux-gnu");
     }
 
     #[test]

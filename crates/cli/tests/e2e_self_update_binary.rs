@@ -159,8 +159,14 @@ fn payload() -> (String, Vec<u8>) {
     let name = self_update::asset_name(target);
     #[cfg(unix)]
     {
+        // The archive is `coderex-<target>.tar.gz` and holds
+        // `coderex-<target>`: the extension is on the archive, not the binary.
+        // The release workflow packages it that way (`cp … dist/coderex-$target`
+        // then `tar czf coderex-$target.tar.gz -C dist coderex-$target`), and
+        // building the fixture with the extension inside the archive is what
+        // let a real "holds X, not X.tar.gz" failure through once.
         let script = b"#!/bin/sh\necho fake-new-version\n";
-        let archive = tarball(&name, script);
+        let archive = tarball(&self_update::archive_member(target), script);
         (name, archive)
     }
     #[cfg(windows)]
