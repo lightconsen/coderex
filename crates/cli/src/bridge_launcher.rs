@@ -256,7 +256,7 @@ pub struct ProcessSessionRunner {
 impl Default for ProcessSessionRunner {
     fn default() -> Self {
         Self {
-            grace: SESSION_SHUTDOWN_GRACE,
+            grace: shutdown_grace(),
         }
     }
 }
@@ -387,9 +387,38 @@ fn spawn_registered_child(
 #[derive(Debug, Default)]
 struct StreamCapture {
     transcript: String,
+    /// The turn's usage: the final `result` frame's totals when it carries
+    /// them, otherwise the sum of every assistant frame's own usage.
     usage: UsageStats,
+    /// Usage summed from the assistant frames, kept separately so the result
+    /// frame can override it and tests can see both.
+    streamed_usage: UsageStats,
     /// Detail from the final `result` frame when the turn reported an error.
     result_error: Option<String>,
+}
+
+/// How long a stopped session gets before it is killed.
+///
+/// `CODEREX_BRIDGE_SHUTDOWN_GRACE_SECS` overrides the default; a session whose
+/// child has real cleanup to do (writing a transcript, stopping a database)
+/// needs more than five seconds, and the right value depends on that child.
+#[must_use]
+fn shutdown_grace() -> Duration {
+    shutdown_grace_from(
+        std::env::var("CODEREX_BRIDGE_SHUTDOWN_GRACE_SECS")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// The override rule, pure so a test does not have to mutate the process
+/// environment (which the workspace forbids outside `unsafe`).
+#[must_use]
+fn shutdown_grace_from(value: Option<&str>) -> Duration {
+    value
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .map_or(SESSION_SHUTDOWN_GRACE, Duration::from_secs)
 }
 
 /// Run a child with piped stdout/stderr, streaming both concurrently.
@@ -602,11 +631,40 @@ where
                 }
                 continue;
             }
+            // An assistant frame carries its own usage; the turn's total is
+            // the sum of them unless the result frame reports one.
+            Some("assistant") => {
+                if let Some(usage) = frame
+                    .get("message")
+                    .and_then(|message| message.get("usage"))
+                {
+                    capture.streamed_usage =
+                        add_usage(capture.streamed_usage, usage_from_usage(usage));
+                }
+                continue;
+            }
             Some("result") => {}
             _ => continue,
         }
 
-        capture.usage = usage_from_result(&frame);
+        // The final `result` frame may carry the turn's totals, or it may not
+        // carry usage at all (an older child, or a provider that reports per
+        // message). The assistant frames' usage was accumulated above, so a
+        // session that never emits totals still reports what it spent; the
+        // result frame wins when it does carry them, because its numbers are
+        // the provider's own totals rather than our sum.
+        let from_result = usage_from_result(&frame);
+        // Copied out, not moved: `streamed_usage` keeps accumulating.
+        let streamed_so_far = capture.streamed_usage;
+        capture.usage = if from_result.input_tokens == 0
+            && from_result.output_tokens == 0
+            && from_result.cache_read_tokens == 0
+            && from_result.cache_creation_tokens == 0
+        {
+            streamed_so_far
+        } else {
+            from_result
+        };
         if frame
             .get("is_error")
             .and_then(Value::as_bool)
@@ -662,6 +720,41 @@ fn forward_output(
             stream,
             line: line.to_string(),
         });
+    }
+}
+
+/// Add two usage reports, field by field.
+fn add_usage(total: UsageStats, add: UsageStats) -> UsageStats {
+    UsageStats {
+        input_tokens: total.input_tokens.saturating_add(add.input_tokens),
+        output_tokens: total.output_tokens.saturating_add(add.output_tokens),
+        cache_read_tokens: total
+            .cache_read_tokens
+            .saturating_add(add.cache_read_tokens),
+        cache_creation_tokens: total
+            .cache_creation_tokens
+            .saturating_add(add.cache_creation_tokens),
+        cost_usd: total.cost_usd + add.cost_usd,
+    }
+}
+
+/// Read a usage object in either spelling.
+fn usage_from_usage(usage: &Value) -> UsageStats {
+    let tokens = |keys: &[&str]| -> usize {
+        usize::try_from(
+            keys.iter()
+                .find_map(|key| usage.get(*key))
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+        )
+        .unwrap_or(usize::MAX)
+    };
+    UsageStats {
+        input_tokens: tokens(&["input_tokens"]),
+        output_tokens: tokens(&["output_tokens"]),
+        cache_read_tokens: tokens(&["cache_read_input_tokens", "cache_read_tokens"]),
+        cache_creation_tokens: tokens(&["cache_creation_input_tokens", "cache_creation_tokens"]),
+        cost_usd: usage.get("cost_usd").and_then(Value::as_f64).unwrap_or(0.0),
     }
 }
 
@@ -2628,6 +2721,94 @@ mod tests {
         assert_eq!(usage.cache_read_tokens, 3);
         assert_eq!(usage.cache_creation_tokens, 4);
         assert!((usage.cost_usd - 0.5).abs() < f64::EPSILON);
+    }
+
+    /// The shutdown grace is the default unless the override parses as a
+    /// positive number of seconds.
+    #[test]
+    fn the_shutdown_grace_can_be_overridden() {
+        assert_eq!(shutdown_grace_from(Some("30")), Duration::from_secs(30));
+        assert_eq!(shutdown_grace_from(Some(" 30 ")), Duration::from_secs(30));
+        for ignored in ["0", "soon", "", "  "] {
+            assert_eq!(
+                shutdown_grace_from(Some(ignored)),
+                SESSION_SHUTDOWN_GRACE,
+                "{ignored:?} should keep the default"
+            );
+        }
+        assert_eq!(shutdown_grace_from(None), SESSION_SHUTDOWN_GRACE);
+    }
+
+    /// A session whose child never emits totals still reports what it spent:
+    /// every assistant frame's own usage is summed. The result frame, when it
+    /// does carry totals, is the provider's own number and wins.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn streaming_usage_falls_back_to_the_per_message_usage() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session_dir = tmp.path().join("session");
+        let script = r#"printf '%s\n' '{"type":"assistant","session_id":"s1","message":{"usage":{"input_tokens":10,"output_tokens":5}}}' '{"type":"assistant","session_id":"s1","message":{"usage":{"input_tokens":7,"output_tokens":3}}}' '{"type":"result","subtype":"success","is_error":false}'"#;
+
+        let child = Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+
+        let output = run_child_streaming(
+            child,
+            "s1",
+            &session_dir,
+            None,
+            None,
+            None,
+            SessionStop::new(),
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(output.usage.input_tokens, 17);
+        assert_eq!(output.usage.output_tokens, 8);
+    }
+
+    /// The result frame's totals are preferred over the sum when both exist.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn result_totals_win_over_the_per_message_sum() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session_dir = tmp.path().join("session");
+        let script = r#"printf '%s\n' '{"type":"assistant","session_id":"s1","message":{"usage":{"input_tokens":10,"output_tokens":5}}}' '{"type":"result","subtype":"success","is_error":false,"usage":{"input_tokens":10,"output_tokens":5}}'"#;
+
+        let child = Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+
+        let output = run_child_streaming(
+            child,
+            "s1",
+            &session_dir,
+            None,
+            None,
+            None,
+            SessionStop::new(),
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(output.usage.input_tokens, 10);
+        assert_eq!(output.usage.output_tokens, 5);
     }
 
     #[cfg(unix)]

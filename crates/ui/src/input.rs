@@ -1593,6 +1593,23 @@ mod tests {
         assert_eq!(buf.text, "hello");
     }
 
+    /// Indenting a Visual selection leaves the selection for the caller to
+    /// drop. The REPL does; this pins the input side so a stale highlight
+    /// cannot come from here.
+    #[test]
+    fn indenting_a_selection_does_not_touch_the_selection_itself() {
+        let mut buf = buffer_with("one\ntwo\nthree");
+        buf.cursor = 0;
+        buf.start_visual(true);
+        buf.cursor = 4;
+        buf.indent(1);
+        assert_eq!(buf.text, "    one\n    two\nthree");
+        // The range is still there; the caller clears it after the operator.
+        assert!(buf.selection_range().is_some());
+        buf.clear_visual_selection();
+        assert!(buf.selection_range().is_none());
+    }
+
     #[test]
     fn indent_and_outdent_the_line() {
         let mut buf = buffer_with("code");

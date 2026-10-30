@@ -1916,6 +1916,65 @@ fn vim_counted_3dd_deletes_three_lines() {
     }
 }
 
+/// A count applies to vertical motion too: `3j` moves three lines, and a
+/// Visual `>` leaves Visual rather than keeping a stale highlight.
+#[test]
+fn vim_counted_motion_and_visual_indent_leave_no_selection() {
+    let dir = setup_project_dir();
+    let mut session = session_without_engine(dir.path());
+    session.wait_for_text("CodeRex v", SCREEN_TIMEOUT);
+    session.send_line("/vim");
+    session.wait_for_text("Vim mode: enabled", SCREEN_TIMEOUT);
+
+    // Four lines in the buffer: "one", then three opened below.
+    session.send_text("one");
+    session.esc();
+    thread::sleep(Duration::from_millis(150));
+    for line in ["two", "three", "four"] {
+        session.send_text("o");
+        session.send_text(line);
+        session.esc();
+        thread::sleep(Duration::from_millis(120));
+    }
+
+    // From the last line, `3k` lands on the first (the display column is kept
+    // across the shorter lines). `0` then puts the cursor at the start so the
+    // insertion is unambiguous, and its position proves the count moved three
+    // lines rather than one. `1k` first, so a count that only moved one line
+    // would land on "two" and the assertion below would fail.
+    session.send_text("1k");
+    session.send_text("j");
+    session.send_text("3k");
+    session.send_text("0");
+    session.send_text("i");
+    session.send_text("HEAD");
+    let screen = session.wait_for_text("HEADone", SCREEN_TIMEOUT);
+    assert!(
+        screen.contains("HEADone"),
+        "3k did not move three lines:\n{screen}"
+    );
+
+    // Select the line and indent it; the badge must go when the operator ends.
+    // crossterm reads an ESC followed immediately by a character as Alt+char,
+    // so each keystroke gets its own gap.
+    session.esc();
+    thread::sleep(Duration::from_millis(500));
+    session.send_text("0");
+    session.send_text("V");
+    let visual = session.wait_for_text("VISUAL", SCREEN_TIMEOUT);
+    assert!(visual.contains("VISUAL"), "{visual}");
+    session.send_text(">");
+    let after = session.wait_for_text("    HEADone", SCREEN_TIMEOUT);
+    assert!(
+        after.contains("    HEADone"),
+        "the selected line was not indented:\n{after}"
+    );
+    assert!(
+        !after.contains("VISUAL"),
+        "the Visual indicator outlived the indent:\n{after}"
+    );
+}
+
 #[test]
 fn resize_keeps_tui_alive() {
     let dir = setup_project_dir();

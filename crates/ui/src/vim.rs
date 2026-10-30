@@ -33,10 +33,10 @@ pub enum VimAction {
     Left(usize),
     /// Move cursor right, `count` times.
     Right(usize),
-    /// Move cursor up (e.g., in message list).
-    Up,
-    /// Move cursor down (e.g., in message list).
-    Down,
+    /// Move cursor up `count` lines (e.g., in message list).
+    Up(usize),
+    /// Move cursor down `count` lines (e.g., in message list).
+    Down(usize),
     /// Jump to beginning of line.
     JumpToStart,
     /// Jump to end of line.
@@ -255,8 +255,8 @@ impl VimState {
             // Navigation
             KeyCode::Char('h') | KeyCode::Left => VimAction::Left(count),
             KeyCode::Char('l') | KeyCode::Right => VimAction::Right(count),
-            KeyCode::Char('j') | KeyCode::Down => VimAction::Down,
-            KeyCode::Char('k') | KeyCode::Up => VimAction::Up,
+            KeyCode::Char('j') | KeyCode::Down => VimAction::Down(count),
+            KeyCode::Char('k') | KeyCode::Up => VimAction::Up(count),
             KeyCode::Char('0') | KeyCode::Home => VimAction::JumpToStart,
             KeyCode::Char('$') | KeyCode::End => VimAction::JumpToEnd,
             KeyCode::Char('g') if event.modifiers.is_empty() => {
@@ -479,8 +479,8 @@ impl VimState {
             // layer treats them as no-ops rather than walking history.
             KeyCode::Char('h') | KeyCode::Left => VimAction::Left(count),
             KeyCode::Char('l') | KeyCode::Right => VimAction::Right(count),
-            KeyCode::Char('j') | KeyCode::Down => VimAction::Down,
-            KeyCode::Char('k') | KeyCode::Up => VimAction::Up,
+            KeyCode::Char('j') | KeyCode::Down => VimAction::Down(count),
+            KeyCode::Char('k') | KeyCode::Up => VimAction::Up(count),
             KeyCode::Char('w') => VimAction::WordForward(count),
             KeyCode::Char('b') => VimAction::WordBackward(count),
             KeyCode::Char('e') => VimAction::WordEnd(count),
@@ -623,8 +623,8 @@ mod tests {
     fn h_j_k_l_navigation() {
         let mut state = VimState::new();
         assert_eq!(state.handle_key(key('h')), VimAction::Left(1));
-        assert_eq!(state.handle_key(key('j')), VimAction::Down);
-        assert_eq!(state.handle_key(key('k')), VimAction::Up);
+        assert_eq!(state.handle_key(key('j')), VimAction::Down(1));
+        assert_eq!(state.handle_key(key('k')), VimAction::Up(1));
         assert_eq!(state.handle_key(key('l')), VimAction::Right(1));
     }
 
@@ -744,7 +744,7 @@ mod tests {
         // 3j would be: '3' accumulates count, 'j' returns down with count=3
         assert_eq!(state.handle_key(key('3')), VimAction::Ignore);
         assert_eq!(state.count, Some(3));
-        assert_eq!(state.handle_key(key('j')), VimAction::Down);
+        assert_eq!(state.handle_key(key('j')), VimAction::Down(3));
         // count cleared after action
         assert!(state.count.is_none());
     }
@@ -909,11 +909,11 @@ mod tests {
         );
         assert_eq!(
             state.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
-            VimAction::Up
+            VimAction::Up(1)
         );
         assert_eq!(
             state.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
-            VimAction::Down
+            VimAction::Down(1)
         );
     }
 
@@ -984,8 +984,8 @@ mod tests {
         let mut state = visual_state();
         assert_eq!(state.handle_key(key('h')), VimAction::Left(1));
         assert_eq!(state.handle_key(key('l')), VimAction::Right(1));
-        assert_eq!(state.handle_key(key('j')), VimAction::Down);
-        assert_eq!(state.handle_key(key('k')), VimAction::Up);
+        assert_eq!(state.handle_key(key('j')), VimAction::Down(1));
+        assert_eq!(state.handle_key(key('k')), VimAction::Up(1));
         assert_eq!(state.handle_key(key('w')), VimAction::WordForward(1));
         assert_eq!(state.handle_key(key('b')), VimAction::WordBackward(1));
         assert_eq!(state.handle_key(key('e')), VimAction::WordEnd(1));

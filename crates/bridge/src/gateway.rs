@@ -22,10 +22,15 @@
 //! each outbound `permission_request` before it goes on the wire, and
 //! [`crate::orchestrator::Bridge::handle_transport_message`] relays each
 //! inbound `permission_response` before it resolves anything, so a duplicate or
-//! unknown answer is refused on the worker side too. What remains genuinely
-//! outside this repository is the gateway service that owns the *host*
-//! connection: authenticating it, fanning frames out to the right human client,
-//! and presenting the approval UI.
+//! unknown answer is refused on the worker side too.
+//!
+//! The process that serves the host side lives in `coderex-server`
+//! (`gateway::GatewayServer`): it runs the control plane and a per-environment
+//! frame mailbox that a worker and an operator poll. What is still outside this
+//! repository is the *human* half of that — authenticating the operator,
+//! fanning frames out to the right person, and the approval UI itself. The
+//! mailbox carries whatever that process sends; it does not decide who may
+//! read it.
 
 use std::collections::HashSet;
 

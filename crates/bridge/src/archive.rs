@@ -30,7 +30,7 @@ pub struct SessionArchive {
 }
 
 /// Token usage statistics.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct UsageStats {
     /// Input tokens.
     pub input_tokens: usize,

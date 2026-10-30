@@ -5484,24 +5484,33 @@ impl ReplLoop {
                                         ui_state.input.apply(&InputAction::CursorRight);
                                     }
                                 }
-                                VimAction::Up => {
+                                VimAction::Up(count) => {
                                     // `k` moves to the line above once the
                                     // buffer has one. A single-line buffer has
                                     // no line above, so it keeps its original
                                     // meaning: walk back through history. A
                                     // Visual selection must never be replaced
-                                    // by a history entry.
+                                    // by a history entry. The count applies to
+                                    // both meanings, as `3k` does in Vim.
                                     if vim.is_visual() || ui_state.input.line_count() > 1 {
-                                        ui_state.input.move_line(-1);
+                                        for _ in 0..count {
+                                            ui_state.input.move_line(-1);
+                                        }
                                     } else {
-                                        ui_state.input.apply(&InputAction::HistoryUp);
+                                        for _ in 0..count {
+                                            ui_state.input.apply(&InputAction::HistoryUp);
+                                        }
                                     }
                                 }
-                                VimAction::Down => {
+                                VimAction::Down(count) => {
                                     if vim.is_visual() || ui_state.input.line_count() > 1 {
-                                        ui_state.input.move_line(1);
+                                        for _ in 0..count {
+                                            ui_state.input.move_line(1);
+                                        }
                                     } else {
-                                        ui_state.input.apply(&InputAction::HistoryDown);
+                                        for _ in 0..count {
+                                            ui_state.input.apply(&InputAction::HistoryDown);
+                                        }
                                     }
                                 }
                                 VimAction::JumpToStart => {
@@ -5812,9 +5821,14 @@ impl ReplLoop {
                                 }
                                 VimAction::Indent(count) => {
                                     ui_state.input.indent(count);
+                                    // `>` ends the Visual range, like every
+                                    // other operator; the badge and highlight
+                                    // must not outlive the mode.
+                                    ui_state.input.clear_visual_selection();
                                 }
                                 VimAction::Outdent(count) => {
                                     ui_state.input.outdent(count);
+                                    ui_state.input.clear_visual_selection();
                                 }
                             }
 

@@ -127,6 +127,13 @@ impl Heartbeat {
         Duration::from_secs(self.config.timeout_secs)
     }
 
+    /// The epoch second of the last successful beat, or `None` before the
+    /// first one.
+    #[must_use]
+    pub const fn last_success(&self) -> Option<i64> {
+        self.last_success
+    }
+
     /// Reset the heartbeat (after reconnection).
     pub const fn reset(&mut self) {
         self.consecutive_failures = 0;
@@ -417,6 +424,18 @@ impl SessionRecoveryState {
 
 #[cfg(test)]
 mod tests {
+
+    /// The last successful beat is observable: an operator needs to know how
+    /// long a worker has been silent, not just that the counter reset.
+    #[test]
+    fn last_success_is_reported_and_cleared_on_reset() {
+        let mut heartbeat = Heartbeat::new(HeartbeatConfig::default());
+        assert_eq!(heartbeat.last_success(), None);
+        heartbeat.record_success();
+        assert!(heartbeat.last_success().is_some());
+        heartbeat.reset();
+        assert_eq!(heartbeat.last_success(), None);
+    }
     use super::*;
 
     #[test]
