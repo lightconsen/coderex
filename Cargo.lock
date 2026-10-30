@@ -1452,7 +1452,7 @@ dependencies = [
  "tokio",
  "tracing",
  "unicode-segmentation",
- "unicode-width 0.2.0",
+ "unicode-width 0.2.3",
 ]
 
 [[package]]
@@ -2919,7 +2919,7 @@ dependencies = [
  "nom",
  "tendril",
  "thiserror 2.0.21",
- "unicode-width 0.2.0",
+ "unicode-width 0.2.3",
 ]
 
 [[package]]
@@ -4289,7 +4289,7 @@ dependencies = [
  "smallvec",
  "textwrap",
  "unicode-segmentation",
- "unicode-width 0.2.0",
+ "unicode-width 0.2.3",
 ]
 
 [[package]]
@@ -5209,7 +5209,7 @@ dependencies = [
  "thiserror 2.0.21",
  "unicode-segmentation",
  "unicode-truncate",
- "unicode-width 0.2.0",
+ "unicode-width 0.2.3",
 ]
 
 [[package]]
@@ -5272,7 +5272,7 @@ dependencies = [
  "strum 0.28.0",
  "time",
  "unicode-segmentation",
- "unicode-width 0.2.0",
+ "unicode-width 0.2.3",
 ]
 
 [[package]]
@@ -6298,7 +6298,7 @@ checksum = "6ecfad6c3abc80a577f2b91c1e412ee57e7a060d430b553c1b0c940974ebcd49"
 dependencies = [
  "icu_segmenter",
  "smawk",
- "unicode-width 0.2.0",
+ "unicode-width 0.2.3",
 ]
 
 [[package]]
@@ -6770,7 +6770,7 @@ checksum = "16b380a1238663e5f8a691f9039c73e1cdae598a30e9855f541d29b08b53e9a5"
 dependencies = [
  "itertools 0.14.0",
  "unicode-segmentation",
- "unicode-width 0.2.0",
+ "unicode-width 0.2.3",
 ]
 
 [[package]]
@@ -6781,9 +6781,9 @@ checksum = "7dd6e30e90baa6f72411720665d41d89b9a3d039dc45b8faea1ddd07f617f6af"
 
 [[package]]
 name = "unicode-width"
-version = "0.2.0"
+version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1fc81956842c57dac11422a97c3b8195a1ff727f06e85c84ed2e8aa277c9a0fd"
+checksum = "ca718471876992059f251e33aafc334346ada08042b7661dd1fe313a9bced557"
 
 [[package]]
 name = "unicode_categories"
@@ -7278,7 +7278,7 @@ dependencies = [
  "bumpalo",
  "leb128fmt",
  "memchr",
- "unicode-width 0.2.0",
+ "unicode-width 0.2.3",
  "wasm-encoder 0.262.0",
 ]
 
