@@ -3330,13 +3330,16 @@ impl StartupOrchestrator {
                 report.latest.as_deref().unwrap_or("the latest release"),
                 path.display()
             ),
-            None => match &report.latest {
-                Some(latest) if check => println!(
+            None => match (report.update_available, &report.latest) {
+                (true, Some(latest)) => println!(
                     "New version available: {latest} (current: {}). Run `coderex update` to install it.",
                     report.current
                 ),
-                Some(latest) => println!("CodeRex is up to date ({latest})."),
-                None => println!("CodeRex is up to date."),
+                (true, None) => println!(
+                    "A newer version may be available; the release lookup did not return one."
+                ),
+                (false, Some(latest)) => println!("CodeRex is up to date ({latest})."),
+                (false, None) => println!("CodeRex is up to date."),
             },
         }
         version::record_check_time(std::path::Path::new(&cwd));

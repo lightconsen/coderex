@@ -72,6 +72,10 @@ pub struct UpdateReport {
     pub current: String,
     /// The latest published version, when the release lookup succeeded.
     pub latest: Option<String>,
+    /// Whether `latest` is newer than `current`. `latest` alone cannot say
+    /// this: "the newest release" and "a newer release than you have" are two
+    /// different answers.
+    pub update_available: bool,
     /// Where the new binary was installed, when one was.
     pub installed: Option<PathBuf>,
 }
@@ -524,6 +528,7 @@ pub async fn update(options: UpdateOptions) -> Result<UpdateReport, String> {
         return Ok(UpdateReport {
             current,
             latest: Some(release.version),
+            update_available: false,
             installed: None,
         });
     }
@@ -532,6 +537,7 @@ pub async fn update(options: UpdateOptions) -> Result<UpdateReport, String> {
         return Ok(UpdateReport {
             current,
             latest: Some(release.version),
+            update_available: true,
             installed: None,
         });
     }
@@ -628,6 +634,7 @@ pub async fn update(options: UpdateOptions) -> Result<UpdateReport, String> {
     Ok(UpdateReport {
         current,
         latest: Some(release.version),
+        update_available: true,
         installed: Some(current_exe),
     })
 }

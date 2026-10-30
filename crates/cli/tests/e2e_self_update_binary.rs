@@ -259,6 +259,30 @@ fn update_downloads_verifies_and_replaces_the_binary() {
     }
 }
 
+/// Up to date means up to date: when the latest release is not newer, the
+/// check must not say one is available.
+#[test]
+fn update_check_says_up_to_date_when_the_latest_is_the_same() {
+    let (tag_name, asset) = payload();
+    let release = FakeRelease::new("v0.1.0", &tag_name, asset);
+    let server = FakeServer::start(release);
+    let (_dir, binary) = copied_binary();
+
+    let output = run_update(&binary, &server, &["--check"]);
+
+    assert!(
+        output.status.success(),
+        "update --check failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("up to date"), "{stdout}");
+    assert!(
+        !stdout.contains("New version available"),
+        "it claimed a newer release for the same version:\n{stdout}"
+    );
+}
+
 #[test]
 fn a_bad_checksum_leaves_the_binary_untouched() {
     let (tag_name, asset) = payload();
