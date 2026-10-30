@@ -381,7 +381,7 @@ jobs:
           fi
       - name: Upload coverage report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: coverage-lcov
           path: |
@@ -440,7 +440,7 @@ jobs:
             --force
       - name: Upload eval report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: eval-report
           path: |
@@ -493,7 +493,7 @@ jobs:
         run: scripts/fuzz.sh 120
       - name: Upload soak and fuzz reports
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: nightly-soak-and-fuzz
           path: |
@@ -564,7 +564,7 @@ jobs:
         run: scripts/test-live-eval.sh
       - name: Upload live eval report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: live-eval-report
           path: |
