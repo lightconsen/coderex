@@ -170,12 +170,31 @@ jobs:
           path: artifacts
           merge-multiple: true
 
+      - name: Resolve the release tag
+        id: tag
+        run: |
+          # The action defaults to `github.ref`, which on a manual dispatch is
+          # the branch (`refs/heads/main`) — it would publish under a tag called
+          # `main`. Resolve it once so the release and its prerelease flag
+          # cannot disagree.
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            tag="${{ inputs.tag }}"
+          else
+            tag="${GITHUB_REF_NAME}"
+          fi
+          echo "name=${tag}" >> "$GITHUB_OUTPUT"
+          case "$tag" in
+            *alpha*|*beta*|*rc*) echo "prerelease=true" >> "$GITHUB_OUTPUT" ;;
+            *) echo "prerelease=false" >> "$GITHUB_OUTPUT" ;;
+          esac
+
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ steps.tag.outputs.name }}
           files: artifacts/*
           generate_release_notes: true
           draft: false
-          prerelease: ${{ contains(github.ref, 'alpha') || contains(github.ref, 'beta') || contains(github.ref, 'rc') }}
+          prerelease: ${{ steps.tag.outputs.prerelease == 'true' }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
