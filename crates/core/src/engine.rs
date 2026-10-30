@@ -2285,7 +2285,11 @@ impl QueryEngine {
     /// Record tool calls from a turn and check for loops.
     ///
     /// Returns `Some(TerminalReason::LoopDetected)` if a loop is detected.
-    fn record_and_check_loop(&self, tool_calls: &[PendingToolCall]) -> Option<TerminalReason> {
+    fn record_and_check_loop(
+        &self,
+        tool_calls: &[PendingToolCall],
+        results: &[ToolResult],
+    ) -> Option<TerminalReason> {
         let mut guard = self
             .loop_detector
             .lock()
@@ -2304,7 +2308,9 @@ impl QueryEngine {
         if calls.is_empty() {
             detector.record_empty_turn();
         } else {
-            detector.record_turn(&calls);
+            // The answers are part of the turn: a poll that returns a different
+            // status each time is progress, not a loop.
+            detector.record_turn_with_results(&calls, results);
         }
 
         match detector.check() {
@@ -3506,7 +3512,25 @@ impl QueryEngine {
             return None;
         }
 
-        self.record_and_check_loop(pending_for_loop)
+        // The results belong to the calls of this turn, not to earlier turns
+        // whose calls happen to share a direction.
+        let pending_ids: std::collections::HashSet<&str> = pending_for_loop
+            .iter()
+            .map(|call| call.id.as_str())
+            .collect();
+        let results: Vec<ToolResult> = turn
+            .messages
+            .iter()
+            .filter_map(|message| match &message.content {
+                crate::types::MessageContent::ToolResult(result)
+                    if pending_ids.contains(result.tool_call_id.as_str()) =>
+                {
+                    Some(result.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        self.record_and_check_loop(pending_for_loop, &results)
     }
 
     /// Close a turn that ends for a reason other than how the model stopped.
@@ -9420,11 +9444,14 @@ mod tests {
     #[tokio::test]
     async fn compaction_clears_the_loop_history() {
         let (engine, _rx, _session) = make_test_engine();
-        engine.record_and_check_loop(&[PendingToolCall {
-            id: "call-1".into(),
-            name: "Read".into(),
-            input: serde_json::json!({"file_path": "src/lib.rs"}),
-        }]);
+        engine.record_and_check_loop(
+            &[PendingToolCall {
+                id: "call-1".into(),
+                name: "Read".into(),
+                input: serde_json::json!({"file_path": "src/lib.rs"}),
+            }],
+            &[],
+        );
         assert_eq!(
             engine.loop_history_len(),
             Some(1),

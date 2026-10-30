@@ -27,7 +27,7 @@ The foundational engine of CodeRex. Manages LLM API communication, conversation 
 - **`HookExecutor`** / `HookSecurity` — Hook execution with SSRF guard, URL validation, and environment interpolation.
 - **`ShellSecurity`** (`shell_security.rs`) — Bash AST parsing and destructive command detection.
 - **`WireProtocol` / `WireTransport`** (`wire_protocol.rs`, `wire_transport.rs`) — JSON-RPC wire encoding/decoding with stdio and in-memory transports.
-- **`LoopDetector`** (`loop_detector.rs`) — Detects repetitive agent loops and triggers intervention.
+- **`LoopDetector`** (`loop_detector.rs`) — Detects repetitive agent loops and triggers intervention. The engine records each turn with what its calls returned, so the same call with a changing answer (polling a build) is progress, not a loop; only a repeated call that keeps returning the same thing counts.
 - **`StopHook`** (`stop_hook.rs`) — Pre/post-turn hooks for cleanup and state synchronization.
 - **`WorktreeManager`** / `TeamManager` / `Coordinator` — Multi-session orchestration, team memory sharing, and coordinator state machine.
 

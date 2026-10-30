@@ -12,7 +12,7 @@
 //! JSON input, so semantically identical calls with different field ordering
 //! produce the same fingerprint.
 
-use crate::types::ToolCall;
+use crate::types::{ToolCall, ToolResult};
 use sha2::{Digest, Sha256};
 use std::collections::VecDeque;
 
@@ -32,6 +32,29 @@ pub struct ToolCallFingerprint {
 }
 
 impl ToolCallFingerprint {
+    /// Create a fingerprint from a tool call and what it returned.
+    ///
+    /// A call whose result is missing hashes as if the result were empty: the
+    /// point is that two turns with the same calls and different answers are
+    /// different, and a missing answer is a difference too.
+    #[must_use]
+    pub fn from_tool_call_and_result(call: &ToolCall, results: &[ToolResult]) -> Self {
+        let canonical = canonicalize_json(&call.input);
+        let result = results.iter().find(|result| result.tool_call_id == call.id);
+        let mut hasher = Sha256::new();
+        hasher.update(canonical.as_bytes());
+        hasher.update([0]);
+        if let Some(result) = result {
+            hasher.update(result.output.as_bytes());
+            hasher.update([u8::from(result.is_error)]);
+        }
+        let hash = format!("{:x}", hasher.finalize());
+        Self {
+            tool_name: call.name.clone(),
+            input_hash: hash,
+        }
+    }
+
     /// Create a fingerprint from a tool call.
     #[must_use]
     pub fn from_tool_call(call: &ToolCall) -> Self {
@@ -98,11 +121,34 @@ impl LoopDetector {
     }
 
     /// Record the tool calls from a completed turn.
+    ///
+    /// The fingerprint covers the calls only. The engine uses
+    /// [`Self::record_turn_with_results`], which also covers what the calls
+    /// returned; this form is for callers that have no results to show.
     pub fn record_turn(&mut self, calls: &[ToolCall]) {
         let fingerprint: TurnFingerprint = calls
             .iter()
             .map(ToolCallFingerprint::from_tool_call)
             .collect();
+        self.push(fingerprint);
+    }
+
+    /// Record a completed turn together with what its calls returned.
+    ///
+    /// A repeated call whose output changed is progress, not a loop: polling
+    /// a build every eight minutes repeats one `Bash` call three times with
+    /// three different answers. Folding the result into the call's fingerprint
+    /// keeps that out of the detector while leaving a loop — the same call
+    /// returning the same thing — exactly as it was.
+    pub fn record_turn_with_results(&mut self, calls: &[ToolCall], results: &[ToolResult]) {
+        let fingerprint: TurnFingerprint = calls
+            .iter()
+            .map(|call| ToolCallFingerprint::from_tool_call_and_result(call, results))
+            .collect();
+        self.push(fingerprint);
+    }
+
+    fn push(&mut self, fingerprint: TurnFingerprint) {
         self.history.push_back(fingerprint);
         while self.history.len() > self.max_history {
             self.history.pop_front();
@@ -111,10 +157,7 @@ impl LoopDetector {
 
     /// Record an empty turn (no tool calls).
     pub fn record_empty_turn(&mut self) {
-        self.history.push_back(Vec::new());
-        while self.history.len() > self.max_history {
-            self.history.pop_front();
-        }
+        self.push(Vec::new());
     }
 
     /// Check whether the history contains a loop pattern.
@@ -325,6 +368,52 @@ mod tests {
             "expected alternation loop, got {:?}",
             detector.check()
         );
+    }
+
+    /// Polling a build repeats one call three times and gets three different
+    /// answers; that is progress, not a loop. Real sessions do this.
+    #[test]
+    fn the_same_call_with_changing_results_is_not_a_loop() {
+        let call = make_call(
+            "Bash",
+            serde_json::json!({"command": "gh run view --json status"}),
+        );
+        let mut detector = LoopDetector::new();
+        for status in ["queued", "in_progress", "in_progress", "completed"] {
+            let result = ToolResult::text(&call.id, status);
+            detector.record_turn_with_results(std::slice::from_ref(&call), &[result]);
+            assert_eq!(detector.check(), LoopDetection::Ok);
+        }
+    }
+
+    /// The same call returning the same answer is the loop this exists to catch.
+    #[test]
+    fn the_same_call_with_the_same_result_is_still_a_loop() {
+        let call = make_call("Bash", serde_json::json!({"command": "cargo build"}));
+        let mut detector = LoopDetector::new();
+        for _ in 0..3 {
+            let result = ToolResult::text(&call.id, "error: cannot find crate");
+            detector.record_turn_with_results(std::slice::from_ref(&call), &[result]);
+        }
+        assert!(matches!(
+            detector.check(),
+            LoopDetection::LoopDetected { .. }
+        ));
+    }
+
+    /// A missing result is a difference too: two turns that look identical
+    /// cannot be compared on their answers.
+    #[test]
+    fn a_turn_without_results_does_not_match_one_with_them() {
+        let call = make_call("Read", serde_json::json!({"file_path": "a"}));
+        let mut detector = LoopDetector::new();
+        detector.record_turn_with_results(std::slice::from_ref(&call), &[]);
+        detector.record_turn_with_results(
+            std::slice::from_ref(&call),
+            &[ToolResult::text(&call.id, "content")],
+        );
+        detector.record_turn_with_results(std::slice::from_ref(&call), &[]);
+        assert_eq!(detector.check(), LoopDetection::Ok);
     }
 
     #[test]
