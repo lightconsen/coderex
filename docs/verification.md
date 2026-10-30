@@ -37,6 +37,7 @@ this table is what they check):
 |---|---|
 | `fmt` | `cargo fmt --all --check` |
 | `cassettes` | `python3 scripts/cassette_tool.py check --strict` (metadata, size, staleness, credentials; runs in seconds) |
+| `cross-check-musl` | `cargo check --workspace --target x86_64-unknown-linux-musl` — the release matrix's musl target, whose libc differs from glibc in ways a gnu build cannot see |
 | `ssh-integration` | a throwaway `sshd` on a high port, then `cargo test -p coderex-bridge --test ssh_spawn` — the SSH spawn path against a real server |
 | `clippy` | `cargo clippy --workspace --all-targets -- -D warnings` (the backlog is zero, so a warning fails) |
 | `test` | `cargo nextest run --workspace --no-fail-fast` on Linux; the macOS plist carrier and the live benchmark replay run in `test-macos`, the Windows runtime sandbox tests in `test-windows`, and the SSH spawn path in `ssh-integration` |
