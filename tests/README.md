@@ -139,6 +139,26 @@ The tree budget is 30 MiB by default (`CASSETTE_MAX_MB`). Large responses
 should keep only the fields replay needs; the request side already stores the
 canonical form.
 
+### The real-session corpus
+
+`crates/cli/tests/real_session_corpus.rs` replays sessions recorded by another
+machine's agent — the JSONL transcripts Claude Code writes under
+`~/.claude/projects` — through the engine's context paths: import, compaction,
+loop detection and the transcript store. It exists because the conversations
+this repository composes are tidy, and the bugs that matter (a tool result whose
+call was compacted away, a detector that fires on a legitimate poll) only show
+up in real ones.
+
+The corpus is **not** committed: it is private conversation data and it is
+large. The test reads `CODEREX_REAL_SESSIONS_DIR` (default
+`~/.claude/projects`), keeps the longest 20 sessions with at least a dozen
+assistant turns, and prints the counts it used. On a machine without the corpus
+— CI included — every test prints why it skipped and passes.
+
+```bash
+cargo test -p coderex-cli --test real_session_corpus -- --nocapture
+```
+
 ### What the E2E suites cover
 
 - Tool call assembly and multi-turn loops (`Write`, `Edit`, `Bash`, `Read`)

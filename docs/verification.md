@@ -21,6 +21,12 @@ scripts/verify.sh --lenient       # report clippy/rustdoc counts without failing
 Logs and a summary go to `target/verify/`. `scripts/nightly.sh` runs
 `verify` by default (`RUN_VERIFY=0` disables it).
 
+`cargo test -p coderex-cli --test real_session_corpus` replays real recorded
+sessions through compaction, loop detection and the transcript store when the
+machine has them (`~/.claude/projects`, or `CODEREX_REAL_SESSIONS_DIR`); without
+a corpus it reports that and passes, which is what CI does. See
+`tests/README.md`.
+
 ## The CI gate
 
 `.github/workflows/ci.yml` runs the same checks on every push and pull
