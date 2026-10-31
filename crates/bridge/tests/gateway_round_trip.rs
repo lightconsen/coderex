@@ -167,3 +167,98 @@ async fn the_gateway_refuses_a_frame_with_no_environment_to_deliver_it_to() {
         tokio::time::timeout(std::time::Duration::from_millis(400), other.receive()).await;
     assert!(received.is_err(), "a frame leaked between environments");
 }
+
+/// A claim that the control plane answers with a transient error is retried:
+/// the assignment is already off the queue, and a 5xx says nothing about
+/// whether it is ours. A 4xx that is not "lost" is the server's answer and is
+/// reported at once.
+#[tokio::test]
+async fn a_transient_claim_failure_is_retried() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // Three answers: 503, 503, 200 — the client should claim on the third.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind a loopback port");
+    let address = listener.local_addr().expect("local address");
+    let seen = std::sync::Arc::new(AtomicUsize::new(0));
+    let seen_server = std::sync::Arc::clone(&seen);
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let seen = std::sync::Arc::clone(&seen_server);
+            tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+                let mut buffer = [0_u8; 4096];
+                let _ = stream.read(&mut buffer).await;
+                let attempt = seen.fetch_add(1, Ordering::SeqCst);
+                let (status, body) = if attempt < 2 {
+                    ("503 Service Unavailable", "{}")
+                } else {
+                    ("200 OK", r#"{"ok":true}"#)
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            });
+        }
+    });
+
+    let client = HttpControlPlaneClient::new(format!("http://{address}"));
+    let outcome = client
+        .claim_assignment("env-a", "a1")
+        .await
+        .expect("the third attempt succeeds");
+    assert_eq!(outcome, coderex_bridge::poller::ClaimOutcome::Claimed);
+    assert_eq!(
+        seen.load(Ordering::SeqCst),
+        3,
+        "the client should have retried twice"
+    );
+}
+
+#[tokio::test]
+async fn a_non_transient_claim_failure_is_not_retried() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind a loopback port");
+    let address = listener.local_addr().expect("local address");
+    let seen = std::sync::Arc::new(AtomicUsize::new(0));
+    let seen_server = std::sync::Arc::clone(&seen);
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let seen = std::sync::Arc::clone(&seen_server);
+            tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+                let mut buffer = [0_u8; 4096];
+                let _ = stream.read(&mut buffer).await;
+                seen.fetch_add(1, Ordering::SeqCst);
+                let body = r#"{"error":"bad assignment"}"#;
+                let response = format!(
+                    "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            });
+        }
+    });
+
+    let client = HttpControlPlaneClient::new(format!("http://{address}"));
+    let error = client
+        .claim_assignment("env-a", "a1")
+        .await
+        .expect_err("a 400 is the server's answer, not a transient failure");
+    assert!(error.contains("400"), "{error}");
+    assert_eq!(seen.load(Ordering::SeqCst), 1, "a 400 must not be retried");
+}

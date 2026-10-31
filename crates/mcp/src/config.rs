@@ -68,6 +68,16 @@ pub struct McpSandboxConfig {
     pub allowed_write_paths: Vec<PathBuf>,
     /// Extra paths the server may execute (must be absolute).
     pub allowed_exec_paths: Vec<PathBuf>,
+    /// Resident-memory ceiling in MiB, or `None` for no ceiling.
+    ///
+    /// Off by default on purpose. On Linux the ceiling is `RLIMIT_AS`, which
+    /// caps *address space*: a Node or JVM server reserves several GiB of
+    /// virtual memory before doing anything and would fail to start. Where the
+    /// platform can measure resident memory (macOS's proc watchdog) or job
+    /// commit (Windows), the value means what it says. Set it per server when
+    /// you know what that server needs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_memory_mb: Option<u64>,
 }
 
 impl Default for McpSandboxConfig {
@@ -78,6 +88,7 @@ impl Default for McpSandboxConfig {
             allowed_read_paths: Vec::new(),
             allowed_write_paths: Vec::new(),
             allowed_exec_paths: Vec::new(),
+            max_memory_mb: None,
         }
     }
 }

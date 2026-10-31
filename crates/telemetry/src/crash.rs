@@ -1133,6 +1133,7 @@ impl CrashReporter {
     /// Turn a captured report into a row, respecting the current mode.
     fn crash_record(&self, report: &CrashReport, scrubber: &crate::Scrubber) -> CrashRecord {
         let classification = classification_from_report(report);
+        let created_at = Some(report.timestamp.to_rfc3339());
         let include_free_form = self.include_free_form();
         let has_raw_text = !is_structured(&report.panic_info);
 
@@ -1183,6 +1184,7 @@ impl CrashReporter {
                 .as_ref()
                 .map(|symbols| i64::try_from(symbols.symbols_len).unwrap_or(i64::MAX)),
             backtrace_symbols_sha256: symbols.map(|symbols| symbols.symbols_sha256),
+            created_at,
         }
     }
 

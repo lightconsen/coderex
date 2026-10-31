@@ -167,7 +167,14 @@ fn stdio_sandbox_config_with(
         allowed_exec_paths: exec,
         additional_working_dirs: vec![workspace],
         max_open_files: None,
-        max_memory_bytes: None,
+        // `None` (the default) leaves the server unconstrained; a configured
+        // ceiling is passed through to whichever layer the platform has —
+        // `RLIMIT_AS` on Linux, the RSS watchdog on macOS, the Job Object on
+        // Windows. See `McpSandboxConfig::max_memory_mb` for why there is no
+        // default.
+        max_memory_bytes: sandbox
+            .max_memory_mb
+            .map(|megabytes| megabytes.saturating_mul(1024 * 1024)),
         max_cpu_seconds: None,
         allow_network: sandbox.allow_network,
     })
@@ -354,6 +361,44 @@ mod tests {
     /// the process-global `CODEREX_MCP_SANDBOX` never has to be touched.
     fn policy_with_env(disabled_by_env: bool) -> Option<SandboxConfig> {
         stdio_sandbox_config_with("node", &sandbox(), Path::new("."), disabled_by_env)
+    }
+
+    /// A configured ceiling reaches the sandbox; without one the server is
+    /// unconstrained, which is the documented default because `RLIMIT_AS`
+    /// (the Linux layer) breaks Node and JVM servers.
+    #[test]
+    fn a_configured_memory_ceiling_reaches_the_sandbox() {
+        let cwd = std::env::current_dir().unwrap();
+        let unlimited =
+            stdio_sandbox_config_with("node", &sandbox(), &cwd, false).expect("enabled by default");
+        assert_eq!(unlimited.max_memory_bytes, None);
+
+        let capped = McpSandboxConfig {
+            max_memory_mb: Some(512),
+            ..sandbox()
+        };
+        let config =
+            stdio_sandbox_config_with("node", &capped, &cwd, false).expect("enabled by default");
+        assert_eq!(config.max_memory_bytes, Some(512 * 1024 * 1024));
+    }
+
+    /// The ceiling round-trips through JSON, and an absent field means "no
+    /// ceiling" rather than a silent default.
+    #[test]
+    fn the_memory_ceiling_is_optional_in_the_config_file() {
+        let parsed: McpSandboxConfig =
+            serde_json::from_value(serde_json::json!({"enabled": true})).unwrap();
+        assert_eq!(parsed.max_memory_mb, None);
+
+        let parsed: McpSandboxConfig =
+            serde_json::from_value(serde_json::json!({"max_memory_mb": 256})).unwrap();
+        assert_eq!(parsed.max_memory_mb, Some(256));
+
+        let serialized = serde_json::to_value(McpSandboxConfig::default()).unwrap();
+        assert!(
+            serialized.get("max_memory_mb").is_none(),
+            "an unset ceiling should not be written into the file: {serialized}"
+        );
     }
 
     #[test]

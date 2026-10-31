@@ -266,6 +266,18 @@ fn worker_epoch_from_response(body: &str) -> u64 {
         .unwrap_or(0)
 }
 
+/// How many times a claim is attempted before the failure is reported.
+pub const CLAIM_ATTEMPTS: u32 = 3;
+
+/// How long to wait before retry `attempt` (1-based).
+///
+/// Short and bounded: the worker's poll loop is already the slower retry, and
+/// holding an assignment's slot while the control plane is down helps nobody.
+#[must_use]
+pub fn claim_backoff(attempt: u32) -> std::time::Duration {
+    std::time::Duration::from_millis(100 * u64::from(attempt).saturating_mul(u64::from(attempt)))
+}
+
 /// Whether a claim response means "this assignment is not ours to run".
 ///
 /// The control-plane server answers 409 for an already-claimed (or missing)
@@ -340,22 +352,55 @@ impl ControlPlaneClient for HttpControlPlaneClient {
         assignment_id: &str,
     ) -> Result<ClaimOutcome, String> {
         let url = self.claim_url(env_id, assignment_id);
-        let response = self
-            .request(reqwest::Method::POST, url)
-            .send()
-            .await
-            .map_err(|e| format!("claim assignment failed: {e}"))?;
+        // A claim is the one call where "try again" is safe and useful: the
+        // assignment has already been taken off the queue, and a 5xx or a
+        // dropped connection from the control plane says nothing about whether
+        // it is ours. Anything else — a 4xx that is not "lost" — is the
+        // server's answer about the assignment itself, and retrying it would
+        // only repeat the same no.
+        let mut attempt = 0_u32;
+        loop {
+            attempt += 1;
+            let sent = self
+                .request(reqwest::Method::POST, url.clone())
+                .send()
+                .await;
 
-        let status = response.status();
-        if status.is_success() {
-            return Ok(ClaimOutcome::Claimed);
+            match sent {
+                Ok(response) => {
+                    let status = response.status();
+                    if status.is_success() {
+                        return Ok(ClaimOutcome::Claimed);
+                    }
+                    if claim_status_is_lost(status) {
+                        return Ok(ClaimOutcome::Lost);
+                    }
+                    let retryable = status.is_server_error() || status == 429;
+                    if !retryable || attempt >= CLAIM_ATTEMPTS {
+                        let text = response.text().await.unwrap_or_default();
+                        return Err(format!("claim assignment returned {status}: {text}"));
+                    }
+                    tracing::warn!(
+                        attempt,
+                        %status,
+                        assignment_id,
+                        "claim assignment failed transiently; retrying"
+                    );
+                }
+                Err(error) => {
+                    if attempt >= CLAIM_ATTEMPTS {
+                        return Err(format!("claim assignment failed: {error}"));
+                    }
+                    tracing::warn!(
+                        attempt,
+                        error = %error,
+                        assignment_id,
+                        "claim assignment failed transiently; retrying"
+                    );
+                }
+            }
+            tokio::time::sleep(claim_backoff(attempt)).await;
         }
-        if claim_status_is_lost(status) {
-            return Ok(ClaimOutcome::Lost);
-        }
-
-        let text = response.text().await.unwrap_or_default();
-        Err(format!("claim assignment returned {status}: {text}"))
     }
 
     async fn report_capacity(&self, env_id: &str, report: &CapacityReport) -> Result<(), String> {

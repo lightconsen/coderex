@@ -167,6 +167,14 @@ backed by the live manager.
 - Startup wiring: `StartupOrchestrator` phase loads config, starts servers, discovers tools/resources, sets `mcp_ready`.
 - 253 tests: 181 unit tests plus 27 socket-level HTTP/SSE tests and 45 integration tests covering channel, server, proxy, config, OAuth, re-authorization, typed elicitation, prompts, notification handling, manager, result adapter, and tool executor.
 
+### Resource limits
+
+A server may set a resident-memory ceiling with `"sandbox": {"max_memory_mb": N}`.
+It is **off by default**: on Linux the ceiling is `RLIMIT_AS`, which caps
+address space, and a Node or JVM server reserves several GiB of virtual memory
+before doing anything. Where the platform measures what it enforces (macOS's
+proc watchdog, Windows's Job Object commit) the number means what it says.
+
 ### What Is Stubbed/Partial
 
 - **Servers without refresh tokens cannot be kept alive silently.** A server that hands back an access token with no refresh token cannot be refreshed by `OAuthManager`. An expired credential with no refresh token is handed to the installed `ReauthHandler` once, before the request goes out; the same handler is invoked for a `401 invalid_token` no refresh token can recover: an interactive CLI runs the authorization-code/PKCE flow again, while a headless run can only print the authorization URL and instructions and then surface `ReauthRequired`. With no handler installed the request goes out unauthenticated and the server's `401` is surfaced unchanged. Nothing retries forever, and there is no background sign-in.

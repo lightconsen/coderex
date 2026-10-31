@@ -194,7 +194,10 @@ impl TelemetryStore {
 
     /// Insert a crash report with its structured classification.
     pub(crate) fn insert_crash_record(&self, record: &CrashRecord) -> Result<i64, TelemetryError> {
-        let now = chrono::Utc::now().to_rfc3339();
+        let now = record
+            .created_at
+            .clone()
+            .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
         self.conn.execute(
             "INSERT INTO crash_reports (
                 panic_info, backtrace, created_at, panic_template, panic_fields,
@@ -485,6 +488,12 @@ pub struct CrashRecord {
     pub backtrace_symbols_len: Option<i64>,
     /// SHA-256 of the joined symbol representation.
     pub backtrace_symbols_sha256: Option<String>,
+    /// When the crash was captured, as RFC 3339.
+    ///
+    /// Set from the report itself rather than from the moment the pending file
+    /// is drained: draining can happen hours later, and the preview command
+    /// has to show the value the row will actually carry.
+    pub created_at: Option<String>,
 }
 
 /// Types of telemetry events.
@@ -677,8 +686,17 @@ mod tests {
             backtrace_frame_count: Some(1),
             backtrace_symbols_len: Some(10),
             backtrace_symbols_sha256: Some("b".repeat(64)),
+            // The capture time travels with the record, so the row keeps the
+            // moment the crash happened rather than the moment it was drained.
+            created_at: Some("2026-10-31T09:00:00+00:00".into()),
         };
         store.insert_crash_record(&record).unwrap();
+
+        assert_eq!(
+            store.pending_crashes(10).unwrap()[0].created_at,
+            "2026-10-31T09:00:00+00:00",
+            "ingestion must store the capture time, not the drain time"
+        );
 
         let pending = store.pending_crashes(10).unwrap();
         assert_eq!(pending.len(), 1);

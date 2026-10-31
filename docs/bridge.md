@@ -354,6 +354,12 @@ ends the worker cleanly.
 | `--heartbeat-lost-threshold N` | `CODEREX_BRIDGE_HEARTBEAT_LOST_THRESHOLD` | `5` | Missed beats before `Lost` |
 | `--poll-interval-secs N` | `CODEREX_BRIDGE_POLL_INTERVAL_SECS` | `5` | Seconds between assignment fetches and capacity reports |
 | `--claim-path PATH` | `CODEREX_BRIDGE_CLAIM_PATH` | `/api/environments/{env_id}/assignments/{assignment_id}/claim` | Claim route template; must contain `{assignment_id}` |
+The worker retries a claim that the control plane answers with a 5xx or 429 (or
+that fails to connect) up to three times with a short backoff: the assignment is
+already off the queue, and a server error says nothing about whether it is ours.
+Any other 4xx is the server's answer about the assignment and is reported at
+once.
+
 | — (no flag) | `CODEREX_BRIDGE_SHUTDOWN_GRACE_SECS` | `5` | How long a stopped session gets before its child tree is killed. A child with real cleanup (flushing a transcript, closing a database) needs more; a non-numeric or zero value keeps the default. |
 
 The historical `CODEREX_BRIDGE_URL=ws://host:port` spelling is the transport
