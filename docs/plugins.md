@@ -326,7 +326,7 @@ The manifest is parsed with `deny_unknown_fields`: a field that is not in the ta
 | `lspServers` | ✅ implemented | The first configured server is the default for the `LSP` tool (the REPL fills the tool's shared default at startup). |
 | `channels` | ✅ implemented | A channel names a configured MCP server and routes that server's JSON-RPC notifications to subscribed sinks (`PluginManager::subscribe_channel` / `route_channel_notification`). `/plugin components` lists each channel with its live state — `subscribed`, `idle (no subscriber)`, or `server not configured`. See "Channels". |
 | `binaries` | ✅ implemented | SHA-256-pinned HTTPS fetch into `<plugin>/bin/` (`fetch_plugin_binaries`); `CODEREX_PLUGIN_NO_BINARIES=1` skips the fetch. |
-| `types` | ✅ implemented | Validated `.d.ts` files are exported at startup to `config_home()/plugin-types/<plugin>/` (`export_plugin_types`) so a plugin author has a stable include path, **and** read into a `PluginTypeRegistry` that `/plugin components` lists. The same export writes the host's generated surface — `coderex/`, `coderex-tools/`, `coderex-mcp/` and a `tsconfig.json` — from the registered tool schemas; `/plugin types [name]` lists or prints them. CodeRex has no TypeScript runtime, so "loaded" means read into memory and exposed — never executed. See "Types". |
+| `types` | ✅ implemented | Validated `.d.ts` files are exported at startup to `config_home()/plugin-types/<plugin>/` (`export_plugin_types`) so a plugin author has a stable include path, **and** read into a `PluginTypeRegistry` that `/plugin components` lists. The same export writes the host's generated surface — `coderex/`, `coderex-tools/`, `coderex-mcp/` and a `tsconfig.json` — from the registered tool schemas; `/plugin types [name]` lists or prints them. The exported tree is **type-checked** with a real `tsc` when one is available (startup, plus `coderex plugin-typecheck`); nothing is ever executed. See "Types". |
 | `settings` | ✅ implemented (allowlisted) | A typed patch deep-merges into the resolved settings, by source: user/project values win over every plugin, and a plugin only fills a key the user left unset. `permission_mode`, `telemetry` and `max_budget_usd` are tighten-only; `hooks`, `mcpServers`, `api_key`, `provider` and `env` are never taken. Unknown keys warn and are ignored. See "Settings". |
 | `experimental` | ✅ implemented (raw) | Exposed per plugin; expansion (themes/monitors/outputStyles/…) is the caller's job. |
 
@@ -475,6 +475,26 @@ Property and tool names that are not TypeScript identifiers are quoted (`"run-in
 
 - `/plugin types` lists every emitted declaration with its path: `coderex`, `coderex-tools`, `coderex-mcp`, `tsconfig`, and one entry per plugin directory.
 - `/plugin types <name>` prints one. The name is the listed name; a relative path such as `coderex-tools/index.d.ts` also works. A name that is not in the list is an error — the resolver only matches already-listed files, so it cannot read outside the type root.
+
+### Type-checking the exported declarations
+
+Exporting made the declarations readable, not correct. `crates/plugins/src/typecheck.rs`
+runs a real TypeScript compiler over `config_home()/plugin-types`:
+
+- at startup, after the export, best-effort (a warning names the first
+  diagnostic; a missing compiler is logged at debug and nothing more);
+- on demand with `coderex plugin-typecheck [--dir DIR]`, which prints every
+  diagnostic and exits `1` when the plugin's declarations have errors, `2` when
+  the compiler timed out, and `0` when it passed **or when there was no compiler
+  to check with** — "nothing checked" is not "failed".
+
+The compiler is found at `CODEREX_TSC` (when set), then
+`<root>/node_modules/.bin/tsc`, then `tsc` on `PATH`. Nothing is bundled, so a
+machine without TypeScript reports that instead of pretending. The whole check
+can be turned off with `CODEREX_PLUGIN_NO_TYPECHECK=1`.
+
+The run is a real subprocess (`tsc --noEmit --pretty false -p tsconfig.json`)
+with a 20-second ceiling; it reads the exported files and writes nothing.
 - `/plugin components` continues to list the *plugin-declared* declarations as `name (plugin)`; the generated modules are a separate artefact.
 
 ### Deliberately out of scope

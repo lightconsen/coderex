@@ -908,6 +908,10 @@ impl StartupOrchestrator {
                     run_teleport_service(port, ttl_secs).await
                 }
                 crate::cli::Command::Gateway { port } => run_gateway(port).await,
+                crate::cli::Command::PluginTypecheck { dir } => {
+                    run_plugin_typecheck(dir);
+                    Ok(())
+                }
                 crate::cli::Command::Mcp { action } => self.run_mcp(action).await,
                 crate::cli::Command::Plugin { action } => self.run_plugin(action).await,
                 crate::cli::Command::AutoMode => self.run_auto_mode().await,
@@ -1620,6 +1624,45 @@ impl StartupOrchestrator {
                 None
             }
         };
+        // Exported, but until now never checked: a plugin could ship a
+        // declaration with a syntax error and the only symptom was an editor
+        // underline. The compile runs off the startup thread and only when a
+        // compiler exists; "no compiler" is said rather than treated as a pass.
+        if let Some(root) = self.ctx.plugin_types_dir.clone()
+            && !Self::env_flag("CODEREX_PLUGIN_NO_TYPECHECK")
+        {
+            let root = std::path::PathBuf::from(root);
+            tokio::spawn(async move {
+                let outcome = tokio::task::spawn_blocking(move || {
+                    coderex_plugins::typecheck::typecheck(
+                        &root,
+                        coderex_plugins::typecheck::DEFAULT_TIMEOUT,
+                    )
+                })
+                .await;
+                match outcome {
+                    Ok(coderex_plugins::typecheck::TypeCheckOutcome::Failed(diagnostics)) => {
+                        tracing::warn!(
+                            count = diagnostics.len(),
+                            first = %diagnostics[0].render(),
+                            "plugin type declarations have errors"
+                        );
+                    }
+                    Ok(coderex_plugins::typecheck::TypeCheckOutcome::Passed) => {
+                        tracing::info!("plugin type declarations type-check");
+                    }
+                    Ok(coderex_plugins::typecheck::TypeCheckOutcome::TimedOut(limit)) => {
+                        tracing::warn!(seconds = limit.as_secs(), "plugin type check timed out");
+                    }
+                    Ok(coderex_plugins::typecheck::TypeCheckOutcome::Unavailable(reason)) => {
+                        tracing::debug!(%reason, "plugin type check unavailable");
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "plugin type check task failed");
+                    }
+                }
+            });
+        }
         // Declared binaries are pinned by SHA-256; fetch them once, after the
         // plugins are active. Failures are warnings: a plugin can still work
         // without its helper.
@@ -3834,6 +3877,37 @@ async fn run_teleport_service(port: u16, ttl_secs: u64) -> Result<()> {
          Point clients at it with CODEREX_TELEPORT_URL."
     );
     service.run().await.map_err(|error| anyhow::anyhow!(error))
+}
+
+/// Type-check the exported plugin declarations and report what the compiler said.
+///
+/// This is the on-demand half of the startup check: the same compiler, the
+/// same outcome, but printed for a person and with an exit status.
+fn run_plugin_typecheck(dir: Option<std::path::PathBuf>) {
+    let root = dir.unwrap_or_else(|| coderex_config::config_home().join("plugin-types"));
+    let outcome =
+        coderex_plugins::typecheck::typecheck(&root, coderex_plugins::typecheck::DEFAULT_TIMEOUT);
+    match &outcome {
+        coderex_plugins::typecheck::TypeCheckOutcome::Passed => {
+            println!("{}: {}", root.display(), outcome.summary());
+        }
+        coderex_plugins::typecheck::TypeCheckOutcome::Failed(diagnostics) => {
+            println!("{} type error(s) in {}", diagnostics.len(), root.display());
+            for diagnostic in diagnostics {
+                println!("  {}", diagnostic.render());
+            }
+            std::process::exit(1);
+        }
+        // "Unavailable" is not a failure: there was nothing to check with, and
+        // saying "failed" would blame the plugin for the host's toolchain.
+        coderex_plugins::typecheck::TypeCheckOutcome::Unavailable(reason) => {
+            println!("nothing checked: {reason}");
+        }
+        coderex_plugins::typecheck::TypeCheckOutcome::TimedOut(limit) => {
+            eprintln!("the compiler did not finish within {}s", limit.as_secs());
+            std::process::exit(2);
+        }
+    }
 }
 
 /// Run the bridge gateway until the process is stopped.

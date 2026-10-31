@@ -252,6 +252,13 @@ pub enum Command {
     Auth,
     /// Run diagnostics and report issues.
     Doctor,
+    /// Type-check the exported plugin declarations with a TypeScript compiler.
+    PluginTypecheck {
+        /// Directory holding the exported declarations and `tsconfig.json`.
+        /// Defaults to `<config home>/plugin-types`.
+        #[arg(long)]
+        dir: Option<std::path::PathBuf>,
+    },
     /// Install the latest release, or report whether one exists.
     Update {
         /// Report whether a newer release exists without downloading it.

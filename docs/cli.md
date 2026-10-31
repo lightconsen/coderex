@@ -108,6 +108,7 @@ main() → parse_args() → StartupOrchestrator::run()
 | `serve-status` | Show daemon status |
 | `gateway [--port PORT]` | Run the bridge gateway: control plane, work submission and the permission-frame relay a remote operator answers through. See `docs/bridge.md`. |
 | `teleport-service [--port PORT] [--ttl-secs N]` | Run the teleport rendezvous service that `/teleport --share` uploads to and other machines join from. See `docs/teleport.md`. |
+| `plugin-typecheck [--dir DIR]` | Type-check the exported plugin declarations with a TypeScript compiler; exits 1 on errors, 2 on a timeout, 0 when there is nothing to check with. See `docs/plugins.md`. |
 | `agents [--detailed]` | List available agents |
 | `auth` | Check authentication status |
 | `doctor` | Run diagnostics |

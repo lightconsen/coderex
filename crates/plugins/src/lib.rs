@@ -9,4 +9,5 @@ pub mod plugins;
 pub mod runtime;
 pub mod skills;
 pub mod tool_executor;
+pub mod typecheck;
 pub mod wasm_runtime;
