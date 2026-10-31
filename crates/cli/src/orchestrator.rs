@@ -138,6 +138,20 @@ impl coderex_plugins::plugins::ChannelSink for PluginChannelSink {
     }
 }
 
+/// What `subscribe_plugin_channels` installed.
+#[derive(Debug)]
+struct PluginChannelSubscriptions {
+    /// The bounded log every channel writes to.
+    log: Arc<
+        std::sync::Mutex<std::collections::VecDeque<coderex_plugins::plugins::PluginChannelEvent>>,
+    >,
+    /// The webhook sink per channel that declared a delivery target.
+    webhooks: Vec<(
+        String,
+        Arc<coderex_plugins::channel_webhook::WebhookChannelSink>,
+    )>,
+}
+
 /// Resolved settings and state passed between startup phases.
 #[derive(Debug, Default)]
 pub struct SessionContext {
@@ -191,6 +205,12 @@ pub struct SessionContext {
     pub plugin_channel_events: Arc<
         std::sync::Mutex<std::collections::VecDeque<coderex_plugins::plugins::PluginChannelEvent>>,
     >,
+    /// Webhook sinks for channels that declared a `deliver` target, with the
+    /// counters each one keeps.
+    pub plugin_channel_webhooks: Vec<(
+        String,
+        Arc<coderex_plugins::channel_webhook::WebhookChannelSink>,
+    )>,
     /// Marketplaces configured in settings.
     pub marketplaces: Vec<coderex_config::MarketplaceSetting>,
     /// Telemetry handle (initialized during LoadSettings).
@@ -615,6 +635,7 @@ impl StartupOrchestrator {
                 plugin_channel_events: Arc::new(std::sync::Mutex::new(
                     std::collections::VecDeque::new(),
                 )),
+                plugin_channel_webhooks: Vec::new(),
                 marketplaces: Vec::new(),
                 telemetry_handle: None,
                 telemetry_uploader: None,
@@ -1690,7 +1711,9 @@ impl StartupOrchestrator {
         // would report `Idle` forever and a routed notification would reach
         // nobody. Subscribe one sink to every declared channel and keep the log
         // it records into.
-        self.ctx.plugin_channel_events = Self::subscribe_plugin_channels(&manager);
+        let subscriptions = Self::subscribe_plugin_channels(&manager);
+        self.ctx.plugin_channel_events = subscriptions.log;
+        self.ctx.plugin_channel_webhooks = subscriptions.webhooks;
         self.ctx.plugin_manager = Some(manager);
         Ok(())
     }
@@ -1918,17 +1941,33 @@ impl StartupOrchestrator {
     /// subscriber — the one place the channel layer is actually consumed.
     fn subscribe_plugin_channels(
         manager: &Arc<coderex_plugins::plugins::PluginManager>,
-    ) -> Arc<
-        std::sync::Mutex<std::collections::VecDeque<coderex_plugins::plugins::PluginChannelEvent>>,
-    > {
+    ) -> PluginChannelSubscriptions {
         let log = Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
         let sink: Arc<dyn coderex_plugins::plugins::ChannelSink> = Arc::new(PluginChannelSink {
             log: Arc::clone(&log),
         });
+        let mut webhooks = Vec::new();
         for report in manager.plugin_channel_report() {
             manager.subscribe_channel(&report.channel, Arc::clone(&sink));
+            // A channel that declared a delivery target gets a webhook sink as
+            // well. The declaration was validated when the report was built, so
+            // an invalid one has no `delivery` here and is left to the report
+            // to explain.
+            if let Some(delivery) = &report.delivery {
+                let webhook = coderex_plugins::channel_webhook::WebhookChannelSink::spawn(
+                    delivery.url.clone(),
+                );
+                manager.subscribe_channel(
+                    &report.channel,
+                    Arc::clone(&webhook) as Arc<dyn coderex_plugins::plugins::ChannelSink>,
+                );
+                webhooks.push((report.channel.clone(), webhook));
+            }
         }
-        log
+        if !webhooks.is_empty() {
+            tracing::info!(count = webhooks.len(), "plugin channel webhooks subscribed");
+        }
+        PluginChannelSubscriptions { log, webhooks }
     }
 
     /// Marketplaces configured in settings plus the legacy environment pair.
@@ -2634,7 +2673,26 @@ impl StartupOrchestrator {
                     "plugin channel names an MCP server that is not configured"
                 );
             }
-            other.push(("channel".to_string(), vec![report.render()]));
+            if report.status == coderex_plugins::plugins::ChannelStatus::DeliveryInvalid {
+                tracing::warn!(
+                    channel = %report.channel,
+                    error = report.delivery_error.as_deref().unwrap_or("refused"),
+                    "plugin channel delivery was refused"
+                );
+            }
+            // What the webhook has actually done, when this channel has one:
+            // "delivered 3, dropped 0, failed 1; last error: …".
+            let stats = self
+                .ctx
+                .plugin_channel_webhooks
+                .iter()
+                .find(|(channel, _)| channel == &report.channel)
+                .map(|(_, sink)| sink.stats().render());
+            let line = match stats {
+                Some(stats) => format!("{} [{stats}]", report.render()),
+                None => report.render(),
+            };
+            other.push(("channel".to_string(), vec![line]));
         }
         if let Some(dir) = self.ctx.plugin_types_dir.clone() {
             other.push(("types-dir".to_string(), vec![dir]));
@@ -4223,6 +4281,74 @@ mod tests {
         );
     }
 
+    /// A channel that declares a delivery target gets a webhook sink; the
+    /// report names the target so `/plugin components` shows where events go.
+    #[tokio::test]
+    async fn a_channel_with_a_delivery_gets_a_webhook_sink() {
+        let manager = coderex_plugins::plugins::PluginManager::new();
+        manager.load_plugin(
+            serde_json::from_value(serde_json::json!({
+                "name": "chan",
+                "version": "1.0.0",
+                "mcpServers": {"chat": {"command": "chat-server"}},
+                "channels": [{
+                    "server": "chat",
+                    "displayName": "Team chat",
+                    "deliver": {"url": "https://hooks.example.com/coderex"}
+                }]
+            }))
+            .expect("the manifest should parse"),
+            std::path::PathBuf::from("/tmp/chan"),
+        );
+        let manager = Arc::new(manager);
+
+        let subscriptions = StartupOrchestrator::subscribe_plugin_channels(&manager);
+
+        assert_eq!(subscriptions.webhooks.len(), 1);
+        assert_eq!(subscriptions.webhooks[0].0, "chat");
+        assert_eq!(
+            subscriptions.webhooks[0].1.url(),
+            "https://hooks.example.com/coderex"
+        );
+        let report = manager.plugin_channel_report();
+        assert_eq!(
+            report[0].status,
+            coderex_plugins::plugins::ChannelStatus::Subscribed
+        );
+        assert!(
+            report[0]
+                .render()
+                .contains("https://hooks.example.com/coderex")
+        );
+    }
+
+    /// A refused declaration subscribes nothing and says why, rather than
+    /// silently behaving like a channel with no delivery.
+    #[tokio::test]
+    async fn a_refused_delivery_subscribes_no_webhook() {
+        let manager = coderex_plugins::plugins::PluginManager::new();
+        manager.load_plugin(
+            serde_json::from_value(serde_json::json!({
+                "name": "chan",
+                "version": "1.0.0",
+                "mcpServers": {"chat": {"command": "chat-server"}},
+                "channels": [{"server": "chat", "deliver": {"url": "http://hooks.example.com/x"}}]
+            }))
+            .expect("the manifest should parse"),
+            std::path::PathBuf::from("/tmp/chan"),
+        );
+        let manager = Arc::new(manager);
+
+        let subscriptions = StartupOrchestrator::subscribe_plugin_channels(&manager);
+
+        assert!(subscriptions.webhooks.is_empty());
+        let report = manager.plugin_channel_report();
+        assert_eq!(
+            report[0].status,
+            coderex_plugins::plugins::ChannelStatus::DeliveryInvalid
+        );
+    }
+
     /// The production subscriber moves a configured channel off `Idle` and
     /// records what a routed notification delivers.
     #[test]
@@ -4245,7 +4371,7 @@ mod tests {
             coderex_plugins::plugins::ChannelStatus::Idle
         );
 
-        let log = StartupOrchestrator::subscribe_plugin_channels(&manager);
+        let subscriptions = StartupOrchestrator::subscribe_plugin_channels(&manager);
         let report = manager.plugin_channel_report();
         assert_eq!(
             report[0].status,
@@ -4261,7 +4387,7 @@ mod tests {
         );
         assert_eq!(delivered, 1);
 
-        let events = log.lock().unwrap();
+        let events = subscriptions.log.lock().unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].channel, "chat");
         assert_eq!(events[0].plugin, "chan");
@@ -4286,7 +4412,7 @@ mod tests {
         manager.load_plugin(manifest, std::path::PathBuf::from("/tmp/chan"));
 
         let manager = Arc::new(manager);
-        let log = StartupOrchestrator::subscribe_plugin_channels(&manager);
+        let subscriptions = StartupOrchestrator::subscribe_plugin_channels(&manager);
         let router = PluginChannelRouter {
             manager: Arc::clone(&manager),
         };
@@ -4297,7 +4423,7 @@ mod tests {
             "notifications/message",
             Some(&serde_json::json!({"level": "info"})),
         );
-        assert_eq!(log.lock().unwrap().len(), 1);
+        assert_eq!(subscriptions.log.lock().unwrap().len(), 1);
 
         // A notification from a server no channel binds to goes nowhere.
         coderex_mcp::manager::ServerNotificationRouter::route(
@@ -4306,7 +4432,7 @@ mod tests {
             "notifications/message",
             None,
         );
-        assert_eq!(log.lock().unwrap().len(), 1);
+        assert_eq!(subscriptions.log.lock().unwrap().len(), 1);
     }
 
     /// The registry's real consumer: `/plugin components` lists a declared

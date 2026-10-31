@@ -2261,6 +2261,64 @@ pub struct PluginChannelEvent {
     pub sequence: u64,
 }
 
+/// Where a channel's notifications are delivered.
+///
+/// A declaration opts in with a `deliver` object on the channel:
+///
+/// ```json
+/// "channels": {
+///   "ops": { "server": "ops-server", "deliver": { "url": "https://hooks.example.com/coderex" } }
+/// }
+/// ```
+///
+/// `https` is required everywhere except for a loopback host, where plain
+/// `http` is allowed: that is the shape a local integration or a test server
+/// uses, and it cannot leave the machine by accident. Anything else (other
+/// schemes, a remote `http` URL) is refused when the manifest is read, so a
+/// plugin cannot quietly send its events somewhere in the clear.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChannelDelivery {
+    /// Absolute URL the event is POSTed to.
+    pub url: String,
+}
+
+impl ChannelDelivery {
+    /// Read the `deliver` object from a channel declaration.
+    ///
+    /// `Ok(None)` means the channel declares no delivery. `Err` carries the
+    /// reason a declared one was refused; the channel still exists, but the
+    /// report marks it [`ChannelStatus::DeliveryInvalid`] instead of silently
+    /// dropping the configuration.
+    pub fn parse(entry: &Value) -> Result<Option<Self>, String> {
+        let Some(deliver) = entry.get("deliver") else {
+            return Ok(None);
+        };
+        let Some(url) = deliver.get("url").and_then(Value::as_str) else {
+            return Err("deliver needs a `url` string".to_string());
+        };
+        let url = url.trim();
+        if url.is_empty() {
+            return Err("deliver.url is empty".to_string());
+        }
+        let parsed =
+            url::Url::parse(url).map_err(|error| format!("deliver.url is not a URL: {error}"))?;
+        match parsed.scheme() {
+            "https" => {}
+            "http" if is_loopback_host(parsed.host_str()) => {}
+            "http" => {
+                return Err(format!(
+                    "deliver.url uses plain http to {}; use https, or a loopback host",
+                    parsed.host_str().unwrap_or("an unnamed host")
+                ));
+            }
+            other => return Err(format!("deliver.url scheme '{other}' is not supported")),
+        }
+        Ok(Some(Self {
+            url: parsed.to_string(),
+        }))
+    }
+}
+
 /// A consumer of channel notifications.
 ///
 /// The manager owns the delivery decision; a sink only receives. A sink that
@@ -2284,6 +2342,10 @@ pub enum ChannelStatus {
     /// The channel names an MCP server that is not configured. No notification
     /// can arrive, and CodeRex says so instead of pretending the channel works.
     ServerNotConfigured,
+    /// The channel declares a `deliver` block that was refused (a bad scheme,
+    /// a plain-http remote URL, a missing url). Nothing is delivered until the
+    /// declaration is fixed.
+    DeliveryInvalid,
 }
 
 /// The live state of one declared plugin channel.
@@ -2301,6 +2363,10 @@ pub struct PluginChannelReport {
     pub status: ChannelStatus,
     /// How many sinks are subscribed.
     pub subscribers: usize,
+    /// Where notifications are delivered, when the declaration opted in.
+    pub delivery: Option<ChannelDelivery>,
+    /// Why a declared `deliver` block was refused, when it was.
+    pub delivery_error: Option<String>,
 }
 
 impl PluginChannelReport {
@@ -2312,8 +2378,16 @@ impl PluginChannelReport {
             ChannelStatus::Subscribed => format!("subscribed ({} sinks)", self.subscribers),
             ChannelStatus::Idle => "idle (no subscriber)".to_string(),
             ChannelStatus::ServerNotConfigured => "server not configured".to_string(),
+            ChannelStatus::DeliveryInvalid => match &self.delivery_error {
+                Some(error) => format!("delivery refused: {error}"),
+                None => "delivery refused".to_string(),
+            },
         };
-        format!("{label} -> {} [{state}]", self.server)
+        let target = match &self.delivery {
+            Some(delivery) => format!(" -> {}", delivery.url),
+            None => String::new(),
+        };
+        format!("{label} -> {} [{state}]{target}", self.server)
     }
 }
 
@@ -3497,7 +3571,7 @@ impl PluginManager {
     /// plugin-name order. The same rules as the listing apply: a channel whose
     /// entry names no server is warned about and skipped by
     /// [`normalize_channel_component`].
-    fn channel_bindings(&self) -> Vec<(String, String, String, Option<String>)> {
+    fn channel_bindings(&self) -> Vec<(String, String, String, Option<String>, Value)> {
         let mut bindings = Vec::new();
         for (plugin, _dir, value) in self.active_plugin_values(|handle| handle.channels.clone()) {
             for (channel, entry) in normalize_channel_component(&plugin, &value) {
@@ -3510,7 +3584,7 @@ impl PluginManager {
                     .get("displayName")
                     .and_then(Value::as_str)
                     .map(str::to_string);
-                bindings.push((channel, plugin.clone(), server, display));
+                bindings.push((channel, plugin.clone(), server, display, entry.clone()));
             }
         }
         bindings
@@ -3565,9 +3639,26 @@ impl PluginManager {
         let configured = self.configured_mcp_server_names();
         self.channel_bindings()
             .into_iter()
-            .map(|(channel, plugin, server, display_name)| {
+            .map(|(channel, plugin, server, display_name, entry)| {
                 let subscribers = self.channel_subscribers(&channel);
-                let status = if !configured.contains(&server) {
+                let (delivery, delivery_error) = match ChannelDelivery::parse(&entry) {
+                    Ok(delivery) => (delivery, None),
+                    Err(error) => {
+                        tracing::warn!(
+                            plugin = %plugin,
+                            channel = %channel,
+                            %error,
+                            "plugin channel delivery was refused"
+                        );
+                        (None, Some(error))
+                    }
+                };
+                // A refused delivery comes before the subscription state: the
+                // channel cannot deliver at all, and "idle" would suggest that
+                // subscribing is all it needs.
+                let status = if delivery_error.is_some() {
+                    ChannelStatus::DeliveryInvalid
+                } else if !configured.contains(&server) {
                     ChannelStatus::ServerNotConfigured
                 } else if subscribers == 0 {
                     ChannelStatus::Idle
@@ -3581,6 +3672,8 @@ impl PluginManager {
                     display_name,
                     status,
                     subscribers,
+                    delivery,
+                    delivery_error,
                 }
             })
             .collect()
@@ -3604,7 +3697,7 @@ impl PluginManager {
         params: Option<&Value>,
     ) -> usize {
         let mut delivered = 0;
-        for (channel, plugin, bound_server, _display) in self.channel_bindings() {
+        for (channel, plugin, bound_server, _display, _entry) in self.channel_bindings() {
             if bound_server != server {
                 continue;
             }
@@ -7409,6 +7502,107 @@ mod tests {
             })
         );
         assert_eq!(log.warnings().len(), 1, "{:?}", log.warnings());
+    }
+
+    /// A delivery target is accepted only where it can be trusted: https
+    /// anywhere, plain http on loopback.
+    #[test]
+    fn channel_delivery_requires_a_secure_url() {
+        let ok = |entry: serde_json::Value| ChannelDelivery::parse(&entry).unwrap();
+        assert_eq!(
+            ChannelDelivery::parse(&serde_json::json!({"server": "s"})).unwrap(),
+            None
+        );
+        assert_eq!(
+            ok(serde_json::json!({"deliver": {"url": "https://hooks.example.com/x"}})),
+            Some(ChannelDelivery {
+                url: "https://hooks.example.com/x".into()
+            })
+        );
+        assert_eq!(
+            ok(serde_json::json!({"deliver": {"url": "http://127.0.0.1:8080/x"}})),
+            Some(ChannelDelivery {
+                url: "http://127.0.0.1:8080/x".into()
+            })
+        );
+
+        for (entry, needle) in [
+            (
+                serde_json::json!({"deliver": {"url": "http://hooks.example.com/x"}}),
+                "plain http",
+            ),
+            (
+                serde_json::json!({"deliver": {"url": "ftp://example.com/x"}}),
+                "scheme",
+            ),
+            (serde_json::json!({"deliver": {}}), "url"),
+            (serde_json::json!({"deliver": {"url": "  "}}), "empty"),
+            (
+                serde_json::json!({"deliver": {"url": "not a url"}}),
+                "not a URL",
+            ),
+        ] {
+            let error = ChannelDelivery::parse(&entry).expect_err("should be refused");
+            assert!(error.contains(needle), "{error:?} for {entry}");
+        }
+    }
+
+    /// A refused delivery is reported, not dropped: the channel is listed as
+    /// `DeliveryInvalid` with the reason, and nothing subscribes a webhook.
+    #[test]
+    fn a_refused_delivery_is_reported_on_the_channel() {
+        let mgr = PluginManager::new();
+        mgr.load_plugin(
+            serde_json::from_value(serde_json::json!({
+                "name": "chan",
+                "version": "1.0.0",
+                "mcpServers": {"chat": {"command": "chat-server"}},
+                "channels": [{"server": "chat", "deliver": {"url": "http://remote.example.com/x"}}]
+            }))
+            .unwrap(),
+            std::path::PathBuf::from("/tmp/chan"),
+        );
+        let report = mgr.plugin_channel_report();
+        assert_eq!(report[0].status, ChannelStatus::DeliveryInvalid);
+        assert!(report[0].delivery.is_none());
+        assert!(
+            report[0]
+                .delivery_error
+                .as_deref()
+                .is_some_and(|error| error.contains("plain http")),
+            "{report:?}"
+        );
+        assert!(report[0].render().contains("delivery refused"));
+    }
+
+    /// A valid declaration is carried on the report and shown by `render`.
+    #[test]
+    fn an_accepted_delivery_is_shown_on_the_channel() {
+        let mgr = PluginManager::new();
+        mgr.load_plugin(
+            serde_json::from_value(serde_json::json!({
+                "name": "chan",
+                "version": "1.0.0",
+                "mcpServers": {"chat": {"command": "chat-server"}},
+                "channels": [{"server": "chat", "deliver": {"url": "https://hooks.example.com/x"}}]
+            }))
+            .unwrap(),
+            std::path::PathBuf::from("/tmp/chan"),
+        );
+        let report = mgr.plugin_channel_report();
+        assert_eq!(report[0].status, ChannelStatus::Idle);
+        assert_eq!(
+            report[0]
+                .delivery
+                .as_ref()
+                .map(|delivery| delivery.url.as_str()),
+            Some("https://hooks.example.com/x")
+        );
+        assert!(
+            report[0]
+                .render()
+                .contains("-> https://hooks.example.com/x")
+        );
     }
 
     #[derive(Debug, Default)]
