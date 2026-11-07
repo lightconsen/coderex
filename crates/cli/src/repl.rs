@@ -5211,11 +5211,214 @@ impl ReplLoop {
                 tracing::warn!("TUI draw error: {e}");
             }
 
+            // `biased` and the engine-event branch first. `select!` otherwise
+            // polls its branches in random order, and `query_done` decides
+            // "did the provider say anything?" from the transcript. A text
+            // delta that lost that coin toss was still in the channel when the
+            // answer was judged empty: the turn reported "provider returned no
+            // visible response" and the text arrived immediately afterwards,
+            // under the notice. Draining the channel before the verdict is the
+            // point of the order, not a scheduling preference.
             tokio::select! {
+                biased;
                 code = &mut signal_wait => {
                     signal_exit = Some(code);
                     break Ok(());
                 }
+                Some(engine_event) = async {
+                    event_rx.as_mut().unwrap().recv().await
+                }, if event_rx.is_some() => {
+                    self.record_engine_event_telemetry(&engine_event);
+                    match engine_event {
+                        EngineEvent::TextDelta(delta) => {
+                            phase.note_text_delta();
+                            set_plan_step(&mut ui_state, "Thinking through response");
+                            if let Some(last) = ui_state
+                                .messages
+                                .messages
+                                .iter_mut()
+                                .rev()
+                                .find(|msg| msg.role == MessageRole::Assistant)
+                            {
+                                let mut content = last.content.to_string();
+                                content.push_str(&delta);
+                                last.content = content.into();
+                                last.streaming = true;
+                            }
+                            if last_stream_snapshot.elapsed() >= Duration::from_secs(1) {
+                                self.persist_interactive_snapshot(&ui_state);
+                                last_stream_snapshot = Instant::now();
+                            }
+                        }
+                        EngineEvent::ToolUseSummary { id, summary, .. } => {
+                            // Render with the matching `ToolCallStart`, which
+                            // also carries the summary. Holding it here keeps
+                            // the two events from producing duplicate rows
+                            // while still letting this event drive the label.
+                            self.tool_use_summaries.insert(id, summary);
+                        }
+                        EngineEvent::ToolCallStart { id, name, summary } => {
+                            let summary = self.tool_use_summaries.remove(&id).unwrap_or(summary);
+                            self.tool_names.insert(id.clone(), name.clone());
+                            phase.note_tool_start(&summary);
+                            set_plan_step(&mut ui_state, &summary);
+                            // The log feeds `/activity`; the transcript row is
+                            // the ToolCall message below, so this must not add
+                            // a second visible row.
+                            record_activity(&mut ui_state, &summary);
+                            ui_state.messages.push(Message {
+                                role: MessageRole::ToolCall,
+                                content: summary.into(),
+                                tool_name: Some(name.into()),
+                                streaming: false,
+                                folded: false,
+                            });
+                            self.persist_interactive_snapshot(&ui_state);
+                        }
+                        EngineEvent::ToolCallEnd { id, result } => {
+                            // A call blocked before its start event never
+                            // consumed its label; drop it here.
+                            self.tool_use_summaries.remove(&id);
+                            let tool_name = self
+                                .tool_names
+                                .remove(&id)
+                                .unwrap_or_else(|| "Tool".to_string());
+                            phase.note_tool_end();
+                            complete_plan(&mut ui_state);
+                            pending_confirmation = None;
+                            clear_permission_overlay(&mut ui_state);
+                            let content = if result.is_error {
+                                // Name the tool and the first line of the
+                                // error: "Tool failed" alone cannot be acted
+                                // on, and the output lives further up the
+                                // transcript.
+                                let reason = result
+                                    .output
+                                    .lines()
+                                    .next()
+                                    .unwrap_or_default()
+                                    .trim()
+                                    .chars()
+                                    .take(80)
+                                    .collect::<String>();
+                                let reason = if reason.is_empty() {
+                                    "no output".to_string()
+                                } else {
+                                    reason
+                                };
+                                ui_state
+                                    .notifications
+                                    .err(format!("{tool_name} failed: {reason}"));
+                                format!("Error: {}", result.output)
+                            } else {
+                                ui_state
+                                    .notifications
+                                    .success(format!("{tool_name} completed"));
+                                result.output
+                            };
+                            ui_state.messages.push(Message {
+                                role: MessageRole::ToolResult,
+                                content: content.into(),
+                                // Kept for syntax highlighting and future
+                                // per-tool rendering; the result row does not
+                                // print a second `[name]` label.
+                                tool_name: Some(tool_name.into()),
+                                streaming: false,
+                                folded: false,
+                            });
+                            self.persist_interactive_snapshot(&ui_state);
+                        }
+                        EngineEvent::PermissionRequest { tool, args, .. } => {
+                            let label =
+                                permission_activity_label(&ToolCall::summarize_activity(&tool, &args));
+                            phase.note_permission_request(&tool, &args);
+                            set_plan_step(&mut ui_state, &label);
+                            push_activity_row(&mut ui_state, &label);
+                            ui_state.permission_bar.set_pending(label.clone());
+                            sync_permission_overlay(
+                                &mut ui_state,
+                                &tool,
+                                &args.to_string(),
+                                "Awaiting approval",
+                                true,
+                            );
+                            ui_state.notifications.warn(label.clone());
+                            coderex_ui::terminal_notification::emit(
+                                "CodeRex",
+                                &format!("Permission needed: {label}"),
+                                notify_osc9,
+                                notify_tmux,
+                            );
+                            self.persist_interactive_snapshot(&ui_state);
+                        }
+                        EngineEvent::AgentEvent { agent_id, event } => {
+                            apply_agent_event(&mut ui_state, &agent_id, &event);
+                            self.persist_interactive_snapshot(&ui_state);
+                        }
+                        EngineEvent::ModUi(elements) => {
+                            // A mod rendered UI during a hook. The tree is a
+                            // snapshot, so it renders here without touching
+                            // the mod runtime. It belongs in the transcript,
+                            // not on stdout interleaved with the turn.
+                            let rendered = coderex_ui::mod_elements::render_mod_ui_text(
+                                &elements,
+                                coderex_ui::mod_elements::MOD_UI_DEFAULT_WIDTH,
+                            );
+                            if rendered.is_empty() {
+                                // An empty tree clears what was focusable: there
+                                // is no block to route input to.
+                                mod_ui_focus = ModUiFocus::default();
+                            } else {
+                                ui_state.messages.push(Message {
+                                    role: MessageRole::System,
+                                    content: rendered.into(),
+                                    tool_name: None,
+                                    streaming: false,
+                                    folded: false,
+                                });
+                                let index = ui_state.messages.messages.len().saturating_sub(1);
+                                mod_ui_focus.reset(&elements, index);
+                                self.persist_interactive_snapshot(&ui_state);
+                            }
+                        }
+                        EngineEvent::PermissionExplanation { tool, explanation } => {
+                            // The Risk line carries the deterministic shell
+                            // analysis when there is one ("Dangerous: rm -rf
+                            // ..."). The explanation is model prose and arrives
+                            // on its own schedule; replacing the analysis with
+                            // it left the user approving a dangerous command
+                            // whose danger was no longer on screen. It fills
+                            // the line only when nothing else does.
+                            let has_analysis =
+                                ui_state.permission_detail.as_ref().is_some_and(|detail| {
+                                    detail.tool.eq_ignore_ascii_case(&tool)
+                                        && !matches!(
+                                            detail.risk_summary.trim(),
+                                            "" | "Awaiting approval"
+                                        )
+                                });
+                            if !has_analysis {
+                                if let Some(detail) = ui_state.permission_detail.as_mut()
+                                    && detail.tool.eq_ignore_ascii_case(&tool)
+                                {
+                                    detail.risk_summary.clone_from(&explanation);
+                                }
+                                if let Some(Overlay::PermissionDialog {
+                                    tool: open_tool,
+                                    risk_summary,
+                                    ..
+                                }) = ui_state.overlays.top_mut()
+                                    && open_tool.eq_ignore_ascii_case(&tool)
+                                {
+                                    risk_summary.clone_from(&explanation);
+                                }
+                            }
+                            self.persist_interactive_snapshot(&ui_state);
+                        }
+                        _ => {}
+                    }
+                }
+
                 Some(event) = ct_rx.recv() => {
                     match event {
                         Event::Key(key) => {
@@ -6049,199 +6252,6 @@ impl ReplLoop {
                     self.drain_agent_observable_events();
                 }
 
-                Some(engine_event) = async {
-                    event_rx.as_mut().unwrap().recv().await
-                }, if event_rx.is_some() => {
-                    self.record_engine_event_telemetry(&engine_event);
-                    match engine_event {
-                        EngineEvent::TextDelta(delta) => {
-                            phase.note_text_delta();
-                            set_plan_step(&mut ui_state, "Thinking through response");
-                            if let Some(last) = ui_state
-                                .messages
-                                .messages
-                                .iter_mut()
-                                .rev()
-                                .find(|msg| msg.role == MessageRole::Assistant)
-                            {
-                                let mut content = last.content.to_string();
-                                content.push_str(&delta);
-                                last.content = content.into();
-                                last.streaming = true;
-                            }
-                            if last_stream_snapshot.elapsed() >= Duration::from_secs(1) {
-                                self.persist_interactive_snapshot(&ui_state);
-                                last_stream_snapshot = Instant::now();
-                            }
-                        }
-                        EngineEvent::ToolUseSummary { id, summary, .. } => {
-                            // Render with the matching `ToolCallStart`, which
-                            // also carries the summary. Holding it here keeps
-                            // the two events from producing duplicate rows
-                            // while still letting this event drive the label.
-                            self.tool_use_summaries.insert(id, summary);
-                        }
-                        EngineEvent::ToolCallStart { id, name, summary } => {
-                            let summary = self.tool_use_summaries.remove(&id).unwrap_or(summary);
-                            self.tool_names.insert(id.clone(), name.clone());
-                            phase.note_tool_start(&summary);
-                            set_plan_step(&mut ui_state, &summary);
-                            // The log feeds `/activity`; the transcript row is
-                            // the ToolCall message below, so this must not add
-                            // a second visible row.
-                            record_activity(&mut ui_state, &summary);
-                            ui_state.messages.push(Message {
-                                role: MessageRole::ToolCall,
-                                content: summary.into(),
-                                tool_name: Some(name.into()),
-                                streaming: false,
-                                folded: false,
-                            });
-                            self.persist_interactive_snapshot(&ui_state);
-                        }
-                        EngineEvent::ToolCallEnd { id, result } => {
-                            // A call blocked before its start event never
-                            // consumed its label; drop it here.
-                            self.tool_use_summaries.remove(&id);
-                            let tool_name = self
-                                .tool_names
-                                .remove(&id)
-                                .unwrap_or_else(|| "Tool".to_string());
-                            phase.note_tool_end();
-                            complete_plan(&mut ui_state);
-                            pending_confirmation = None;
-                            clear_permission_overlay(&mut ui_state);
-                            let content = if result.is_error {
-                                // Name the tool and the first line of the
-                                // error: "Tool failed" alone cannot be acted
-                                // on, and the output lives further up the
-                                // transcript.
-                                let reason = result
-                                    .output
-                                    .lines()
-                                    .next()
-                                    .unwrap_or_default()
-                                    .trim()
-                                    .chars()
-                                    .take(80)
-                                    .collect::<String>();
-                                let reason = if reason.is_empty() {
-                                    "no output".to_string()
-                                } else {
-                                    reason
-                                };
-                                ui_state
-                                    .notifications
-                                    .err(format!("{tool_name} failed: {reason}"));
-                                format!("Error: {}", result.output)
-                            } else {
-                                ui_state
-                                    .notifications
-                                    .success(format!("{tool_name} completed"));
-                                result.output
-                            };
-                            ui_state.messages.push(Message {
-                                role: MessageRole::ToolResult,
-                                content: content.into(),
-                                // Kept for syntax highlighting and future
-                                // per-tool rendering; the result row does not
-                                // print a second `[name]` label.
-                                tool_name: Some(tool_name.into()),
-                                streaming: false,
-                                folded: false,
-                            });
-                            self.persist_interactive_snapshot(&ui_state);
-                        }
-                        EngineEvent::PermissionRequest { tool, args, .. } => {
-                            let label =
-                                permission_activity_label(&ToolCall::summarize_activity(&tool, &args));
-                            phase.note_permission_request(&tool, &args);
-                            set_plan_step(&mut ui_state, &label);
-                            push_activity_row(&mut ui_state, &label);
-                            ui_state.permission_bar.set_pending(label.clone());
-                            sync_permission_overlay(
-                                &mut ui_state,
-                                &tool,
-                                &args.to_string(),
-                                "Awaiting approval",
-                                true,
-                            );
-                            ui_state.notifications.warn(label.clone());
-                            coderex_ui::terminal_notification::emit(
-                                "CodeRex",
-                                &format!("Permission needed: {label}"),
-                                notify_osc9,
-                                notify_tmux,
-                            );
-                            self.persist_interactive_snapshot(&ui_state);
-                        }
-                        EngineEvent::AgentEvent { agent_id, event } => {
-                            apply_agent_event(&mut ui_state, &agent_id, &event);
-                            self.persist_interactive_snapshot(&ui_state);
-                        }
-                        EngineEvent::ModUi(elements) => {
-                            // A mod rendered UI during a hook. The tree is a
-                            // snapshot, so it renders here without touching
-                            // the mod runtime. It belongs in the transcript,
-                            // not on stdout interleaved with the turn.
-                            let rendered = coderex_ui::mod_elements::render_mod_ui_text(
-                                &elements,
-                                coderex_ui::mod_elements::MOD_UI_DEFAULT_WIDTH,
-                            );
-                            if rendered.is_empty() {
-                                // An empty tree clears what was focusable: there
-                                // is no block to route input to.
-                                mod_ui_focus = ModUiFocus::default();
-                            } else {
-                                ui_state.messages.push(Message {
-                                    role: MessageRole::System,
-                                    content: rendered.into(),
-                                    tool_name: None,
-                                    streaming: false,
-                                    folded: false,
-                                });
-                                let index = ui_state.messages.messages.len().saturating_sub(1);
-                                mod_ui_focus.reset(&elements, index);
-                                self.persist_interactive_snapshot(&ui_state);
-                            }
-                        }
-                        EngineEvent::PermissionExplanation { tool, explanation } => {
-                            // The Risk line carries the deterministic shell
-                            // analysis when there is one ("Dangerous: rm -rf
-                            // ..."). The explanation is model prose and arrives
-                            // on its own schedule; replacing the analysis with
-                            // it left the user approving a dangerous command
-                            // whose danger was no longer on screen. It fills
-                            // the line only when nothing else does.
-                            let has_analysis =
-                                ui_state.permission_detail.as_ref().is_some_and(|detail| {
-                                    detail.tool.eq_ignore_ascii_case(&tool)
-                                        && !matches!(
-                                            detail.risk_summary.trim(),
-                                            "" | "Awaiting approval"
-                                        )
-                                });
-                            if !has_analysis {
-                                if let Some(detail) = ui_state.permission_detail.as_mut()
-                                    && detail.tool.eq_ignore_ascii_case(&tool)
-                                {
-                                    detail.risk_summary.clone_from(&explanation);
-                                }
-                                if let Some(Overlay::PermissionDialog {
-                                    tool: open_tool,
-                                    risk_summary,
-                                    ..
-                                }) = ui_state.overlays.top_mut()
-                                    && open_tool.eq_ignore_ascii_case(&tool)
-                                {
-                                    risk_summary.clone_from(&explanation);
-                                }
-                            }
-                            self.persist_interactive_snapshot(&ui_state);
-                        }
-                        _ => {}
-                    }
-                }
 
                 Some(request) = async {
                     confirmation_rx.as_mut().unwrap().recv().await
